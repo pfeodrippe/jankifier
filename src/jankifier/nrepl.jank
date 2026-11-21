@@ -1,0 +1,656 @@
+(ns jankifier.nrepl
+  "CIDER support for jank's built-in nREPL server, which only has the core
+  nREPL ops. Requiring this namespace in a running REPL adds these ops,
+  under both their bare and `cider/` names:
+
+    complete      completions, including `alias/` and `full.ns/` prefixes
+    info, eldoc   docs, arglists and source locations for vars
+    lookup        like jank's, but also for qualified symbols
+    test          runs a namespace's tests, or some of them
+    test-var-query  runs the tests a var query selects, as Calva asks
+    test-all      runs the tests of every loaded namespace
+    retest        reruns the tests which didn't pass
+    test-stacktrace
+
+  and adds them to `describe`, so CIDER knows they're there. It also makes
+  `eval` and `load-file` send their final `done` in a message of its own (see
+  `done-apart`), without which CIDER never finishes an evaluation which
+  throws.
+
+  It's a development tool which uses jank's own nREPL server namespaces, so
+  only require it in a REPL, e.g. right after connecting:
+
+    (require 'jankifier.nrepl)"
+  (:require [clojure.string :as string]
+            [clojure.test :as test]
+            [jank.nrepl.server.capture :refer [with-capture]]
+            [jank.nrepl.server.handler :refer [handle-message]]
+            [jank.nrepl.server.handler.completions :as jank-completions]
+            ;; Loaded first so that the methods here replace or wrap them.
+            [jank.nrepl.server.handler.describe]
+            [jank.nrepl.server.handler.eval]
+            [jank.nrepl.server.handler.lookup]))
+
+(cpp/raw "
+#include <chrono>
+#include <filesystem>
+#include <jank/util/environment.hpp>
+
+namespace jankifier::nrepl
+{
+  inline jank::runtime::object_ref ns_aliases(jank::runtime::object_ref const n)
+  {
+    return *jank::runtime::try_object<jank::runtime::ns>(n)->aliases.rlock();
+  }
+
+  inline bool file_exists(jank::runtime::object_ref const path)
+  {
+    std::error_code ec;
+    return std::filesystem::exists(std::string{ jank::runtime::to_string(path).c_str() }, ec);
+  }
+
+  inline jank::runtime::object_ref resource_dir()
+  {
+    return jank::runtime::make_box(jank::util::resource_dir());
+  }
+
+  inline long long now_ms()
+  {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+  }
+}")
+
+;; Namespaces and vars.
+
+(defn ns-aliases*
+  "The aliases of the namespace `ns-obj`, as a map from symbol to namespace.
+  jank's `ns-aliases` isn't ported yet."
+  [ns-obj]
+  (cpp/jankifier.nrepl.ns_aliases ns-obj))
+
+(defn find-ns*
+  "The namespace called `ns-name` (a string) from `ns-obj`: one of its aliases,
+  or a namespace with that name."
+  [ns-obj ns-name]
+  (let [sym (symbol ns-name)]
+    (or (get (ns-aliases* ns-obj) sym)
+        (find-ns sym))))
+
+(defn var-ns-name
+  "The name of the namespace of the var `v`."
+  [v]
+  (namespace (symbol v)))
+
+(defn var-name
+  "The name of the var `v`, without its namespace."
+  [v]
+  (name (symbol v)))
+
+(defn var-type
+  "The kind of thing the var `v` holds, as CIDER names it."
+  [v]
+  (let [m (meta v)]
+    (cond (:macro m) "macro"
+          (:arglists m) "function"
+          :else "var")))
+
+(defn split-symbol
+  "`[qualifier name]` for the symbol string `s`, e.g. [\"str\" \"join\"] for
+  \"str/join\", or [nil name] when it isn't qualified. \"/\" alone is a name."
+  [s]
+  (let [i (string/last-index-of s "/")]
+    (if (and i (pos? i) (< i (dec (count s))))
+      [(subs s 0 i) (subs s (inc i))]
+      [nil s])))
+
+(defn resolve-var
+  "The var the symbol string `s` names in the namespace `ns-obj`, or nil."
+  [ns-obj s]
+  (let [[qualifier n] (split-symbol s)]
+    (if qualifier
+      (when-let [target (find-ns* ns-obj qualifier)]
+        (find-var (symbol (str (ns-name target)) n)))
+      (let [found (get (ns-map ns-obj) (symbol n))]
+        (when (var? found)
+          found)))))
+
+(defn special-form?
+  "Whether the symbol string `s` names a special form."
+  [s]
+  (contains? jank-completions/special-forms s))
+
+(defn request-ns
+  "The namespace named by the request's \"ns\", or `user`."
+  [msg]
+  (or (some-> (get msg "ns") symbol find-ns)
+      (find-ns 'user)))
+
+;; Source files.
+
+(defn source-file
+  "A path to the file `file` which exists on this machine. jank's own
+  namespaces point at where jank was built, so those are looked for in jank's
+  installed sources instead."
+  [file]
+  (when file
+    (if (cpp/jankifier.nrepl.file_exists file)
+      file
+      (when-let [i (string/index-of file "/src/jank/")]
+        (let [installed (str (cpp/jankifier.nrepl.resource_dir) (subs file i))]
+          (when (cpp/jankifier.nrepl.file_exists installed)
+            installed))))))
+
+(defn source-location
+  "The file, line and column the var `v` is defined at, as far as known."
+  [v]
+  (let [source (:jank/source (meta v))
+        file (source-file (:file source))]
+    (when file
+      {:file file
+       :line (get-in source [:start :line])
+       :column (get-in source [:start :col])})))
+
+;; Responses.
+
+(defn without-nils
+  "`m` without its nil values, which can't be sent as bencode."
+  [m]
+  (into {} (remove (comp nil? val) m)))
+
+;; Completion.
+
+(defn var-candidate
+  "The completion candidate for the var `v`, shown as `candidate`."
+  [candidate v]
+  {:candidate candidate
+   :type (var-type v)
+   :ns (var-ns-name v)})
+
+(defn qualified-candidates
+  "Candidates for `qualifier/prefix`, from the public vars of the namespace
+  the qualifier names."
+  [ns-obj qualifier prefix]
+  (when-let [target (find-ns* ns-obj qualifier)]
+    (for [[sym v] (ns-publics target)
+          :when (string/starts-with? (str sym) prefix)]
+      (var-candidate (str qualifier "/" sym) v))))
+
+(defn unqualified-candidates
+  "Candidates for `prefix`: the vars the namespace `ns-obj` can use, its
+  aliases, namespace names and special forms."
+  [ns-obj prefix]
+  (let [matches? #(string/starts-with? (str %) prefix)]
+    (concat
+     (for [[sym v] (ns-map ns-obj)
+           :when (and (var? v) (matches? sym))]
+       (var-candidate (str sym) v))
+     (for [[alias _] (ns-aliases* ns-obj)
+           :when (matches? alias)]
+       {:candidate (str alias) :type "namespace"})
+     (for [n (all-ns)
+           :let [n (str (ns-name n))]
+           :when (matches? n)]
+       {:candidate n :type "namespace"}))))
+
+(defn special-form-candidates
+  "Candidates for `prefix` among the special forms, some of which, like
+  `cpp/raw`, look qualified."
+  [prefix]
+  (for [form jank-completions/special-forms
+        :when (string/starts-with? form prefix)]
+    {:candidate form :type "special-form"}))
+
+(defn completions
+  "The completion candidates for `prefix` in the namespace `ns-obj`, sorted
+  and without duplicates."
+  [ns-obj prefix]
+  (let [[qualifier n] (split-symbol prefix)
+        candidates (concat (if qualifier
+                             (qualified-candidates ns-obj qualifier n)
+                             (unqualified-candidates ns-obj prefix))
+                           (special-form-candidates prefix))]
+    (->> candidates
+         (reduce (fn [acc c]
+                   (if (contains? acc (:candidate c))
+                     acc
+                     (assoc acc (:candidate c) (without-nils c))))
+                 {})
+         vals
+         (sort-by :candidate)
+         vec)))
+
+;; Docs.
+
+(defn arglists-str
+  "The arglists of the var `v`, one per line, as cider-nrepl formats them."
+  [v]
+  (some->> (:arglists (meta v))
+           seq
+           (map pr-str)
+           (string/join "\n")))
+
+(defn var-info
+  "What CIDER's `info` op returns for the var `v`."
+  [v]
+  (let [m (meta v)]
+    (without-nils
+     (merge {:ns (var-ns-name v)
+             :name (var-name v)
+             :doc (some-> (:doc m) str)
+             :arglists-str (arglists-str v)
+             :macro (when (:macro m) "true")}
+            (source-location v)))))
+
+(defn info
+  "CIDER's `info` for the symbol string `s` in the namespace `ns-obj`, or nil
+  if it doesn't name a var or special form."
+  [ns-obj s]
+  (cond
+    (string/blank? s) nil
+    (special-form? s) {:name s :special-form "true"}
+    :else (some-> (resolve-var ns-obj s) var-info)))
+
+(defn eldoc
+  "CIDER's `eldoc` for the symbol string `s` in the namespace `ns-obj`, or nil."
+  [ns-obj s]
+  (if (special-form? s)
+    {:name s :type "special-form" :eldoc []}
+    (when-let [v (some->> s (resolve-var ns-obj))]
+      (let [m (meta v)]
+        (without-nils
+         {:ns (var-ns-name v)
+          :name (var-name v)
+          :type (case (var-type v)
+                  "var" "variable"
+                  (var-type v))
+          :docstring (some-> (:doc m) str)
+          :eldoc (mapv #(mapv str %) (:arglists m))})))))
+
+;; Tests.
+
+(def last-results
+  "The results of the last test run, by namespace and var, used to rerun the
+  tests which didn't pass and to find errors."
+  (atom {}))
+
+(defn test-var?
+  "Whether the var `v` is a test."
+  [v]
+  (some? (:test (meta v))))
+
+(defn source-line
+  "The line the var `v` is defined at, to run tests in file order."
+  [v]
+  (or (get-in (meta v) [:jank/source :start :line]) 0))
+
+(defn ns-tests
+  "The test vars of the namespace `ns-obj`, in the order they're defined."
+  [ns-obj]
+  (->> (vals (ns-interns ns-obj))
+       (filter test-var?)
+       (sort-by source-line)))
+
+(defn selected?
+  "Whether the test var `v` passes the `include` and `exclude` selectors,
+  which are metadata keys as strings."
+  [include exclude v]
+  (let [m (meta v)
+        has? (fn [k] (get m (keyword k)))]
+    (and (or (empty? include) (some has? include))
+         (not (some has? exclude)))))
+
+(defn print-value
+  "`x` printed the way cider-nrepl sends expected and actual values."
+  [x]
+  (str (pr-str x) "\n"))
+
+(defn exception?
+  "Whether the thrown value `e` is an exception, as opposed to any other
+  value, which jank can throw too. jank's `ex-message` throws for those."
+  [e]
+  (= "exception_info" (str (type e))))
+
+(defn error-summary
+  "A short form of the thrown value `e`, without jank's native trace."
+  [e]
+  (if (exception? e)
+    (str "#error " (pr-str (without-nils {:cause (ex-message e) :data (ex-data e)})))
+    (pr-str e)))
+
+(defn traces?
+  "Whether exception traces can be read. Reading one (`Throwable->map`, or
+  printing the exception) crashes jank outside of a REPL, e.g. in `jank run`
+  and so in `lein test`, so they're only read when jank's nREPL server is
+  running in this process."
+  []
+  (some? (find-ns 'jank.nrepl.server.core)))
+
+(defn error-trace
+  "The `[name file line]` frames of the thrown value `e`, or nil if it isn't
+  an exception or traces can't be read."
+  [e]
+  (when (and (exception? e) (traces?))
+    (:trace (Throwable->map e))))
+
+(defn file-name
+  "The last part of the path `path`."
+  [path]
+  (last (string/split path #"/")))
+
+(defn error-line
+  "The line in the file of the test var `v` where `e` was thrown from, found
+  in its trace."
+  [v e]
+  (when-let [file (some-> (:file (:jank/source (meta v))) file-name)]
+    (some (fn [[_ frame-file line]]
+            (when (= file frame-file)
+              line))
+          (error-trace e))))
+
+(defn assertion-result
+  "The result CIDER shows for one assertion, from the clojure.test report
+  `m`. `index` is the assertion's position in its test var."
+  [ns-name v index m]
+  (let [type (:type m)
+        error? (= :error type)]
+    (without-nils
+     {:type (name type)
+      :ns ns-name
+      :var (var-name v)
+      :index index
+      :context (let [context (test/testing-contexts-str)]
+                 (when-not (string/blank? context)
+                   context))
+      :message (some-> (:message m) str)
+      :expected (when (contains? #{:fail :error} type) (print-value (:expected m)))
+      :actual (case type
+                :fail (print-value (:actual m))
+                :error (str (error-summary (:actual m)) "\n")
+                nil)
+      :file (:file m)
+      :line (or (:line m) (when error? (error-line v (:actual m))))})))
+
+(defn empty-report
+  "A report with nothing run yet."
+  []
+  {:summary {:ns 0 :var 0 :test 0 :pass 0 :fail 0 :error 0}
+   :results {}})
+
+(defn reporter
+  "A `clojure.test/report` which records results in the atom `report`, and
+  the errors themselves in the atom `errors`."
+  [report errors]
+  (fn [m]
+    (case (:type m)
+      :begin-test-ns (swap! report update-in [:summary :ns] inc)
+      :begin-test-var (swap! report update-in [:summary :var] inc)
+      (:pass :fail :error)
+      (let [v (last test/*testing-vars*)
+            ns-name (var-ns-name v)
+            index (count (get-in @report [:results ns-name (var-name v)]))]
+        (when (= :error (:type m))
+          (swap! errors assoc [ns-name (var-name v) index] (:actual m)))
+        (swap! report
+               #(-> %
+                    (update-in [:summary :test] inc)
+                    (update-in [:summary (:type m)] inc)
+                    (update-in [:results ns-name (var-name v)]
+                               (fnil conj [])
+                               (assertion-result ns-name v index m)))))
+      nil)))
+
+(defn failed?
+  "Whether the report has any failures or errors."
+  [report]
+  (pos? (+ (get-in report [:summary :fail]) (get-in report [:summary :error]))))
+
+(defn elapsed
+  "The time since `start` (from `now_ms`), as CIDER shows it."
+  [start]
+  (let [ms (- (cpp/jankifier.nrepl.now_ms) start)]
+    {:ms ms :humanized (str "Completed in " ms " ms")}))
+
+(defn run-ns-tests
+  "Runs the test vars `vars` of the namespace `ns-obj` with its fixtures,
+  stopping after the first failing var when `fail-fast?`, and records how long
+  the namespace and each var took."
+  [ns-obj vars fail-fast? report]
+  (let [ns-meta (meta ns-obj)
+        ns-name (str (ns-name ns-obj))
+        once (test/join-fixtures (:clojure.test/once-fixtures ns-meta))
+        each (test/join-fixtures (:clojure.test/each-fixtures ns-meta))
+        ns-start (cpp/jankifier.nrepl.now_ms)]
+    (test/do-report {:type :begin-test-ns :ns ns-obj})
+    (once (fn []
+            (loop [vars vars]
+              (when-let [v (first vars)]
+                (let [start (cpp/jankifier.nrepl.now_ms)]
+                  (each (fn [] (test/test-var v)))
+                  (swap! report assoc-in [:var-elapsed-time ns-name (var-name v) :elapsed-time]
+                         (elapsed start)))
+                (when-not (and fail-fast? (failed? @report))
+                  (recur (rest vars)))))))
+    (test/do-report {:type :end-test-ns :ns ns-obj})
+    (swap! report assoc-in [:ns-elapsed-time ns-name] (elapsed ns-start))))
+
+(defn run-tests
+  "Runs the tests in `plan`, a seq of `[ns-obj vars]`, and returns the report
+  CIDER expects, with what the tests printed in `:out`."
+  [plan fail-fast?]
+  (let [report (atom (empty-report))
+        errors (atom {})
+        start (cpp/jankifier.nrepl.now_ms)
+        {:keys [stdout stderr]}
+        (with-capture
+          (fn []
+            (binding [test/report (reporter report errors)
+                      test/*report-counters* (atom test/*initial-report-counters*)
+                      test/*testing-vars* (list)
+                      test/*testing-contexts* (list)]
+              (loop [plan plan]
+                (when-let [[ns-obj vars] (first plan)]
+                  (run-ns-tests ns-obj vars fail-fast? report)
+                  (when-not (and fail-fast? (failed? @report))
+                    (recur (rest plan))))))))
+        total (elapsed start)]
+    (reset! last-results {:results (:results @report) :errors @errors})
+    (without-nils
+     (assoc @report
+            :elapsed-time total
+            :out (when-not (string/blank? stdout) stdout)
+            :err (when-not (string/blank? stderr) stderr)))))
+
+(defn loaded-test-nss
+  "The loaded namespaces, other than jank's own, sorted by name."
+  []
+  (for [ns-obj (sort-by (comp str ns-name) (all-ns))
+        :let [n (str (ns-name ns-obj))]
+        :when (not (or (string/starts-with? n "clojure.")
+                       (string/starts-with? n "jank.")))]
+    ns-obj))
+
+(defn var-query-plan
+  "The `[ns-obj vars]` pairs for cider-nrepl's `var-query`, as Calva sends
+  it: namespaces in `ns-query` (`exactly`, or `project?` for every loaded
+  one), optionally narrowed to the vars named in `exactly`, and filtered by
+  the `include-meta-key` and `exclude-meta-key` selectors."
+  [var-query]
+  (let [ns-query (get var-query "ns-query")
+        include (get var-query "include-meta-key")
+        exclude (get var-query "exclude-meta-key")
+        nss (if-let [names (seq (get ns-query "exactly"))]
+              (keep #(find-ns (symbol %)) names)
+              (loaded-test-nss))
+        only (some->> (get var-query "exactly") seq (keep #(find-var (symbol %))) set)]
+    (for [ns-obj nss
+          :let [vars (cond->> (ns-tests ns-obj)
+                       only (filter only)
+                       true (filter #(selected? include exclude %)))]
+          :when (seq vars)]
+      [ns-obj vars])))
+
+(defn test-plan
+  "What the request asks to test, as `[ns-obj vars]` pairs."
+  [msg]
+  (let [include (get msg "include")
+        exclude (get msg "exclude")
+        select (fn [vars] (filter #(selected? include exclude %) vars))]
+    (case (get msg "op")
+      ("test-var-query" "cider/test-var-query")
+      (var-query-plan (get msg "var-query"))
+
+      ("test" "cider/test")
+      (let [ns-sym (symbol (get msg "ns"))
+            _ (when-not (find-ns ns-sym)
+                (when (= "true" (get msg "load?"))
+                  (require ns-sym)))
+            ns-obj (find-ns ns-sym)
+            tests (seq (get msg "tests"))]
+        (when ns-obj
+          [[ns-obj (select (if tests
+                             (keep #(find-var (symbol (str ns-sym) %)) tests)
+                             (ns-tests ns-obj)))]]))
+
+      ("test-all" "cider/test-all")
+      (for [ns-obj (loaded-test-nss)
+            :let [vars (select (ns-tests ns-obj))]
+            :when (seq vars)]
+        [ns-obj vars])
+
+      ("retest" "cider/retest")
+      (for [[ns-name vars] (:results @last-results)
+            :let [ns-obj (find-ns (symbol ns-name))
+                  failing (for [[var-name results] vars
+                                :when (some #(contains? #{"fail" "error"} (:type %)) results)]
+                            (find-var (symbol ns-name var-name)))]
+            :when (and ns-obj (seq failing))]
+        [ns-obj (remove nil? failing)]))))
+
+(defn test-responses
+  "The responses for a test request: what the tests printed, then the
+  report, then done."
+  [msg]
+  (if-let [plan (seq (test-plan msg))]
+    (let [{:keys [out err] :as report} (run-tests plan (= "true" (get msg "fail-fast")))]
+      (vec (remove nil? [(when out {:out out})
+                         (when err {:err err})
+                         (dissoc report :out :err)
+                         {:status [:done]}])))
+    (if (contains? #{"test" "cider/test"} (get msg "op"))
+      {:status [:namespace-not-found :done]}
+      [(empty-report) {:status [:done]}])))
+
+(defn stack-frame
+  "A frame of jank's trace as CIDER's stacktrace shows it. Frames of jank
+  sources are flagged `clj`, and native ones `java`, so CIDER's filters can
+  hide either."
+  [[frame-name file line]]
+  {:name (str frame-name)
+   :file (str file)
+   :line line
+   :flags [(if (string/ends-with? (str file) ".jank") "clj" "java")]})
+
+(defn test-stacktrace-responses
+  "The error of an assertion from the last test run, as a single cause."
+  [msg]
+  (if-let [e (get-in @last-results [:errors [(get msg "ns") (get msg "var") (get msg "index")]])]
+    [(without-nils
+      {:class (str (type e))
+       :message (if (exception? e) (ex-message e) (pr-str e))
+       :data (when (exception? e) (some-> (ex-data e) pr-str))
+       :stacktrace (mapv stack-frame (error-trace e))})
+     {:status [:done]}]
+    {:status [:no-error :done]}))
+
+;; Ops.
+
+(def ops
+  "The ops this namespace adds, by their bare names. Each is also added under
+  `cider/`, which is what newer versions of CIDER ask for."
+  {"complete"
+   (fn [msg]
+     {:completions (completions (request-ns msg) (get msg "prefix" ""))
+      :status [:done]})
+
+   "info"
+   (fn [msg]
+     (if-let [i (info (request-ns msg) (or (get msg "sym") (get msg "symbol")))]
+       (assoc i :status [:done])
+       {:status [:no-info :done]}))
+
+   "eldoc"
+   (fn [msg]
+     (if-let [e (eldoc (request-ns msg) (or (get msg "sym") (get msg "symbol")))]
+       (assoc e :status [:done])
+       {:status [:no-eldoc :done]}))
+
+   "lookup"
+   (fn [msg]
+     (if-let [i (info (request-ns msg) (get msg "sym"))]
+       {:info i :status [:done]}
+       {:status [:lookup-error :done]}))
+
+   "test" test-responses
+   "test-var-query" test-responses
+   "test-all" test-responses
+   "retest" test-responses
+   "test-stacktrace" test-stacktrace-responses})
+
+(defn op-names
+  "Every name the ops are added under, as the keywords jank's server
+  dispatches on."
+  []
+  (mapcat (fn [op] [(keyword op) (keyword "cider" op)]) (keys ops)))
+
+(defonce jank-describe
+  (get-method handle-message :describe))
+
+(defonce jank-eval
+  (get-method handle-message :eval))
+
+(defonce jank-load-file
+  (get-method handle-message :load-file))
+
+(defn done-apart
+  "The responses `resps` (one or several, as handlers return them) with the
+  final `done` in a message of its own, as Clojure's nREPL sends it.
+
+  jank's server sends it together with the other statuses, e.g. `eval-error`,
+  and CIDER (2.1) handles that by running its eval error handler, which
+  leaves it in another buffer, before marking the request done, which then
+  fails. The request stays pending forever, with its spinner, for every
+  evaluation which throws."
+  [resps]
+  (vec (mapcat (fn [resp]
+                 (let [status (:status resp)
+                       others (vec (remove #{:done "done"} status))]
+                   (if (and (not= others status)
+                            (or (seq others) (seq (dissoc resp :status))))
+                     [(if (seq others)
+                        (assoc resp :status others)
+                        (dissoc resp :status))
+                      {:status [:done]}]
+                     [resp])))
+               (remove nil? (if (map? resps) [resps] resps)))))
+
+(defn install!
+  "Adds the ops to jank's nREPL server, and to its `describe`. Requiring this
+  namespace calls it, and calling it again is harmless."
+  []
+  (doseq [[op handler] ops
+          op-name [(keyword op) (keyword "cider" op)]]
+    (defmethod handle-message op-name [msg]
+      (handler msg)))
+  (defmethod handle-message :eval [msg]
+    (done-apart (jank-eval msg)))
+  (defmethod handle-message :load-file [msg]
+    (done-apart (jank-load-file msg)))
+  (defmethod handle-message :describe [msg]
+    (-> (jank-describe msg)
+        (update :ops merge (zipmap (op-names) (repeat {})))
+        (assoc-in [:versions :jankifier-nrepl] {:version-string "0.1.0"})))
+  :installed)
+
+(install!)

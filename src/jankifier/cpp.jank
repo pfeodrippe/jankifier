@@ -1,0 +1,147 @@
+(ns jankifier.cpp
+  "Helpers for generating C++ source from jank data, used by the macros in
+  the other jankifier namespaces."
+  (:require [clojure.string :as string]))
+
+(def types
+  "C++ types for the keywords which can be used as types."
+  {:void "void"
+   :bool "bool"
+   :char "char"
+   :i8 "int8_t"
+   :i16 "int16_t"
+   :i32 "int32_t"
+   :i64 "int64_t"
+   :u8 "uint8_t"
+   :u16 "uint16_t"
+   :u32 "uint32_t"
+   :u64 "uint64_t"
+   :f32 "float"
+   :f64 "double"
+   :isize "ptrdiff_t"
+   :usize "size_t"})
+
+(def keywords
+  "C++ keywords, which can't be used as names."
+  #{"alignas" "alignof" "and" "and_eq" "asm" "auto" "bitand" "bitor" "bool"
+    "break" "case" "catch" "char" "char8_t" "char16_t" "char32_t" "class"
+    "compl" "concept" "const" "consteval" "constexpr" "constinit" "const_cast"
+    "continue" "co_await" "co_return" "co_yield" "decltype" "default" "delete"
+    "do" "double" "dynamic_cast" "else" "enum" "explicit" "export" "extern"
+    "false" "float" "for" "friend" "goto" "if" "inline" "int" "long" "mutable"
+    "namespace" "new" "noexcept" "not" "not_eq" "nullptr" "operator" "or"
+    "or_eq" "private" "protected" "public" "register" "reinterpret_cast"
+    "requires" "return" "short" "signed" "sizeof" "static" "static_assert"
+    "static_cast" "struct" "switch" "template" "this" "thread_local" "throw"
+    "true" "try" "typedef" "typeid" "typename" "union" "unsigned" "using"
+    "virtual" "void" "volatile" "wchar_t" "while" "xor" "xor_eq"})
+
+(defn type-name
+  "The C++ type for `t`, which is one of:
+
+    a keyword from `types`
+    a string or symbol with the C++ type itself, e.g. \"ecs_iter_t\"
+    [:* t]      a pointer to `t`
+    [:& t]      a reference to `t`
+    [:const t]  a const `t`"
+  [t]
+  (cond
+    (keyword? t) (or (get types t)
+                     (throw (ex-info (str "Unknown type " t ", use one of "
+                                          (string/join ", " (sort (keys types)))
+                                          " or a string with the C++ type")
+                                     {:type t})))
+    (or (string? t) (symbol? t)) (str t)
+    (and (vector? t) (= 2 (count t)) (#{:* :& :const} (first t)))
+    (let [[kind inner] t]
+      (str (type-name inner) (case kind :* "*" :& "&" :const " const")))
+    :else (throw (ex-info (str "Invalid type " (pr-str t)) {:type t}))))
+
+(defn indirect?
+  "Whether `t` is a pointer or reference type."
+  [t]
+  (and (vector? t) (contains? #{:* :&} (first t))))
+
+(defn strip-const
+  "`t` without its outer `[:const ...]`."
+  [t]
+  (if (and (vector? t) (= :const (first t)))
+    (second t)
+    t))
+
+(defn identifier
+  "The C++ identifier for the jank name `n` (a keyword, symbol or string),
+  with each `-` turned into `_`. Throws if the result isn't a valid C++
+  identifier."
+  [n]
+  (let [id (string/replace (if (keyword? n) (name n) (str n)) "-" "_")]
+    (if (and (re-matches #"[A-Za-z_][A-Za-z0-9_]*" id)
+             (not (contains? keywords id)))
+      id
+      (throw (ex-info (str "Can't use " (pr-str n) " as a C++ name") {:name n})))))
+
+(defn namespace-segments
+  "The C++ namespace segments for the jank namespace `ns-name`, e.g.
+  `my.cool-app` gives [\"my\" \"cool_app\"]."
+  [ns-name]
+  (mapv identifier (string/split (str ns-name) #"\.")))
+
+(defn qualified-name
+  "The C++ name of `n` inside the C++ namespace of the jank namespace
+  `ns-name`, e.g. \"my::app::Vec2\"."
+  [ns-name n]
+  (string/join "::" (conj (namespace-segments ns-name) (identifier n))))
+
+(defn jank-symbol
+  "The jank symbol for `n` inside the C++ namespace of the jank namespace
+  `ns-name`, e.g. `cpp/my.app.Vec2`."
+  [ns-name n]
+  (symbol "cpp" (string/join "." (conj (namespace-segments ns-name) (identifier n)))))
+
+(defn params
+  "The C++ parameter list for `[[name type] ...]`."
+  [args]
+  (string/join ", " (for [[n t] args]
+                      (str (type-name t) " " (identifier n)))))
+
+(defn string-literal
+  "`s` as a C++ string literal."
+  [s]
+  (str "\"" (-> (str s)
+                (string/replace "\\" "\\\\")
+                (string/replace "\"" "\\\"")
+                (string/replace "\n" "\\n"))
+       "\""))
+
+(defn literal
+  "The jank value `v` as a C++ literal. Only numbers, booleans, strings and
+  nil have one."
+  [v]
+  (cond
+    (nil? v) "nullptr"
+    (boolean? v) (str v)
+    (integer? v) (str v)
+    (float? v) (let [s (str v)]
+                 (if (re-find #"[.eE]" s) s (str s ".0")))
+    (string? v) (string-literal v)
+    :else (throw (ex-info (str "No C++ literal for " (pr-str v)) {:value v}))))
+
+(defn comment-lines
+  "`doc` as C++ `//` comment lines, each prefixed by `indent`, or an empty
+  string without a doc."
+  [indent doc]
+  (if (string/blank? doc)
+    ""
+    (apply str (for [line (string/split-lines doc)]
+                 (str indent "// " (string/trim line) "\n")))))
+
+(defn dsl-type
+  "The jank symbol for the C++ type name `cpp-name`, as used inside
+  `#cpp (...)`, e.g. `my.app.Vec2` for \"my::app::Vec2\"."
+  [cpp-name]
+  (symbol (string/replace cpp-name "::" ".")))
+
+(defn box-name
+  "The type name jank expects in the box of a pointer to `pointee`."
+  [pointee]
+  (str pointee "*"))

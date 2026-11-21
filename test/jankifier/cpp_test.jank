@@ -1,0 +1,77 @@
+(ns jankifier.cpp-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [jankifier.cpp :as jc]))
+
+(deftest type-name-test
+  (testing "keywords"
+    (is (= "double" (jc/type-name :f64)))
+    (is (= "uint32_t" (jc/type-name :u32)))
+    (is (= "void" (jc/type-name :void))))
+  (testing "C++ types as strings and symbols"
+    (is (= "ecs_iter_t*" (jc/type-name "ecs_iter_t*")))
+    (is (= "Velocity" (jc/type-name 'Velocity))))
+  (testing "pointers, references and const"
+    (is (= "Vec2*" (jc/type-name '[:* Vec2])))
+    (is (= "double&" (jc/type-name [:& :f64])))
+    (is (= "Vec2 const&" (jc/type-name '[:& [:const Vec2]])))
+    (is (= "char const**" (jc/type-name [:* [:* [:const :char]]]))))
+  (testing "invalid types"
+    (is (thrown? (jc/type-name [:ptr :f64])))
+    (is (thrown? (jc/type-name :f128)))
+    (is (thrown? (jc/type-name 42)))))
+
+(deftest indirect-test
+  (is (jc/indirect? [:* :f64]))
+  (is (jc/indirect? [:& 'Vec2]))
+  (is (not (jc/indirect? [:const 'Vec2])))
+  (is (not (jc/indirect? :f64)))
+  (is (= 'Vec2 (jc/strip-const '[:const Vec2])))
+  (is (= :f64 (jc/strip-const :f64))))
+
+(deftest identifier-test
+  (is (= "length" (jc/identifier 'length)))
+  (is (= "scaled_length" (jc/identifier 'scaled-length)))
+  (is (= "max_mp" (jc/identifier :max-mp)))
+  (is (= "Vec2" (jc/identifier "Vec2")))
+  (testing "invalid names"
+    (is (thrown? (jc/identifier 'alive?)))
+    (is (thrown? (jc/identifier "2d"))))
+  (testing "C++ keywords"
+    (is (thrown? (jc/identifier 'new)))
+    (is (thrown? (jc/identifier :class)))))
+
+(deftest namespace-names-test
+  (is (= ["my" "cool_app"] (jc/namespace-segments 'my.cool-app)))
+  (is (= "my::cool_app::Vec2" (jc/qualified-name 'my.cool-app 'Vec2)))
+  (is (= 'cpp/my.cool_app.Vec2 (jc/jank-symbol "my.cool-app" 'Vec2)))
+  (is (thrown? (jc/namespace-segments 'my.new.app))))
+
+(deftest params-test
+  (is (= "double x, uint32_t entity_id" (jc/params '[[x :f64] [entity-id :u32]])))
+  (is (= "" (jc/params []))))
+
+(deftest string-literal-test
+  (is (= "\"ns.core\"" (jc/string-literal "ns.core")))
+  (is (= "\"a \\\"b\\\" \\\\ c\\n\"" (jc/string-literal "a \"b\" \\ c\n"))))
+
+(deftest literal-test
+  (is (= "2" (jc/literal 2)))
+  (is (= "-7" (jc/literal -7)))
+  (is (= "0.25" (jc/literal 0.25)))
+  (is (= "1.0" (jc/literal 1.0)))
+  (is (= "true" (jc/literal true)))
+  (is (= "\"hi\"" (jc/literal "hi")))
+  (is (= "nullptr" (jc/literal nil)))
+  (is (thrown? (jc/literal :k)))
+  (is (thrown? (jc/literal [1]))))
+
+(deftest comment-lines-test
+  (is (= "  // one\n  // two\n" (jc/comment-lines "  " "one\n   two")))
+  (is (= "" (jc/comment-lines "  " nil))))
+
+(deftest dsl-type-test
+  (is (= 'my.app.Vec2 (jc/dsl-type "my::app::Vec2")))
+  (is (= 'ecs_iter_t (jc/dsl-type "ecs_iter_t"))))
+
+(deftest box-name-test
+  (is (= "my::app::Vec2*" (jc/box-name "my::app::Vec2"))))

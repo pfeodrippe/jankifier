@@ -1,0 +1,468 @@
+(ns jankifier.core-test
+  (:require [clojure.string :as string]
+            [clojure.test :refer [deftest is testing]]
+            [jankifier.core :as core :refer [cpp-cast cpp-fn cpp-type defcfn defcstruct
+                                             defcstructs]]
+            [jankifier.cpp :as jc]))
+
+;; Types, arguments and calls.
+
+(def env {:resolve-type {'Vec2 "my::app::Vec2"}})
+
+(deftest parse-type-test
+  (testing "by value"
+    (is (= {:type :f64 :cpp-type "double"} (core/parse-type env :f64))))
+  (testing "structs are resolved to their C++ names"
+    (is (= {:type '[:* Vec2] :cpp-type "my::app::Vec2*" :indirection :* :pointee "my::app::Vec2"}
+           (core/parse-type env '[:* Vec2]))))
+  (testing "const is dropped from the pointee"
+    (is (= {:type '[:& [:const Vec2]] :cpp-type "my::app::Vec2 const&"
+            :indirection :& :pointee "my::app::Vec2"}
+           (core/parse-type env '[:& [:const Vec2]]))))
+  (testing "named C++ types"
+    (is (= "ecs_iter_t" (:pointee (core/parse-type env [:* "ecs_iter_t"])))))
+  (testing "pointers to keyword types aren't supported"
+    (is (thrown? (core/parse-type env [:* :f64])))))
+
+(deftest dsl-form-test
+  (testing "keyword types"
+    (is (= 'double (core/dsl-form env :f64)))
+    (is (= 'int32_t (core/dsl-form env :i32))))
+  (testing "structs are resolved to their C++ names"
+    (is (= 'my.app.Vec2 (core/dsl-form env 'Vec2))))
+  (testing "named C++ types"
+    (is (= 'flecs.world (core/dsl-form env 'flecs.world)))
+    (is (= 'flecs.world (core/dsl-form env "flecs::world"))))
+  (testing "pointers, references and const"
+    (is (= '(:* (:const my.app.Vec2)) (core/dsl-form env '[:* [:const Vec2]])))
+    (is (= '(:& double) (core/dsl-form env [:& :f64]))))
+  (testing "templates"
+    (is (= '(flecs.system_builder my.app.Vec2 (:const my.app.Vec2))
+           (core/dsl-form env '(flecs.system_builder Vec2 [:const Vec2]))))
+    (is (= '(std.array my.app.Vec2 4) (core/dsl-form env '(std.array Vec2 4)))))
+  (testing "errors"
+    (is (thrown? (core/dsl-form env "unsigned char")))
+    (is (thrown? (core/dsl-form env [:ptr :f64])))
+    (is (thrown? (core/dsl-form env :f128)))
+    (is (thrown? (core/dsl-form env 42)))))
+
+(deftest parse-args-test
+  (is (= '[k v] (map :name (core/parse-args env '[[k :f64] [v [:* Vec2]]]))))
+  (testing "errors"
+    (is (thrown? (core/parse-args env '[k :f64])))
+    (is (thrown? (core/parse-args env '([k :f64]))))
+    (is (thrown? (core/parse-args env '[[k :void]])))
+    (is (thrown? (core/parse-args env '[[v Vec2]])))
+    (is (thrown? (core/parse-args env '[[:k :f64]])))))
+
+(deftest parse-ret-test
+  (is (= "void" (:cpp-type (core/parse-ret env :void))))
+  (is (= "bool" (:cpp-type (core/parse-ret env :bool))))
+  (is (thrown? (core/parse-ret env '[:* Vec2])))
+  (is (thrown? (core/parse-ret env "Vec2"))))
+
+(deftest into-jank-source-test
+  (let [[k p r] (core/parse-args env '[[k :f64] [p [:* Vec2]] [r [:& [:const Vec2]]]])]
+    (is (= "jank::runtime::convert<double>::into_object(k)" (core/into-jank-source k)))
+    (is (= (str "jank::runtime::make_box<jank::runtime::obj::opaque_box>("
+                "const_cast<void *>(static_cast<void const *>(p)), \"my::app::Vec2*\")")
+           (core/into-jank-source p)))
+    (testing "references are boxed by address"
+      (is (string/includes? (core/into-jank-source r) "static_cast<void const *>(&r)")))))
+
+(deftest call-source-test
+  (let [args (core/parse-args env '[[k :f64]])
+        source (core/call-source 'my.app/f* args (core/parse-ret env :i32))]
+    (is (string/includes? source "find_var(\"my.app\", \"f*\")"))
+    (is (string/includes? source "jankifier: my.app/f* is not defined"))
+    (is (string/includes? source (str "return jank::runtime::convert<int32_t>::from_object("
+                                      "jank_var->call(jank::runtime::convert<double>::into_object(k)));"))))
+  (testing "void"
+    (is (not (string/includes? (core/call-source 'my.app/f* [] (core/parse-ret env :void))
+                               "return")))))
+
+(deftest fn-form-test
+  (let [args (core/parse-args env '[[k :f64] [p [:* Vec2]]])]
+    (testing "pointers are unboxed"
+      (is (= '(clojure.core/defn- f* "Doc." [x k p]
+                (clojure.core/let [p (cpp/unbox (cpp/dsl (:* my.app.Vec2)) p)]
+                  (* k x)))
+             (core/fn-form 'my.app/f* "Doc." '[x] args '[(* k x)]))))
+    (testing "without pointers"
+      (is (= '(clojure.core/defn- f* [k] (inc k))
+             (core/fn-form 'my.app/f* nil [] [(first args)] '[(inc k)]))))))
+
+;; Structs.
+
+(defn- parse [struct-name & declaration]
+  (core/parse-struct core/default-env 'my.app struct-name declaration))
+
+(deftest parse-struct-test
+  (let [description (parse 'Vec2
+                           "A 2D vector."
+                           {:layout :packed}
+                           '[[:x :f64]
+                             [:y {:doc "Vertical" :default 0.0} :f64]
+                             [:dims {:const 2} :i32]
+                             [:count {:var 0} :i32]
+                             (fn scaled :f64 "Scaled." [[k :f64]] (* k x))])]
+    (testing "names"
+      (is (= 'Vec2 (:name description)))
+      (is (= "my::app::Vec2" (:cpp-name description)))
+      (is (= 'cpp/my.app.Vec2 (:cpp-symbol description))))
+    (testing "doc and attributes"
+      (is (= "A 2D vector." (:doc description)))
+      (is (= :packed (:layout description))))
+    (testing "instance fields"
+      (is (= [{:name :x :kind :field :type :f64 :cpp-type "double"}
+              {:name :y :kind :field :type :f64 :cpp-type "double" :doc "Vertical" :default 0.0}]
+             (:fields description))))
+    (testing "static members"
+      (is (= [[:dims :const 2] [:count :var 0]]
+             (map (juxt :name :kind :value) (:members description)))))
+    (testing "methods"
+      (let [[method] (:methods description)]
+        (is (= 'scaled (:name method)))
+        (is (= "double" (:cpp-type (:ret method))))
+        (is (= [{:name 'k :type :f64 :cpp-type "double"}] (:args method)))
+        (is (= 'my.app/Vec2-scaled (:fn method)))
+        (is (= "Scaled." (:doc method)))
+        (is (= '((* k x)) (:body method)))))))
+
+(deftest parse-struct-defaults-test
+  (let [description (parse 'Point '[[x :i32]])]
+    (is (= :normal (:layout description)))
+    (is (nil? (:doc description)))
+    (is (= [:x] (map :name (:fields description))))
+    (is (empty? (:methods description)))))
+
+(deftest parse-struct-resolves-struct-types-test
+  (let [env {:resolve-type {'Vec2 "my::app::Vec2"}}
+        description (core/parse-struct env 'my.game 'Particle ['[[:vel Vec2] [:target "Vec2*"]]])]
+    (is (= ["my::app::Vec2" "Vec2*"] (map :cpp-type (:fields description))))))
+
+(deftest parse-struct-errors-test
+  (testing "members in one vector"
+    (is (thrown? (parse 'P '[x :i32] '[y :i32])))
+    (is (thrown? (parse 'P))))
+  (testing "fields"
+    (is (thrown? (parse 'P '[[:x]])))
+    (is (thrown? (parse 'P '[[:x {:defualt 1} :i32]])))
+    (is (thrown? (parse 'P '[[:x {:default 1 :const 2} :i32]])))
+    (is (thrown? (parse 'P '[[:x {:default [1]} :i32]])))
+    (is (thrown? (parse 'P '[[:x :f128]])))
+    (is (thrown? (parse 'P '[["x" :i32]]))))
+  (testing "attributes"
+    (is (thrown? (parse 'P {:layout :tight} '[[:x :i32]])))
+    (is (thrown? (parse 'P {:align 8} '[[:x :i32]]))))
+  (testing "methods"
+    (is (thrown? (parse 'P '[[:x :i32] (fn f :i32)])))
+    (is (thrown? (parse 'P '[[:x :i32] (fn f :i32 [k :i32] k)])))
+    (is (thrown? (parse 'P '[[:x :i32] (defn f :i32 [] 1)])))
+    (is (thrown? (parse 'P '[[:x :i32] (fn alive? :bool [] true)])))))
+
+;; Generated source.
+
+(deftest struct-source-test
+  (let [point (parse 'Point
+                     "A point."
+                     {:layout :packed}
+                     '[[:x :i32]
+                       [:y {:doc "Vertical" :default 3} :i32]
+                       [:dims {:const 2} :i32]
+                       [:debug {:var false} :bool]])]
+    (is (= (str "#include <concepts>\n"
+                "#include <cstddef>\n"
+                "#include <cstdint>\n"
+                "#include <type_traits>\n"
+                "namespace my::app {\n"
+                "  // A point.\n"
+                "  struct __attribute__((packed)) Point {\n"
+                "    int32_t x;\n"
+                "    // Vertical\n"
+                "    int32_t y = 3;\n"
+                "    static constexpr int32_t dims = 2;\n"
+                "    static inline bool debug = false;\n"
+                "  };\n"
+                "}\n"
+                (core/convert-source point)
+                (core/get-source point))
+           (core/struct-source point)))))
+
+(deftest convert-source-test
+  (let [source (core/convert-source (parse 'Point '[[:x :i32]
+                                                    [:max-y {:default 3} :i32]
+                                                    [:dims {:const 2} :i32]
+                                                    [:p [:* "void"]]]))]
+    (testing "a specialization for the struct"
+      (is (string/includes? source "struct convert<::my::app::Point>")))
+    (testing "instance fields with keyword or struct types, by their keyword"
+      (is (string/includes? source "intern_keyword(\"x\")"))
+      (is (string/includes? source "intern_keyword(\"max-y\")"))
+      (is (string/includes? source "v.max_y = convert<int32_t>::from_object"))
+      (is (not (string/includes? source "\"dims\"")))
+      (is (not (string/includes? source "\"p\""))))
+    (testing "without convertible fields"
+      (is (string/includes? (core/convert-source (parse 'Empty '[[:p [:* "void"]]]))
+                            "persistent_array_map::empty()")))))
+
+(deftest method-source-test
+  (let [{:keys [fields methods]} (parse 'Vec2 '[[:x :f64]
+                                                (fn scaled :f64 [[k :f64]] (* k x))
+                                                (fn log :void [] nil)])
+        [scaled log] methods
+        scaled-source (core/method-source fields scaled)]
+    (testing "signature"
+      (is (string/starts-with? scaled-source "    double scaled(double k) {\n")))
+    (testing "looks the method's function up by name"
+      (is (string/includes? scaled-source "find_var(\"my.app\", \"Vec2-scaled\")")))
+    (testing "passes the fields, then the arguments"
+      (is (string/includes? scaled-source (str "call(jank::runtime::convert<double>::into_object(x), "
+                                               "jank::runtime::convert<double>::into_object(k))"))))
+    (testing "converts the result back"
+      (is (string/includes? scaled-source "return jank::runtime::convert<double>::from_object(")))
+    (testing "void methods return nothing"
+      (is (not (string/includes? (core/method-source fields log) "return"))))))
+
+(deftest method-fn-form-test
+  (let [{:keys [fields methods]} (parse 'Vec2 '[[:x :f64]
+                                                [:y-max :f64]
+                                                (fn scaled :f64 "Scaled." [[k :f64]] (* k x))])]
+    (is (= '(clojure.core/defn- Vec2-scaled "Scaled." [x y-max k] (* k x))
+           (core/method-fn-form fields (first methods))))))
+
+(deftest constructor-form-test
+  (let [description (parse 'Vec2 '[[:x :f64] [:y {:default 7.0} :f64] [:dims {:const 2} :i32]])]
+    (is (= '(cpp/my.app.Vec2 1.0 2.0) (core/constructor-form description {:x 1.0 :y 2.0})))
+    (is (= '(cpp/my.app.Vec2 (inc a) 2.0) (core/constructor-form description {:y 2.0 :x '(inc a)})))
+    (testing "defaults"
+      (is (= '(cpp/my.app.Vec2 1.0 7.0) (core/constructor-form description {:x 1.0}))))
+    (testing "a vector of the values in order"
+      (is (= '(cpp/my.app.Vec2 1.0 2.0) (core/constructor-form description [1.0 2.0])))
+      (is (= '(cpp/my.app.Vec2 (inc a) 2.0) (core/constructor-form description '[(inc a) 2.0])))
+      (is (= '(cpp/my.app.Vec2 1.0 7.0) (core/constructor-form description [1.0]))))
+    (testing "errors"
+      (is (thrown? (core/constructor-form description {})))
+      (is (thrown? (core/constructor-form description {:x 1.0 :z 2.0})))
+      (is (thrown? (core/constructor-form description {:x 1.0 :dims 3})))
+      (is (thrown? (core/constructor-form description [])))
+      (is (thrown? (core/constructor-form description [1.0 2.0 3.0])))
+      (is (thrown? (core/constructor-form description '(1.0 2.0)))))))
+
+(deftest method-fields-test
+  (let [{:keys [fields methods]} (parse 'Particle '[[:id :u32]
+                                                    [:vel Vec2]
+                                                    [:raw "void*"]
+                                                    (fn f :i64 [] id)])]
+    (is (= [:id] (map :name (core/method-fields fields))))
+    (is (= '[id] (nth (core/method-fn-form fields (first methods)) 2)))))
+
+;; Functions.
+
+(deftest parse-fn-test
+  (let [description (core/parse-fn core/default-env 'my.app 'scale
+                                 '[:f64 "Scales." [[k :f64] [p [:* "Vec2"]]] (* k (.-x p))])]
+    (is (= "my::app::scale" (:cpp-name description)))
+    (is (= 'cpp/my.app.scale (:cpp-symbol description)))
+    (is (= 'my.app/scale* (:fn description)))
+    (is (= "Scales." (:doc description)))
+    (is (= '[k p] (map :name (:args description))))
+    (is (= '((* k (.-x p))) (:body description))))
+  (testing "doc is optional"
+    (is (nil? (:doc (core/parse-fn core/default-env 'my.app 'f '[:void [] nil])))))
+  (testing "errors"
+    (is (thrown? (core/parse-fn core/default-env 'my.app 'f '[:void])))
+    (is (thrown? (core/parse-fn core/default-env 'my.app 'f '[:void [[k "Vec2"]] nil])))
+    (is (thrown? (core/parse-fn core/default-env 'my.app 'f '["Vec2" [] nil])))))
+
+(deftest fn-source-test
+  (let [source (core/fn-source (core/parse-fn core/default-env 'my.app 'scale
+                                          '[:f64 "Scales." [[k :f64]] (* 2 k)]))]
+    (is (string/includes? source "namespace my::app {\n  // Scales.\n  double scale(double k)\n  {\n"))
+    (is (string/includes? source "find_var(\"my.app\", \"scale*\")"))))
+
+;; defcstruct
+
+(def logged (atom []))
+
+(defcstruct Vec2
+  "A 2D vector."
+  [[:x :f64]
+   [:y {:doc "Vertical component" :default 0.0} :f64]
+   [:dims {:const 2} :i32]
+   [:created {:var 0} :i32]
+   (fn length-squared :f64 [] (+ (* x x) (* y y)))
+   (fn scaled :f64 "Squared length times k." [[k :f64]] (* k (+ (* x x) (* y y))))
+   (fn above :bool [[limit :f64]] (> y limit))
+   (fn log :void [[tag :i32]] (swap! logged conj [tag x y]))])
+
+(defcstruct Particle
+  {:layout :packed}
+  [[:id :u32]
+   [:vel Vec2]
+   [:alive {:default true} :bool]
+   (fn id-plus :i64 [[n :i64]] (+ id n))
+   (fn push :void [[target [:* Vec2]]] (cpp/= (.-x target) (+ (.-x target) id)))])
+
+(cpp/raw "namespace jankifier::core_test {
+  inline double sum(Vec2 v) { return v.x + v.y; }
+}")
+
+(deftest struct-as-map-test
+  (let [v (Vec2 {:x 3.0 :y 4.0})
+        p (Particle {:id 7 :vel v})]
+    (testing "keywords and get read fields at runtime"
+      (is (= 3.0 (:x v)))
+      (is (= 4.0 (get v :y)))
+      (is (= 7 (:id p))))
+    (testing "the map has the instance fields, in order"
+      (is (= {:x 3.0 :y 4.0} (into {} v)))
+      (is (= [:x :y] (keys v)))
+      (is (= "{:x 3.0, :y 4.0}" (pr-str v))))
+    (testing "pointers, and fallbacks"
+      (let [pv (cpp/& v)]
+        (is (= 3.0 (:x pv)))
+        (is (= 4.0 (get pv :y)))
+        (is (nil? (:z pv)))
+        (is (= :none (:z pv :none)))
+        (is (= :none (get v :z :none)))))
+    (testing "nested structs"
+      (is (= 4.0 (:y (:vel p))))
+      (is (= {:id 7 :vel {:x 3.0 :y 4.0} :alive true} (into {} p))))
+    (testing "maps given to C++ become the struct"
+      (is (= 3.0 (cpp/jankifier.core_test.sum {:x 1.0 :y 2.0})))
+      (testing "with defaults for the fields left out"
+        (is (= 1.0 (cpp/jankifier.core_test.sum {:x 1.0})))))))
+
+(deftest defcstruct-test
+  (let [v (Vec2 {:x 3.0 :y 4.0})]
+    (testing "fields"
+      (is (= 3.0 (.-x v)))
+      (is (= 4.0 (.-y v))))
+    (testing "defaults"
+      (is (= 0.0 (.-y (Vec2 {:x 1.0})))))
+    (testing "from a vector of the values in order"
+      (let [p (Vec2 [4 1])]
+        (is (= [4.0 1.0] [(.-x p) (.-y p)])))
+      (is (= 0.0 (.-y (Vec2 [1.0])))))
+    (testing "static members"
+      (is (= 2 cpp/jankifier.core_test.Vec2.dims))
+      (is (= 0 cpp/jankifier.core_test.Vec2.created)))
+    (testing "methods"
+      (is (= 25.0 (.length_squared v)))
+      (is (= 50.0 (.scaled v 2.0)))
+      (is (true? (.above v 3.5)))
+      (is (false? (.above v 4.5))))
+    (testing "void methods"
+      (reset! logged [])
+      (.log v 7)
+      (is (= [[7 3.0 4.0]] @logged)))
+    (testing "the C++ name is in the namespace's C++ namespace"
+      (is (= 3.0 (.-x (cpp/jankifier.core_test.Vec2 3.0 4.0)))))))
+
+(deftest defcstruct-var-test
+  (let [description (:jankifier/struct (meta #'Vec2))]
+    (is (= "jankifier::core_test::Vec2" (:cpp-name description)))
+    (is (= [:x :y] (map :name (:fields description))))
+    (is (= '[length-squared scaled above log] (map :name (:methods description))))
+    (is (string/starts-with? (:doc (meta #'Vec2)) "A 2D vector."))
+    (is (:macro (meta #'Vec2)))))
+
+(deftest nested-struct-test
+  (let [p (Particle {:id 7 :vel (Vec2 {:x 1.0 :y 2.0})})]
+    (is (= 7 (.-id p)))
+    (is (= 2.0 (.-y (.-vel p))))
+    (is (true? (.-alive p)))
+    (is (= 10 (.id_plus p 3)))
+    (testing "methods taking pointers to other structs"
+      (let [target (Vec2 {:x 1.0})]
+        (.push p (cpp/& target))
+        (is (= 8.0 (.-x target)))))))
+
+(def struct-specs
+  '[[Health [[:hp :i32]
+             (fn dead :bool [] (<= hp 0))]]
+    [Mana [[:mp :i32] [:max-mp :i32]]]])
+
+(defcstructs struct-specs)
+
+(defcstructs [[Armor [[:defense :i32]]]])
+
+(deftest defcstructs-test
+  (testing "from a var"
+    (is (true? (.dead (Health {:hp 0}))))
+    (is (false? (.dead (Health {:hp 10}))))
+    (is (= 20 (.-max_mp (Mana {:mp 5 :max-mp 20})))))
+  (testing "from a literal vector"
+    (is (= 3 (.-defense (Armor {:defense 3}))))))
+
+;; defcfn
+
+(defcfn twice :i64 [[n :i64]]
+  (* 2 n))
+
+(defcfn move :void
+  "Moves p by v."
+  [[p [:& Vec2]]
+   [v [:& [:const Vec2]]]]
+  (cpp/= (.-x p) (+ (.-x p) (.-x v)))
+  (cpp/= (.-y p) (+ (.-y p) (.-y v))))
+
+(defcfn length-squared :f64 [[p [:* [:const Vec2]]]]
+  (+ (* (.-x p) (.-x p)) (* (.-y p) (.-y p))))
+
+;; C++ which takes a callback, like many C and C++ libraries do.
+(cpp/raw "namespace jankifier::core_test {
+  void apply_twice(void (*f)(Vec2 &, Vec2 const &), Vec2 &p, Vec2 const &v)
+  { f(p, v); f(p, v); }
+}")
+
+(deftest defcfn-test
+  (testing "calling it from jank, through the macro"
+    (is (= 42 (twice 21))))
+  (testing "calling the C++ function"
+    (is (= 42 (cpp/jankifier.core_test.twice 21))))
+  (testing "references are changed in place"
+    (let [p (Vec2 {:x 1.0 :y 2.0})]
+      (move p (Vec2 {:x 10.0 :y 20.0}))
+      (is (= [11.0 22.0] [(.-x p) (.-y p)]))))
+  (testing "pointers"
+    (let [p (Vec2 {:x 3.0 :y 4.0})]
+      (is (= 25.0 (length-squared (cpp/& p))))))
+  (testing "as a C++ callback"
+    (let [p (Vec2 {:x 0.0 :y 0.0})]
+      (cpp/jankifier.core_test.apply_twice cpp/jankifier.core_test.move p (Vec2 {:x 1.0 :y 5.0}))
+      (is (= [2.0 10.0] [(.-x p) (.-y p)])))))
+
+(deftest defcfn-var-test
+  (let [description (:jankifier/fn (meta #'move))]
+    (is (= "jankifier::core_test::move" (:cpp-name description)))
+    (is (= "jankifier::core_test::Vec2&" (:cpp-type (first (:args description)))))
+    (is (nil? (:body description)))
+    (is (string/starts-with? (:doc (meta #'move)) "Moves p by v."))
+    (is (:macro (meta #'move)))))
+
+;; C++ interop with jank names.
+
+(cpp/raw "#include <utility>")
+
+(deftest cpp-type-test
+  (testing "a template with keyword and struct arguments, constructed"
+    (let [pair ((cpp-type (std.pair :i32 Vec2)) 7 (Vec2 {:x 1.0 :y 2.0}))]
+      (is (= 7 (.-first pair)))
+      (is (= 2.0 (.-y (.-second pair)))))))
+
+(deftest cpp-cast-test
+  (testing "keyword types"
+    (is (= 3 (cpp-cast :i32 3.7))))
+  (testing "pointers to structs"
+    (let [v (Vec2 {:x 3.0 :y 4.0})
+          untyped (cpp-cast [:* :void] (cpp/& v))
+          p (cpp-cast [:* Vec2] untyped)]
+      (is (= 4.0 (.-y p))))))
+
+(deftest cpp-fn-test
+  (testing "a defcfn as a C++ callback"
+    (let [p (Vec2 {:x 0.0 :y 0.0})]
+      (cpp/jankifier.core_test.apply_twice (cpp-fn move) p (Vec2 {:x 1.0 :y 5.0}))
+      (is (= [2.0 10.0] [(.-x p) (.-y p)])))))

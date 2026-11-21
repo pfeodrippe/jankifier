@@ -1,0 +1,237 @@
+(ns jankifier.nrepl-test
+  (:require [clojure.string :as string]
+            [clojure.test :as test :refer [deftest is testing]]
+            [jank.nrepl.server.handler :refer [handle-message]]
+            [jankifier.nrepl :as nrepl]))
+
+(def this-ns (find-ns 'jankifier.nrepl-test))
+
+(defn candidates
+  "The completion candidates for `prefix` in this namespace."
+  [prefix]
+  (set (map :candidate (nrepl/completions this-ns prefix))))
+
+;; Namespaces and vars.
+
+(deftest split-symbol-test
+  (is (= ["str" "join"] (nrepl/split-symbol "str/join")))
+  (is (= ["clojure.string" "join"] (nrepl/split-symbol "clojure.string/join")))
+  (is (= [nil "join"] (nrepl/split-symbol "join")))
+  (testing "a trailing or lone slash isn't a qualifier"
+    (is (= [nil "/"] (nrepl/split-symbol "/")))
+    (is (= [nil "str/"] (nrepl/split-symbol "str/")))))
+
+(deftest resolve-var-test
+  (is (= #'clojure.string/join (nrepl/resolve-var this-ns "string/join")))
+  (is (= #'clojure.string/join (nrepl/resolve-var this-ns "clojure.string/join")))
+  (is (= #'clojure.core/map (nrepl/resolve-var this-ns "map")))
+  (is (= #'jankifier.nrepl-test/candidates (nrepl/resolve-var this-ns "candidates")))
+  (is (nil? (nrepl/resolve-var this-ns "nope/join")))
+  (is (nil? (nrepl/resolve-var this-ns "nope"))))
+
+(deftest ns-aliases-test
+  (is (= (find-ns 'clojure.string) (get (nrepl/ns-aliases* this-ns) 'string)))
+  (is (= (find-ns 'jankifier.nrepl) (nrepl/find-ns* this-ns "nrepl")))
+  (is (= (find-ns 'clojure.string) (nrepl/find-ns* this-ns "clojure.string"))))
+
+;; Source files.
+
+(deftest source-file-test
+  (testing "existing files are kept"
+    (let [file (:file (nrepl/source-location #'nrepl/completions))]
+      (is (string/ends-with? file "src/jankifier/nrepl.jank"))))
+  (testing "jank's own sources are found where jank is installed"
+    (let [file (:file (nrepl/source-location #'clojure.core/map))]
+      (is (string/ends-with? file "/src/jank/clojure/core.jank"))
+      (is (nrepl/source-file file))))
+  (is (nil? (nrepl/source-file "/nope/nope.jank")))
+  (is (nil? (nrepl/source-file nil))))
+
+;; Completion.
+
+(deftest completions-test
+  (testing "aliases"
+    (is (contains? (candidates "string/jo") "string/join"))
+    (is (= {:candidate "string/join" :type "function" :ns "clojure.string"}
+           (first (nrepl/completions this-ns "string/jo")))))
+  (testing "namespaces by name"
+    (is (contains? (candidates "clojure.string/starts") "clojure.string/starts-with?")))
+  (testing "vars the namespace can use"
+    (is (contains? (candidates "defmult") "defmulti"))
+    (is (contains? (candidates "candi") "candidates")))
+  (testing "alias and namespace names"
+    (is (contains? (candidates "stri") "string"))
+    (is (contains? (candidates "jankifier.nr") "jankifier.nrepl")))
+  (testing "special forms, including the qualified looking ones"
+    (is (contains? (candidates "let") "let*"))
+    (is (= [{:candidate "cpp/raw" :type "special-form"}]
+           (nrepl/completions this-ns "cpp/ra"))))
+  (testing "sorted, without duplicates"
+    (let [cs (map :candidate (nrepl/completions this-ns "s"))]
+      (is (= (sort cs) cs))
+      (is (= (distinct cs) cs))))
+  (testing "nothing for unknown qualifiers"
+    (is (empty? (nrepl/completions this-ns "nope/x")))))
+
+;; Docs.
+
+(deftest info-test
+  (let [i (nrepl/info this-ns "string/join")]
+    (is (= "clojure.string" (:ns i)))
+    (is (= "join" (:name i)))
+    (is (string? (:doc i)))
+    (is (= "[coll]\n[separator coll]" (:arglists-str i)))
+    (is (string/ends-with? (:file i) "clojure/string.jank"))
+    (is (pos? (:line i))))
+  (is (= "true" (:macro (nrepl/info this-ns "when"))))
+  (is (= {:name "if" :special-form "true"} (nrepl/info this-ns "if")))
+  (is (nil? (nrepl/info this-ns "nope")))
+  (is (nil? (nrepl/info this-ns ""))))
+
+(deftest eldoc-test
+  (is (= {:ns "jankifier.nrepl"
+          :name "split-symbol"
+          :type "function"
+          :docstring (:doc (meta #'nrepl/split-symbol))
+          :eldoc [["s"]]}
+         (nrepl/eldoc this-ns "nrepl/split-symbol")))
+  (is (= "macro" (:type (nrepl/eldoc this-ns "when"))))
+  (is (= "variable" (:type (nrepl/eldoc this-ns "this-ns"))))
+  (is (nil? (nrepl/eldoc this-ns "nope"))))
+
+;; Tests.
+
+(deftest selected-test
+  (let [integration (intern 'jankifier.nrepl-test 'integration-sample nil)]
+    (alter-meta! integration assoc :integration true)
+    (is (nrepl/selected? [] [] integration))
+    (is (nrepl/selected? ["integration"] [] integration))
+    (is (not (nrepl/selected? [] ["integration"] integration)))
+    (is (not (nrepl/selected? ["slow"] [] integration)))))
+
+(deftest error-summary-test
+  (let [e (try (throw (ex-info "boom" {:a 1}))
+               (catch cpp/jank.runtime.object_ref e e))]
+    (is (= "#error {:cause \"boom\", :data {:a 1}}" (nrepl/error-summary e)))
+    (testing "traces are only read in a REPL"
+      (if (nrepl/traces?)
+        (is (seq (nrepl/error-trace e)))
+        (is (nil? (nrepl/error-trace e))))))
+  (is (= ":not-an-exception" (nrepl/error-summary :not-an-exception)))
+  (is (nil? (nrepl/error-trace :not-an-exception))))
+
+(defn sample-ns!
+  "A namespace with a passing, a failing and an erroring test. It's made at
+  runtime, so `lein test` doesn't run its tests."
+  []
+  (let [n 'jankifier.nrepl-sample]
+    (create-ns n)
+    (doseq [[sym line f] [['passing 1 (fn [] (is (= 1 1)))]
+                          ['failing 2 (fn [] (testing "math" (is (= 1 2) "one is two")))]
+                          ['erroring 3 (fn [] (is (throw (ex-info "boom" {}))))]]]
+      (alter-meta! (intern n sym nil) assoc :test f :jank/source {:start {:line line}}))
+    n))
+
+(defn run-op
+  "The report and the other responses to the test `msg`."
+  [msg]
+  (let [resps (handle-message msg)
+        resps (if (map? resps) [resps] resps)]
+    {:report (first (filter :summary resps))
+     :status (:status (last resps))}))
+
+(deftest test-op-test
+  (sample-ns!)
+  (testing "a namespace"
+    (let [{:keys [report status]} (run-op {"op" "cider/test" "ns" "jankifier.nrepl-sample" "tests" []})
+          results (get-in report [:results "jankifier.nrepl-sample"])]
+      (is (= [:done] status))
+      (is (= {:ns 1 :var 3 :test 3 :pass 1 :fail 1 :error 1} (:summary report)))
+      (is (= {:type "fail" :ns "jankifier.nrepl-sample" :var "failing" :index 0
+              :context "math" :message "one is two"
+              :expected "(= 1 2)\n" :actual "(not (= 1 2))\n"}
+             (first (get results "failing"))))
+      (is (= "error" (:type (first (get results "erroring")))))
+      (is (string/starts-with? (:actual (first (get results "erroring"))) "#error {:cause \"boom\""))
+      (is (= {:type "pass" :ns "jankifier.nrepl-sample" :var "passing" :index 0}
+             (first (get results "passing"))))
+      (is (number? (get-in report [:elapsed-time :ms])))
+      (is (number? (get-in report [:ns-elapsed-time "jankifier.nrepl-sample" :ms])))
+      (is (number? (get-in report [:var-elapsed-time "jankifier.nrepl-sample" "failing"
+                                   :elapsed-time :ms])))))
+  (testing "some of its tests"
+    (is (= 1 (get-in (run-op {"op" "test" "ns" "jankifier.nrepl-sample" "tests" ["passing"]})
+                     [:report :summary :var]))))
+  (testing "fail fast stops at the first failing test"
+    (is (= {:ns 1 :var 2 :test 2 :pass 1 :fail 1 :error 0}
+           (:summary (:report (run-op {"op" "cider/test" "ns" "jankifier.nrepl-sample"
+                                       "tests" [] "fail-fast" "true"}))))))
+  (testing "retest runs what didn't pass"
+    (run-op {"op" "cider/test" "ns" "jankifier.nrepl-sample" "tests" []})
+    (is (= {:ns 1 :var 2 :test 2 :pass 0 :fail 1 :error 1}
+           (:summary (:report (run-op {"op" "cider/retest"}))))))
+  (testing "the stacktrace of an error"
+    (let [[cause done] (handle-message {"op" "cider/test-stacktrace" "ns" "jankifier.nrepl-sample"
+                                        "var" "erroring" "index" 0})]
+      (is (= "boom" (:message cause)))
+      (is (= (if (nrepl/traces?) true false) (boolean (seq (:stacktrace cause)))))
+      (is (= [:done] (:status done))))
+    (is (= {:status [:no-error :done]}
+           (handle-message {"op" "cider/test-stacktrace" "ns" "jankifier.nrepl-sample"
+                            "var" "passing" "index" 0}))))
+  (testing "unknown namespaces"
+    (is (= {:status [:namespace-not-found :done]}
+           (handle-message {"op" "cider/test" "ns" "jankifier.nope" "tests" []})))))
+
+(deftest test-var-query-test
+  (sample-ns!)
+  (let [summary (fn [var-query]
+                  (:summary (:report (run-op {"op" "test-var-query" "var-query" var-query}))))]
+    (testing "a namespace"
+      (is (= 3 (:var (summary {"ns-query" {"exactly" ["jankifier.nrepl-sample"]}})))))
+    (testing "some of its vars"
+      (is (= {:ns 1 :var 1 :test 1 :pass 1 :fail 0 :error 0}
+             (summary {"ns-query" {"exactly" ["jankifier.nrepl-sample"]}
+                       "exactly" ["jankifier.nrepl-sample/passing"]}))))
+    (testing "selectors"
+      (is (= 0 (:var (summary {"ns-query" {"exactly" ["jankifier.nrepl-sample"]}
+                               "include-meta-key" ["integration"]})))))
+    (testing "every loaded namespace, without jank's own"
+      (let [nss (map first (nrepl/var-query-plan {"ns-query" {"project?" "true"}}))]
+        (is (some #{(find-ns 'jankifier.nrepl-sample)} nss))
+        (is (not-any? #(string/starts-with? (str (ns-name %)) "clojure.") nss))))))
+
+;; Ops.
+
+(deftest done-apart-test
+  (testing "done is sent apart from the other statuses and slots"
+    (is (= [{:ex "boom" :status [:eval-error]} {:status [:done]}]
+           (nrepl/done-apart [{:ex "boom" :status [:done :eval-error]}])))
+    (is (= [{:value "3"} {:status [:done]}]
+           (nrepl/done-apart {:value "3" :status [:done]}))))
+  (testing "a done on its own, and other responses, are kept"
+    (is (= [{:out "hi"} {:status [:done]}]
+           (nrepl/done-apart [{:out "hi"} nil {:status [:done]}])))))
+
+(deftest describe-test
+  (let [ops (:ops (handle-message {"op" "describe"}))]
+    (doseq [op ["complete" "info" "eldoc" "lookup" "test" "test-var-query" "test-all" "retest"
+                "test-stacktrace"]]
+      (is (contains? ops (keyword op)))
+      (is (contains? ops (keyword "cider" op))))
+    (testing "jank's own ops are kept"
+      (is (contains? ops :eval))
+      (is (contains? ops :completions)))))
+
+(deftest op-responses-test
+  (is (= [:done] (:status (handle-message {"op" "cider/complete" "ns" "jankifier.nrepl-test"
+                                           "prefix" "string/jo"}))))
+  (is (= "join" (:name (handle-message {"op" "cider/info" "ns" "jankifier.nrepl-test"
+                                        "sym" "string/join"}))))
+  (is (= {:status [:no-info :done]}
+         (handle-message {"op" "info" "ns" "jankifier.nrepl-test" "sym" "nope"})))
+  (is (= "join" (get-in (handle-message {"op" "lookup" "ns" "jankifier.nrepl-test"
+                                         "sym" "string/join"})
+                        [:info :name])))
+  (is (= {:status [:no-eldoc :done]}
+         (handle-message {"op" "cider/eldoc" "ns" "jankifier.nrepl-test" "sym" "nope"}))))

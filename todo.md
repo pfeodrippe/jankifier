@@ -1,0 +1,18 @@
+- [x] macros
+- [ ] autocompletion and stuff
+  - I start a nrepl from core-test, but unable to run tests or check autocompletion
+  - [ ] autocompletion
+  - [ ] run tests from the repl
+- [ ] clj-kondo
+- [ ] kaocha can be used here ? guess not, but it's a hell of a test runner and it should be possible to have something like it
+
+## Jank improvements
+
+- [ ] plain defmethod currently fails outside clojure.core, it calls the private defmethod*
+  - this happens only when there isn't a associated file path
+- [ ] nrepl (at least from the cider PoV)
+  - [ ] startup hook so people can add their own plugins/middleware
+  - [ ] no autocompletion
+  - [ ] no test run
+- [ ] outside the REPL (e.g. running tests), printing an exception or calling Throwable->map on one segfaults
+- [ ] ex-message on a non-exception throws in jank, Clojure returns nil

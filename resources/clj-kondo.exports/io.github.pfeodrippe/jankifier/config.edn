@@ -1,0 +1,6 @@
+{:hooks {:macroexpand {jankifier.core/defcstruct hooks.jankifier/defcstruct
+                       jankifier.core/defcstructs hooks.jankifier/defcstructs
+                       jankifier.core/defcfn hooks.jankifier/defcfn
+                       jankifier.core/cpp-type hooks.jankifier/cpp-type
+                       jankifier.core/cpp-cast hooks.jankifier/cpp-cast
+                       jankifier.core/cpp-fn hooks.jankifier/cpp-fn}}}

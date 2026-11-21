@@ -1,0 +1,665 @@
+(ns jankifier.core
+  "Write more jank than C++: C++ structs and functions defined from jank,
+  with an interface like aguafria's.
+
+    (ns my.app
+      (:require [jankifier.core :refer [defcstruct defcfn]]))
+
+    (defcstruct Vec2
+      [[:x :f64]
+       [:y {:default 0.0} :f64]
+       (fn length-squared :f64 [] (+ (* x x) (* y y)))])
+
+    (defcfn move :void [[p [:& Vec2]] [v [:& [:const Vec2]]]]
+      (cpp/= (.-x p) (+ (.-x p) (.-x v)))
+      (cpp/= (.-y p) (+ (.-y p) (.-y v))))
+
+  Everything is generated in the C++ namespace of the jank namespace, so
+  `Vec2` in `my.app` is `my::app::Vec2`, which jank calls `cpp/my.app.Vec2`.
+  `cpp-type`, `cpp-cast` and `cpp-fn` let C++ interop use the jank names
+  instead, e.g. `((cpp-type (std.vector Vec2)))` or `(cpp-fn move)`.
+
+  Types are keywords (see `jankifier.cpp/types`), structs defined by
+  `defcstruct`, strings or symbols with a C++ type, or `[:* t]`, `[:& t]` and
+  `[:const t]`. Values cross between C++ and jank by value for keyword types (numbers,
+  `bool`, ...), and by pointer or reference (`[:* T]`, `[:& T]`) for structs
+  and other named C++ types, which arrive in jank as pointers.
+
+  A struct value given where jank expects a jank value becomes a map of its
+  fields, so `(:x v)` works at runtime, and a map given where C++ expects the
+  struct becomes the struct, see `convert-source`. `(:x v)` on a struct, or
+  a pointer to one, reads the field without building the map, see
+  `get-source`.
+
+  The C++ is in `cpp/raw` forms, so it works in AOT compiled programs too,
+  but, as with any `cpp/raw`, it can only be used by later top level forms
+  and can't be redefined in a running process."
+  (:require [clojure.string :as string]
+            [jankifier.cpp :as jc]))
+
+;; Types and arguments, and calls from C++ into jank.
+
+(def default-env
+  "How types are resolved without looking at any vars: as written. See
+  `var-env` for how the macros resolve them."
+  {:resolve-type (constantly nil)})
+
+(defn var-env
+  "How types are resolved while a macro expands: a symbol naming a var
+  defined by `defcstruct` is that struct's C++ name."
+  []
+  {:resolve-type (fn [sym]
+                   (when-let [v (resolve sym)]
+                     (:cpp-name (:jankifier/struct (meta v)))))})
+
+(defn- invalid [message data]
+  (throw (ex-info message data)))
+
+(defn resolve-names
+  "`t` with each symbol which `resolve-type` knows (a struct) replaced by its
+  C++ name."
+  [{:keys [resolve-type] :as env} t]
+  (cond
+    (symbol? t) (or (resolve-type t) t)
+    (and (vector? t) (= 2 (count t))) [(first t) (resolve-names env (second t))]
+    :else t))
+
+(defn parse-type
+  "`t` with its C++ type, plus, for pointers and references, how it's
+  passed to jank: its `:indirection` (`:*` or `:&`) and its `:pointee`, the
+  C++ type it points to, without const."
+  [env t]
+  (let [resolved (resolve-names env t)
+        parsed {:type t :cpp-type (jc/type-name resolved)}]
+    (if (jc/indirect? resolved)
+      (let [pointee (jc/strip-const (second resolved))]
+        (when-not (or (string? pointee) (symbol? pointee))
+          (invalid (str "Pointers and references must be to a struct or a named C++ type, got "
+                        (pr-str t))
+                   {:type t}))
+        (assoc parsed :indirection (first resolved) :pointee (str pointee)))
+      parsed)))
+
+(defn dsl-form
+  "The type `t` as jank's C++ DSL writes it, which is what `#cpp` and
+  `cpp/cast` take. `t` is a type as the macros take it (see `parse-type`), or
+  a template instantiation `(template arg ...)`, whose template is a C++ name
+  and whose arguments are types or integers. For example, in `my.app`:
+
+    :f64                     double
+    Vec2 (a defcstruct)      my.app.Vec2
+    \"flecs::world\"           flecs.world
+    [:* [:const Vec2]]       (:* (:const my.app.Vec2))
+    (std.array Vec2 4)       (std.array my.app.Vec2 4)"
+  [{:keys [resolve-type] :as env} t]
+  (cond
+    (keyword? t) (symbol (jc/type-name t))
+    (symbol? t) (if-let [cpp-name (resolve-type t)]
+                  (jc/dsl-type cpp-name)
+                  t)
+    (string? t) (if (re-matches #"[A-Za-z_][A-Za-z0-9_:]*" t)
+                  (jc/dsl-type t)
+                  (invalid (str "Only plain C++ names can be strings here, got " (pr-str t)
+                                ", use [:* t], [:const t] or (template arg ...) instead")
+                           {:type t}))
+    (and (vector? t) (= 2 (count t)) (contains? #{:* :& :const} (first t)))
+    (list (first t) (dsl-form env (second t)))
+    (and (seq? t) (seq t))
+    (apply list
+           (dsl-form env (first t))
+           (map #(if (integer? %) % (dsl-form env %)) (rest t)))
+    :else (invalid (str "Invalid type " (pr-str t)) {:type t})))
+
+(defn parse-arg
+  "The description of the argument `[name type]`."
+  [env arg]
+  (when-not (and (vector? arg) (= 2 (count arg)) (symbol? (first arg)))
+    (invalid (str "Arguments are [name type], got " (pr-str arg)) {:arg arg}))
+  (let [[arg-name arg-type] arg
+        parsed (merge {:name arg-name} (parse-type env arg-type))]
+    (jc/identifier arg-name)
+    (when-not (or (:indirection parsed)
+                  (and (keyword? arg-type) (not= :void arg-type)))
+      (invalid (str "Pass " (pr-str arg-type) " by pointer [:* T] or reference [:& T], "
+                    "only keyword types can be passed by value, in " (pr-str arg))
+               {:arg arg}))
+    parsed))
+
+(defn parse-args
+  "The descriptions of `[[name type] ...]`."
+  [env args]
+  (when-not (vector? args)
+    (invalid (str "Arguments are [[name type] ...], got " (pr-str args)) {:args args}))
+  (mapv #(parse-arg env %) args))
+
+(defn parse-ret
+  "The description of the result type `t`, a keyword type or `:void`."
+  [env t]
+  (when-not (keyword? t)
+    (invalid (str "Results are keyword types or :void, got " (pr-str t)) {:type t}))
+  (parse-type env t))
+
+(defn into-jank-source
+  "The C++ expression which turns the argument `arg` into a jank value."
+  [{arg-name :name :keys [cpp-type indirection pointee]}]
+  (let [id (jc/identifier arg-name)]
+    (if indirection
+      (str "jank::runtime::make_box<jank::runtime::obj::opaque_box>("
+           "const_cast<void *>(static_cast<void const *>(" (when (= :& indirection) "&") id ")), "
+           (jc/string-literal (jc/box-name pointee)) ")")
+      (str "jank::runtime::convert<" cpp-type ">::into_object(" id ")"))))
+
+(defn call-source
+  "The C++ statements which call the jank function `fn-sym` (a qualified
+  symbol) with `args` and return its result as `ret`."
+  [fn-sym args ret]
+  (let [call (str "jank_var->call(" (string/join ", " (map into-jank-source args)) ")")]
+    (str "      auto const jank_var(jank::runtime::__rt_ctx->find_var("
+         (jc/string-literal (namespace fn-sym)) ", " (jc/string-literal (name fn-sym)) "));\n"
+         "      if(!jank_var.is_some())\n"
+         "      { throw jank::runtime::object_ref{ jank::runtime::make_box("
+         (jc/string-literal (str "jankifier: " fn-sym " is not defined")) ") }; }\n"
+         (if (= "void" (:cpp-type ret))
+           (str "      " call ";\n")
+           (str "      return jank::runtime::convert<" (:cpp-type ret)
+                ">::from_object(" call ");\n")))))
+
+(defn unbox-bindings
+  "The `let` bindings which turn the boxed pointers among `args` back into
+  pointers, in the jank function."
+  [args]
+  (vec (mapcat (fn [{arg-name :name :keys [pointee]}]
+                 [arg-name (list 'cpp/unbox (list 'cpp/dsl (list :* (jc/dsl-type pointee))) arg-name)])
+               (filter :indirection args))))
+
+(defn fn-form
+  "The `defn-` form of the jank function `fn-sym` which C++ calls, taking
+  the locals `params` (symbols) and then `args`."
+  [fn-sym doc params args body]
+  (let [bindings (unbox-bindings args)]
+    `(defn- ~(symbol (name fn-sym))
+       ~@(when doc [doc])
+       [~@params ~@(map :name args)]
+       ~@(if (seq bindings)
+           [`(let ~bindings ~@body)]
+           body))))
+
+;; Structs.
+
+(def layouts #{:normal :extern :packed})
+
+(def field-properties #{:doc :default :const :var})
+
+(defn parse-field
+  "The description of the member entry `[name type]` or
+  `[name props type]`."
+  [env entry]
+  (let [[field-name props field-type] (case (count entry)
+                                        2 [(first entry) {} (second entry)]
+                                        3 entry
+                                        (invalid (str "Expected [name type] or [name {props} type], got "
+                                                      (pr-str entry))
+                                                 {:entry entry}))]
+    (when-not (or (keyword? field-name) (symbol? field-name))
+      (invalid (str "Field names are keywords or symbols, got " (pr-str field-name))
+               {:entry entry}))
+    (when-not (map? props)
+      (invalid (str "Field properties must be a map, got " (pr-str props)) {:entry entry}))
+    (when-let [unknown (seq (remove field-properties (keys props)))]
+      (invalid (str "Unknown field properties " (pr-str unknown) " in " (pr-str entry))
+               {:entry entry}))
+    (when (< 1 (count (filter #(contains? props %) [:default :const :var])))
+      (invalid (str "Use only one of :default, :const or :var, in " (pr-str entry))
+               {:entry entry}))
+    (doseq [k [:default :const :var]
+            :when (contains? props k)]
+      (jc/literal (get props k)))
+    (jc/identifier field-name)
+    (merge {:name (keyword (name field-name))
+            :kind (cond
+                    (contains? props :const) :const
+                    (contains? props :var) :var
+                    :else :field)}
+           (parse-type env field-type)
+           (when (and (symbol? field-type) ((:resolve-type env) field-type))
+             {:struct true})
+           (select-keys props [:doc :default])
+           (when (contains? props :const) {:value (:const props)})
+           (when (contains? props :var) {:value (:var props)}))))
+
+(defn method-form?
+  "Whether `form` is a `(fn ...)` method form."
+  [form]
+  (and (seq? form)
+       (symbol? (first form))
+       (= "fn" (name (first form)))))
+
+(defn parse-method
+  "The description of the method `(fn name ret doc? [[arg type] ...] body...)`
+  of the struct `struct-name` in the jank namespace `ns-name`."
+  [env ns-name struct-name form]
+  (let [[_ method-name ret & more] form
+        [doc more] (if (string? (first more)) [(first more) (rest more)] [nil more])
+        [args & body] more]
+    (when-not (and (symbol? method-name) (some? ret) (vector? args))
+      (invalid (str "Expected (fn name ret doc? [[arg type] ...] body...), got "
+                    (pr-str form))
+               {:form form}))
+    (jc/identifier method-name)
+    (merge {:name method-name
+            :ret (parse-ret env ret)
+            :args (parse-args env args)
+            :fn (symbol (str ns-name) (str struct-name "-" method-name))
+            :body body}
+           (when doc {:doc doc}))))
+
+(defn parse-struct
+  "The description of `(defcstruct struct-name & declaration)` in the jank
+  namespace `ns-name`. `env` resolves symbols, see `default-env`."
+  [env ns-name struct-name declaration]
+  (let [[doc declaration] (if (string? (first declaration))
+                            [(first declaration) (rest declaration)]
+                            [nil declaration])
+        [attrs declaration] (if (map? (first declaration))
+                              [(first declaration) (rest declaration)]
+                              [{} declaration])
+        members (first declaration)]
+    (when-not (symbol? struct-name)
+      (invalid (str "A struct's name must be a symbol, got " (pr-str struct-name))
+               {:name struct-name}))
+    (when-not (and (vector? members) (= 1 (count declaration)))
+      (invalid (str "Expected (defcstruct " struct-name " doc? {attrs}? [members]), "
+                    "with all members in one vector")
+               {:declaration declaration}))
+    (when-let [unknown (seq (remove #{:layout} (keys attrs)))]
+      (invalid (str "Unknown struct attributes " (pr-str unknown)) {:attrs attrs}))
+    (let [layout (:layout attrs :normal)
+          entries (filter vector? members)
+          methods (filter method-form? members)
+          parsed (mapv #(parse-field env %) entries)]
+      (when-not (contains? layouts layout)
+        (invalid (str "Unknown layout " layout ", use one of " (pr-str (sort layouts)))
+                 {:layout layout}))
+      (when-let [other (seq (remove #(or (vector? %) (method-form? %)) members))]
+        (invalid (str "Unknown struct members " (pr-str other)) {:members other}))
+      (merge {:name struct-name
+              :ns (symbol (str ns-name))
+              :cpp-name (jc/qualified-name ns-name struct-name)
+              :cpp-symbol (jc/jank-symbol ns-name struct-name)
+              :layout layout
+              :fields (filterv #(= :field (:kind %)) parsed)
+              :members (filterv #(not= :field (:kind %)) parsed)
+              :methods (mapv #(parse-method env ns-name struct-name %) methods)}
+             (when doc {:doc doc})))))
+
+;; Generating C++.
+
+(defn method-fields
+  "The instance `fields` which methods see: the ones with keyword types,
+  which jank can convert."
+  [fields]
+  (filterv #(keyword? (:type %)) fields))
+
+(defn field-source
+  "The C++ declaration of an instance field."
+  [{field-name :name :keys [cpp-type doc] :as field}]
+  (str (jc/comment-lines "    " doc)
+       "    " cpp-type " " (jc/identifier field-name)
+       (when (contains? field :default)
+         (str " = " (jc/literal (:default field))))
+       ";\n"))
+
+(defn member-source
+  "The C++ declaration of a static member."
+  [{member-name :name :keys [kind cpp-type doc value]}]
+  (str (jc/comment-lines "    " doc)
+       "    static " (if (= :const kind) "constexpr " "inline ")
+       cpp-type " " (jc/identifier member-name) " = " (jc/literal value) ";\n"))
+
+(defn- field-args
+  "The instance `fields` which methods see, as call arguments."
+  [fields]
+  (for [{field-name :name :as field} (method-fields fields)]
+    (assoc field :name (symbol (name field-name)))))
+
+(defn method-source
+  "The C++ definition of a method of a struct with the instance `fields`."
+  [fields {method-name :name :keys [ret args doc] :as method}]
+  (str (jc/comment-lines "    " doc)
+       "    " (:cpp-type ret) " " (jc/identifier method-name)
+       "(" (string/join ", " (for [{arg-name :name :keys [cpp-type]} args]
+                               (str cpp-type " " (jc/identifier arg-name)))) ") {\n"
+       (call-source (:fn method) (concat (field-args fields) args) ret)
+       "    }\n"))
+
+(defn convertible?
+  "Whether the field is in the jank map of its struct, see `convert-source`:
+  an instance field with a keyword type or a struct type."
+  [{:keys [kind type struct]}]
+  (and (= :field kind)
+       (or (keyword? type) struct)))
+
+(defn convert-source
+  "The C++ specialization of `jank::runtime::convert` for the struct
+  `description`, which jank uses when a struct value is given where a jank
+  value is expected: the struct becomes a map of its convertible fields (see
+  `convertible?`), so `(:x v)`, `(get v :x)` and printing it work, and a map
+  given where C++ expects the struct becomes the struct, with the fields it
+  leaves out taking their default value (or zero)."
+  [{:keys [cpp-name fields]}]
+  (let [t (str "::" cpp-name)
+        fields (filter convertible? fields)
+        kw #(str "jankifier_" (jc/identifier (:name %)))
+        keywords (apply str (for [field fields]
+                              (str "      static object_ref const " (kw field)
+                                   "{ __rt_ctx->intern_keyword("
+                                   (jc/string-literal (name (:name field)))
+                                   ").expect_ok() };\n")))]
+    (str "namespace jank::runtime {\n"
+         "  template <>\n"
+         "  struct convert<" t "> {\n"
+         "    static object_ref into_object(" t " const &v) {\n"
+         keywords
+         "      return "
+         (if (seq fields)
+           (str "obj::" (if (< 8 (count fields)) "persistent_hash_map" "persistent_array_map")
+                "::create_unique("
+                (string/join ", " (for [{:keys [cpp-type] :as field} fields]
+                                    (str (kw field) ", convert<" cpp-type ">::into_object("
+                                         "static_cast<" cpp-type ">(v." (jc/identifier (:name field)) "))")))
+                ")")
+           "obj::persistent_array_map::empty()")
+         ";\n"
+         "    }\n"
+         "    static " t " from_object(object_ref const o) {\n"
+         keywords
+         "      " t " v{};\n"
+         (apply str (for [{:keys [cpp-type] :as field} fields]
+                      (str "      if(contains(o, " (kw field) ")) { v." (jc/identifier (:name field))
+                           " = convert<" cpp-type ">::from_object(get(o, " (kw field) ")); }\n")))
+         "      return v;\n"
+         "    }\n"
+         "  };\n"
+         "}\n")))
+
+(defn get-source
+  "The C++ overloads of `jank::runtime::get` for the struct `description` and
+  pointers to it. jank compiles `(:x v)` and `(get v :x)` to a call to
+  `jank::runtime::get`, which C++ resolves by the static type of `v`, so for
+  a struct (or a pointer to one) these read the field directly, without
+  converting the whole struct to a map (see `convert-source`). They return
+  the field as a jank value, nil for other keys, or the fallback."
+  [{:keys [cpp-name fields]}]
+  (let [t (str "::" cpp-name)
+        fields (filter convertible? fields)
+        kw #(str "jankifier_" (jc/identifier (:name %)))]
+    (str "namespace jank::runtime {\n"
+         ;; Templates which only match the struct itself, as jank would
+         ;; otherwise also consider converting any object to the struct, which
+         ;; makes every other `get` call ambiguous.
+         "  template <typename T>\n"
+         "  requires std::same_as<T, " t ">\n"
+         "  object_ref const get(T const &v, object_ref const key, object_ref const fallback) {\n"
+         (apply str (for [{:keys [cpp-type] :as field} fields]
+                      (str "    static object_ref const " (kw field)
+                           "{ __rt_ctx->intern_keyword(" (jc/string-literal (name (:name field)))
+                           ").expect_ok() };\n"
+                           "    if(key == " (kw field) ") { return convert<" cpp-type ">::into_object("
+                           "static_cast<" cpp-type ">(v." (jc/identifier (:name field)) ")); }\n")))
+         "    return fallback;\n"
+         "  }\n"
+         "  template <typename T>\n"
+         "  requires std::same_as<T, " t ">\n"
+         "  object_ref const get(T const &v, object_ref const key) {\n"
+         "    return get(v, key, jank_nil);\n"
+         "  }\n"
+         "  template <typename T>\n"
+         "  requires std::same_as<std::remove_const_t<T>, " t ">\n"
+         "  object_ref const get(T *v, object_ref const key, object_ref const fallback) {\n"
+         "    return v ? get(*v, key, fallback) : fallback;\n"
+         "  }\n"
+         "  template <typename T>\n"
+         "  requires std::same_as<std::remove_const_t<T>, " t ">\n"
+         "  object_ref const get(T *v, object_ref const key) {\n"
+         "    return get(v, key, jank_nil);\n"
+         "  }\n"
+         "}\n")))
+
+(defn struct-source
+  "The C++ definition of the struct `description`, in its C++ namespace,
+  its `convert-source` and its `get-source`."
+  [{struct-name :name :keys [ns layout doc fields members methods] :as description}]
+  (str "#include <concepts>\n"
+       "#include <cstddef>\n"
+       "#include <cstdint>\n"
+       "#include <type_traits>\n"
+       "namespace " (string/join "::" (jc/namespace-segments ns)) " {\n"
+       (jc/comment-lines "  " doc)
+       "  struct " (when (= :packed layout) "__attribute__((packed)) ")
+       (jc/identifier struct-name) " {\n"
+       (apply str (map field-source fields))
+       (apply str (map member-source members))
+       (apply str (map #(method-source fields %) methods))
+       "  };\n"
+       "}\n"
+       (convert-source description)
+       (get-source description)))
+
+;; Constructing.
+
+(defn constructor-form
+  "The jank form which builds the struct `description` from `values`: a
+  literal map of its fields, or a vector of their values in order. Fields
+  left out take their default value."
+  [{:keys [cpp-symbol cpp-name fields]} values]
+  (let [values (cond
+                 (nil? values) {}
+                 (map? values) values
+                 (vector? values)
+                 (if (<= (count values) (count fields))
+                   (zipmap (map :name fields) values)
+                   (invalid (str cpp-name " has " (count fields) " fields, got "
+                                 (count values) " values in " (pr-str values))
+                            {:values values}))
+                 :else (invalid (str cpp-name " is built from a literal map of its fields, "
+                                     "or a vector of their values in order, got "
+                                     (pr-str values))
+                                {:values values}))]
+    (when-let [unknown (seq (remove (set (map :name fields)) (keys values)))]
+      (invalid (str "Unknown fields " (pr-str unknown) " for " cpp-name
+                    ", its fields are " (pr-str (mapv :name fields)))
+               {:values values}))
+    (apply list cpp-symbol
+           (mapv (fn [{field-name :name :as field}]
+                   (cond
+                     (contains? values field-name) (get values field-name)
+                     (contains? field :default) (:default field)
+                     :else (invalid (str "Missing field " field-name " for " cpp-name
+                                         ", which has no default")
+                                    {:values values})))
+                 fields))))
+
+;; Jank functions for methods.
+
+(defn method-fn-form
+  "The `defn-` form of a method's jank function, for a struct with the
+  instance `fields`."
+  [fields {f :fn :keys [args body doc]}]
+  (fn-form f doc (map :name (field-args fields)) args body))
+
+(defn struct-expansion
+  "The form `defcstruct` expands to for the struct
+  `description`: its methods' jank functions, the C++ struct, and the
+  struct's macro, which builds it from a literal map of its fields, or a
+  vector of their values in order."
+  [description]
+  (let [;; The method bodies are in the jank functions already.
+        summary (update description :methods (fn [methods] (mapv #(dissoc % :body) methods)))]
+    `(do ~@(map #(method-fn-form (:fields description) %) (:methods description))
+         (cpp/raw ~(struct-source description))
+         (defmacro ~(with-meta (:name description) {:jankifier/struct (list 'quote summary)})
+           ~(str (when-let [doc (:doc description)] (str doc "\n\n"))
+                 "Builds the C++ struct " (:cpp-name description)
+                 " from a literal map of its fields, or a vector of their values in order.")
+           ([] (constructor-form '~summary nil))
+           ([values#] (constructor-form '~summary values#))))))
+
+;; Functions.
+
+(defn parse-fn
+  "The description of `(defcfn fn-name ret doc? [[arg type] ...] body...)` in
+  the jank namespace `ns-name`. `env` resolves symbols, see
+  `jankifier.default-env`."
+  [env ns-name fn-name declaration]
+  (let [[ret & more] declaration
+        [doc more] (if (string? (first more)) [(first more) (rest more)] [nil more])
+        [args & body] more]
+    (when-not (and (symbol? fn-name) (some? ret) (vector? args))
+      (invalid (str "Expected (defcfn name ret doc? [[arg type] ...] body...), got "
+                    (pr-str (list* 'defcfn fn-name declaration)))
+               {:declaration declaration}))
+    (merge {:name fn-name
+            :ns (symbol (str ns-name))
+            :cpp-name (jc/qualified-name ns-name fn-name)
+            :cpp-symbol (jc/jank-symbol ns-name fn-name)
+            :fn (symbol (str ns-name) (str fn-name "*"))
+            :ret (parse-ret env ret)
+            :args (parse-args env args)
+            :body body}
+           (when doc {:doc doc}))))
+
+(defn fn-source
+  "The C++ definition of the function `description`, in its C++ namespace."
+  [{fn-name :name f :fn :keys [ns doc ret args]}]
+  (str "#include <cstddef>\n"
+       "#include <cstdint>\n"
+       "namespace " (string/join "::" (jc/namespace-segments ns)) " {\n"
+       (jc/comment-lines "  " doc)
+       "  " (:cpp-type ret) " " (jc/identifier fn-name) "("
+       (string/join ", " (for [{arg-name :name :keys [cpp-type]} args]
+                           (str cpp-type " " (jc/identifier arg-name))))
+       ")\n  {\n"
+       (call-source f args ret)
+       "  }\n"
+       "}"))
+
+(defn fn-expansion
+  "The form `defcfn` expands to for the function
+  `description`: its jank function, the C++ function, and the macro which
+  calls it."
+  [{f :fn fn-name :name :keys [doc args body cpp-symbol cpp-name] :as description}]
+  (let [summary (dissoc description :body)]
+    `(do ~(fn-form f doc [] args body)
+         (cpp/raw ~(fn-source description))
+         (defmacro ~(with-meta fn-name {:jankifier/fn (list 'quote summary)})
+           ~(str (when doc (str doc "\n\n")) "Calls the C++ function " cpp-name ".")
+           [& args#]
+           (list* '~cpp-symbol args#)))))
+
+;; Macros.
+
+(defmacro defcstruct
+  "Defines a C++ struct, and a `struct-name` macro which builds it from a
+  literal map of its fields, or a vector of their values in order.
+
+    (defcstruct Vec2
+      \"A 2D vector.\"
+      {:layout :packed}
+      [[:x :f64]
+       [:y {:doc \"Vertical component\" :default 0.0} :f64]
+       [:dims {:const 2} :i32]
+       (fn scaled :f64 \"Doc.\" [[k :f64]] (* k (+ (* x x) (* y y))))])
+
+    (let [v (Vec2 {:x 3.0 :y 4.0})]   ; or (Vec2 [3.0 4.0])
+      (.scaled v 2.0)
+      (:x v))                          ; 3.0, the struct is also a jank map
+
+  In a vector, trailing fields with a default can be left out, so
+  `(Vec2 [3.0])` is `(Vec2 {:x 3.0})`.
+
+  The docstring and the attribute map are optional, and `:layout` is
+  `:normal` (the default), `:extern` or `:packed`. All members are in one
+  vector:
+
+    [name type] or [name {props} type]
+      An instance field. `:default` gives it a default value, which fields
+      left out of the map take, and `:doc` documents it.
+    [name {:const value} type] or [name {:var value} type]
+      A static member, without instance storage.
+    (fn name ret doc? [[arg type] ...] body...)
+      A method, written in jank. Its body sees the struct's instance fields
+      with keyword types (as copies) and its arguments as locals, and its
+      result is converted back to `ret`. Fields typed as another struct or as
+      raw C++ aren't visible, since jank can't convert them. It becomes the
+      private jank function `Struct-method` (`Vec2-scaled` above), which the
+      C++ method calls, so `(.scaled v 2.0)` works. Since it's defined
+      together with the struct, its body can't use the struct's own type.
+
+  Default and static values are numbers, booleans, strings or nil. The var
+  `struct-name` keeps the struct's description in its metadata, under
+  `:jankifier/struct`."
+  [struct-name & declaration]
+  (struct-expansion (parse-struct (var-env) (str *ns*) struct-name declaration)))
+
+(defmacro defcstructs
+  "Defines a struct for each `[struct-name & declaration]` in `specs`, as
+  `defcstruct` does. `specs` is either a vector or a symbol naming a var
+  holding one, so structs can be described as plain data."
+  [specs]
+  (let [specs (if (symbol? specs) @(resolve specs) specs)]
+    `(do ~@(for [spec specs]
+             `(defcstruct ~@spec)))))
+
+(defmacro defcfn
+  "Defines a C++ function whose body is jank, and a `fn-name` macro which
+  calls it.
+
+    (defcfn move :void
+      \"Moves p by v.\"
+      [[p [:& Vec2]]
+       [v [:& [:const Vec2]]]]
+      (cpp/= (.-x p) (+ (.-x p) (.-x v)))
+      (cpp/= (.-y p) (+ (.-y p) (.-y v))))
+
+  defines the C++ function `my::app::move(Vec2 &p, Vec2 const &v)` in
+  `my.app`. Its body becomes the private jank function `move*`, which the C++
+  function calls after converting its arguments: pointers and references
+  arrive as pointers, so `(.-x p)` reads a field and `(cpp/= (.-x p) v)`
+  writes it.
+
+  C++ code can call it, and C++ APIs which take a callback can be given
+  `cpp/my.app.move`. From jank, `(move p v)` calls it. The var `fn-name` keeps
+  the function's description in its metadata, under `:jankifier/fn`."
+  [fn-name & declaration]
+  (fn-expansion (parse-fn (var-env) (str *ns*) fn-name declaration)))
+
+(defmacro cpp-type
+  "The C++ type `t` as a `#cpp` value, with `t` written like the other
+  macros' types, plus template instantiations (see `dsl-form`), so structs
+  are named as in jank. Call it to construct one:
+
+    ;; flecs::system_builder<Position, Velocity const>(world, \"Move\")
+    ((cpp-type (flecs.system_builder Position [:const Velocity])) world \"Move\")
+
+  jank doesn't expand macros where it expects a type as an argument, so it
+  can't be the type of `cpp/cast`; use `cpp-cast` for that."
+  [t]
+  (list 'cpp/dsl (dsl-form (var-env) t)))
+
+(defmacro cpp-cast
+  "`(cpp/cast t x)` with `t` written like `cpp-type`'s:
+
+    (cpp-cast [:* Position] (cpp/ecs_get_mut_id world e id))"
+  [t x]
+  (list 'cpp/cast (list 'cpp/dsl (dsl-form (var-env) t)) x))
+
+(defmacro cpp-fn
+  "The C++ function `defcfn` defined as `fn-name`, e.g. to give a C++ API
+  which takes a callback:
+
+    (.each builder (cpp-fn move))"
+  [fn-name]
+  (if-let [description (some-> (resolve fn-name) meta :jankifier/fn)]
+    (:cpp-symbol description)
+    (invalid (str "`" fn-name "` isn't a function defined with defcfn")
+             {:name fn-name})))
