@@ -1,0 +1,28 @@
+; RESULTS.md C4.
+; Each future's thread pushes its conveyed binding frame (push_thread_bindings) and never pops it,
+; and the frames are kept per OS thread id (context::thread_binding_frames) and never removed. So
+; every finished future leaves a frame behind: the count grows with each future, for good (on
+; macOS, which reuses thread ids, they pile up on a few ids). Clojure pops a future's bindings
+; when its body ends. jank code can't see the frames, so this counts them through C++.
+(cpp/raw "
+#include <jank/runtime/context.hpp>
+inline long jank_repro_binding_frames()
+{
+  auto const locked{ jank::runtime::__rt_ctx->thread_binding_frames.rlock() };
+  long n{};
+  for(auto const &p : *locked)
+  {
+    n += static_cast<long>(p.second.size());
+  }
+  return n;
+}
+inline long jank_repro_binding_thread_ids()
+{
+  return static_cast<long>(jank::runtime::__rt_ctx->thread_binding_frames.rlock()->size());
+}")
+(def before (cpp/jank_repro_binding_frames))
+(dotimes [_ 1000] @(future 1))
+(println "expected" before "binding frames, after 1000 futures finished:" (cpp/jank_repro_binding_frames)
+         "(on" (cpp/jank_repro_binding_thread_ids) "thread ids)")
+(dotimes [_ 1000] @(future 1))
+(println "expected" before "binding frames, after 1000 more:" (cpp/jank_repro_binding_frames))

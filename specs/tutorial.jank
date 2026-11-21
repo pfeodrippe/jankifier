@@ -1,0 +1,458 @@
+(ns tutorial
+  "TUTORIAL.md, to read and run in a REPL: the Veil checks run from here, and
+  jank replays what they find."
+  (:require [clojure.string :as string]))
+
+;;;; Modelling jank in Veil
+;;
+;; This file has the text of TUTORIAL.md, with forms to evaluate in a REPL.
+;;
+;; specs/ is a lein project (specs/project.clj), and its REPL has the Veil model of part 2 loaded
+;; through lean-sys. Before starting it the first time:
+;;
+;;   cd lean-sys && lein install                                 # lean-sys, into ~/.m2
+;;   cd specs && lake build +JankSpecs.Native.TinyAtom:dynlib     # the model, as shared libraries
+;;
+;; Then CIDER's jack-in from this file starts the REPL in specs/ (`lein repl` there does too).
+;; Without those two steps, `cd specs && jank repl --module-path .` gives a REPL for everything
+;; except the forms that call the model.
+;;
+;; Evaluate the forms from this file's buffer, top to bottom: the editor sends the file's
+;; namespace with each form, while (in-ns 'tutorial) typed in the REPL doesn't stick in jank 0.1.
+;; The forms are in (comment ...) blocks, with their output as `;=>` notes.
+;;
+;; - (veil "Module") builds a Veil model with lake and prints what it found: counterexamples
+;;   (each step), proof tables, counterexamples to induction. The first build of a model takes a
+;;   minute or two; after that lake prints its findings again at once. (veil "Module" true)
+;;   prints everything, with whole states. The models are in JankSpecs/Tutorial/; after editing
+;;   one, run (veil ...) again.
+;; - (sh "command") runs a shell command in specs/, wherever the REPL started, and returns its
+;;   output.
+;; - Other forms replay Veil's counterexamples on jank, step by step, and part 2 calls the model
+;;   from jank.
+
+(cpp/raw "
+#include <cstdio>
+#include <string>
+#include <jank/runtime/obj/persistent_string.hpp>
+
+inline jank::runtime::object_ref tutorial_sh(jank::runtime::object_ref const cmd)
+{
+  auto const text{ cmd.to_string() };
+  std::string const command{ \"( \" + std::string{ text.data(), text.size() } + \" ) 2>&1\" };
+  FILE * const p{ popen(command.c_str(), \"r\") };
+  if(!p)
+  {
+    return jank::runtime::make_box<jank::runtime::obj::persistent_string>(\"(couldn't start it)\");
+  }
+  std::string out;
+  char buf[4096];
+  size_t n{};
+  while((n = std::fread(buf, 1, sizeof buf, p)) > 0)
+  {
+    out.append(buf, n);
+  }
+  pclose(p);
+  return jank::runtime::make_box<jank::runtime::obj::persistent_string>(
+    jtl::immutable_string{ out.data(), out.size() });
+}")
+
+(def specs-dir
+  "Where `sh` runs commands: specs/, found from the REPL's directory (specs/
+  itself, or the project root, where CIDER's jack-in starts the REPL)."
+  (string/trim (cpp/tutorial_sh (str "if [ -f lakefile.lean ]; then pwd; "
+                                     "elif [ -f specs/lakefile.lean ]; then cd specs && pwd; fi"))))
+
+(defn sh
+  "Runs `cmd` with the shell, in specs/, and returns its output and errors.
+  elan's and Homebrew's bin directories are added to the PATH (an editor's REPL
+  may not have them)."
+  [cmd]
+  (if (string/blank? specs-dir)
+    (str "Can't find specs/ from this REPL's directory: start the REPL in the project or in specs/.")
+    (cpp/tutorial_sh (str "cd '" specs-dir "' && "
+                          "export PATH=\"$HOME/.elan/bin:/opt/homebrew/bin:$PATH\" && "
+                          cmd))))
+
+(defn- noise? [line]
+  (boolean (re-find #"^ld64|^trace:|^info: stderr:|Replayed|^\s*$" line)))
+
+(defn- finding? [line]
+  (boolean (re-find #"Violation|No violation|\(via |Initialization must|following set|\.\.\. |Counterexample|Action:|Theory:|^error|^Build|^  [A-Za-z_]+$|^Can't find" line)))
+
+(defn veil
+  "Builds the Veil module `module` (as `JankSpecs.Tutorial.TinyArrayMap`) and
+  prints what it found. With `all?`, every line, whole states included."
+  ([module]
+   (veil module false))
+  ([module all?]
+   (let [lines (remove noise? (string/split-lines (sh (str "lake build " module))))]
+     (if all?
+       (doseq [l lines]
+         (println l))
+       ;; The fields of a state are printed only inside a counterexample to induction.
+       (loop [ls lines
+              in-state? false]
+         (when-let [l (first ls)]
+           (let [starts? (re-find #"Pre-state:|Post-state:" l)
+                 in-state? (cond
+                             starts? true
+                             (re-find #"Action:|Counterexample|^\S|^  \S" l) false
+                             :else in-state?)]
+             (when (or in-state? (finding? l))
+               (println l))
+             (recur (rest ls) in-state?))))))))
+
+;;;; Veil and TLA+
+;;
+;; Veil's constructs and their TLA+ counterparts:
+;;
+;;   VARIABLES                      individual (one value), function, relation (a set of tuples)
+;;   CONSTANTS                      type, and immutable fields, given per instance
+;;   Init                           after_init { ... }
+;;   Next == A1 \/ A2 \/ ...        one `action` each: any enabled one, with any arguments
+;;   an enabling condition          require
+;;   an invariant checked by TLC    safety [name] ...
+;;   TLC on a finite model          #model_check { thread := Fin 3 } { ... }
+;;   a TLAPS proof                  #check_invariants: SMT, for any size, checked by Lean's kernel
+;;
+;; The same step in both:
+;;
+;;   Load(t) == /\ pc[t] = "idle"                       action load (t : thread) {
+;;              /\ seen' = [seen EXCEPT ![t] = value]      require pc t = idle
+;;              /\ pc' = [pc EXCEPT ![t] = "loaded"]       seen t := value
+;;              /\ UNCHANGED <<value, swaps>>              pc t := loaded
+;;                                                      }
+;;
+;; In Veil, fields an action doesn't assign stay unchanged, so there's no UNCHANGED.
+
+;;;; 1. Array map transients
+;;
+;; Three facts from jank 0.1's C++:
+;; - a small map (up to 8 entries) is an array map: a pointer to an array of key/value slots;
+;; - (transient m) copies that pointer, not the array;
+;; - assoc! of a key that's already there overwrites its slot in place.
+;;
+;; The property comes from transient's docstring ("Returns a new, transient version of the
+;; collection") and was written before looking for any bug: a persistent map always holds what it
+;; should. What a map should hold isn't anywhere in jank, so the model keeps it as ghost state: a
+;; field that records the intended contents, updated by each step as the docs say.
+;;
+;; In the model (JankSpecs/Tutorial/TinyArrayMap.lean), maps point to arrays and arrays hold the
+;; entries, as in the C++:
+;;
+;;   relation points : obj → arr → Bool            -- map o points to array a
+;;   relation slot   : arr → key → val → Bool      -- array a holds k v
+;;   relation should : obj → key → val → Bool      -- ghost: what o should hold
+;;
+;;   action transient (p : obj) (t : obj) (a : arr) {
+;;     ...
+;;     points t A := points p A                    -- jank: the same array
+;;     should t K V := should p K V
+;;   }
+;;
+;;   action assocBang (t : obj) (k : key) (v : val) {
+;;     require ∃ A V, points t A ∧ slot A k V      -- the key is there
+;;     slot A K V := decide ((points t A ∧ K = k ∧ V = v) ∨ (¬ points t A ∧ slot A K V))
+;;     should t K V := decide (K = k ∧ V = v)
+;;   }
+;;
+;;   safety [maps_hold_what_they_should]
+;;     persistentMap O → ((∃ A, points O A ∧ slot A K V) ↔ should O K V)
+
+(comment
+  ;; Model checking, without and with the fix (copyOnTransient: transient copies the array).
+  (veil "JankSpecs.Tutorial.TinyArrayMap")
+  ;=> ❌ Violation: safety_failure (violates: maps_hold_what_they_should)
+  ;     State 1 (via literal(o=0, a=2, k=0, v=1)):    map 0 is {k 1}, in array 2
+  ;     State 2 (via transient(p=0, t=2, a=0)):       transient 2 points to array 2 too
+  ;     State 3 (via assocBang(t=2, k=0, v=0)):       array 2 now holds {k 0}: map 0 changed
+  ;   ✅ No violation (explored 715 states)             with the fix
+
+  ;; Every field of each state (points, slot, should...):
+  (veil "JankSpecs.Tutorial.TinyArrayMap" true)
+
+  ;; A counterexample is a statement about the model, so it has to be checked on jank. Each
+  ;; replay below is a vector: evaluating it runs every step and shows each result, and each step
+  ;; inside it can also be evaluated alone.
+  [(def m0 {:k 1})            ; literal(o=0, k=0, v=1)
+   (def t2 (transient m0))    ; transient(p=0, t=2)
+   (assoc! t2 :k 0)           ; assocBang(t=2, k=0, v=0)
+   m0]
+  ;=> [#'tutorial/m0 #'tutorial/t2 #object [transient_array_map ...] {:k 0}]
+  ;   m0 is {:k 0}, where Clojure gives {:k 1}. It reproduces, so it's a jank bug; had it not
+  ;   reproduced, the model would have been wrong.
+
+  ;; clojure.core uses transients, so ordinary code is affected:
+  [(def m2 {:a 1 :b 2})
+   (into m2 {:a 9})
+   m2]
+  ;=> [#'tutorial/m2 {:a 9, :b 2} {:a 9, :b 2}]: m2 changed
+
+  ;; A hash map (more than 8 entries) isn't affected, because its transient copies on write:
+  [(def h (zipmap (range 20) (range 20)))
+   (count (persistent! (assoc! (transient h) 0 99)))
+   (get h 0)]
+  ;=> [#'tutorial/h 20 0]: h kept 0
+
+  ;; The reproduction file, run on jank and then on Clojure:
+  (println (sh "jank run repro/transient-array-map-mutates-source.cljc; clojure -M repro/transient-array-map-mutates-source.cljc")))
+
+;; My first transient model only tracked whether each transient was still active. The bug is in
+;; the storage, which that model didn't describe, so it couldn't find it. A model only finds bugs
+;; in what it describes; this one describes which object points to which array. A differential
+;; test against Clojure found the bug first; this model then finds it in 3 steps, and checks the
+;; fix before it's written in C++.
+
+;;;; 2. swap! on atoms
+;;
+;; jank's swap! reads the value, computes the new one, then does a compare-and-set: if the atom
+;; changed in the meantime, it starts again. The model (JankSpecs/Tutorial/TinyAtom.lean):
+;;
+;;   individual value : Nat
+;;   function pc : thread → pc_t                   -- idle, loaded, done
+;;   function seen : thread → Nat                  -- what the thread read
+;;   individual swaps : Nat                        -- ghost: swap!s that took effect
+;;
+;;   action load (t : thread) { require pc t = idle; seen t := value; pc t := loaded }
+;;
+;;   action cas (t : thread) {
+;;     require pc t = loaded
+;;     if value = seen t then                      -- unchanged since the read
+;;       value := seen t + 1
+;;       swaps := swaps + 1
+;;       pc t := done
+;;     else
+;;       pc t := idle                              -- read again
+;;   }
+;;
+;;   safety [no_lost_update] value = swaps
+
+(comment
+  ;; NaiveAtom.lean stores without the compare. Model checking it:
+  (veil "JankSpecs.Tutorial.NaiveAtom")
+  ;=> ❌ Violation: safety_failure (violates: no_lost_update)
+  ;     State 1 (via load(t=1))   State 2 (via load(t=0))   State 3 (via store(t=1))   State 4 (via store(t=0))
+
+  ;; Every field of each state; the last state has value = 1 and swaps = 2:
+  (veil "JankSpecs.Tutorial.NaiveAtom" true)
+
+  ;; Each step is atomic, so the trace can be replayed in one thread. The swap! without compare,
+  ;; as deref then reset!:
+  (let [a (atom 0)
+        seen-1 @a                  ; load(t=1)
+        seen-0 @a                  ; load(t=0)
+        _ (reset! a (inc seen-1))  ; store(t=1)
+        _ (reset! a (inc seen-0))] ; store(t=0)
+    @a)
+  ;=> 1: two increments, one lost
+
+  ;; The same steps in the same order, with compare-and-set! as in jank's swap!:
+  (let [a (atom 0)
+        seen-1 @a
+        seen-0 @a
+        ok-1 (compare-and-set! a seen-1 (inc seen-1))
+        ok-0 (compare-and-set! a seen-0 (inc seen-0))]
+    [ok-1 ok-0 @a])
+  ;=> [true false 1]: thread 0's compare fails because the atom changed, so it reads again (the
+  ;   model's `pc t := idle`) and its update isn't lost
+
+  ;; jank's swap! from four futures, a thousand swap!s each:
+  (let [a (atom 0)
+        fs (doall (for [_ (range 4)] (future (dotimes [_ 1000] (swap! a inc)))))]
+    (doseq [f fs] @f)
+    @a)
+  ;=> 4000, every time
+  )
+
+;; JankSpecs/Native/TinyAtom.lean exports the executable TinyAtom model (two threads) as C
+;; functions, and native/src/jank_specs/native.jank calls them through lean-sys. These forms need
+;; the specs/ REPL described at the top of this file.
+
+(comment
+  (require '[jank-specs.native :as native])
+  (native/init!)
+
+  ;; The steps the model can take after a given list of steps:
+  (native/enabled [])
+  ;=> ["load 0" "load 1"]
+  (native/model-state ["load 1" "load 0" "cas 1" "cas 0"])
+  ;=> {:value 1, :swaps 1, :max-returned 1, :stale false, :pc [:idle :done], :seen [0 0]}
+  (native/enabled ["load 1" "load 0" "cas 1" "cas 0"])
+  ;=> ["load 0"]: thread 0's compare-and-set failed, so it reads again
+
+  ;; random-run uses the model as a test oracle: it takes random enabled steps until none is
+  ;; left, does each one on an atom too (deref for load, compare-and-set! for cas), and compares
+  ;; the model's state with the atom's after every step.
+  (native/random-run)
+  ;=> {:steps ["load 1" "cas 1" "load 0" "cas 0"], :disagreement nil, :value 2}
+  (count (remove #(nil? (:disagreement %)) (repeatedly 200 native/random-run)))
+  ;=> 0
+  )
+
+;; For jank's swap! with three threads, model checking finds no violation (71 states). That covers
+;; every interleaving of three threads, and no more. A proof covers any number of threads, by
+;; induction over steps:
+;;
+;; 1. the properties hold in the initial state;
+;; 2. in any state where all of them hold, any step keeps them holding.
+;;
+;; Then they hold in every reachable state, for any number of threads and any interleaving.
+;; #check_invariants asks an SMT solver both questions, for every action, and Lean's kernel checks
+;; the answers (set_option veil.smt.trust false).
+;;
+;; The model has a second property: each swap! returns more than every swap! before it. A ghost
+;; flag `stale` is set if one returns a value no larger than the largest returned so far
+;; (`maxReturned`):
+;;
+;;   safety [results_increase] ¬ stale
+
+(comment
+  ;; TinyAtomFirstTry.lean is the first attempt, without the invariant max_is_swaps:
+  (veil "JankSpecs.Tutorial.TinyAtomFirstTry")
+  ;=>   cas
+  ;       no_lost_update ... ✅
+  ;       results_increase ... ❌
+  ;         Pre-state:  value = 0, swaps = 0, maxReturned = 1, stale = false
+  ;         Action: cas(t=0)
+  ;         Post-state: value = 1, swaps = 1, maxReturned = 1, stale = true
+  ;
+  ;; no_lost_update is proved. For results_increase, the solver shows a state where the property
+  ;; holds and one step breaks it. No run reaches that state: maxReturned = 1 while no swap! is
+  ;; done. Step 2 of the induction considers every state where the properties hold, reachable or
+  ;; not. This is why model checking passed (it only visits reachable states) while the proof
+  ;; failed.
+  ;;
+  ;; The proof needs the fact that rules this state out. The question is why maxReturned = 1,
+  ;; swaps = 0 can't happen, and the answer is that the largest value returned always equals the
+  ;; number of swap!s:
+  ;;
+  ;;   invariant [max_is_swaps] maxReturned = swaps
+
+  (veil "JankSpecs.Tutorial.TinyAtom")
+  ;=> every row ✅, for load and cas, max_is_swaps included
+  ;; A missing invariant is found this way: read the counterexample to induction, find why its
+  ;; state is unreachable, and add that fact as an invariant. Deleting max_is_swaps from
+  ;; TinyAtom.lean and running this again shows the failure.
+  )
+
+;; The proof is about the model: every interleaving of any number of threads doing swap! as a load
+;; followed by a compare-and-set loses no update and returns increasing values. It assumes the
+;; model matches the C++, where one compare-and-set is one atomic step. The full model
+;; (JankSpecs/Concurrency/Atom.lean) is also checked against 5000 runs of jank.
+
+;;;; 3. The nREPL server model
+;;
+;; Editors talk to jank through its nREPL server, often over several connections at once. This
+;; section describes how JankSpecs/Nrepl.lean was built.
+;;
+;; 1. Properties. They come from nREPL's documentation and from what CIDER expects: N1 every
+;;    request gets an answer; N2 every response carries its request's id and session; N3 `done`
+;;    comes in its own message; N4 an eval's :out holds what it printed, and only that; N5 when no
+;;    eval runs, the server's stdout is its own again; N6 *1 is the session's last value; N7 an
+;;    unknown op is reported as one.
+;;
+;; 2. Shared state in the code. Each connection gets a thread that takes its requests one at a
+;;    time. To capture an eval's output, capture.jank saves file descriptor 1 (dup), flushes C's
+;;    stdout buffer, points descriptor 1 at a temp file (dup2), evaluates, flushes, points
+;;    descriptor 1 back, reads and deletes the temp file. Descriptor 1 and C's stdout buffer
+;;    belong to the process, not the connection, so every operation on them is a step of its own:
+;;    another connection's steps can come in between.
+;;
+;; 3. Actions, one per operation on shared state:
+;;
+;;    queued -take-> taken -redirect-> capturing -evaluate-> evaluated -endFlush-> flushed -release-> released -respond-> answered
+;;           dup         fflush, dup2           prints go to          fflush           dup2 back,
+;;                                              the buffer                             delete temp
+;;
+;; 4. State. The state has only what the properties need: where descriptor 1 points, each eval's
+;;    backup, deleted temp files, what is in C's buffer (a flush moves it to wherever descriptor 1
+;;    points at that moment), and, as ghost state, where each print ended up. The requests (which
+;;    connection, what kind, which session) are constants: two connections, four requests.
+;;
+;; 5. Properties in Veil:
+;;
+;;    safety [n4_output_isolation]
+;;      focus = 4 → ((printedIn X R → X = R) ∧ ¬ printedLost X ∧ ¬ printedTerminal X)
+;;    safety [n5_stdout_restored] focus = 5 → ((∀ C, ¬ busy C) → ¬ stdoutTo Q)
+;;
+;;    `focus` selects which expected-to-fail property a run checks; see "Conventions" in
+;;    AGENTS.md.
+
+(comment
+  ;; 6. Counterexamples. This builds the whole model, with one instance per property; its first
+  ;; build takes a few minutes.
+  (veil "JankSpecs.Nrepl")
+  ;; N4 (two connections, r0 and r2, each printing):
+  ;;   take(r0) take(r2) redirect(r0) redirect(r2) evaluate(r0) endFlush(r0)
+  ;;   the flush writes r0's print into r2's temp file, so r0's output is in r2's response
+  ;; N5:
+  ;;   take(r0) redirect(r0)     r0's backup: the real stdout; fd 1 -> r0's temp
+  ;;   take(r2)                  r2's backup: r0's temp file (saved while r0 captures)
+  ;;   redirect(r2) ...
+  ;;   release(r0)               fd 1 -> the real stdout; r0's temp deleted
+  ;;   release(r2)               fd 1 -> r0's temp file, which is deleted, so stdout is lost
+
+  ;; The reproduction on jank needs two connections to a fresh server (doing it to this REPL's
+  ;; server would break its output), so it's a script: 20 rounds of two concurrent evals, then a
+  ;; print from a future.
+  (println (sh "python3 repro/nrepl-concurrent-output-swap.py"))
+  ;=> expected 0, rounds where an eval's :out wasn't exactly its own print, of 20: 20
+  ;   expected visible, a future's print after the rounds, on the server's stdout: lost
+  ;   (or visible: whether stdout is lost depends on how the captures interleaved)
+
+  ;; Reproductions of the other nREPL findings:
+  (println (sh "python3 repro/nrepl-bad-argument-ends-connection.py"))   ; N1
+  (println (sh "python3 repro/nrepl-done-with-eval-error.py"))           ; N3
+  (println (sh "python3 repro/nrepl-sessions-share-star1.py"))           ; N6
+  )
+
+;; 7. Conformance testing. The harness ran scripts of four requests on a real server, many times,
+;;    and checked that every outcome jank showed is one the model allows. At first it wasn't: jank
+;;    showed a print on the server's own stdout with stdout working afterwards, which my first
+;;    model said was impossible. That model captured output in one atomic step and sent a print
+;;    to wherever descriptor 1 pointed when it was printed. Working out how that print could reach
+;;    the real stdout gave two facts the first model had wrong: println writes to C's buffer, and
+;;    the bytes reach descriptor 1 at the next fflush, done by whichever capture comes next; and
+;;    starting a capture is three system calls, with room for another connection's steps in
+;;    between. The model then got the buffer, the flush and the split between take and redirect,
+;;    and every outcome conformed (24 scripts, 3 runs each).
+
+(comment
+  ;; The conformance check; it starts many servers and takes about 20 minutes:
+  (println (sh "python3 conformance/nrepl/run.py --random 20 --seed 3 --repeat 3"))
+  )
+
+;; 8. Proofs. The checker found no violation of "one eval at a time per connection" in the
+;;    instance. The proof for any number of connections needed the reason a connection can't run
+;;    two evals at once: take requires the connection not to be busy, and it stays busy until
+;;    respond.
+;;
+;;      invariant [eval_busy] inEval R → busy (reqConn R)
+;;
+;;    With it (and the invariant that only evals are captured, for N7), one_eval_per_connection,
+;;    in_order, N2 and N7 are proved. Their table is pinned in the file with #guard_msgs (the
+;;    build fails if a proof breaks), so the build doesn't print it; this shows it:
+
+(comment
+  (println (sh "grep -n -A12 'info: Initialization must' JankSpecs/Nrepl.lean"))
+  )
+
+;; 9. Results. The model found five bugs, each with a counterexample and a reproduction on jank:
+;;    N1, N3, N4, N5, N6. It also shows where a fix has to go: while captures swap the process's
+;;    descriptor 1, concurrent evals interfere. A capture that doesn't touch it removes N4 and N5,
+;;    and such a design can be modelled and checked before it's written, as the copy in part 1
+;;    was.
+
+;;;; Summary of the method
+;;
+;; 1. Write the properties from the docs, before reading the code for bugs.
+;; 2. Model each step of the code that touches shared state as an action (a read, a
+;;    compare-and-set, a lock), and model the data layout where bugs can be.
+;; 3. Add ghost state for what the properties need (swaps, should).
+;; 4. Model check small instances. Reproduce each counterexample on jank; if it doesn't reproduce,
+;;    fix the model.
+;; 5. Use #check_invariants to prove the properties that model checking didn't violate. For each
+;;    ❌, read the counterexample to induction, find why its state is unreachable, and add that as
+;;    an invariant.
+;; 6. Test the model against real runs of jank.

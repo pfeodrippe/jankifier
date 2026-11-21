@@ -1,0 +1,18 @@
+(ns lean-sys.example
+  "Calls the Lean functions of lean/LeanSysExample.lean from jank."
+  (:require [lean-sys.core :as lean]))
+
+;; A Lean function declared like any C function, with lean.h's types, and called directly.
+(cpp/raw "extern \"C\" uint64_t lean_sys_example_sum_below(uint64_t);")
+
+(defn -main [& _]
+  ;; Once, before calling the module's functions: package `leanSysExample`, module `LeanSysExample`.
+  (lean/initialize-module! "leanSysExample" "LeanSysExample")
+  (println (lean/call-string "lean_sys_example_greet" "jank"))
+  (println "sorted by Lean:" (lean/call-string "lean_sys_example_sort_words" "the quick brown fox jumps"))
+  (println "sum below 1000, by Lean:" (lean/call-u64 "lean_sys_example_sum_below" 1000))
+  (println "the same, called directly:" (cpp/lean_sys_example_sum_below 1000))
+  ;; From other threads: lean-sys registers each one with Lean's runtime.
+  (println "from 4 futures:"
+           (mapv deref (doall (for [i (range 4)]
+                                (future (lean/call-string "lean_sys_example_greet" (str "future " i))))))))

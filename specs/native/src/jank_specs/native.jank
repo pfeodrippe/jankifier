@@ -1,0 +1,79 @@
+(ns jank-specs.native
+  "The Veil model of `swap!` (JankSpecs/Tutorial/TinyAtom.lean), called from jank through lean-sys,
+  and used as a test oracle: random runs of the model's steps, each done on a real atom too, with
+  the model's state and the atom's compared after every step."
+  (:require [clojure.string :as string]
+            [lean-sys.core :as lean]))
+
+(defn init!
+  "Runs the model module's initializer (and its imports': Veil's, Lean's runtime). Once."
+  []
+  (lean/initialize-module! "jankSpecs" "JankSpecs.Native.TinyAtom"))
+
+(defn- model-call [symbol steps]
+  (let [out (lean/call-string symbol (string/join ";" steps))]
+    (when (string/starts-with? out "error:")
+      (throw (ex-info out {:steps steps})))
+    out))
+
+(defn enabled
+  "The steps the model can take after `steps` (as [\"load 0\" \"cas 1\"]): two threads, each doing
+  one `swap! inc` as a load, then a compare-and-set that starts again when it fails."
+  [steps]
+  (vec (remove string/blank? (string/split (model-call "jank_specs_tiny_atom_enabled" steps) #";"))))
+
+(defn model-state
+  "The model's state after `steps`."
+  [steps]
+  (read-string (model-call "jank_specs_tiny_atom_state" steps)))
+
+(defn real-step
+  "One step on the real thing: `state` holds the atom, and each thread's program counter and
+  what it read. A load derefs the atom; a compare-and-set is `compare-and-set!`."
+  [state step]
+  (let [[op t] (string/split step #" ")
+        t (read-string t)
+        a (:atom state)]
+    (if (= op "load")
+      (-> state (assoc-in [:seen t] @a) (assoc-in [:pc t] :loaded))
+      (let [v (get-in state [:seen t])]
+        (assoc-in state [:pc t] (if (compare-and-set! a v (inc v)) :done :idle))))))
+
+(defn agree?
+  "Whether the model's state and the real one agree: the atom's value, each thread's program
+  counter and what it read."
+  [model real]
+  (and (= (:value model) @(:atom real))
+       (= (:pc model) (:pc real))
+       (= (:seen model) (:seen real))))
+
+(defn random-run
+  "Takes random enabled steps until none is left, on the model and on a real atom; returns the
+  steps, and the first step after which they disagree (or nil)."
+  []
+  (loop [steps []
+         real {:atom (atom 0) :pc [:idle :idle] :seen [0 0]}]
+    (let [choices (enabled steps)]
+      (if (empty? choices)
+        {:steps steps :disagreement nil :value @(:atom real)}
+        (let [step (rand-nth choices)
+              steps (conj steps step)
+              real (real-step real step)
+              model (model-state steps)]
+          (if (agree? model real)
+            (recur steps real)
+            {:steps steps :disagreement {:model model :real (update real :atom deref)}}))))))
+
+(defn -main [& _]
+  (init!)
+  (println "enabled at the start:" (enabled []))
+  (println "the tutorial's trace, in the model:" (model-state ["load 1" "load 0" "cas 1" "cas 0"]))
+  (println "and what's enabled after it:" (enabled ["load 1" "load 0" "cas 1" "cas 0"]))
+  (let [runs (repeatedly 200 random-run)
+        bad (remove #(nil? (:disagreement %)) runs)]
+    (println "200 random runs, the model and a real atom compared after every step:"
+             (count bad) "disagreements; final values" (frequencies (map :value runs)))
+    (println "one run:" (string/join ", " (:steps (first runs)))))
+  (println "from 4 futures:"
+           (mapv deref (doall (for [_ (range 4)] (future (count (:steps (random-run)))))))
+           "steps"))
