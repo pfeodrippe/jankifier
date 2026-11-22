@@ -1,0 +1,316 @@
+(ns inkling.core
+  "Inkling 2 Mini from jank: open the model file, inspect it, run sessions and
+  inspect what they computed.
+
+  A model (`open`) is the memory-mapped model file with its configuration,
+  tensors, per-layer weights, execution plan and tokenizer. A session
+  (`session`) is one sequence: its tokens, caches and last logits. Several
+  sessions can share a model, and `copy!` forks one.
+
+  With tracing on (`trace! s true`), each `eval!` records named values of its
+  last token: per visit of the plan (\"v12.attn.q\", \"v12.ffn.experts\", ...)
+  the attention inputs, queries, keys, values, attention weights and output,
+  the routing (expert ids and weights) and the feed-forward output; and the
+  final hidden state.
+
+  The C++ objects behind models and sessions (inkling::model and
+  inkling::session in inkling/inkling.hpp) are reachable with `model-ptr` and
+  `session-ptr`."
+  (:refer-clojure :exclude [reset!])
+  (:require [clojure.string :as string]))
+
+(cpp/raw "#include <inkling/jank.hpp>")
+
+;; Model
+
+(defn convert!
+  "Converts a checkpoint (a safetensors directory, or a manifest file listing
+  tensor blobs) into a model file."
+  [source out]
+  (cpp/inkling.jank_layer.convert (str source) (str out)))
+
+(defn open
+  "Opens a model file."
+  [path]
+  (cpp/inkling.jank_layer.open_model (str path)))
+
+(defn close!
+  "Unmaps a model. Its sessions must not be used afterwards."
+  [m]
+  (cpp/inkling.jank_layer.close_model m))
+
+(defn model-ptr
+  "The inkling::model* of a model, boxed. Its fields are read with jank's C++ interop:
+  (cpp/.-hidden (cpp/.-cfg (cpp/* (cpp/unbox (:* inkling.model) (model-ptr m)))))."
+  [m]
+  (cpp/box (cpp/inkling.jank_layer.model_of m)))
+
+(defn model?
+  "Whether x is a model (one not closed)."
+  [x]
+  (cpp/inkling.jank_layer.is_model x))
+
+(defn path "The model's file." [m] (cpp/inkling.jank_layer.model_path m))
+
+(defn config
+  "The model's configuration: its sizes (:layers :hidden :heads :kv-heads :head-dim
+  :experts :top-k :expert-width :vocab), the loop (:loop {:start :end :passes}: layers
+  start to end - 1 are run that many times), the window of the local layers (:window), and
+  the constants of its arithmetic."
+  [m]
+  (cpp/inkling.jank_layer.config m))
+
+(defn plan
+  "The decoder's visits in order: {:visit :layer :pass :local}."
+  [m]
+  (cpp/inkling.jank_layer.plan m))
+
+(defn tensors
+  "All tensors: {:name :dtype :shape :bytes}."
+  [m]
+  (cpp/inkling.jank_layer.tensors m))
+
+(defn tensor [m name] (cpp/inkling.jank_layer.tensor_info m (str name)))
+
+(defn tensor-values
+  "Elements [start, start + n) of a tensor, row-major, as doubles (packed
+  types give their raw integers)."
+  ([m name n] (tensor-values m name 0 n))
+  ([m name start n] (cpp/inkling.jank_layer.tensor_values m (str name) start n)))
+
+(defn layer
+  "A physical layer's weights, by tensor name."
+  [m index]
+  (cpp/inkling.jank_layer.layer m index))
+
+(defn options [m] (cpp/inkling.jank_layer.options m))
+
+(defn set-option!
+  "Options: :gpu (run evals on the Metal backend; false uses the CPU
+  reference), :threads (CPU workers), :quantize-expert-inputs (quantize the
+  experts' inputs as the checkpoint's reference does; false keeps FP32)."
+  [m k v]
+  (cpp/inkling.jank_layer.set_option m k v))
+
+;; Tokenizer
+
+(defn tokenize
+  "Token ids of a text. Special token strings (<|message_user|>, ...) become
+  their ids unless :special false."
+  ([m text] (tokenize m text true))
+  ([m text special] (cpp/inkling.jank_layer.tokenize m (str text) special)))
+
+(defn detokenize [m ids] (cpp/inkling.jank_layer.detokenize m (vec ids)))
+
+(defn token-id [m piece] (cpp/inkling.jank_layer.token_id m (str piece)))
+
+(defn pieces
+  "Each id with its piece of text: [{:id :piece} ...]."
+  [m ids]
+  (cpp/inkling.jank_layer.pieces m (vec ids)))
+
+;; Sessions
+
+(defn session
+  "A new session of up to `context` tokens (default 8192)."
+  ([m] (session m 8192))
+  ([m context] (cpp/inkling.jank_layer.new_session m context)))
+
+(defn free! [s] (cpp/inkling.jank_layer.free_session s))
+
+(defn session-ptr
+  "The inkling::session* of a session, boxed. Its fields are read with jank's C++ interop:
+  (cpp/.-pos (cpp/* (cpp/unbox (:* inkling.session) (session-ptr s))))."
+  [s]
+  (cpp/box (cpp/inkling.jank_layer.session_of s)))
+
+;; The session last worked on, and the thread that did: for a tool that follows the session
+;; a person is working on (`used-session!`).
+(defonce ^:private used (atom nil))
+
+(defn- used! [s]
+  (clojure.core/reset! used [s (cpp/inkling.jank_layer.thread_token)]))
+
+(defn used-session!
+  "The session this thread last evaluated on, reset or copied into, since this was last
+  asked: nil when none, or when another thread worked on one since. For a tool that shows
+  the session being worked on (the window does, after each evaluation of the REPL)."
+  []
+  (let [[s thread] @used]
+    (when (and s (= thread (cpp/inkling.jank_layer.thread_token)))
+      (clojure.core/reset! used nil)
+      s)))
+
+(defn eval!
+  "Evaluates token ids (or a string, tokenized with special tokens) at the end
+  of the session."
+  [s ids-or-text]
+  (used! s)
+  (if (string? ids-or-text)
+    (cpp/inkling.jank_layer.eval_text s ids-or-text)
+    (cpp/inkling.jank_layer.eval s (vec ids-or-text))))
+
+(defn reset! [s]
+  (used! s)
+  (cpp/inkling.jank_layer.reset s))
+
+(defn session?
+  "Whether x is a session (one not freed)."
+  [x]
+  (cpp/inkling.jank_layer.is_session x))
+
+(defn info
+  "{:position :context :logits :gpu} of a session: where it is, its size, whether it has
+  logits, and whether its next eval runs on the GPU."
+  [s]
+  (cpp/inkling.jank_layer.session_info s))
+
+(defn tail
+  "The text of the session's last n tokens."
+  [s n]
+  (cpp/inkling.jank_layer.tail s n))
+
+(defn copy!
+  "Copies src's state into dst (both of the same model and context)."
+  [dst src]
+  (used! dst)
+  (cpp/inkling.jank_layer.copy_session dst src))
+
+(defn position [s] (cpp/inkling.jank_layer.position s))
+
+(defn tokens [s] (cpp/inkling.jank_layer.tokens s))
+
+(defn logits [s] (cpp/inkling.jank_layer.logits s))
+
+(defn top
+  "The n most likely next tokens: {:id :piece :logit :logprob :prob}."
+  ([s] (top s 10))
+  ([s n] (cpp/inkling.jank_layer.top s n)))
+
+(defn sample
+  "A next token: greedy when :temperature is 0 (the default)."
+  ([s] (sample s {}))
+  ([s {:keys [temperature top-p top-k seed] :or {temperature 0 top-p 1.0 top-k 0 seed 1}}]
+   (cpp/inkling.jank_layer.sample s (double temperature) (double top-p) top-k seed)))
+
+(defn trace!
+  "Turns tracing on or off."
+  [s on?]
+  (cpp/inkling.jank_layer.set_trace s on?))
+
+(defn traces
+  "Names and shapes of the values the last eval! recorded."
+  [s]
+  (cpp/inkling.jank_layer.trace_names s))
+
+(defn trace
+  "A recorded value: {:name :shape :values}. Attention weights also say what their rows
+  and columns are (:row-name, :column-name), for whatever draws them."
+  [s name]
+  (let [value (cpp/inkling.jank_layer.trace s (str name))]
+    (if (and value (string/ends-with? (str name) ".attn.weights"))
+      (assoc value :row-name "head" :column-name "token")
+      value)))
+
+(defn cache
+  "A visit's cache: :keys, :values (BF16 widened to doubles), or the
+  convolution history :k-conv, :v-conv, :attn-conv or :mlp-conv."
+  [s visit which]
+  (cpp/inkling.jank_layer.cache s visit ({:keys 0 :values 1 :k-conv 2 :v-conv 3 :attn-conv 4 :mlp-conv 5} which)))
+
+;; Verification, captures, experiments
+
+(defn check-gpu
+  "Evaluates ids (or a text) at the end of the session on the CPU, then on the
+  GPU from the same state with the CPU's values forced in after every stage of
+  every visit, and compares the two stage by stage. Returns {:ok :compared
+  :beyond :rows}; a row is {:visit :field :count :different :beyond :worst}:
+  values compared, values not bitwise equal, values beyond the field's
+  tolerance, and the worst difference as a fraction of that tolerance."
+  [s ids-or-text]
+  (used! s)
+  (let [ids (if (string? ids-or-text)
+              (cpp/inkling.jank_layer.tokenize_for s ids-or-text)
+              ids-or-text)]
+    (cpp/inkling.jank_layer.check_gpu s (vec ids))))
+
+(defn capture!
+  "Turns capturing on or off: each eval! then keeps the values of every stage
+  of every visit, for every token of its last chunk (see `captured`). On the
+  GPU a capturing eval runs stage by stage, so it is slow."
+  [s on?]
+  (cpp/inkling.jank_layer.set_capture s on?))
+
+(defn capture-info
+  "{:tokens :pos :visits} of the last capture."
+  [s]
+  (cpp/inkling.jank_layer.capture_info s))
+
+(defn captured
+  "A field of the last capture, as a vector of doubles: of one token of the
+  chunk, or of all of them. Fields of a visit: :input.q :input.k :input.v :q_proj
+  :r_proj :k_proj :v_proj :k_taps :v_taps :k_conv :v_conv :q :r :sink :gate :k
+  :v :attended :attn_proj :after_attention :ffn_input :router :experts
+  :expert_weights :expert_input :expert_input_max :activations_raw
+  :activations :activation_max :ffn :ffn_routes :partial, the controllers'
+  :pair.q :compressed.q (and .k .v .ffn), and the histories :conv.k :conv.v
+  :conv.attn :conv.ffn. Visit -1 has :embed; visit (count (plan m)) has
+  :hidden and :logits."
+  ([s visit field] (captured s visit field -1))
+  ([s visit field token]
+   (cpp/inkling.jank_layer.captured s visit (name field) token)))
+
+(defn routing
+  "The experts each visit routed a token to, as a matrix [visits, experts] of the routes'
+  weights (0 where an expert wasn't chosen): of a token of the last capture, its last one by
+  default. {:name :shape :values :row-labels :column-name}."
+  ([s] (routing s -1))
+  ([s token] (assoc (cpp/inkling.jank_layer.routing s token) :column-name "expert")))
+
+(defn record!
+  "Turns on or off the recording of the Metal forward's residual stream
+  bookkeeping (see `events`)."
+  [s on?]
+  (cpp/inkling.jank_layer.set_record s on?))
+
+(defn events
+  "The last Metal forward's stream events: {:kind :visit :slot}, kind one of
+  :take :push :restart :release :read :write."
+  [s]
+  (cpp/inkling.jank_layer.events s))
+
+(def ^:private ablation-bits {:attention 1 :feed-forward 2 :messages 4})
+
+(defn ablate!
+  "Switches parts of a visit off: a set of :attention (it adds nothing to the
+  stream), :feed-forward (the experts add nothing) and :messages (a later pass
+  of the loop ignores the previous one). #{} restores the visit. While
+  anything is switched off, evals run on the CPU."
+  [m visit parts]
+  (cpp/inkling.jank_layer.set_ablation m visit (reduce + 0 (map ablation-bits parts))))
+
+(defn ablations
+  "Per visit, the set of parts switched off."
+  [m]
+  (mapv (fn [bits] (set (keep (fn [[k b]] (when (pos? (bit-and bits b)) k)) ablation-bits)))
+        (cpp/inkling.jank_layer.ablations m)))
+
+(defn ban-experts!
+  "Experts of a layer that the router may not choose ([] to allow all)."
+  [m layer ids]
+  (cpp/inkling.jank_layer.ban_experts m layer (vec ids)))
+
+(defn generate!
+  "Samples up to n tokens after the session's tokens, evaluating each. Stops
+  at the end-of-sampling token. Returns the generated ids."
+  ([s n] (generate! s n {}))
+  ([s n opts]
+   (let [eos (:eos-token opts 200006)]
+     (loop [out [] i 0 seed (:seed opts 1)]
+       (if (= i n)
+         out
+         (let [id (sample s (assoc opts :seed seed))]
+           (if (= id eos)
+             (conj out id)
+             (do (eval! s [id])
+                 (recur (conj out id) (inc i) (inc seed))))))))))

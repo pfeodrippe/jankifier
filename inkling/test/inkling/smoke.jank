@@ -1,0 +1,45 @@
+(ns inkling.smoke
+  "A walk through inkling.core against the real model: jank -I include -L lib
+  -l <abs>/lib/libinkling.dylib --module-path src:test run-main inkling.smoke"
+  (:require [inkling.core :as ink]))
+
+(defn -main [& args]
+  (let [m (ink/open (or (first args) "models/inkling-2-mini.ink"))
+        s (ink/session m 4096)
+        prompt "The capital of France is"]
+    (println "options" (ink/options m))
+    (println "config" (select-keys (ink/config m) [:layers :hidden :experts :top-k :loop]))
+    (println "plan" (count (ink/plan m)) "visits; first" (first (ink/plan m)))
+    (println "tensor" (ink/tensor m "model.llm.layers.0.attn.wq_du.weight"))
+    (println "tokens" (ink/tokenize m prompt))
+    ;; GPU
+    (ink/eval! s prompt)
+    (println "gpu top" (mapv (juxt :piece :logprob) (ink/top s 3)))
+    (println "generated" (pr-str (ink/detokenize m (ink/generate! s 8))))
+    ;; The same on the CPU reference, with traces of the last token.
+    (ink/reset! s)
+    (ink/trace! s true)
+    (ink/eval! s prompt)
+    (println "cpu top" (mapv (juxt :piece :logprob) (ink/top s 3)))
+    (println "traces" (count (ink/traces s)) "experts of visit 12" (:values (ink/trace s "v12.ffn.experts")))
+    (ink/trace! s false)
+    ;; Every stage of every visit, for every token.
+    (ink/reset! s)
+    (ink/capture! s true)
+    (ink/record! s true)
+    (ink/eval! s prompt)
+    (println "capture" (ink/capture-info s) "experts of visit 12, last token" (ink/captured s 12 :experts 4))
+    (println "events" (count (ink/events s)) (take 3 (ink/events s)))
+    (ink/capture! s false)
+    (ink/record! s false)
+    ;; The GPU against the CPU, stage by stage.
+    (ink/reset! s)
+    (let [r (ink/check-gpu s prompt)]
+      (println "check-gpu" (select-keys r [:ok :compared :beyond])))
+    ;; Switching parts off.
+    (ink/ablate! m 47 #{:feed-forward})
+    (ink/reset! s)
+    (ink/eval! s prompt)
+    (println "without the last feed-forward" (mapv (juxt :piece :logprob) (ink/top s 3)))
+    (ink/ablate! m 47 #{})
+    (println "position" (ink/position s))))
