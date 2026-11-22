@@ -32,9 +32,10 @@
             [harness.verify :as verify]
             [cards.repl :as repl]))
 
-;; Where results and recordings go: ../trials-out, made absolute when this is loaded (a run
-;; works from a directory of its own, see agent-home!).
-(def dir (str (cpp/harness.real_path "../trials-out")))
+;; Where results and recordings go: ../trials-out, made absolute the first time this is loaded
+;; (a run works from a directory of its own, see agent-home!: loading this again from there
+;; must not move it).
+(defonce dir (str (cpp/harness.real_path "../trials-out")))
 
 ;; The tasks.
 
