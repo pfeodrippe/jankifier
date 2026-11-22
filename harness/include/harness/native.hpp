@@ -555,6 +555,158 @@ namespace harness
   }
 
   /* A line on stdout, written at once (jank's own printing is buffered). */
+  /* Where the top-level forms of jank code are: "ok" then a line "start end" (byte offsets)
+   * a form, or "error" then what doesn't read, with its line: a bracket that closes nothing,
+   * one that closes another kind, one left open, a string left open. Strings, comments and
+   * character literals are skipped; a form of other things (a symbol, 'quoted, #"regex")
+   * ends at white space. */
+  inline object_ref top_forms(object_ref const text)
+  {
+    auto const s(to_std(text));
+    std::string out{ "ok\n" };
+    struct opened
+    {
+      char c;
+      size_t line;
+    };
+    std::vector<opened> stack;
+    size_t line{ 1 }, i{}, n{ s.size() }, start_line{};
+    long start{ -1 };
+    bool atom{};
+    auto const closer([](char const o) { return o == '(' ? ')' : (o == '[' ? ']' : '}'); });
+    auto const finish([&](size_t const end) {
+      out += std::to_string(start) + " " + std::to_string(end) + "\n";
+      start = -1;
+      atom = false;
+    });
+    auto const fail([](std::string const &said) { return str("error\n" + said); });
+    auto const begin([&](size_t const at) {
+      if(start < 0)
+      {
+        start = static_cast<long>(at);
+        start_line = line;
+      }
+    });
+    while(i < n)
+    {
+      char const c{ s[i] };
+      if(c == '"')
+      {
+        begin(i);
+        atom = false;
+        size_t const from{ line };
+        ++i;
+        while(i < n && s[i] != '"')
+        {
+          if(s[i] == '\\')
+          {
+            ++i;
+          }
+          else if(s[i] == '\n')
+          {
+            ++line;
+          }
+          ++i;
+        }
+        if(i >= n)
+        {
+          return fail("a string that starts at line " + std::to_string(from) + " isn't closed");
+        }
+        ++i;
+        if(stack.empty())
+        {
+          finish(i);
+        }
+        continue;
+      }
+      if(c == ';')
+      {
+        if(atom && stack.empty())
+        {
+          finish(i);
+        }
+        while(i < n && s[i] != '\n')
+        {
+          ++i;
+        }
+        continue;
+      }
+      if(c == '\\')
+      {
+        begin(i);
+        if(stack.empty())
+        {
+          atom = true;
+        }
+        i += 2;
+        continue;
+      }
+      if(c == '(' || c == '[' || c == '{')
+      {
+        begin(i);
+        atom = false;
+        stack.push_back({ c, line });
+        ++i;
+        continue;
+      }
+      if(c == ')' || c == ']' || c == '}')
+      {
+        if(stack.empty())
+        {
+          return fail("line " + std::to_string(line) + ": a '" + std::string(1, c) + "' that closes nothing");
+        }
+        auto const o(stack.back());
+        if(closer(o.c) != c)
+        {
+          return fail("line " + std::to_string(line) + ": a '" + std::string(1, c) + "' closes the '"
+                      + std::string(1, o.c) + "' opened at line " + std::to_string(o.line));
+        }
+        stack.pop_back();
+        ++i;
+        if(stack.empty())
+        {
+          finish(i);
+        }
+        continue;
+      }
+      bool const space{ c == ' ' || c == '\n' || c == '\t' || c == '\r' || c == ',' };
+      if(c == '\n')
+      {
+        ++line;
+      }
+      if(stack.empty())
+      {
+        if(space)
+        {
+          if(atom)
+          {
+            finish(i);
+          }
+        }
+        else
+        {
+          if(start < 0)
+          {
+            atom = true;
+          }
+          begin(i);
+        }
+      }
+      ++i;
+    }
+    if(!stack.empty())
+    {
+      return fail("the form that starts at line " + std::to_string(start_line) + " isn't closed: the '"
+                  + std::string(1, stack.back().c) + "' opened at line " + std::to_string(stack.back().line)
+                  + " is still open");
+    }
+    if(atom)
+    {
+      finish(n);
+    }
+    return str(out);
+  }
+
   inline void say(object_ref const text)
   {
     std::printf("%s\n", to_std(text).c_str());

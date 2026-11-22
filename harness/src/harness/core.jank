@@ -347,6 +347,18 @@
       text
       (str (subs text 0 limit) "\n[cut here: " (- n limit) " more characters]"))))
 
+(defn- params-said
+  "A tool's parameters, as the model is told when a call lacks one."
+  [t]
+  (str/join ", " (map (fn [[k p]]
+                        (str (subs (str k) 1)
+                             (cond
+                               (and (:doc p) (not (some #{k} (:required t)))) (str " (optional: " (:doc p) ")")
+                               (:doc p) (str " (" (:doc p) ")")
+                               (not (some #{k} (:required t))) " (optional)"
+                               :else "")))
+                      (:params t))))
+
 (defn call!
   "A call's frame run for agent `a`: its JSON read, its tool found and called. `called` is
   {:name :text}, the frame's name and its JSON text. Returns the entries [call result]; the
@@ -369,21 +381,34 @@
                                             (str/join ", " (map :name tools)))}
                   (not (map? args)) {:error "the call's args must be an object"}
                   :else
-                  (let [missing (remove (fn [k] (contains? args k)) (:required found))]
+                  (let [missing (remove (fn [k] (contains? args k)) (:required found))
+                        unknown (remove (fn [k] (contains? (:params found) k)) (keys args))
+                        ;; One argument missing and one given under another name ("code" for
+                        ;; "command"): taken as the missing one, and the model told so.
+                        renamed (when (and (= 1 (count missing)) (= 1 (count unknown)))
+                                  [(first unknown) (first missing)])
+                        args (if renamed
+                               (-> args (dissoc (first renamed)) (assoc (second renamed) (get args (first renamed))))
+                               args)
+                        missing (if renamed [] missing)]
                     (if (seq missing)
-                      {:error (str "the call lacks " (str/join ", " (map (fn [k] (subs (str k) 1)) missing)))}
+                      {:error (str "the call lacks " (str/join ", " (map (fn [k] (subs (str k) 1)) missing))
+                                   ". " (:name found) " takes " (params-said found))}
                       (try
                         ;; On a large stack: the turn's own thread has the system's small
                         ;; one, which a tool that recurses overflows.
                         {:value (binding [*agent* a]
-                                  (repl/on-big-stack (fn [] ((:fn found) args))))}
+                                  (repl/on-big-stack (fn [] ((:fn found) args))))
+                         :note (when renamed
+                                 (str "(the call's \"" (subs (str (first renamed)) 1) "\" was taken as \""
+                                      (subs (str (second renamed)) 1) "\")\n"))}
                         (catch jank.runtime.object_ref e {:error (or (ex-message e) (str e))})
                         (catch cpp/jank.error_ref e {:error (str (cpp/.-message (cpp/* e)))})
                         (catch cpp/std.exception e {:error (str (cpp/.what e))})
                         (catch :default _ {:error "the tool threw something jank does not say"})))))
         text (if (:error outcome)
                (str "error: " (:error outcome))
-               (result-text (:value outcome) (or (:limit found) 8000)))]
+               (str (:note outcome) (result-text (:value outcome) (or (:limit found) 8000))))]
     [{:role :call :name (str named) :args args
       :began (:began called) :ended (:ended called)}
      {:role :result :name (str named) :text text :error (boolean (:error outcome))

@@ -75,7 +75,8 @@ The default tools (`(tools/defaults)`):
 
 | | |
 |---|---|
-| `eval` | jank code evaluated in this process's nREPL: what it printed and its value. Definitions stay |
+| `eval` | jank code evaluated in this process's nREPL, form by form: what it printed and each form's value (code that doesn't read says where). `str` is clojure.string, `set` clojure.set. Definitions stay |
+| `load_file` | a jank file loaded: its forms evaluated in order, or where it fails |
 | `functions`, `describe` | what a namespace defines, and one function's parameters and documentation |
 | `read_file`, `write_file`, `edit_file`, `list_dir` | files |
 | `shell` | a command line, its output and exit code |
@@ -341,7 +342,20 @@ in a log file that recovers from a crash tearing its last record.
 (trials/summary)                            ; right runs per task and mode
 ```
 
-Each run's conversation is kept in `work/trials/` for `hc/replay!`.
+Each run starts with `work/` empty, and its conversation is kept in
+`../trials-out/` for `hc/replay!`. The model must not see what it is graded
+against, or earlier runs: start the process with those hidden from it,
+
+```sh
+HARNESS_PROFILES=extras HARNESS_HIDE="$PWD/../trials-out:/where/the/references/are" ./sandbox.sh
+```
+
+(`HARNESS_HIDE`: directories the sandboxed process can't read but can
+write; not inside the project, whose files the build reads), and show the window only the run in progress: the model can
+evaluate code in the process, so earlier conversations kept there are within
+its reach. The graders themselves (`src/harness/trials.jank`) are loaded
+before the model runs, so they can't be hidden; they say what the tasks
+require, not how.
 
 ## Two problems of jank's REPL this needed fixed
 

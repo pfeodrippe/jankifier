@@ -8,6 +8,7 @@
 ;;
 ;; None of these is confined to a directory, and nothing is asked before they act.
 (ns harness.tools
+  (:refer-clojure :exclude [load-file])
   (:require [clojure.string :as str]
             [harness.core :as h]
             ;; The process's eval operation, on a large stack and safe for evaluations at the
@@ -41,26 +42,102 @@
 ;; The namespace the model's code is evaluated in.
 (defonce evaluation-ns (atom "user"))
 
-(defn evaluate
-  "Evaluates jank code (a Clojure dialect) in the running process and returns what it
-  printed and its value. Several forms may be given: the value is the last one's.
-  Definitions stay for later calls. clojure.core is there; inkling.core is the engine this
-  model runs on, and (harness.core/me) gives this conversation's {:model :session :agent}."
+;; What every evaluation can count on in `user`: clojure.string as str, clojure.set as set.
+(defonce ^:private prepared (atom false))
+
+(defn- prepare! []
+  (when-not @prepared
+    (cards.repl/evaluate "(require '[clojure.string :as str] '[clojure.set :as set])" "user" "harness" 1 1 false)
+    (reset! prepared true)))
+
+(defn- forms-of
+  "Where the code's top-level forms are: {:spans [[start end] ...]} (byte offsets), or
+  {:error what doesn't read}."
   [code]
-  (let [answer (handler/handle-message {"op" "eval" "code" (str code) "ns" @evaluation-ns})
+  (let [lines (str/split-lines (str (cpp/harness.top_forms (str code))))]
+    (if (= "ok" (first lines))
+      {:spans (mapv (fn [l] (mapv parse-long (str/split l #" "))) (rest lines))}
+      {:error (str/join " " (rest lines))})))
+
+(defn- eval-one
+  "One piece of code evaluated as an editor would send it: {:out :err :failed :value :ns}."
+  [code ns]
+  (let [answer (handler/handle-message {"op" "eval" "code" (str code) "ns" ns})
         parts (if (map? answer) [answer] (remove nil? answer))
-        out (apply str (keep :out parts))
-        failed (some :ex parts)
-        value (some :value parts)
-        ;; What was written to stderr, apart from the error itself (the nREPL sends that
-        ;; there too): a C++ compiler's messages are only there.
-        err (apply str (remove (fn [text] (= text failed)) (keep :err parts)))
-        ended (fn [text] (str (plain text) (when-not (str/ends-with? text "\n") "\n")))]
-    (str (when (seq out) (ended out))
-         (when (seq (str/trim err)) (ended err))
-         (if failed
-           (str "error: " (cause failed))
-           (str "=> " value)))))
+        failed (some :ex parts)]
+    {:out (apply str (keep :out parts))
+     :failed failed
+     :value (some :value parts)
+     ;; What was written to stderr, apart from the error itself (the nREPL sends that
+     ;; there too): a C++ compiler's messages are only there.
+     :err (apply str (remove (fn [text] (= text failed)) (keep :err parts)))
+     :ns (or (some :ns parts) ns)}))
+
+(defn- ended [text]
+  (str (plain text) (when-not (str/ends-with? text "\n") "\n")))
+
+(defn- head-of
+  "A form's first line, short: how a value is labelled."
+  [text]
+  (let [line (first (str/split-lines (str/trim text)))]
+    (if (> (count line) 60) (str (subs line 0 57) "...") line)))
+
+(defn evaluate
+  "Evaluates jank code (a Clojure dialect) in the running process: what it printed and
+  each top-level form's value, as a REPL shows them, form by form (an error stops there).
+  Definitions stay for later calls. clojure.core is there, clojure.string as str and
+  clojure.set as set; inkling.core is the engine this model runs on, and
+  (harness.core/me) gives this conversation's {:model :session :agent}."
+  [code]
+  (prepare!)
+  (let [code (str code)
+        found (forms-of code)
+        spans (:spans found)]
+    (cond
+      (:error found)
+      (str "error: the code doesn't read: " (:error found))
+
+      (<= (count spans) 1)
+      (let [r (eval-one code @evaluation-ns)]
+        (str (when (seq (:out r)) (ended (:out r)))
+             (when (seq (str/trim (:err r))) (ended (:err r)))
+             (if (:failed r)
+               (str "error: " (cause (:failed r)))
+               (str "=> " (:value r)))))
+
+      :else
+      ;; Form by form, each from its own text (so its metadata, ^:dynamic, stays), in the
+      ;; namespace the one before left.
+      (loop [spans spans ns @evaluation-ns said ""]
+        (if (empty? spans)
+          (str/trimr said)
+          (let [[a b] (first spans)
+                text (subs code a b)
+                r (eval-one text ns)
+                said (str said
+                          (when (seq (:out r)) (ended (:out r)))
+                          (when (seq (str/trim (:err r))) (ended (:err r))))]
+            (if (:failed r)
+              (str said "error in " (head-of text) ": " (cause (:failed r))
+                   (when (seq (rest spans)) (str "\n(the " (count (rest spans)) " forms after it were not evaluated)")))
+              (recur (rest spans) (:ns r) (str said (head-of text) " => " (:value r) "\n")))))))))
+
+(defn load-file
+  "Loads a jank file: its forms evaluated in order, as loading it would (its ns form first).
+  Says what it printed and the namespace it is in, or what failed, with its line."
+  [path]
+  (prepare!)
+  (when-not (cpp/harness.is_file (str path))
+    (throw (ex-info (str "there is no file " path) {})))
+  (let [text (slurp (str path))
+        found (forms-of text)]
+    (if (:error found)
+      (str "error: " path " doesn't read: " (:error found))
+      (let [r (cards.repl/evaluate text "user" (str path) 1 1 false)]
+        (str (when (seq (:out r)) (ended (:out r)))
+             (if (:ok r)
+               (str "loaded " path ": " (count (:spans found)) " forms, namespace " (:ns r))
+               (str "error loading " path ": " (cause (:error r)))))))))
 
 (defn functions
   "Lists what a namespace of the running process defines: a line a name, with the start of
@@ -188,6 +265,9 @@
   [(h/wrap #'evaluate {:name "eval"
                        :params {:code "the code to evaluate"}
                        :limit 12000})
+   (h/wrap #'load-file {:name "load_file"
+                        :params {:path "the file's path, like work/x.jank"}
+                        :limit 12000})
    (h/wrap #'functions {:params {:namespace "the namespace's name, like inkling.core"}
                         :limit 12000})
    (h/wrap #'describe {:params {:name "the full name, like inkling.core/routing"}})

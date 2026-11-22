@@ -16,9 +16,11 @@ the syntax, the data structures and most of `clojure.core` and
   `(* 100000.0 100000.0)`.
 - **`format` does not format**: `(format "%d items" 3)` returns `"%d items"`.
   Use `str`.
-- **No `load-file`, no `doc`.** Send code with the eval tool; read
+- **No `load-file`, no `doc`.** Load a file with the load_file tool; read
   documentation with the describe tool or `(:doc (meta (var some.ns/name)))`,
   and list a namespace with the functions tool or `(keys (ns-publics 'some.ns))`.
+- **In the eval tool**, `str` is clojure.string and `set` clojure.set, and every
+  top-level form's value is shown.
 - **`require` first, in an evaluation of its own.** `(do (require '[x :as y])
   (y/f))` fails, because the whole form is read before any of it runs. Several
   forms in one evaluation are fine: they run one after the other.
@@ -32,11 +34,15 @@ the syntax, the data structures and most of `clojure.core` and
   `(count "é")` is 2.
 - **Regular expressions**: `[...]` classes and `\s` also match the bytes of
   accented letters. On such text use plain strings, or patterns without them.
-- **Errors**: `(catch jank.runtime.object_ref e (ex-message e))` catches
-  `ex-info` and `throw`n values; `(catch cpp/jank.error_ref e (cpp/.-message
-  (cpp/* e)))` catches jank's own errors (`(subs "ab" 2 1)`);
-  `(catch cpp/std.exception e (cpp/.what e))` catches C++ exceptions (`slurp`
-  of a file that isn't there throws one).
+- **Errors** are caught by type, inside `try` as in Clojure:
+
+  ```clojure
+  (try
+    (risky)
+    (catch jank.runtime.object_ref e (ex-message e))   ; ex-info and thrown values
+    (catch cpp/jank.error_ref e (cpp/.-message (cpp/* e)))   ; jank's own: (subs "ab" 2 1)
+    (catch cpp/std.exception e (cpp/.what e)))          ; C++'s: slurp of a missing file
+  ```
 - **Sleeping**: `(cpp/usleep 250000)` (microseconds).
 - These are here: atoms, `future` and `deref`, `binding`, `delay`,
   `slurp` and `spit`, `read-string`, `parse-long`, `re-find`, `sort-by`,

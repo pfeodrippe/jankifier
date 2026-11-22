@@ -249,13 +249,35 @@
                    (and (str/starts-with? text (apply str (repeat 100 "x")))
                         (str/includes? text "[cut here: 400 more characters]"))))]
          ["eval: a value, with what was printed"
-          (fn [] (= (tools/evaluate "(println \"hi\") (+ 1 2)") "hi\n=> 3"))]
+          (fn [] (= (tools/evaluate "(do (println \"hi\") (+ 1 2))") "hi\n=> 3"))]
+         ["eval: several forms, each one's value, as a REPL shows them"
+          (fn [] (= (tools/evaluate "(def bench-x 2)\n(println \"hi\")\n(* bench-x 21)")
+                    "(def bench-x 2) => #'user/bench-x\nhi\n(println \"hi\") => nil\n(* bench-x 21) => 42"))]
+         ["eval: code that doesn't read says where"
+          (fn [] (= (tools/evaluate "(defn bench-f [x]\n  (+ x 1)))\n(bench-f 1)")
+                    "error: the code doesn't read: line 2: a ')' that closes nothing"))]
+         ["eval: clojure.string is str there"
+          (fn [] (= (tools/evaluate "(str/join \",\" [1 2])") "=> \"1,2\""))]
+         ["load_file: a file's namespace loaded, or where it doesn't read"
+          (fn [] (let [p (path "loaded.jank")]
+                   (cpp/harness.make_parents p)
+                   (spit p "(ns bench-loaded)\n(defn twice [x] (* 2 x))\n")
+                   (let [ok (tools/load-file p)
+                         v (tools/evaluate "(bench-loaded/twice 21)")]
+                     (spit p "(ns bench-loaded)\n(defn twice [x] (* 2 x)\n")
+                     (and (= ok (str "loaded " p ": 2 forms, namespace bench-loaded"))
+                          (= v "=> 42")
+                          (str/includes? (tools/load-file p) "line 2")))))]
+         ["call: an argument under another name is taken, and the model told"
+          (fn [] (= (call-text a "add" {:a 1 :c 2}) "(the call's \"c\" was taken as \"b\")\n3"))]
+         ["call: a missing argument says what the tool takes"
+          (fn [] (str/includes? (call-text a "add" {}) "add takes a"))]
          ["eval: an error, without its trace"
           (fn [] (let [said (tools/evaluate "(no-such-function 1)")]
                    (and (str/starts-with? said "error: ") (not (str/includes? said ":trace")))))]
          ["eval: a function calling itself 3000 deep (a large stack)"
-          (fn [] (= (tools/evaluate "(defn bench-down [n] (if (zero? n) 0 (inc (bench-down (dec n))))) (bench-down 3000)")
-                    "=> 3000"))]
+          (fn [] (str/ends-with? (tools/evaluate "(defn bench-down [n] (if (zero? n) 0 (inc (bench-down (dec n))))) (bench-down 3000)")
+                                 "(bench-down 3000) => 3000"))]
          ["call: a tool calling itself 3000 deep (a large stack)"
           (fn [] (let [deep (fn deep [n] (if (zero? n) 0 (inc (deep (dec n)))))
                        b (stub [{:name "deep" :doc "" :fn (fn [_] (deep 3000))}])]
