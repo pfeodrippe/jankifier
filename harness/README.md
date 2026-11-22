@@ -162,40 +162,44 @@ tool says so; `curl https://example.com` gets no connection.
 ## The window
 
 `(hc/watch! a "name")` shows the agent above the cards: a line for each
-conversation watched, and the one chosen written out. A person's messages, the
-model's thinking folded, each tool's call folded with its result, and what the
-model said with its headings, lists, tables, code and bold drawn. Clicking a
-conversation's line chooses it; clicking a folded entry opens it; the wheel
-looks back. What the model evaluates with `eval` is a card below, like any
-evaluation.
+conversation watched, and the one chosen written out as a terminal shows it,
+in its type: a person's messages after a prompt, the model's thinking, each
+tool's call with all it gave under it, and what the model said with its
+headings, lists, tables, code and bold drawn. Nothing is folded, and the newest
+is at the bottom; a conversation shorter than the space sits at the bottom of
+it. Under it is a line of what is going on ("thinking (12 s)", "running
+shell"), or the person's message being typed in a replay, and the timeline.
+Clicking a conversation's line chooses it. What the model evaluates with
+`eval` is a card below, like any evaluation.
 
-Under the conversation is its timeline:
+The timeline has:
 
-- a mark for each entry (a person's message, thinking, a call, an answer), and
-  a knob where the conversation is shown up to;
+- a mark for each step: a person's message, a tool's call with what it gave,
+  an answer of the model's, and a knob where the conversation is shown up to;
 - the time since the conversation began, and what was going on then
   ("1:23 running eval");
-- play or pause, from the start, to the end of the next entry, and the pace
-  (1, 2, 4 or 8 times).
+- play or pause, from the start, to the next step, and the pace (1, 2, 4 or
+  8 times).
 
 The whole is small (380 points) and always as tall, whatever the conversation
 holds and however many there are (four lines in view, the wheel over them shows
 the others): the timeline stays in its place. "expand", at its right, opens it
 over the window as a modal, the cards dimmed beneath; "close", Esc or a click
-outside puts it back. The
-wheel, or the bar at the conversation's right, scrolls: what is looked at
-stays put while it plays or is sought in, until "latest" (or scrolling to the
-end) follows the end again. An entry opened is whole, and scrolls with the
-rest.
+outside puts it back.
+
+While the end is followed, what comes is shown as it comes. The wheel, or the
+bar at the conversation's right, looks back: what is looked at then stays put
+while it plays or is sought in, until "Jump to latest" (or scrolling to the
+end) follows the end again.
 
 While a turn runs, the end is followed as it is written ("live"). Pause stops
 the view there, and the turn itself goes on. A click on the line (or the mouse
 held and moved along it) goes to that moment, and plays on from there if it was
-playing; on a mark, to that entry's end, the entry shown whole. Playing is at
-the pace things were written, and follows the turn again when it
-gets to the end. So does a click at the line's end. Waits are shown short and marked on
-the line with a break: a tool running, a result being read (1.2 seconds at
-most each).
+playing. A click on a mark goes to that step's end and shows the step from its
+start; on the last one, or at the line's end, the end is followed. Playing is
+at the pace things were written, and follows the turn again when it gets to the
+end. Waits are shown short and marked on the line with a break: a tool
+running, a result being read (1.2 seconds at most each).
 
 ## A conversation kept
 
