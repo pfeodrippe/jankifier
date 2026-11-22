@@ -77,6 +77,10 @@ namespace cards
     std::mutex pointer_lock;
     std::vector<pointer_event> pointer_events;
     bool pointer_scripted{};
+    /* The mouse's place was asked of GLFW, the window not being in front (frame_begin). */
+    bool pointer_asked{};
+    /* What is being drawn is under an overlay: the mouse isn't its (cover). */
+    bool covered{};
   };
 
   inline state &get()
@@ -211,6 +215,27 @@ namespace cards
       ImGui::GetIO().DisplaySize = ImVec2(static_cast<float>(s.frame_width), static_cast<float>(s.frame_height));
       ImGui::GetIO().DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
     }
+    /* A window behind another one (the editor just typed in) is told when the wheel turns
+     * over it, but not where the mouse is: asked here, so that what is under it answers. */
+    if(!s.target && !s.pointer_scripted)
+    {
+      bool const front(glfwGetWindowAttrib(s.window, GLFW_FOCUSED) != 0);
+      if(!front && glfwGetWindowAttrib(s.window, GLFW_HOVERED) != 0)
+      {
+        double x{}, y{};
+        glfwGetCursorPos(s.window, &x, &y);
+        ImGui::GetIO().AddMousePosEvent(static_cast<float>(x), static_cast<float>(y));
+        s.pointer_asked = true;
+      }
+      else if(s.pointer_asked)
+      {
+        if(!front)
+        {
+          ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        }
+        s.pointer_asked = false;
+      }
+    }
     {
       std::lock_guard<std::mutex> const lock(s.pointer_lock);
       auto &io(ImGui::GetIO());
@@ -231,6 +256,10 @@ namespace cards
           case 4:
             io.AddMouseWheelEvent(0.0f, e.y);
             break;
+          case 5:
+            io.AddKeyEvent(ImGuiKey_Escape, true);
+            io.AddKeyEvent(ImGuiKey_Escape, false);
+            break;
           default:
             io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
             s.pointer_scripted = false;
@@ -250,6 +279,11 @@ namespace cards
   inline void frame_end()
   {
     auto &s(get());
+    if(s.covered)
+    {
+      ImGui::EndDisabled();
+      s.covered = false;
+    }
     ImGui::End();
     ImGui::Render();
     int frame_width{ s.frame_width }, frame_height{ s.frame_height };
@@ -337,17 +371,51 @@ namespace cards
   /* The mouse, in points, and how far its wheel turned this frame (up is positive). */
   inline double mouse_x()
   {
-    return ImGui::GetIO().MousePos.x;
+    return get().covered ? -FLT_MAX : ImGui::GetIO().MousePos.x;
   }
 
   inline double mouse_y()
   {
-    return ImGui::GetIO().MousePos.y;
+    return get().covered ? -FLT_MAX : ImGui::GetIO().MousePos.y;
   }
 
   inline double wheel()
   {
-    return ImGui::GetIO().MouseWheel;
+    return get().covered ? 0.0 : ImGui::GetIO().MouseWheel;
+  }
+
+  /* What is drawn from here on is under an overlay (or no longer): the mouse and ImGui's
+   * widgets answer only to the overlay. */
+  inline void cover(obj const on)
+  {
+    auto &s(get());
+    bool const wanted(jank::runtime::truthy(on));
+    if(wanted == s.covered)
+    {
+      return;
+    }
+    if(wanted)
+    {
+      ImGui::BeginDisabled(true);
+    }
+    else
+    {
+      ImGui::EndDisabled();
+    }
+    s.covered = wanted;
+  }
+
+  /* Whether Esc was pressed in this frame, and the scripted one. */
+  inline bool escaped()
+  {
+    return !get().covered && ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+  }
+
+  inline void escape()
+  {
+    auto &s(get());
+    std::lock_guard<std::mutex> const lock(s.pointer_lock);
+    s.pointer_events.push_back({ 5, 0.0f, 0.0f });
   }
 
   /* A scripted mouse, for a window nobody points at (hidden: a test, a video): moved to a
@@ -367,6 +435,14 @@ namespace cards
     s.pointer_events.push_back({ 0, static_cast<float>(num(x)), static_cast<float>(num(y)) });
     s.pointer_events.push_back({ 1, 0.0f, 0.0f });
     s.pointer_events.push_back({ 2, 0.0f, 0.0f });
+  }
+
+  /* The scripted mouse's button pressed or let go where it is (dragging). */
+  inline void button(obj const held)
+  {
+    auto &s(get());
+    std::lock_guard<std::mutex> const lock(s.pointer_lock);
+    s.pointer_events.push_back({ jank::runtime::truthy(held) ? 1 : 2, 0.0f, 0.0f });
   }
 
   inline void pointer_off()
@@ -394,6 +470,10 @@ namespace cards
    * parts of its drawing answer the mouse. */
   inline bool inside(obj const x1, obj const y1, obj const x2, obj const y2)
   {
+    if(get().covered)
+    {
+      return false;
+    }
     auto const at(ImGui::GetIO().MousePos);
     return at.x >= num(x1) && at.x < num(x2) && at.y >= num(y1) && at.y < num(y2);
   }
@@ -401,7 +481,7 @@ namespace cards
   /* Whether the mouse's button is held down (for dragging). */
   inline bool down()
   {
-    return ImGui::IsMouseDown(0);
+    return !get().covered && ImGui::IsMouseDown(0);
   }
 
   inline bool clicked(obj const x1, obj const y1, obj const x2, obj const y2)

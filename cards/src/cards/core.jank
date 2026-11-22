@@ -68,6 +68,8 @@
   ((cpp/ImGui.Text \"...\"), (cpp/ImGui.Button \"...\"), ...)."
   [x y]
   (cpp/cards.cursor x y))
+(defn window-width "The window's width, in points." [] (cpp/cards.width))
+(defn window-height "The window's height, in points." [] (cpp/cards.height))
 (defn mouse-x [] (cpp/cards.mouse_x))
 (defn mouse-y [] (cpp/cards.mouse_y))
 
@@ -81,6 +83,12 @@
   "The mouse moved to (x, y), pressed and released there."
   [x y]
   (cpp/cards.press x y))
+(defn escape! "Esc pressed by the program." [] (cpp/cards.escape))
+(defn escape? "Whether Esc was pressed in this frame." [] (cpp/cards.escaped))
+(defn button!
+  "The scripted mouse's button pressed (true) or let go (false) where it is: for dragging."
+  [held]
+  (cpp/cards.button (boolean held)))
 (defn pointer-off!
   "The scripted mouse gone."
   []
@@ -225,6 +233,16 @@
     (swap! shapes (fn [all] (vec (cons [kind shape] (remove (fn [[k _]] (= k kind)) all))))))
   kind)
 
+(defonce ^:private overlay (atom nil))
+
+(defn overlay!
+  "What can be drawn over everything, a modal: `shown?` (fn []) and `draw` (fn [width
+  height], the window's). While it is shown, what is under it is drawn as ever and doesn't
+  answer the mouse. nil for none."
+  [drawn]
+  (reset! overlay drawn)
+  nil)
+
 (defn header!
   "What is drawn above the cards: `height` (fn [width]) and `draw` (fn [x y width]). nil for
   none."
@@ -293,7 +311,8 @@
 
 (defn- add-card! [made]
   (let [cards (conj (:cards @state) made)
-        dropped (max 0 (- (count cards) 200))]
+        ;; (count is unsigned: made signed before anything is taken from it.)
+        dropped (max 0 (- (long (count cards)) 200))]
     (doseq [old (take dropped cards)]
       (release! old))
     (swap! state assoc :cards (vec (drop dropped cards))))
@@ -662,7 +681,7 @@
   (let [n (count (:parts part))
         weights (or (:widths (:attrs part)) (repeat n 1))
         total (* 1.0 (apply + (take n weights)))
-        room (- width (* 16 (max 0 (dec n))))]
+        room (- width (* 16 (max 0 (dec (long n)))))]
     (loop [i 0 at 0.0 out []]
       (if (= i n)
         out
@@ -678,7 +697,7 @@
       (= kind :space) (:tall part)
       (= kind :draw) (:tall part)
       (= kind :col) (+ (apply + 0 (map (fn [p] (part-height p width)) (:parts part)))
-                       (* 10 (max 0 (dec (count (:parts part))))))
+                       (* 10 (max 0 (dec (long (count (:parts part)))))))
       :else (apply max 0 (map (fn [p [_ wide]] (part-height p wide)) (:parts part) (shares part width))))))
 
 (defn- draw-part [part x y width]
@@ -861,7 +880,10 @@
         total (apply + 0 heights)
         was @roll
         fits (- bottom y)
-        back (max 0.0 (min (max 0.0 (- total fits)) (+ (:back was) (* 60.0 (cpp/cards.wheel)))))
+        ;; Over what is above the cards (a header), the wheel is that's.
+        my (mouse-y)
+        turned (if (and (>= my 0.0) (< my y)) 0.0 (cpp/cards.wheel))
+        back (max 0.0 (min (max 0.0 (- total fits)) (+ (:back was) (* 60.0 turned))))
         target (max 0.0 (- total fits back))
         now (seconds)
         dt (max 0.0 (min 0.1 (- now (:at was))))
@@ -889,15 +911,22 @@
   (let [width (cpp/cards.width)
         height (cpp/cards.height)
         top @header
-        tall (or (when top (guarded (fn [] ((:height top) (- width 64))))) 0)]
+        tall (or (when top (guarded (fn [] ((:height top) (- width 64))))) 0)
+        lid @overlay
+        covered (boolean (when lid (guarded (fn [] ((:shown? lid))))))]
     (follow-pins!)
+    (cpp/cards.cover covered)
     (text! 32 18 ink title (str (:title s)))
     (when (and top (pos? tall))
       (guarded (fn [] ((:draw top) 32 62 (- width 64)))))
     (let [y (draw-pinned s 32 (+ 70 tall (if (pos? tall) 12 0)) (- width 64))]
-      (if (empty? (:cards s))
-        (text! 32 y muted serif "Evaluate something in the REPL: it is shown here.")
-        (draw-feed s 32 y (- width 64) (- height 20))))
+      (when (< y (- height 24))
+        (if (empty? (:cards s))
+          (text! 32 y muted serif "Evaluate something in the REPL: it is shown here.")
+          (draw-feed s 32 y (- width 64) (- height 20)))))
+    (cpp/cards.cover false)
+    (when covered
+      (guarded (fn [] ((:draw lid) width height))))
     (cpp/cards.pointer_draw)))
 
 ;; The window.

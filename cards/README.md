@@ -182,8 +182,12 @@ is called on the REPL's thread (now, after each evaluation, and at
    :draw   (fn [card x y width] ...)})
 
 (c/header! {:height (fn [width] 120) :draw (fn [x y width] ...)})        ; above the cards
+(c/overlay! {:shown? (fn [] @open) :draw (fn [width height] ...)})       ; over everything: a modal
 (c/on-evaluation! (fn [code value error] ...))                           ; after each evaluation
 ```
+
+While an overlay is shown, what is under it doesn't answer the mouse.
+`(c/escape?)` says whether Esc was pressed in the frame.
 
 A kind defined later is asked first. A card holds plain data: it is made on
 the REPL's thread and drawn on the main one. Thousands of numbers go to the
@@ -227,7 +231,7 @@ For a script that drives the REPL (a test, a video's take):
 |---|---|
 | `--announce`, `(c/announce! true)` | each evaluation said on stderr as `[cards] evaluated <n>`, with ` error` when it threw |
 | `(c/evaluations)` | how many evaluations the window was told of |
-| `(c/pointer! x y)`, `(c/click! x y)`, `(c/wheel! amount)`, `(c/pointer-off!)` | a scripted mouse, drawn as an arrow: what is under it answers as to a real one (the value under the cursor, ImGui's widgets, `clicked?`). For a hidden window; a window in front follows the real mouse |
+| `(c/pointer! x y)`, `(c/click! x y)`, `(c/button! held)`, `(c/wheel! amount)`, `(c/pointer-off!)` | a scripted mouse, drawn as an arrow: what is under it answers as to a real one (the value under the cursor, ImGui's widgets, `clicked?`). For a hidden window; a window in front follows the real mouse |
 | `(c/newest-box)` | where the newest card's body was drawn, to point at something in it |
 
 The two tutorial videos (this library's and inkling's) were made this way:
