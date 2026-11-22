@@ -78,27 +78,41 @@
   [size width word]
   (c/wrap size width word 50))
 
+(defn- size-of
+  "The size a run's style is drawn in."
+  [style]
+  (case style :code c/mono :bold c/mono-bold prose))
+
 (defn- flow
   "Runs of text ([{:text :style}], styles :plain :bold :code) as lines of at most `width`
-  points: [[{:x :text :style} ...] ...]. Words are kept whole when they fit a line."
+  points: [[{:x :text :style} ...] ...]. Words are kept whole when they fit a line; a run
+  that follows another with no space between (**338,350**:) is glued to it."
   [runs width]
-  (let [size-of (fn [style] (if (= style :code) c/mono prose))
-        gap (c/text-width prose " ")
-        words (mapcat (fn [run]
-                        (mapcat (fn [word]
-                                  (let [size (size-of (:style run))]
-                                    (if (> (c/text-width size word) width)
-                                      (map (fn [piece] {:text piece :style (:style run)})
-                                           (cut-word size width word))
-                                      [{:text word :style (:style run)}])))
-                                (remove empty? (str/split (str (:text run)) #" "))))
-                      runs)]
+  (let [gap (c/text-width prose " ")
+        words (:words
+               (reduce (fn [acc run]
+                         (let [text (str (:text run))
+                               size (size-of (:style run))
+                               glued (and (seq (:words acc)) (not (:space acc))
+                                          (not (str/starts-with? text " ")))
+                               these (vec (mapcat (fn [word]
+                                                    (if (> (c/text-width size word) width)
+                                                      (map (fn [piece] {:text piece :style (:style run)})
+                                                           (cut-word size width word))
+                                                      [{:text word :style (:style run)}]))
+                                                  (remove empty? (str/split text #" "))))
+                               these (if (and glued (seq these)) (assoc-in these [0 :glue] true) these)]
+                           {:words (into (:words acc) these)
+                            :space (if (seq these) (str/ends-with? text " ") (or (:space acc) (seq text)))}))
+                       {:words [] :space true}
+                       runs))]
     (loop [words words x 0.0 line [] lines []]
       (if (empty? words)
         (if (seq line) (conj lines line) lines)
         (let [word (first words)
-              w (c/text-width (size-of (:style word)) (:text word))]
-          (if (and (seq line) (> (+ x w) width))
+              w (c/text-width (size-of (:style word)) (:text word))
+              x (if (and (:glue word) (seq line)) (- x gap) x)]
+          (if (and (seq line) (not (:glue word)) (> (+ x w) width))
             (recur words 0.0 [] (conj lines line))
             (recur (rest words) (+ x w gap) (conj line (assoc word :x x)) lines)))))))
 
@@ -111,8 +125,7 @@
             wy (+ y (* line-prose i))]
         (case (:style word)
           :code (c/text! wx (+ wy 1) c/purple c/mono (:text word))
-          :bold (do (c/text! wx wy color prose (:text word))
-                    (c/text! (+ wx 0.6) wy color prose (:text word)))
+          :bold (c/text! wx wy color c/mono-bold (:text word))
           (c/text! wx wy color prose (:text word)))))))
 
 ;; Markdown, as much as a model's answer has.
@@ -242,9 +255,7 @@
                                               (doseq [col (range n)]
                                                 (let [cell (c/clip prose (- (nth widths col) 14) (str (get cells col "")))
                                                       cx (+ x (nth lefts col) 8)]
-                                                  (c/text! cx (+ ry 3) color prose cell)
-                                                  (when (zero? r)
-                                                    (c/text! (+ cx 0.6) (+ ry 3) color prose cell)))))))})
+                                                  (c/text! cx (+ ry 3) color (if (zero? r) c/mono-bold prose) cell))))))})
                         {:h 0 :draw (fn [x y] nil)}))
                     (blocks text))
         tops (vec (reductions + 0 (map :h parts)))]
@@ -258,7 +269,7 @@
 (defn- mono-lines
   "A text as wrapped lines of small mono, at most `limit` of them."
   [text width limit]
-  (let [all (c/wrap c/small width (str text) (inc limit))]
+  (let [all (c/wrap-words c/small width (str text) (inc limit))]
     (if (> (count all) limit)
       (conj (vec (take limit all)) (str "[more]"))
       (vec all))))
@@ -312,7 +323,7 @@
 (defn- user-item
   "A person's message, on a band, after a prompt: its lines as they were typed."
   [text width]
-  (let [lines (vec (c/wrap c/mono (- width 40) (str text) 400))
+  (let [lines (c/wrap-words c/mono (- width 40) (str text) 400)
         h (* line-mono (max 1 (long (count lines))))]
     {:h (+ h 24)
      :draw (fn [x y w]
