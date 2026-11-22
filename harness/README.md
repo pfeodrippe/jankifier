@@ -330,7 +330,7 @@ goes on (`:max-checks` times at most). The checks are shown in the
 conversation, in green or red. `VERIFY.md` is what the model is told, and
 `examples/parking.jank` the example it reads.
 
-The trials (`../harness-private/trials.jank`, beside their graders) measure
+The trials (`../harness-private/drive.py`, beside their graders) measure
 whether this makes code right more often: each task is asked several times,
 sampled, with and without the gate, and the code is graded by a reference the
 model never sees (random operations against a reference implementation). The
@@ -340,28 +340,25 @@ once (its grader runs producers and consumers together and checks nothing is
 lost, given twice or out of order).
 
 A trial must not let the model see what it is graded against, other runs, or
-that it is a trial. So:
+that it is a trial. So each run is a process of its own, started for it and
+ended after it, driven from outside over its REPL:
 
-- the trials' code and graders are kept outside the harness's sources
-  (`../harness-private`) and sent to the process over its REPL by whoever
-  runs them (the graders only once a run has ended, and removed again before
-  the next);
-- a run works from a directory of its own outside the project
-  (`agent-home!`: its working directory, with copies of JANK.md, VERIFY.md
-  and examples/, and its work/), and the file tools refuse the project;
-- once everything is loaded (the engine, Veil's session, the trials' code),
-  the process sandboxes itself (`harness.tools/confine!`, macOS's
-  `sandbox_init`): it can read, under the home directory, only what compiling
-  needs (the build's cache and headers, Lean's toolchain), not the harness's
-  sources or notes; it writes only to the run's directory, `../trials-out` and
-  the caches; and it reaches only this machine. Everything the model's tools
-  start is inside the same sandbox.
+- it works from a directory of its own outside the project, holding only what
+  its mode should read (JANK.md and work/; VERIFY.md and examples/ when
+  verified), and the file tools refuse the project;
+- once the engine, the model and Veil's session are loaded, the process
+  sandboxes itself (`harness.tools/confine!`, macOS's `sandbox_init`): under
+  the home directory it can read only what compiling needs (the build's cache
+  and headers, Lean's toolchain), not the harness's sources or notes, the
+  trials or the results; it writes only to its directory, the results and the
+  caches; it reaches only this machine. Everything the model's tools start is
+  inside the same sandbox. The driver tries reading those places from inside
+  before each run;
+- only the task's text is sent with the run; the graders are sent once it has
+  ended, and the process is ended after grading.
 
-The process is started outside a sandbox for this (`./harness.sh`):
-`sandbox.sh` applies one from the start, which the process then can't
-tighten, and it must read its own sources to load. A run in progress is kept in
-`../trials-out/live.edn` as it goes; another window follows it:
-`(hc/follow-file! "../trials-out/live.edn" "live")`.
+The run in progress is kept in `../trials-out/live.edn` as it goes; another
+window follows it: `(hc/follow-file! "../trials-out/live.edn" "live")`.
 
 ## What went wrong, across runs
 

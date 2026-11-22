@@ -17,7 +17,7 @@ export HARNESS_OFFLINE=1
 profile="$here/sandbox.sb"
 if [ -n "${HARNESS_HIDE:-}" ]; then
   # The rules, then one more a directory hidden (by its real path: /tmp is /private/tmp).
-  profile="$here/target/sandbox-$$.sb"
+  profile="$(mktemp -t harness-sandbox).sb"
   cp "$here/sandbox.sb" "$profile"
   IFS=':' read -r -a hidden <<< "$HARNESS_HIDE"
   for d in "${hidden[@]}"; do
