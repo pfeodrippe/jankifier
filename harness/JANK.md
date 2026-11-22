@@ -43,6 +43,9 @@ the syntax, the data structures and most of `clojure.core` and
     (catch cpp/jank.error_ref e (cpp/.-message (cpp/* e)))   ; jank's own: (subs "ab" 2 1)
     (catch cpp/std.exception e (cpp/.what e)))          ; C++'s: slurp of a missing file
   ```
+  `(catch :default e ...)` catches anything, but `e` is nil there: use it only
+  when what was thrown doesn't matter.
+- **Integer division by zero gives 0**: `(/ 1 0)` is 0, it doesn't throw.
 - **Sleeping**: `(cpp/usleep 250000)` (microseconds).
 - **A `future` must catch everything it can throw.** What escapes one ends the
   whole process (an abort), not just the future. Wrap its body in `try` with
