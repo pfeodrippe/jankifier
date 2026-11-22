@@ -1,0 +1,13 @@
+(ns inkling-specs.pool-stress
+  "The pool's stress test as a program of its own (see inkling-specs.pool/stress-in-subprocess):
+  jank -I include -I ../include -I ../native -l ../lib/libinkling.dylib --module-path src
+  run-main inkling-specs.pool-stress WORKERS ROUNDS")
+
+(cpp/raw "#include <inkling_specs/harness.hpp>")
+
+(defn -main [& args]
+  (let [workers (parse-long (or (first args) "3"))
+        rounds (parse-long (or (second args) "20000"))]
+    (println (cpp/inkling_specs.pool_stress workers rounds 1))
+    (cpp/fflush cpp/stdout)
+    (cpp/_exit 0)))

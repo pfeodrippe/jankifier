@@ -1,0 +1,117 @@
+(ns inkling-specs.core
+  "What the checks share: a Veil session in this process (`vs`), `check` for
+  the Veil files in models/, the engine's model (`engine`), and the tests'
+  C++ (include/inkling_specs/harness.hpp)."
+  (:require [clojure.string :as string]
+            [inkling.core :as ink]
+            [lean-sys.session :as lean]
+            [veil.core :as veil]))
+
+(cpp/raw "#include <inkling_specs/harness.hpp>")
+
+(defn sh
+  "Runs `cmd` with the shell and returns its output and errors."
+  [cmd]
+  (cpp/inkling_specs.sh (str cmd)))
+
+(def dir
+  "inkling/specs, found from the REPL's directory: itself, inkling/, or the
+  repository's root."
+  (string/trim (sh (str "for d in . specs inkling/specs; do "
+                        "if [ -f \"$d/models/Ring.lean\" ]; then cd \"$d\" && pwd; break; fi; done"))))
+
+(defn path [& parts]
+  (string/join "/" (cons dir parts)))
+
+(def vs
+  "A Veil session: Lean with Veil imported, in this process, from the built
+  Lake project in ../../specs. Created on first use (`@vs`)."
+  (delay (veil/session {:lake-project (path ".." ".." "specs")})))
+
+(def engine
+  "The engine's model (../models/inkling-2-mini.ink). Opened on first use."
+  (delay (ink/open (path ".." "models" "inkling-2-mini.ink"))))
+
+(defn flush! []
+  (cpp/fflush cpp/stdout))
+
+;;;; Veil files
+
+(defn messages
+  "Elaborates models/`file` in the session (its proofs and model checks run)
+  and returns Veil's messages, as data."
+  [file]
+  (veil/load-file! @vs (path "models" file)))
+
+(defn load-model!
+  "Loads models/`file`'s module without running the file's checks, for
+  veil/model-check, veil/prove and veil/system, which take the module's name."
+  [file]
+  (veil/load-file! @vs (path "models" file) {:checks? false}))
+
+(defn summary
+  "What a file's messages say: the proof obligations proven and not, each
+  model check's result, and the errors."
+  [msgs]
+  (let [lines (mapcat (fn [m]
+                        (map (fn [l] {:line (:line m) :text l :severity (:severity m)})
+                             (string/split-lines (str (:text m)))))
+                      msgs)
+        row? (fn [mark] (fn [l] (re-find (re-pattern (str "^\\s+\\S+ \\.\\.\\. " mark)) (:text l))))]
+    {:proven (count (filter (row? "✅") lines))
+     :not-proven (mapv (comp string/trim :text) (filter (fn [l] (or ((row? "❌") l) ((row? "❓") l))) lines))
+     :model-checks (vec (keep (fn [l]
+                                (cond
+                                  (re-find #"No violation" (:text l))
+                                  {:line (:line l) :result :no-violation
+                                   :states (when-let [[_ n] (re-find #"explored (\d+) states" (:text l))] n)}
+                                  (re-find #"Violation" (:text l))
+                                  {:line (:line l) :result :violation :text (:text l)}))
+                              lines))
+     :errors (mapv (fn [m] (str (:line m) ": " (first (string/split-lines (str (:text m))))))
+                   (lean/errors msgs))}))
+
+(defn check
+  "Elaborates models/`file`, prints what Veil found (each finding after its
+  line in the file), and returns the summary."
+  [file]
+  (let [msgs (messages file)
+        s (summary msgs)]
+    (doseq [m msgs
+            l (string/split-lines (str (:line m) ": " (:text m)))
+            :when (re-find #"Violation|No violation|❌|❓|error|must establish|following set|TIMEOUT|depends on axioms" l)]
+      (println l))
+    (println (str file ": " (:proven s) " obligations proven, " (count (:not-proven s)) " not; model checks "
+                  (mapv (juxt :result :states) (:model-checks s))
+                  (when (seq (:errors s)) (str "; errors " (:errors s)))))
+    (flush!)
+    s))
+
+(defn ok?
+  "A summary with nothing unproven, no violation and no error."
+  [s]
+  (and (empty? (:not-proven s))
+       (empty? (:errors s))
+       (every? #(= :no-violation (:result %)) (:model-checks s))))
+
+(defn variant!
+  "Loads a changed copy of models/`file` as module `name`: `f` maps the
+  file's text to the new text (its `veil module` line is renamed here). The
+  copy is written to target/. A model is text, so a variant is the model
+  without an assumption, or with a line changed."
+  [file name f]
+  (let [text (slurp (path "models" file))
+        module (some #(second (re-find #"^veil module (\S+)" %)) (string/split-lines text))
+        changed (string/replace (f text) (str "veil module " module) (str "veil module " name))
+        out (path "target" (str name ".lean"))]
+    (sh (str "mkdir -p '" (path "target") "'"))
+    (spit out changed)
+    (veil/load-file! @vs out {:checks? false})
+    name))
+
+(defn report
+  "Prints a check's name and result, and returns the result."
+  [label result]
+  (println (str label ": " (pr-str result)))
+  (flush!)
+  result)

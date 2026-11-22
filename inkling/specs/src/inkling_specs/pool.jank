@@ -1,0 +1,127 @@
+(ns inkling-specs.pool
+  "The thread pool (models/Pool.lean): its model checks, the states it can get
+  stuck in, and a stress test of the engine's pool."
+  (:require [clojure.string :as string]
+            [inkling-specs.core :as c :refer [vs]]
+            [veil.core :as veil]))
+
+;;;; The model
+
+(defn theory
+  [{:keys [total chunk runs weak spurious fixes] :or {total 3 chunk 1 runs 2 weak false spurious true}}]
+  {:total total
+   :chunk chunk
+   :ord "fun i => i.val"
+   :maxRuns runs
+   :weak weak
+   :spuriousWakeups spurious
+   :fixed (if (seq fixes)
+            (str "fun f => f ∈ [" (string/join ", " (map #(str "fix_t_IndT." (name %)) fixes)) "]")
+            "fun _ => false")})
+
+(defn- instance [{:keys [workers total] :or {workers 2 total 3}}]
+  {:worker workers :item total})
+
+(defn model-check
+  "Veil's model checker on Pool: no worker touches a job out of scope, the
+  task runs at most once per index, and on every index before run returns."
+  [inst]
+  (veil/model-check @vs "Pool" {:instance (instance inst) :theory (theory inst)}))
+
+(defn stuck-states
+  "The reachable states with no step left that aren't the end (the destructor
+  returned): how many, and one of them. A state where the destructor waits for
+  a worker that will never wake is one."
+  [inst]
+  (let [inst (assoc inst :spurious false)
+        sys (veil/system @vs "Pool" {:instance (instance inst) :theory (theory inst)})
+        terminal (veil/reachable-states sys {:terminal true})
+        stuck (remove #(= :m_done (:mpc %)) terminal)]
+    {:terminal (count terminal)
+     :stuck (count stuck)
+     :example (when-let [s (first stuck)]
+                (select-keys s [:mpc :wpc :stopping :generation :seen :runs]))}))
+
+(def now
+  "The changes the engine's pool has (see the model's `fixed`)."
+  [:seq_cst :seen_at_construction])
+
+(defn model-checks
+  "The engine's pool (under what release and acquire allow, for the accesses
+  that still use them), and the pool before each change, which the model
+  showed wrong."
+  []
+  (c/load-model! "Pool.lean")
+  (let [mc (fn [inst]
+             (let [r (model-check inst)]
+               {:result (:result r) :states (:explored-states r) :violates (:violates r)
+                :steps (when (:trace r) (mapv (juxt :action :args) (:trace r)))}))]
+    {:now (mc {:fixes now :weak true})
+     :now-chunks-of-2 (mc {:fixes now :weak true :chunk 2})
+     :now-3-workers (mc {:fixes now :weak true :workers 3 :total 2 :runs 1})
+     ;; Does every run end, the destructor included?
+     :now-stuck (stuck-states {:fixes now :runs 1})
+     :now-stuck-2-runs (stuck-states {:fixes now :runs 2 :total 2})
+     ;; Before seq_cst: a worker works on a job whose run returned.
+     :before-seq-cst (mc {:fixes [:seen_at_construction] :weak true :runs 2 :total 2})
+     ;; Before seen_at_construction: the destructor waits for a worker asleep for good.
+     :before-seen-at-construction-stuck (stuck-states {:fixes [:seq_cst] :runs 1})
+     ;; The other fix of that, which the engine doesn't use.
+     :stop-in-wait-stuck (stuck-states {:fixes [:seq_cst :stop_in_wait] :runs 1})}))
+
+;;;; The engine
+
+(defn stress
+  "The engine's pool: `:rounds` jobs of random sizes (1 to 4096) and grains (1
+  to 64) on `:workers` workers; counts the jobs after which some index wasn't
+  processed exactly once (0). This runs in the REPL's process: while the
+  pool's use after scope isn't fixed, it can end it with a segmentation fault
+  (`stress-in-subprocess` runs it apart)."
+  [{:keys [workers rounds seed] :or {workers 3 rounds 20000 seed 1}}]
+  (cpp/inkling_specs.pool_stress workers rounds seed))
+
+(defn stress-in-subprocess
+  "`stress` in a jank process of its own (inkling-specs.pool-stress), `:times`
+  times: how many ended normally with no wrong job, how many reported a wrong
+  job, and how many were ended by a signal (139: a segmentation fault)."
+  [{:keys [workers rounds times] :or {workers 3 rounds 20000 times 3}}]
+  (let [inkling (c/path "..")
+        cmd (str "cd '" c/dir "' && jank -I include -I '" inkling "/include' -I '" inkling "/native' -l '"
+                 inkling "/lib/libinkling.dylib' --module-path src run-main inkling-specs.pool-stress -- "
+                 workers " " rounds " 2>&1 | grep -v '^dyld' | tail -3; echo \"exit=${pipestatus[1]:-${PIPESTATUS[0]}}\"")
+        outs (mapv (fn [_] (c/sh cmd)) (range times))
+        status (fn [out] (second (re-find #"exit=(\d+)" out)))]
+    {:workers workers
+     :rounds rounds
+     :times times
+     :ok (count (filter #(and (= "0" (status %)) (re-find #":wrong 0" %)) outs))
+     :wrong (count (filter #(and (re-find #":wrong" %) (not (re-find #":wrong 0" %))) outs))
+     :crashed (count (filter #(not= "0" (status %)) outs))
+     :statuses (mapv status outs)}))
+
+(defn churn
+  "Creates and destroys pools `:rounds` times, with `:jobs` jobs in between
+  (0: the destructor runs right after the constructor, while the workers may
+  not have started). `:hung true` if that didn't finish in `:timeout-ms`: a
+  destructor is waiting for a worker that never wakes."
+  [{:keys [workers rounds jobs timeout-ms] :or {workers 3 rounds 2000 jobs 0 timeout-ms 20000}}]
+  (cpp/inkling_specs.pool_churn workers rounds jobs timeout-ms))
+
+(defn run
+  ([] (run {}))
+  ([{:keys [engine] :or {engine true}}]
+   (let [mcs (model-checks)
+         _ (doseq [[k v] mcs] (c/report (str "pool/" (name k)) v))
+         model-ok (and (every? #(= :noViolationFound (:result (get mcs %))) [:now :now-chunks-of-2 :now-3-workers])
+                       (zero? (:stuck (:now-stuck mcs)))
+                       (zero? (:stuck (:now-stuck-2-runs mcs)))
+                       ;; The model still tells the earlier versions apart.
+                       (= [:no_use_after_scope] (:violates (:before-seq-cst mcs)))
+                       (pos? (:stuck (:before-seen-at-construction-stuck mcs)))
+                       (zero? (:stuck (:stop-in-wait-stuck mcs))))]
+     (if-not engine
+       {:ok model-ok}
+       (let [bare (c/report "pool/churn, destructor right after constructor" (churn {:jobs 0 :rounds 2000 :timeout-ms 20000}))
+             jobs (c/report "pool/churn, a job before each destructor" (churn {:jobs 1 :rounds 1000 :timeout-ms 20000}))
+             st (c/report "pool/stress-in-subprocess" (stress-in-subprocess {:times 5}))]
+         {:ok (and model-ok (not (:hung bare)) (not (:hung jobs)) (= (:times st) (:ok st)))})))))

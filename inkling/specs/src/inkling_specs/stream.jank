@@ -1,0 +1,218 @@
+(ns inkling-specs.stream
+  "The residual stream's bookkeeping (models/Stream.lean): the slot version
+  (metal.mm) against the by-value version (cpu.cpp) for the model's plan and
+  for other shapes, and the model's events against the ones the engine's
+  Metal forward records."
+  (:require [inkling-specs.core :as c :refer [engine vs]]
+            [inkling-specs.ring :as ring]
+            [inkling.core :as ink]
+            [veil.core :as veil]))
+
+;;;; The model
+
+(def mini
+  "Inkling 2 Mini's plan, and the engine's constants."
+  {:layers 24 :block 6 :loop {:start 6 :end 18 :passes 3} :slots 12})
+
+(defn- instance [{:keys [slots]}]
+  {:slot slots :bidx 8})
+
+(defn theory
+  [{:keys [layers block loop slots max-src max-prev] :or {max-src 6 max-prev 2}}]
+  {:layers layers
+   :block block
+   :hasLoop (boolean loop)
+   :loopStart (:start loop 0)
+   :loopEnd (:end loop 0)
+   :passes (:passes loop 1)
+   :nSlots slots
+   :sidx "fun s => s.val"
+   :slotAt (str "fun n => ⟨n % " slots ", Nat.mod_lt _ (by decide)⟩")
+   :bord "fun b => b.val"
+   :blockAt "fun n => ⟨n % 8, Nat.mod_lt _ (by decide)⟩"
+   :maxSrc max-src
+   :maxPrev max-prev})
+
+(defn model-check
+  "Veil's model checker on Stream for a plan shape. The run is deterministic:
+  no violation means the slot version reads what the by-value version reads at
+  every step of that plan, never reads a released slot or writes a live one,
+  and has slots and room left."
+  [shape]
+  (let [r (veil/model-check @vs "Stream" {:instance (instance shape) :theory (theory shape)})]
+    {:result (:result r) :states (:explored-states r) :violates (:violates r)}))
+
+(def shapes
+  "Plans of the model's kind: a block boundary every `block` layers, with or
+  without a loop that starts and ends on boundaries and spans one or two
+  blocks, run two or three times."
+  (for [block [1 2 3]
+        blocks [1 2 3 4]
+        :let [layers (* block blocks)]
+        loop (cons nil
+                   (for [start (range 0 layers block)
+                         span [1 2]
+                         :let [end (+ start (* span block))]
+                         :when (<= end layers)
+                         passes [2 3]]
+                     {:start start :end end :passes passes}))]
+    {:layers layers :block block :loop loop :slots 12}))
+
+(defn least-slots
+  "The fewest slots a shape runs with."
+  [shape]
+  (first (filter #(= :noViolationFound (:result (model-check (assoc shape :slots %))))
+                 (range 2 13))))
+
+(defn model-checks []
+  (c/load-model! "Stream.lean")
+  (let [all (mapv #(merge % (model-check %)) shapes)
+        bad (remove #(= :noViolationFound (:result %)) all)]
+    {:mini (model-check mini)
+     :mini-least-slots (least-slots mini)
+     :shapes (count all)
+     :shapes-violating (count bad)
+     :first-violating (first bad)
+     ;; What the Metal version assumes of a plan: each of these plans violates a
+     ;; property (the engine now refuses them or leaves them to the CPU, see
+     ;; engine-against-model).
+     :loop-not-on-a-boundary (model-check {:layers 8 :block 4 :loop {:start 2 :end 6 :passes 2} :slots 12})
+     :loop-over-three-blocks (model-check {:layers 8 :block 2 :loop {:start 2 :end 8 :passes 2} :slots 12})
+     :seven-sources (model-check {:layers 7 :block 1 :loop nil :slots 12})}))
+
+;; What the engine accepts: parse_config fails unless the loop covers whole
+;; blocks at least twice, and metal_open gives no GPU backend when a visit
+;; would have more than 6 sources, more than 2 message sources, or more live
+;; slots than there are (harness.hpp's plan_verdict is a copy of both).
+
+(defn engine-verdict
+  ":config (the model file is refused), :cpu-only (no Metal backend) or :gpu."
+  [{:keys [layers block loop slots]}]
+  (cpp/inkling_specs.plan_verdict layers block (boolean loop) (:start loop 0) (:end loop 0) (:passes loop 1) slots))
+
+(def every-shape
+  "Plans with any loop, aligned with the blocks or not, of 4, 6 and 8 layers,
+  and Mini's layers with fewer slots."
+  (concat
+    (for [layers [4 6 8]
+          block [1 2 3]
+          loop (cons nil
+                     (for [start (range layers)
+                           end (range (inc start) (inc layers))
+                           passes [2 3]]
+                       {:start start :end end :passes passes}))]
+      {:layers layers :block block :loop loop :slots 12})
+    (for [slots [5 6 7 8]]
+      (assoc mini :slots slots))))
+
+(defn engine-against-model
+  "For every shape: the engine's verdict and the model's. Every plan the engine
+  runs on the GPU must be without violation in the model; the plans the model
+  finds a violation in must be refused, or left to the CPU. Returns the counts
+  and the shapes on which they disagree in either direction."
+  []
+  (c/load-model! "Stream.lean")
+  (let [rows (mapv (fn [shape]
+                     (assoc shape :engine (engine-verdict shape) :model (model-check shape)))
+                   every-shape)
+        fine? #(= :noViolationFound (:result (:model %)))
+        unsound (filterv #(and (= :gpu (:engine %)) (not (fine? %))) rows)
+        stricter (filterv #(and (not= :gpu (:engine %)) (fine? %)) rows)]
+    {:shapes (count rows)
+     :gpu (count (filter #(= :gpu (:engine %)) rows))
+     :cpu-only (count (filter #(= :cpu-only (:engine %)) rows))
+     :refused (count (filter #(= :config (:engine %)) rows))
+     :model-violations (frequencies (mapcat #(:violates (:model %)) rows))
+     :gpu-but-model-violates (count unsound)
+     :first-gpu-but-model-violates (first unsound)
+     ;; The engine may refuse more than it must (a loop ending inside a block, for one).
+     :refused-but-model-fine (count stricter)
+     :first-refused-but-model-fine (when-let [r (first stricter)] (dissoc r :model))}))
+
+(defn model-events
+  "The events of the model's run for a shape, in order: [kind visit slot], and
+  [:read visit #{slots}] for a step that reads. Visit -1 is the embeddings, and
+  the plan's size the output, as the engine numbers them."
+  [shape]
+  (let [sys (veil/system @vs "Stream" {:instance (instance shape) :theory (theory shape)})
+        kinds {:e_take :take :e_push :push :e_restart :restart :e_release :release :e_read :read :e_write :write}]
+    (loop [state (first (veil/initial-states sys))
+           out []]
+      (let [steps (veil/successors sys state)]
+        (if (empty? steps)
+          out
+          (let [{:keys [action state]} (first steps)
+                kind (kinds (:evKind state))
+                visit (if (#{:embedTake :embedWrite} action) -1 (:visit state))
+                ;; ffnWrite's event belongs to the visit it ends.
+                visit (if (= :ffnWrite action) (dec visit) visit)]
+            (recur state
+                   (cond
+                     (nil? kind) out
+                     (= :read kind) (conj out [:read visit (set (:reads state))])
+                     :else (conj out [kind visit (:evSlot state)])))))))))
+
+(defn canonical
+  "Events with each run of consecutive reads of a visit as one set: the engine
+  records a read per slot and per kernel, the model a set per step."
+  [events]
+  (reduce (fn [out [kind visit slot]]
+            (let [slots (if (set? slot) slot #{slot})
+                  [pk pv ps] (peek out)]
+              (cond
+                (not= :read kind) (conj out [kind visit slot])
+                (and (= :read pk) (= visit pv)) (conj (pop out) [:read visit (into ps slots)])
+                :else (conj out [:read visit slots]))))
+          []
+          events))
+
+(defn engine-events
+  "What the engine's Metal forward records for a chunk of `n` tokens."
+  [n]
+  (let [m @engine
+        _ (ink/set-option! m :gpu true)
+        s (ink/session m 256)]
+    (cpp/inkling_specs.set_record s true)
+    (ink/eval! s (ring/ids n 21))
+    (let [events (cpp/inkling_specs.events s)]
+      (ink/free! s)
+      events)))
+
+(defn- engine-shape
+  "The model's theory for the engine's plan, read from the engine."
+  []
+  (let [cfg (ink/config @engine)]
+    {:layers (:layers cfg)
+     :block (:residual-block cfg)
+     :loop (when-let [l (:loop cfg)] {:start (:start l) :end (:end l) :passes (:passes l)})
+     :slots 12}))
+
+(defn conformance
+  "The model's events for the engine's plan against the engine's, for a single
+  token and for a chunk of 20: the same slots taken, pushed, released, read
+  and written, in the same order, at the same visits."
+  []
+  (c/load-model! "Stream.lean")
+  (let [model (canonical (model-events (engine-shape)))
+        compare (fn [n]
+                  (let [eng (canonical (engine-events n))
+                        diff (first (remove (fn [[a b]] (= a b))
+                                            (map vector (concat model (repeat nil)) (concat eng [nil]))))]
+                    {:tokens n :engine-events (count eng) :same (= model eng) :first-difference diff}))]
+    {:shape (engine-shape)
+     :model-events (count model)
+     :runs [(compare 1) (compare 20)]}))
+
+(defn run
+  ([] (run {}))
+  ([{:keys [engine] :or {engine true}}]
+   (let [mcs (model-checks)
+         _ (doseq [[k v] mcs] (c/report (str "stream/" (name k)) v))
+         model-ok (and (= :noViolationFound (:result (:mini mcs)))
+                       (zero? (:shapes-violating mcs)))
+         rule (c/report "stream/engine-against-model" (engine-against-model))
+         rule-ok (zero? (:gpu-but-model-violates rule))]
+     (if-not engine
+       {:ok (and model-ok rule-ok)}
+       (let [conf (c/report "stream/conformance" (conformance))]
+         {:ok (and model-ok rule-ok (every? :same (:runs conf)))})))))

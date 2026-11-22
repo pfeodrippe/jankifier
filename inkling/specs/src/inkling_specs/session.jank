@@ -1,0 +1,154 @@
+(ns inkling-specs.session
+  "Sequences of the session API (eval!, reset!, copy!, trace!, the :gpu
+  option) on the engine, against a reference kept in jank: a session is the
+  list of tokens it was given. No Veil model: the ring's and the
+  convolutions' models cover what reset and copy do to the caches; this checks
+  that the engine's sessions agree with new sessions given the same tokens."
+  (:require [inkling-specs.core :as c :refer [engine]]
+            [inkling-specs.ring :as ring]
+            [inkling.core :as ink]))
+
+(def script
+  "Operations on two sessions, :a and :b."
+  [[:eval :a 3]
+   [:copy :b :a]
+   [:eval :a 2]
+   [:eval :b 1]
+   [:eval :b 1]
+   [:reset :a]
+   [:eval :a 4]
+   [:trace :a true]
+   [:eval :a 2]
+   [:trace :a false]
+   [:copy :a :b]
+   [:eval :a 3]
+   [:reset :b]
+   [:copy :b :a]
+   [:eval :b 2]])
+
+(defn- fresh-digest
+  "The state of a new session given `tokens` at once."
+  [tokens]
+  (let [s (ink/session @engine 64)]
+    (when (seq tokens)
+      (ink/eval! s tokens))
+    (let [d (cpp/inkling_specs.digest s)]
+      (ink/free! s)
+      d)))
+
+(defn run-script
+  "Runs `script` on two sessions and on the reference. After every operation
+  each session's position and tokens must be the reference's. At the end each
+  session's state (every visit's keys, values and convolution histories, and
+  the logits) is compared with a new session's that was given the same tokens
+  in one eval.
+
+  On the CPU (`:gpu false`) the comparison is bit for bit. On the GPU, and
+  with `:switching true` (the :gpu option flipped before every operation),
+  chunks of different sizes round differently, so it is a distance: visit 0's
+  convolution histories relative to their largest value."
+  [{:keys [gpu switching] :or {gpu false switching false}}]
+  (let [m @engine
+        _ (ink/set-option! m :gpu gpu)
+        sessions {:a (ink/session m 64) :b (ink/session m 64)}
+        supply (atom (ring/ids 64 31))
+        take! (fn [n]
+                (let [ids (vec (take n @supply))]
+                  (swap! supply #(drop n %))
+                  ids))
+        step (fn [ref [i [op x y]]]
+               (when switching
+                 (ink/set-option! m :gpu (even? i)))
+               (let [ref (case op
+                           :eval (let [ids (take! y)]
+                                   (ink/eval! (sessions x) ids)
+                                   (update ref x into ids))
+                           :reset (do (ink/reset! (sessions x))
+                                      (assoc ref x []))
+                           :copy (do (ink/copy! (sessions x) (sessions y))
+                                     (assoc ref x (ref y)))
+                           :trace (do (ink/trace! (sessions x) y)
+                                      ref))
+                     wrong (remove (fn [k]
+                                     (and (= (count (ref k)) (ink/position (sessions k)))
+                                          (= (ref k) (ink/tokens (sessions k)))))
+                                   [:a :b])]
+                 (if (seq wrong)
+                   (reduced (assoc ref :failed-at [i op x y]))
+                   ref)))
+        ref (reduce step {:a [] :b []} (map-indexed vector script))
+        exact (and (not gpu) (not switching))
+        _ (ink/set-option! m :gpu gpu)
+        ends (into {}
+                   (for [k [:a :b]]
+                     [k (if exact
+                          (= (select-keys (cpp/inkling_specs.digest (sessions k)) [:kv :conv :logits :tokens])
+                             (select-keys (fresh-digest (ref k)) [:kv :conv :logits :tokens]))
+                          (let [f (ink/session m 64)]
+                            (ink/eval! f (ref k))
+                            (let [d (cpp/inkling_specs.distance (sessions k) f)]
+                              (ink/free! f)
+                              d)))]))]
+    (ink/free! (:a sessions))
+    (ink/free! (:b sessions))
+    (ink/set-option! m :gpu true)
+    {:gpu gpu
+     :switching switching
+     :operations (count script)
+     :failed-at (:failed-at ref)
+     :tokens {:a (count (:a ref)) :b (count (:b ref))}
+     :ends ends}))
+
+(defn edges
+  "What the API does at its edges:
+
+  - eval! past the context throws and leaves the session as it was;
+  - copy! between sessions of different contexts throws;
+  - sample on a session with no logits (new, or after reset!) throws (it gave
+    token 0 before the engine checked);
+  - eval! of a token id outside the vocabulary throws and leaves the session
+    as it was (the engine didn't check ids)."
+  []
+  (let [m @engine
+        _ (ink/set-option! m :gpu true)
+        s (ink/session m 8)
+        other (ink/session m 16)
+        ids (ring/ids 16 41)
+        _ (ink/eval! s (vec (take 6 ids)))
+        before (cpp/inkling_specs.digest s)
+        full (try (ink/eval! s (vec (take 3 ids))) :no-error (catch :default _ :threw))
+        after (cpp/inkling_specs.digest s)
+        copied (try (ink/copy! other s) :no-error (catch :default _ :threw))
+        empty-sample (try (ink/sample other) (catch :default _ :threw))
+        vocab (:vocab (ink/config m))
+        outside (try (ink/eval! other [(first ids) (+ vocab 50000)]) :no-error (catch :default _ :threw))
+        negative (try (ink/eval! other [-1]) :no-error (catch :default _ :threw))
+        other-position (ink/position other)]
+    (ink/free! s)
+    (ink/free! other)
+    {:eval-past-context full
+     :unchanged-after (= before after)
+     :copy-different-contexts copied
+     :sample-without-logits empty-sample
+     :eval-id-outside-vocabulary outside
+     :eval-negative-id negative
+     :position-after-refused-ids other-position}))
+
+(defn run
+  ([] (run {}))
+  ([_]
+   (let [cpu (c/report "session/script, CPU" (run-script {:gpu false}))
+         gpu (c/report "session/script, GPU" (run-script {:gpu true}))
+         both (c/report "session/script, switching" (run-script {:switching true}))
+         e (c/report "session/edges" (edges))
+         close? (fn [r] (every? #(< (:kv-conv-visit-0 %) 0.02) (vals (:ends r))))]
+     {:ok (and (nil? (:failed-at cpu)) (every? true? (vals (:ends cpu)))
+               (nil? (:failed-at gpu)) (close? gpu)
+               (nil? (:failed-at both)) (close? both)
+               (= :threw (:eval-past-context e))
+               (:unchanged-after e)
+               (= :threw (:copy-different-contexts e))
+               (= :threw (:sample-without-logits e))
+               (= :threw (:eval-id-outside-vocabulary e))
+               (= :threw (:eval-negative-id e))
+               (zero? (:position-after-refused-ids e)))})))

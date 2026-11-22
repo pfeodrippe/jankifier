@@ -1,0 +1,324 @@
+(ns inkling-specs.ring
+  "The key/value ring (models/Ring.lean, models/RingLemmas.lean): its proof and
+  model checks, and the engine's caches compared with what the model says each
+  slot holds."
+  (:require [clojure.string :as string]
+            [inkling-specs.core :as c :refer [engine vs]]
+            [inkling.core :as ink]
+            [lean-sys.session :as lean]
+            [veil.core :as veil]))
+
+;;;; The model
+
+(defn proof
+  "Elaborates Ring.lean: #check_invariants (every size, any number of
+  sessions; kernel-checked) and the file's two model checks."
+  []
+  (c/check "Ring.lean"))
+
+(def ^:private lemmas-result (atom nil))
+
+(defn lemmas
+  "Elaborates RingLemmas.lean (Lean theorems: `p % nslots` and the engine's
+  number of slots satisfy Ring.lean's assumptions). Returns the errors (none)
+  and the axioms each theorem depends on."
+  []
+  (or @lemmas-result
+      (let [msgs (veil/load-file! @vs (c/path "models" "RingLemmas.lean"))]
+        (reset! lemmas-result
+                {:errors (mapv :text (lean/errors msgs))
+                 :axioms (vec (keep #(re-find #"'.*' depends on axioms: .*" (str (:text %))) msgs))}))))
+
+(defn theory
+  "Ring.lean's theory for slots `Fin slots` and `slotOf p = p % slots`.
+  `:window 0` is a global visit."
+  [{:keys [window max-chunk context slots]}]
+  {:window window
+   :maxChunk max-chunk
+   :context context
+   :nslots slots
+   :slotOf (str "fun p => ⟨p % " slots ", Nat.mod_lt _ (by decide)⟩")
+   :idx "fun l => l.val"})
+
+(defn engine-slots
+  "The engine's number of slots (new_session): min(context, window + max_chunk)
+  for a local visit, context for a global one."
+  [{:keys [window max-chunk context]}]
+  (if (pos? window)
+    (min context (+ window max-chunk))
+    context))
+
+(def instances
+  "Small instances, with the engine's rule for the number of slots: windows and
+  chunks of 1 to 3 with contexts long enough to wrap the ring twice, a context
+  shorter than the ring, global visits, and two sessions (for copy)."
+  (concat
+    (for [[w k] [[1 1] [2 1] [1 2] [2 2] [3 2] [2 3] [3 3]]]
+      {:window w :max-chunk k :context (+ 2 (* 2 (+ w k))) :sessions 1})
+    [{:window 3 :max-chunk 2 :context 4 :sessions 1}
+     {:window 0 :max-chunk 2 :context 6 :sessions 1}
+     {:window 2 :max-chunk 1 :context 7 :sessions 2}
+     {:window 0 :max-chunk 2 :context 4 :sessions 2}]))
+
+(defn model-check
+  "Veil's model checker on Ring (or a variant's module) for an instance."
+  ([inst] (model-check "Ring" inst))
+  ([module inst]
+   (let [slots (or (:slots inst) (engine-slots inst))]
+     (veil/model-check @vs module {:instance {:slot slots :sess (:sessions inst)}
+                                   :theory (theory (assoc inst :slots slots))}))))
+
+(defn model-checks
+  "Every instance: all must explore their states without a violation."
+  []
+  (c/load-model! "Ring.lean")
+  (mapv (fn [inst]
+          (let [r (model-check inst)]
+            (assoc inst :slots (engine-slots inst) :result (:result r) :states (:explored-states r)
+                        :violates (:violates r))))
+        instances))
+
+(defn too-few-slots
+  "The property is about the number of slots: without the `enough` assumption
+  and with window + max_chunk - 2 slots (one less than the least that works),
+  the model checker finds a token attending to a position whose slot was
+  overwritten by its own chunk. Returns the violated property and the steps."
+  []
+  (let [m (c/variant! "Ring.lean" "RingFewSlots"
+                      (fn [text]
+                        (string/join "\n" (remove #(string/starts-with? % "assumption [enough]")
+                                                  (string/split-lines text)))))
+        r (model-check m {:window 3 :max-chunk 2 :context 8 :slots 3 :sessions 1})]
+    {:result (:result r)
+     :violates (:violates r)
+     :steps (mapv (juxt :action :args) (:trace r))}))
+
+;;;; The engine
+
+(defn ids
+  "`n` token ids, the same for a seed, all different from their neighbours."
+  [n seed]
+  (loop [out [] x (+ 12345 (* 7919 seed))]
+    (if (= (count out) n)
+      out
+      (let [x (mod (+ (* x 1103) 12347) 100003)]
+        (recur (conj out (+ 1000 x)) x)))))
+
+(defn chunk-sizes
+  "Chunk sizes adding up to `total`: single tokens, a few, and 16 or more (the
+  GPU uses different kernels from 16 tokens up), in an order fixed by `seed`."
+  [total seed]
+  (let [choices [1 1 2 3 5 7 16 17 31 48 63 64]]
+    (loop [out [] left total x (+ 17 seed)]
+      (if (zero? left)
+        out
+        (let [x (mod (+ (* x 75) 74) 65537)
+              k (min left (nth choices (mod x (count choices))))]
+          (recur (conj out k) (- left k) x))))))
+
+(defn eval-chunks!
+  "Evaluates `ids` in chunks of `sizes` (one forward pass each). With `log`,
+  the session must be capturing: each chunk's rows are logged. `after` is
+  called after each chunk."
+  ([s ids sizes] (eval-chunks! s ids sizes nil nil))
+  ([s ids sizes log after]
+   (loop [ids ids sizes sizes]
+     (when (seq sizes)
+       (let [k (first sizes)]
+         (ink/eval! s (vec (take k ids)))
+         (when log
+           (cpp/inkling_specs.log_append log s))
+         (when after
+           (after))
+         (recur (drop k ids) (rest sizes)))))))
+
+(defn ring-contents
+  "Evaluates `:tokens` tokens (more than a local visit's ring holds, so that it
+  wraps) in chunks of varied sizes, logging the keys and values each position
+  is given in every visit as it is written. After every chunk, in every visit,
+  each position the last token attends to is looked up at slot
+  `position % slots` (the model's slotOf) and compared, bit for bit, with what
+  was logged for it. With `:cpu-tail n`, the last n tokens are evaluated on the
+  CPU, over the caches the GPU filled.
+
+  Returns how many (visit, position) pairs were compared and how many differed
+  (0)."
+  [{:keys [tokens seed cpu-tail context] :or {tokens 1300 seed 1 cpu-tail 0 context 2048}}]
+  (let [m @engine
+        _ (ink/set-option! m :gpu true)
+        s (ink/session m context)
+        log (cpp/inkling_specs.log_new s)
+        all (ids tokens seed)
+        gpu-n (- tokens cpu-tail)
+        compared (atom 0)
+        wrong (atom [])
+        after (fn []
+                (doseq [r (cpp/inkling_specs.ring_check log s)]
+                  (swap! compared + (:checked r))
+                  (when (pos? (:wrong r))
+                    (swap! wrong conj (assoc r :pos (ink/position s))))))]
+    (cpp/inkling_specs.set_capturing s true)
+    (eval-chunks! s (take gpu-n all) (chunk-sizes gpu-n seed) log after)
+    (when (pos? cpu-tail)
+      (ink/set-option! m :gpu false)
+      (eval-chunks! s (drop gpu-n all) (chunk-sizes cpu-tail (inc seed)) log after)
+      (ink/set-option! m :gpu true))
+    (let [shapes (cpp/inkling_specs.cache_shapes s)
+          result {:tokens tokens
+                  :cpu-tail cpu-tail
+                  :local-slots (:slots (first (filter :local shapes)))
+                  :global-slots (:slots (first (remove :local shapes)))
+                  :visits (count shapes)
+                  :compared @compared
+                  :wrong (count @wrong)
+                  :first-wrong (first @wrong)}]
+      (ink/free! s)
+      result)))
+
+(defn visit-0-references
+  "An independent check of what the ring holds, for visit 0 (layer 0, local):
+  its keys and values at position j depend only on tokens j - 3 .. j (the
+  layer's input is the token's embedding, and the keys' and values'
+  convolutions span four positions). So the row a wrapped ring holds for
+  position j must be the row a new session computes for those four tokens
+  alone. Checks `:samples` positions spread over the window of the last token,
+  its two ends included.
+
+  The rows are compared element by element, as stored. They needn't be equal
+  bit for bit: the wrapped session computed most of them in chunks of 16 or
+  more tokens, with other kernels than the four-token reference, and a few of
+  a row's 1024 elements round differently. A row counts as the position's when
+  at most 64 of its elements differ, in keys and in values; as a control, the
+  row is also compared with the reference of the position before, which must
+  differ in most elements."
+  [{:keys [tokens seed samples] :or {tokens 1300 seed 2 samples 48}}]
+  (let [m @engine
+        _ (ink/set-option! m :gpu true)
+        s (ink/session m 2048)
+        ref (ink/session m 16)
+        all (ids tokens seed)
+        _ (eval-chunks! s all (chunk-sizes tokens seed))
+        shape (first (cpp/inkling_specs.cache_shapes s))
+        slots (:slots shape)
+        width (:width shape)
+        window (:window (ink/config m))
+        p (dec tokens)
+        first-pos (max 0 (inc (- p window)))
+        span (- p first-pos)
+        positions (distinct (concat [first-pos (inc first-pos) (dec p) p]
+                                    (map #(+ first-pos (quot (* % span) samples)) (range samples))))
+        rows (mapv (fn [j]
+                     (let [from (- j 3)
+                           four (subvec all from (inc j))]
+                       (ink/reset! ref)
+                       (ink/eval! ref four)
+                       {:position j
+                        :keys (cpp/inkling_specs.row_diff s (mod j slots) ref 3 0 0)
+                        :values (cpp/inkling_specs.row_diff s (mod j slots) ref 3 0 1)
+                        ;; The reference's row 2 is position j - 1's keys, short of one tap.
+                        :control (cpp/inkling_specs.row_diff s (mod j slots) ref 2 0 0)}))
+                   positions)
+        wrong (filterv #(or (> (:keys %) 64) (> (:values %) 64)) rows)]
+    (ink/free! s)
+    (ink/free! ref)
+    {:tokens tokens :slots slots :window [first-pos p] :positions (count positions) :row-elements width
+     :wrong (count wrong)
+     :first-wrong (first wrong)
+     :most-differing {:keys (apply max (map :keys rows)) :values (apply max (map :values rows))}
+     :bitwise-equal (count (filter #(and (zero? (:keys %)) (zero? (:values %))) rows))
+     :control-least-differing (apply min (map :control rows))}))
+
+(defn- weights-at
+  "Evaluates `ids` on the GPU except the last token, which is traced on the
+  CPU: visit 0's attention weights of the last token, [heads, keys] as a
+  vector of rows."
+  [ids]
+  (let [m @engine
+        s (ink/session m 2048)
+        n (dec (count ids))]
+    (ink/set-option! m :gpu true)
+    (eval-chunks! s (take n ids) (chunk-sizes n 5))
+    (ink/trace! s true)
+    (ink/eval! s [(last ids)])
+    (let [t (ink/trace s "v0.attn.weights")
+          [heads keys] (:shape t)
+          rows (mapv vec (partition keys (:values t)))]
+      (ink/free! s)
+      {:heads heads :keys keys :rows rows})))
+
+(defn- changed-keys
+  "The key indices whose weight changed between two runs by more than the
+  common factor of their head (changing one key's logit rescales every weight
+  of the softmax by the same factor)."
+  [a b]
+  (set (mapcat (fn [ra rb]
+                 (let [ratios (keep-indexed (fn [i [x y]]
+                                              (when (and (> x 1e-30) (> y 1e-30))
+                                                [i (/ y x)]))
+                                            (map vector ra rb))
+                       sorted (sort (map second ratios))
+                       median (nth sorted (quot (count sorted) 2))]
+                   (keep (fn [[i r]]
+                           (when (> (abs (- r median)) (* 1e-4 median))
+                             i))
+                         ratios)))
+               (:rows a) (:rows b))))
+
+(defn read-window
+  "Which positions the last token's attention reads, in visit 0, once the
+  ring has wrapped, found by changing one token and seeing which attention
+  weights change (visit 0's key at position j depends on tokens j - 3 .. j
+  only). With p the last position and first = p - window + 1:
+
+  - changing token first - 4 (its keys are first - 4 .. first - 1, all outside
+    the window) changes no weight;
+  - changing token first - 3 changes the weight of the window's oldest key
+    only (index 0);
+  - changing token first + 10 changes the keys 10 .. 13.
+
+  The last token runs on the CPU (traced), over caches the GPU filled."
+  [{:keys [tokens seed] :or {tokens 1151 seed 3}}]
+  (let [m @engine
+        window (:window (ink/config m))
+        base (ids tokens seed)
+        p (dec tokens)
+        first-pos (inc (- p window))
+        change (fn [i] (assoc base i (+ 7 (nth base i))))
+        a (weights-at base)
+        outside (weights-at (change (- first-pos 4)))
+        oldest (weights-at (change (- first-pos 3)))
+        inside (weights-at (change (+ first-pos 10)))]
+    (ink/set-option! m :gpu true)
+    {:tokens tokens
+     :window [first-pos p]
+     :keys (:keys a)
+     :outside-unchanged (= (:rows a) (:rows outside))
+     :oldest-changed (sort (changed-keys a oldest))
+     :inside-changed (sort (changed-keys a inside))}))
+
+(defn run
+  "Every check of the ring. `:engine false` leaves the engine out."
+  ([] (run {}))
+  ([{:keys [engine] :or {engine true}}]
+   (let [proof (c/report "ring/proof" (select-keys (proof) [:proven :not-proven :model-checks :errors]))
+         lem (c/report "ring/lemmas" (lemmas))
+         mcs (c/report "ring/model-checks" (model-checks))
+         few (c/report "ring/too-few-slots" (too-few-slots))
+         model-ok (and (c/ok? proof)
+                       (empty? (:errors lem))
+                       (every? #(= :noViolationFound (:result %)) mcs)
+                       (= [:window_held] (:violates few)))]
+     (if-not engine
+       {:ok model-ok}
+       (let [contents (c/report "ring/ring-contents" (ring-contents {:tokens 1300 :seed 1}))
+             tail (c/report "ring/ring-contents, CPU tail" (ring-contents {:tokens 1170 :seed 4 :cpu-tail 6}))
+             refs (c/report "ring/visit-0-references" (visit-0-references {}))
+             reads (c/report "ring/read-window" (read-window {}))]
+         {:ok (and model-ok
+                   (zero? (:wrong contents))
+                   (zero? (:wrong tail))
+                   (zero? (:wrong refs))
+                   (> (:control-least-differing refs) 512)
+                   (:outside-unchanged reads)
+                   (= [0] (:oldest-changed reads))
+                   (= [10 11 12 13] (:inside-changed reads)))})))))

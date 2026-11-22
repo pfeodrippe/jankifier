@@ -1,0 +1,35 @@
+(ns inkling-specs.check
+  "Runs the checks from the command line: `lein run -m inkling-specs.check`
+  (all of them), or with names: `ring`, `ring-model`, `conv`, `pool`,
+  `stream`, `session`. In a REPL, call the namespaces' functions instead."
+  (:require [inkling-specs.conv :as conv]
+            [inkling-specs.core :as c]
+            [inkling-specs.pool :as pool]
+            [inkling-specs.ring :as ring]
+            [inkling-specs.session :as session]
+            [inkling-specs.stream :as stream]))
+
+(cpp/raw "#include <unistd.h>")
+
+(def checks
+  {"ring" #(ring/run)
+   "ring-model" #(ring/run {:engine false})
+   "conv" #(conv/run)
+   "conv-model" #(conv/run {:engine false})
+   "pool" #(pool/run)
+   "pool-model" #(pool/run {:engine false})
+   "session" #(session/run)
+   "stream" #(stream/run)
+   "stream-model" #(stream/run {:engine false})})
+
+(defn -main [& args]
+  (let [names (if (seq args) args ["ring" "conv" "stream" "session" "pool"])
+        results (mapv (fn [n]
+                        (if-let [f (get checks n)]
+                          [n (:ok (f))]
+                          [n :unknown-check]))
+                      names)]
+    (println "results:" (pr-str results))
+    (c/flush!)
+    ;; jank can crash at exit after an exception was printed: leave directly.
+    (cpp/_exit (if (every? #(true? (second %)) results) 0 1))))

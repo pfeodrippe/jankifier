@@ -1,0 +1,127 @@
+(ns inkling-specs.conv
+  "The short convolutions' history (models/Conv.lean): its proof and model
+  checks, and the engine evaluated with different chunkings."
+  (:require [inkling-specs.core :as c :refer [engine vs]]
+            [inkling-specs.ring :as ring]
+            [inkling.core :as ink]
+            [veil.core :as veil]))
+
+;;;; The model
+
+(defn proof
+  "Elaborates Conv.lean: #check_invariants (any chunk size, context and number
+  of sessions, both implementations; kernel-checked) and its model checks."
+  []
+  (c/check "Conv.lean"))
+
+(def instances
+  (for [impl [:window :rolling]
+        [k context sessions] [[1 5 1] [2 6 1] [3 7 2] [4 9 1]]]
+    {:impl impl :max-chunk k :context context :sessions sessions}))
+
+(defn model-check [{:keys [impl max-chunk context sessions]}]
+  (veil/model-check @vs "Conv" {:instance {:sess sessions}
+                                :theory {:impl (str "impl_t_IndT." (name impl))
+                                         :maxChunk max-chunk
+                                         :context context}}))
+
+(defn model-checks []
+  (c/load-model! "Conv.lean")
+  (mapv (fn [inst]
+          (let [r (model-check inst)]
+            (assoc inst :result (:result r) :states (:explored-states r) :violates (:violates r))))
+        instances))
+
+;;;; The engine
+
+(defn- state-after
+  "A new session's digests after evaluating `ids` in chunks of `sizes`."
+  [ids sizes]
+  (let [s (ink/session @engine 256)]
+    (ring/eval-chunks! s ids sizes)
+    (let [d (cpp/inkling_specs.digest s)]
+      (ink/free! s)
+      d)))
+
+(defn chunking-independence
+  "Evaluates the same tokens with different chunkings, each in a new session,
+  and compares the resulting states: the keys and values of every visit, the
+  convolution histories of every visit, and the logits. One token at a time,
+  a history is the last three inputs by construction; a chunk's must be the
+  same.
+
+  `:gpu false` runs the CPU path (12 tokens): the states must be equal bit for
+  bit. `:gpu true` runs the Metal one (40 tokens, with chunks of 16 or more,
+  which use other kernels and round differently): each chunking's distance
+  from one token at a time is given, as in `gpu-against-cpu`; visit 0's
+  histories must be close."
+  [{:keys [gpu] :or {gpu false}}]
+  (let [m @engine
+        n (if gpu 40 12)
+        ids (ring/ids n 11)
+        chunkings (if gpu
+                    [(vec (repeat 40 1)) [40] [16 24] [17 3 20] [5 7 28] [1 39]]
+                    [(vec (repeat 12 1)) [12] [5 7] [3 4 5] [1 11]])
+        _ (ink/set-option! m :gpu gpu)
+        sessions (mapv (fn [sizes]
+                         (let [s (ink/session m 256)]
+                           (ring/eval-chunks! s ids sizes)
+                           s))
+                       chunkings)
+        digests (mapv #(cpp/inkling_specs.digest %) sessions)
+        distances (mapv #(cpp/inkling_specs.distance (first sessions) %) (rest sessions))]
+    (doseq [s sessions]
+      (ink/free! s))
+    (ink/set-option! m :gpu true)
+    {:gpu gpu
+     :tokens n
+     :chunkings chunkings
+     :same-conv (apply = (map :conv digests))
+     :same-kv (apply = (map :kv digests))
+     :same-logits (apply = (map :logits digests))
+     :farthest {:kv-conv-visit-0 (apply max (map :kv-conv-visit-0 distances))
+                :conv-visit-0 (apply max (map :conv-visit-0 distances))
+                :conv (apply max (map :conv distances))
+                :logits (apply max (map :logits distances))
+                :same-top (every? :same-top distances)}}))
+
+(defn gpu-against-cpu
+  "The same tokens and chunking on the CPU and on the GPU: how far the
+  convolution histories and the logits are (relative to each history's largest
+  value), and whether both give the same most likely token. The two paths sum
+  in different orders and the model's routing and quantization amplify that,
+  so only visit 0's histories (projections of the embeddings) are expected to
+  be close."
+  [{:keys [sizes] :or {sizes [1 3 20]}}]
+  (let [m @engine
+        n (reduce + sizes)
+        ids (ring/ids n 12)
+        run (fn [gpu]
+              (ink/set-option! m :gpu gpu)
+              (let [s (ink/session m 256)]
+                (ring/eval-chunks! s ids sizes)
+                s))
+        cpu (run false)
+        gpu (run true)
+        d (cpp/inkling_specs.distance cpu gpu)]
+    (ink/free! cpu)
+    (ink/free! gpu)
+    (assoc d :sizes sizes)))
+
+(defn run
+  ([] (run {}))
+  ([{:keys [engine] :or {engine true}}]
+   (let [proof (c/report "conv/proof" (select-keys (proof) [:proven :not-proven :model-checks :errors]))
+         mcs (c/report "conv/model-checks" (model-checks))
+         model-ok (and (c/ok? proof) (every? #(= :noViolationFound (:result %)) mcs))]
+     (if-not engine
+       {:ok model-ok}
+       (let [cpu (c/report "conv/chunking-independence, CPU" (chunking-independence {:gpu false}))
+             gpu (c/report "conv/chunking-independence, GPU" (chunking-independence {:gpu true}))
+             both (c/report "conv/gpu-against-cpu" (gpu-against-cpu {}))
+             big (c/report "conv/gpu-against-cpu, a chunk of 24" (gpu-against-cpu {:sizes [24]}))]
+         {:ok (and model-ok
+                   (:same-conv cpu) (:same-kv cpu) (:same-logits cpu)
+                   (< (:kv-conv-visit-0 (:farthest gpu)) 0.02)
+                   (< (:kv-conv-visit-0 both) 0.02)
+                   (< (:kv-conv-visit-0 big) 0.02))})))))

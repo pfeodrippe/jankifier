@@ -1,0 +1,12 @@
+#!/bin/sh
+# Elaborates a Veil file outside jank: ./check-lean models/Ring.lean
+# The same check as (check "Ring.lean") in the REPL, for editing a model without starting jank.
+# Veil comes from ../../specs (its Lake project); #model_check runs interpreted.
+SPECS="$(cd "$(dirname "$0")/../../specs" && pwd)"
+TOOLCHAIN="$HOME/.elan/toolchains/leanprover--lean4---v4.35.0"
+LEAN_PATH="$TOOLCHAIN/lib/lean"
+for p in "$SPECS"/.lake/packages/*/.lake/build/lib/lean; do LEAN_PATH="$p:$LEAN_PATH"; done
+export LEAN_PATH
+export PATH="$TOOLCHAIN/bin:/opt/homebrew/bin:/usr/bin:/bin"
+export VEIL_ONLINE_ENV=1
+exec lean --load-dynlib="$SPECS/.lake/packages/cvc5/.lake/build/lib/libcvc5_cvc5.dylib" "$@"
