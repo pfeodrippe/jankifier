@@ -167,7 +167,8 @@ in its type: a person's messages after a prompt, the model's thinking, each
 tool's call with what it gave under it, and what the model said with its
 headings, lists, tables, code and bold drawn. A long part (thinking, a call's
 arguments, what a tool gave) shows its first three lines and how many more
-there are: a click there shows it whole, and "show less" puts it back
+there are: a click on those words shows it whole, and "show less" (over it
+and under it) puts it back
 (`(hc/unfold! "name" :all)` shows them all whole). While a part is being
 written, its last lines are shown. The newest
 is at the bottom; a conversation shorter than the space sits at the bottom of
@@ -200,10 +201,15 @@ While a turn runs, the end is followed as it is written ("live"). Pause stops
 the view there, and the turn itself goes on. A click on the line (or the mouse
 held and moved along it) goes to that moment, and plays on from there if it was
 playing. A click on a mark goes to that step's end and shows the step from its
-start; on the last one, or at the line's end, the end is followed. Playing is
-at the pace things were written, and follows the turn again when it gets to the
-end. Waits are shown short and marked on the line with a break: a tool
-running, a result being read (1.2 seconds at most each).
+start; on the last one, or at the line's end, the end is followed. Playing
+follows the turn again when it gets to the end.
+
+A replay doesn't take as long as the conversation did. What the model wrote is
+shown at up to 500 characters a second, a thought in 2 seconds at most, a
+call in 1, an answer in 3 (the model writes about 16 tokens a second: a long
+thought took a minute). Waits are shown short and marked on the line with a
+break: a tool running, a result being read (1.2 seconds at most each). The
+clock says the time as it was.
 
 ## A conversation kept
 

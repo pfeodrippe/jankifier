@@ -14,9 +14,10 @@
 ;;
 ;; The timeline has a mark for each step: a person's message and each of the model's
 ;; answers. A click on the line goes to that moment, playing on if it was playing; one on a
-;; mark goes to the end of that step and shows it from its start. Playing goes at the pace
-;; things were written (or 2, 4, 8 times it), the waits (a tool running, a result being
-;; read) shown short. A conversation kept in a file (harness.core/save!) is played the same
+;; mark goes to the end of that step and shows it from its start. Playing is quicker than
+;; the conversation was (what the model wrote at up to 500 characters a second, each piece in
+;; a few seconds at most, the waits short), or 2, 4, 8 times that; the clock says the time
+;; as it was. A conversation kept in a file (harness.core/save!) is played the same
 ;; way, without the model: `replay!`.
 ;;
 ;;   (def a (hc/watch! (h/agent m {:tools (tools/defaults)}) "a question"))
@@ -65,6 +66,10 @@
 (def ^:private status 26)                   ; the line of what is going on, over the timeline
 ;; A wait (a tool running, a result being read) is shown at most this long in a replay.
 (def ^:private wait-shown 1.2)
+;; What the model wrote is shown at most this fast, and each piece in at most this long, in a
+;; replay: the model writes about 16 tokens a second, a long thought takes a minute.
+(def ^:private written-pace 500.0)
+(def ^:private written-most {:thinking 2.0 :call 1.0 :model 3.0})
 
 ;; Text into lines.
 
@@ -275,28 +280,34 @@
 (defn- part
   "A long text's lines as shown: its first `first-lines` and a line saying how many more
   (a click there opens it), or all of it and a line that closes it again. Being written, its
-  last lines. Returns {:lines :toggle :h}: :toggle is the line clicked, [its text, whether it
-  opens]."
+  last lines. Returns {:lines :toggle :top :h}: :toggle is the line clicked under the lines,
+  [its text, whether it opens]; :top, a line over them (an opened part closes from its top
+  too, not only a hundred lines further down)."
   [lines open writing]
   (let [n (long (count lines))
         long-one (> n (inc first-lines))]
     (cond
       (not long-one) {:lines lines :toggle nil :h (* line-small n)}
       writing {:lines (subvec lines (- n first-lines)) :toggle nil :h (* line-small first-lines)}
-      open {:lines lines :toggle [(str "show less") false] :h (* line-small (inc n))}
+      open {:lines lines :toggle [(str "show less") false]
+            :top [(str "show less (" n " lines)") false] :h (* line-small (+ n 2))}
       :else {:lines (subvec lines 0 first-lines)
              :toggle [(str "... " (- n first-lines) " more lines") true]
              :h (* line-small (inc first-lines))})))
 
 (defn- draw-part
-  "A part drawn from (x, y), its toggle's line under its lines. Returns the toggle's place
-  {:part :y :open}, y from the item's top `top`, or nil."
+  "A part drawn from (x, y): its toggles' lines over and under its lines. Returns where the
+  toggles are, [{:part :x :y :open :label}], y from the item's top `top`."
   [shown x y color name top]
-  (draw-lines (:lines shown) x y color)
-  (when-let [[label opens] (:toggle shown)]
-    (let [ty (+ y (* line-small (long (count (:lines shown)))))]
-      (c/text! x ty c/blue c/small label)
-      {:part name :y (- ty top) :open (not opens) :label label})))
+  (let [over (:top shown)
+        ly (if over (+ y line-small) y)
+        toggle (fn [[label opens] ty]
+                 (c/text! x ty c/blue c/small label)
+                 {:part name :x x :y (- ty top) :open (not opens) :label label})]
+    (draw-lines (:lines shown) x ly color)
+    (vec (concat (when over [(toggle over y)])
+                 (when (:toggle shown)
+                   [(toggle (:toggle shown) (+ ly (* line-small (long (count (:lines shown))))))])))))
 
 (defn- user-item
   "A person's message, on a band, after a prompt: its lines as they were typed."
@@ -319,7 +330,7 @@
     {:h (+ 20 (:h shown) 10)
      :draw (fn [x y w]
              (c/text! x y c/muted c/small label)
-             (keep identity [(draw-part shown (+ x 14) (+ y 18) c/muted :text y)]))}))
+             (draw-part shown (+ x 14) (+ y 18) c/muted :text y))}))
 
 (defn- model-item
   "What the model said, after a dot: all of it."
@@ -368,8 +379,8 @@
                           (if out
                             (draw-part out (+ x 36) oy (if failed c/red c/ink) :out y)
                             (do (c/text! (+ x 36) oy c/muted c/small (str "running..."))
-                                nil))))]
-               (keep identity [t1 t2])))}))
+                                []))))]
+               (vec (concat t1 t2))))}))
 
 (defn- entry-item
   "An entry's item. `result` is the entry after a call's (what the tool gave), or nil;
@@ -469,8 +480,9 @@
             wait (max 0.0 (- began real))
             from (+ shown (min wait wait-shown))
             took (max 0.0 (- ended began))
+            chars (count (str (:text e) (main-of (:args e))))
             lasts (cond
-                    (written? role) took
+                    (written? role) (min took (get written-most role 2.0) (max 0.3 (/ chars written-pace)))
                     (= role :result) (min took wait-shown)
                     ;; Typed at the prompt, at forty characters a second.
                     (= role :user) (max 0.6 (min 3.0 (/ (count (str (:text e))) 40.0)))
@@ -931,10 +943,14 @@
                                           :when (and (:key item) (>= ty top) (<= (+ ty line-small) (+ top shown)))]
                                       (assoc t :entry (second (:key item)) :key (:key item) :ty ty)))]
                       (doseq [t here]
-                        (let [ty (:ty t)]
-                          (when (and over (not on-latest) (c/inside? (+ x 14) ty (- right 16) (+ ty line-small)))
-                            (c/line! (+ x 50) (+ ty line-small -2) (+ x 50 (c/text-width c/small (:label t))) (+ ty line-small -2) c/blue 1.0))
-                          (when (and over (not on-latest) (c/clicked? (+ x 14) ty (- right 16) (+ ty line-small)))
+                        ;; Only the words answer, not the whole line: a click that brings the
+                        ;; window to the front opens nothing.
+                        (let [ty (:ty t)
+                              tx (:x t)
+                              tx2 (+ tx (c/text-width c/small (:label t)) 4)]
+                          (when (and over (not on-latest) (c/inside? (- tx 4) ty tx2 (+ ty line-small)))
+                            (c/line! tx (+ ty line-small -2) (- tx2 4) (+ ty line-small -2) c/blue 1.0))
+                          (when (and over (not on-latest) (c/clicked? (- tx 4) ty tx2 (+ ty line-small)))
                             ;; What is looked at stays: opened, it grows below the line clicked.
                             (swap! scrolls assoc named looked)
                             (swap! unfolded update (:key t)
@@ -944,7 +960,7 @@
                 _ (c/clip-end!)
                 _ (draw-status (:seen p) (:value p) (:sched p) (:play p) (+ x 14) (+ top shown 2) (- width 28))
                 timeline (draw-bar named (:value p) (:sched p) (:play p) x (+ top shown status 8) width pressed modal)
-                now-drawn {:x x :y y :modal (boolean modal) :width width :top top :shown shown :tall tall :folds [] :toggles (mapv (fn [t] {:entry (:entry t) :part (subs (str (:part t)) 1) :y (+ (:ty t) (/ line-small 2.0)) :open (:open t)}) toggles)
+                now-drawn {:x x :y y :modal (boolean modal) :width width :top top :shown shown :tall tall :folds [] :toggles (mapv (fn [t] {:entry (:entry t) :part (subs (str (:part t)) 1) :x (+ (:x t) 10) :y (+ (:ty t) (/ line-small 2.0)) :open (:open t)}) toggles)
                            :bar timeline :height (:height p) :looked looked :furthest furthest
                            :latest (when behind {:x (/ (+ lx1 lx2) 2.0) :y (/ (+ ly1 ly2) 2.0)})
                            :anchored (and (not (pos? furthest)) (pos? tall))
@@ -1104,8 +1120,8 @@
   [{name, y}], bar: {y, play, start, next, x1, x2, pace, total, t, mode, marks}, looked,
   furthest, latest, anchored}, in the window's points. `bar` is the timeline: its buttons are
   at (play, y), (start, y), (next, y), its line from x1 to x2, a step's mark at (x, y).
-  `toggles`: the lines in view that open or close a long part ({entry, part, y, open}: a
-  click at (x + 100, y)). (`folds` is always empty.)"
+  `toggles`: the lines in view that open or close a long part ({entry, part, x, y, open}: a
+  click there). (`folds` is always empty.)"
   []
   (json/write (or @drawn {})))
 
