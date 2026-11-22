@@ -224,7 +224,9 @@
     (try
       (told entry)
       (catch jank.runtime.object_ref _ nil)
-      (catch cpp/std.exception _ nil)))
+      (catch cpp/jank.error_ref _ nil)
+      (catch cpp/std.exception _ nil)
+      (catch :default _ nil)))
   entry)
 
 ;; The model speaking.
@@ -518,6 +520,7 @@
                      (swap! a assoc :effort-said true)
                      (turn! a))
                    (catch jank.runtime.object_ref e (failed! a (or (ex-message e) (str e))))
+                   (catch cpp/jank.error_ref e (failed! a (str (cpp/.-message (cpp/* e)))))
                    (catch cpp/std.exception e (failed! a (str (cpp/.what e))))
                    (catch :default _ (failed! a "something jank does not say"))))]
       (swap! a assoc :turn turn)

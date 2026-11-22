@@ -44,6 +44,14 @@ the syntax, the data structures and most of `clojure.core` and
     (catch cpp/std.exception e (cpp/.what e)))          ; C++'s: slurp of a missing file
   ```
 - **Sleeping**: `(cpp/usleep 250000)` (microseconds).
+- **A `future` must catch everything it can throw.** What escapes one ends the
+  whole process (an abort), not just the future. Wrap its body in `try` with
+  the three `catch`es above and `(catch :default _ ...)`.
+- **A loop that never stops doesn't compile as a function's last form**:
+  `(defn spin [] (loop [n 0] (recur (inc n))))` fails when called ("'break'
+  statement not in loop"). Give the loop a way to stop: `(when (running?)
+  (recur ...))`. (A function is compiled the first time it runs, so in a
+  `future` this error too ends the process.)
 - These are here: atoms, `future` and `deref`, `binding`, `delay`,
   `slurp` and `spit`, `read-string`, `parse-long`, `re-find`, `sort-by`,
   transients, multimethods, `defmacro`.

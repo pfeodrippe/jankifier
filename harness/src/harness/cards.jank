@@ -1133,6 +1133,46 @@
     (to-time! named (* total (max 0.0 (min 1.0 share))) false)
     nil))
 
+(defonce ^:private followed (atom {}))   ; name -> the file being followed
+
+(defn follow-file!
+  "A recording that is still being written (harness.trials keeps the run in progress in
+  ../trials-out/live.edn) shown as `named`, and kept up to date: the file is read again
+  every two seconds when it changed, and the end followed, as a live conversation is (an
+  entry shows once it is whole). Stops when `unwatch!`ed or followed again under that name."
+  ([path] (follow-file! path "following"))
+  ([path named]
+   (let [named (str named)
+         path (str path)
+         read (fn [] (try (h/load-recording path)
+                          (catch jank.runtime.object_ref _ nil)
+                          (catch cpp/std.exception _ nil)))
+         first-read (or (read) {:entries [] :state :reading})
+         a (atom (assoc first-read :live nil :generated (or (:generated first-read) 0)
+                        :seconds (or (:seconds first-read) 0.0)))
+         token (str (gensym "following"))]
+     (watch! a named)
+     (swap! scrolls dissoc named)
+     (live! named)
+     (swap! followed assoc named token)
+     ;; (Everything a future does is caught: in jank, what escapes one ends the process.)
+     (future
+       (try
+         (loop [size (count (pr-str first-read))]
+           (cpp/usleep 2000000)
+           (when (and (= token (get @followed named)) (some (fn [w] (= (:name w) named)) @watched))
+             (let [r (read)
+                   now (if r (count (pr-str r)) size)]
+               (when (and r (not= now size))
+                 (swap! a assoc :entries (vec (:entries r)) :state (or (:state r) :reading)
+                        :generated (or (:generated r) 0) :seconds (or (:seconds r) 0.0)))
+               (recur now))))
+         (catch jank.runtime.object_ref _ nil)
+         (catch cpp/jank.error_ref _ nil)
+         (catch cpp/std.exception _ nil)
+         (catch :default _ nil)))
+     nil)))
+
 (defn to-entry!
   "The conversation `named` chosen and shown up to its entry `i` (its place in the
   entries), whole, with that entry at the top of the part shown and its parts opened;
