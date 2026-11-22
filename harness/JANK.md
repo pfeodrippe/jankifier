@@ -32,9 +32,11 @@ the syntax, the data structures and most of `clojure.core` and
   `(count "é")` is 2.
 - **Regular expressions**: `[...]` classes and `\s` also match the bytes of
   accented letters. On such text use plain strings, or patterns without them.
-- **Errors**: `(catch jank.runtime.object_ref e (ex-message e))` catches what
-  jank throws (`ex-info` and its own errors); `(catch cpp/std.exception e
-  (cpp/.what e))` catches C++ exceptions.
+- **Errors**: `(catch jank.runtime.object_ref e (ex-message e))` catches
+  `ex-info` and `throw`n values; `(catch cpp/jank.error_ref e (cpp/.-message
+  (cpp/* e)))` catches jank's own errors (`(subs "ab" 2 1)`);
+  `(catch cpp/std.exception e (cpp/.what e))` catches C++ exceptions (`slurp`
+  of a file that isn't there throws one).
 - **Sleeping**: `(cpp/usleep 250000)` (microseconds).
 - These are here: atoms, `future` and `deref`, `binding`, `delay`,
   `slurp` and `spit`, `read-string`, `parse-long`, `re-find`, `sort-by`,

@@ -167,9 +167,14 @@
                  closes the thinking and the model goes on from what it has thought
     :max-steps   steps a turn may take: a step is the model speaking, then its calls (24)
     :on-entry    (fn [entry]) called with each entry as it is added to the conversation
+    :obligations (fn [agent]) asked when the model answers without calling anything: nil
+                 when the work is done, else what isn't (harness.verify/gate checks a file
+                 against its model). Then that is said to the model and the turn goes on.
+    :max-checks  times the obligations may send the model back in a turn (6)
   The tools and the system text are evaluated now, so the first question starts from them."
   ([m] (agent m {}))
-  ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry]}]
+  ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry
+              obligations max-checks]}]
    (let [tools (mapv tool tools)
          ids (into {} (map (fn [[k piece]] [k (ink/token-id m piece)]) pieces))
          s (ink/session m (or context 16384))
@@ -181,6 +186,8 @@
             :max-thinking (or max-thinking 1536)
             :max-steps (or max-steps 24)
             :on-entry on-entry
+            :obligations obligations
+            :max-checks (or max-checks 6)
             :entries [] :state :idle :live nil :stop false :turn nil
             :generated 0 :seconds 0.0
             ;; When the agent was made: an entry's times are seconds since then.
@@ -371,6 +378,7 @@
                         {:value (binding [*agent* a]
                                   (repl/on-big-stack (fn [] ((:fn found) args))))}
                         (catch jank.runtime.object_ref e {:error (or (ex-message e) (str e))})
+                        (catch cpp/jank.error_ref e {:error (str (cpp/.-message (cpp/* e)))})
                         (catch cpp/std.exception e {:error (str (cpp/.what e))})
                         (catch :default _ {:error "the tool threw something jank does not say"})))))
         text (if (:error outcome)
@@ -399,8 +407,35 @@
         (do (entry! a {:role :stopped :why why :began (clock a) :ended (clock a)})
             (swap! a assoc :state why))
 
+        ;; An answer with nothing called: the turn ends, unless obligations say the work
+        ;; isn't done (then what isn't is said to the model, and it goes on).
         (empty? calls)
-        (swap! a assoc :state :done)
+        (let [v @a
+              ob (:obligations v)
+              checks (get v :checks 0)
+              unmet (when (and ob (< checks (:max-checks v)))
+                      (swap! a assoc :state :checking :live {:kind :tool :name "obligations" :text ""})
+                      (let [began (clock a)
+                            said (try
+                                   (repl/on-big-stack (fn [] (ob a)))
+                                   (catch jank.runtime.object_ref e (str "The harness's check threw: " (or (ex-message e) e)))
+                                   (catch cpp/std.exception e (str "The harness's check threw: " (cpp/.what e))))]
+                        {:text said :began began}))]
+          (cond
+            (and unmet (:text unmet) (< (inc step) (:max-steps @a)))
+            (do (entry! a {:role :check :passed false :text (str (:text unmet))
+                           :began (:began unmet) :ended (clock a)})
+                (swap! a update :checks (fn [n] (inc (or n 0))))
+                (ink/eval! (:session @a) (frame @a :user nil :text (str "[the harness] " (:text unmet))))
+                (recur (inc step)))
+
+            unmet
+            (do (entry! a {:role :check :passed (nil? (:text unmet)) :text (str (or (:text unmet) "every obligation holds"))
+                           :began (:began unmet) :ended (clock a)})
+                (swap! a assoc :state :done))
+
+            :else
+            (swap! a assoc :state :done)))
 
         (>= (inc step) (:max-steps @a))
         (do (entry! a {:role :stopped :why :steps :began (clock a) :ended (clock a)})
@@ -445,7 +480,7 @@
   (let [v @a]
     (when (and (:turn v) (not (realized? (:turn v))))
       (throw (ex-info "the agent's turn is still going: (h/answer a) waits for it, (h/stop! a) stops it" {})))
-    (swap! a assoc :stop false :state :reading)
+    (swap! a assoc :stop false :state :reading :checks 0)
     (entry! a {:role :user :text (str text) :began (clock a) :ended (clock a)})
     (let [turn (future
                  (try
@@ -489,7 +524,8 @@
     {:role :model :text}      the model's words
     {:role :call :name :args} a tool called, its arguments decoded
     {:role :result :name :text :error :seconds}  what the tool gave, as the model read it
-    {:role :stopped :why}     a turn cut short: :limit :context :steps :stopped :error"
+    {:role :stopped :why}     a turn cut short: :limit :context :steps :stopped :error
+    {:role :check :passed :text}  the obligations asked at the turn's end (:obligations)"
   [a]
   (:entries @a))
 
