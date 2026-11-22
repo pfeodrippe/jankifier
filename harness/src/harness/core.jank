@@ -1,0 +1,531 @@
+;; SPDX-License-Identifier: MIT
+;; An agent on the inkling engine: a conversation in a session, tools the model can call, and
+;; the loop that runs its turns.
+;;
+;;   (require '[inkling.core :as ink] '[harness.core :as h] '[harness.tools :as tools])
+;;   (def m (ink/open "../inkling/models/inkling-2-mini.ink"))
+;;   (def a (h/agent m {:tools (tools/defaults)}))
+;;   (h/ask! a "How many layers do you have? Look, don't guess.")
+;;   (h/answer a)
+;;
+;; The conversation is written the way the model was trained on: frames opened and closed by
+;; special tokens. A frame's content is always tokenized as ordinary text, and the model's
+;; output is split by token id, so nothing a person, a tool or the model writes can be taken
+;; for a frame's boundary.
+;;
+;;   <|message_system|>tool_declare<|content_xml|>[the tools, as JSON]<|end_message|>
+;;   <|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>
+;;   <|message_user|><|content_text|>...<|end_message|>
+;;   <|message_model|><|content_thinking|>...<|end_message|>
+;;   <|message_model|>name<|content_invoke_tool_json|>{"name":"name","args":{...}}<|end_message|>
+;;   <|content_model_end_sampling|>
+;;   <|message_tool|>name<|content_text|>the result<|end_message|>
+;;   <|message_model|><|content_text|>...<|end_message|><|content_model_end_sampling|>
+;;
+;; A tool is a function with a name, a description and parameters. The model calls it with
+;; JSON arguments (the form it was trained on, and escapes correctly); the harness decodes
+;; them and calls the function with plain values, so a tool never deals with escaping.
+;;
+;; Nothing here is sandboxed: a tool runs with this process's rights. Whoever starts the
+;; process decides what it may touch.
+(ns harness.core
+  (:refer-clojure :exclude [agent])
+  (:require [clojure.string :as str]
+            [inkling.core :as ink]
+            [harness.json :as json]
+            ;; A large stack for a tool's call (the window library's part that needs no window).
+            [cards.repl :as repl]))
+
+;; Tools.
+
+(defn tool
+  "A tool, checked: a map of
+    :name      what the model calls it by
+    :doc       what it does, as the model is told
+    :params    {:path {:type \"string\" :doc \"...\"} ...} (types: string, integer, number,
+               boolean, array, object; string when not said)
+    :required  the parameters a call must give (all of them when not said)
+    :fn        (fn [args]): args is the call's arguments, a map with keyword keys. What it
+               returns is the result the model reads: a string as it is, anything else as it
+               prints. Throwing is an error the model is told of.
+    :limit     characters of a result the model is given (8000 when not said)"
+  [t]
+  (when-not (and (string? (:name t)) (seq (:name t)))
+    (throw (ex-info "a tool needs a :name" {:tool t})))
+  (when-not (fn? (:fn t))
+    (throw (ex-info (str "the tool " (:name t) " needs a :fn") {:tool (:name t)})))
+  (let [params (or (:params t) {})]
+    (assoc t
+           :doc (str (:doc t))
+           :params params
+           :required (vec (or (:required t) (keys params)))
+           :limit (or (:limit t) 8000))))
+
+(defn- kind-of
+  "A parameter's JSON type from its tag (^long n, ^double x, ^boolean b), else string."
+  [param]
+  (let [tag (str (:tag (meta param)))]
+    (or (some (fn [[part kind]] (when (str/includes? tag part) kind))
+              [["long" "integer"] ["int" "integer"] ["double" "number"] ["bool" "boolean"]])
+        "string")))
+
+(defn wrap
+  "A function's var as a tool: (wrap #'read-file). Its name is the tool's, its docstring the
+  description, and its parameters the tool's parameters, by name: the function is called
+  with the call's arguments in its own order. A parameter is a string unless tagged (^long,
+  ^double, ^boolean). `opts` may give :name, :doc, :limit, :params (per parameter, a
+  description, or {:type \"integer\" :doc \"...\"} to say its type without a tag) and
+  :optional [names] (parameters a call may leave out: the function gets nil for them, so
+  they can't be tagged)."
+  ([v] (wrap v {}))
+  ([v opts]
+   (let [said (meta v)
+         names (first (:arglists said))
+         f (deref v)
+         full (str v)
+         optional (set (map keyword (:optional opts)))]
+     (when (some (fn [p] (not (symbol? p))) names)
+       (throw (ex-info (str "wrap: " full " takes something other than named parameters") {})))
+     (tool {:name (or (:name opts) (subs full (inc (str/index-of full "/"))))
+            :doc (or (:doc opts) (:doc said))
+            :limit (:limit opts)
+            :params (into {} (map (fn [p]
+                                    (let [k (keyword (str p))
+                                          about (get (:params opts) k)]
+                                      [k (cond
+                                           (map? about) (merge {:type (kind-of p)} about)
+                                           about {:type (kind-of p) :doc about}
+                                           :else {:type (kind-of p)})]))
+                                  names))
+            :required (vec (remove optional (map (fn [p] (keyword (str p))) names)))
+            :fn (fn [args] (apply f (map (fn [p] (get args (keyword (str p)))) names)))}))))
+
+(defn- declared
+  "A tool as the model is told of it."
+  [t]
+  {:type "function"
+   :name (:name t)
+   :description (:doc t)
+   :parameters {:type "object"
+                :properties (into {} (map (fn [[k p]]
+                                            [k (if (:doc p)
+                                                 {:type (get p :type "string") :description (:doc p)}
+                                                 {:type (get p :type "string")})])
+                                          (:params t)))
+                :required (mapv (fn [k] (subs (str k) 1)) (:required t))}})
+
+;; Frames.
+
+(def ^:private pieces
+  {:system "<|message_system|>" :user "<|message_user|>" :model "<|message_model|>"
+   :tool "<|message_tool|>" :text "<|content_text|>" :thinking "<|content_thinking|>"
+   :xml "<|content_xml|>" :call "<|content_invoke_tool_json|>"
+   :call-text "<|content_invoke_tool_text|>" :tool-error "<|content_tool_error|>"
+   :end "<|end_message|>" :end-turn "<|content_model_end_sampling|>"})
+
+(def efforts
+  "Thinking effort by name, as the model's publisher writes it."
+  {:none "0" :minimal "0.1" :low "0.2" :medium "0.7" :high "0.9" :max "0.99"})
+
+(defn- plain
+  "A text's tokens, none of them special: a special token's spelling in it is text."
+  [m text]
+  (vec (ink/tokenize m (str text) false)))
+
+(defn- frame
+  "A frame's tokens: who speaks, a name after it or nil, the kind of content, the content."
+  [a role named kind text]
+  (let [{:keys [model ids]} a]
+    (vec (concat [(get ids role)]
+                 (when (seq named) (plain model named))
+                 [(get ids kind)]
+                 (plain model text)
+                 [(get ids :end)]))))
+
+;; The agent a tool is running for: a tool, or code the eval tool evaluates, finds the
+;; conversation it is part of with (h/me).
+(def ^:dynamic *agent* nil)
+
+(defn me
+  "Inside a tool's call (code given to the eval tool included): the agent the call is made
+  for, as {:agent :model :session}. nil anywhere else."
+  []
+  (when *agent*
+    (let [a @*agent*]
+      {:agent *agent* :model (:model a) :session (:session a)})))
+
+(defn agent
+  "An agent on model `m`: an atom holding its session, its tools and its conversation.
+    :tools       tools (`tool`, `wrap`): none when not given
+    :system      what the model is told before anything else
+    :effort      how much it thinks: :none :minimal :low :medium :high :max (:high, the
+                 publisher's own default)
+    :context     tokens the session has room for (16384)
+    :sampling    as ink/sample takes: {:temperature :top-p :top-k :seed} (greedy)
+    :max-tokens  tokens a step may generate (4096)
+    :max-thinking tokens one stretch of thinking may take (1536): at that, the harness
+                 closes the thinking and the model goes on from what it has thought
+    :max-steps   steps a turn may take: a step is the model speaking, then its calls (24)
+    :on-entry    (fn [entry]) called with each entry as it is added to the conversation
+  The tools and the system text are evaluated now, so the first question starts from them."
+  ([m] (agent m {}))
+  ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry]}]
+   (let [tools (mapv tool tools)
+         ids (into {} (map (fn [[k piece]] [k (ink/token-id m piece)]) pieces))
+         s (ink/session m (or context 16384))
+         a {:model m :session s :ids ids
+            :tools tools
+            :effort (get efforts (or effort :high) (str effort))
+            :sampling (or sampling {})
+            :max-tokens (or max-tokens 4096)
+            :max-thinking (or max-thinking 1536)
+            :max-steps (or max-steps 24)
+            :on-entry on-entry
+            :entries [] :state :idle :live nil :stop false :turn nil
+            :generated 0 :seconds 0.0
+            ;; When the agent was made: an entry's times are seconds since then.
+            :born (cpp/harness.seconds)}
+         start (vec (concat (when (seq tools)
+                              (frame a :system "tool_declare" :xml (json/write (mapv declared tools))))
+                            (when (seq system)
+                              (frame a :system nil :text system))))]
+     (when (seq start)
+       (ink/eval! s start))
+     (atom (assoc a :effort-said false)))))
+
+(defn close!
+  "The agent's session freed. A turn in progress is stopped first."
+  [a]
+  (swap! a assoc :stop true)
+  (when-let [turn (:turn @a)]
+    (deref turn))
+  (when (ink/session? (:session @a))
+    (ink/free! (:session @a)))
+  nil)
+
+(defn- clock
+  "Seconds since the agent was made."
+  [a]
+  (let [born (:born @a)]
+    (if born (- (cpp/harness.seconds) born) 0.0)))
+
+(defn- entry!
+  "An entry added to the conversation."
+  [a entry]
+  (swap! a (fn [v] (assoc v :entries (conj (:entries v) entry) :live nil)))
+  (when-let [told (:on-entry @a)]
+    (try
+      (told entry)
+      (catch jank.runtime.object_ref _ nil)
+      (catch cpp/std.exception _ nil)))
+  entry)
+
+;; The model speaking.
+
+(defn- wrote!
+  "A frame the model finished, in the conversation as soon as it is: its thinking and its
+  words. A call's entry is added when it is run, beside its result. Returns the frame."
+  [a f]
+  (let [times {:began (:began f) :ended (:ended f)}]
+    (case (:kind f)
+      :thinking (entry! a (merge (if (:cut f)
+                                   {:role :thinking :text (:text f) :cut true}
+                                   {:role :thinking :text (:text f)})
+                                 times))
+      :text (when (seq (str/trim (:text f)))
+              (entry! a (merge {:role :model :text (:text f)} times)))
+      nil))
+  f)
+
+(defn- speak!
+  "The model's frames from where the session is, until its turn ends: a token sampled, then
+  evaluated, one at a time. Returns [frames why]: frames are {:kind :name :text} (kinds
+  :thinking :text :call :call-text :tool-error; :partial when cut short), and why is
+  :end-turn, :limit (the step's tokens ran out), :context (the session is full) or
+  :stopped."
+  [a]
+  (let [{:keys [model session ids sampling max-tokens max-thinking]} @a
+        m model
+        s session
+        max-thinking (or max-thinking 1536)
+        content {(get ids :text) :text (get ids :thinking) :thinking (get ids :call) :call
+                 (get ids :call-text) :call-text (get ids :tool-error) :tool-error}
+        opens (get ids :model)
+        closes (get ids :end)
+        ends (get ids :end-turn)
+        room (- (:context (ink/info s)) 8)
+        seed (get sampling :seed 1)
+        began (cpp/harness.seconds)
+        ;; When the frame being made was opened (seconds since the agent was made).
+        opened-at (atom nil)
+        made (fn [kind header body]
+               {:kind kind
+                :name (str/trim (ink/detokenize m header))
+                :text (ink/detokenize m body)
+                :began (or @opened-at (clock a))
+                :ended (clock a)})
+        done (fn [frames why n]
+               (swap! a (fn [v] (assoc v :live nil
+                                       :generated (+ (:generated v) n)
+                                       :seconds (+ (:seconds v) (- (cpp/harness.seconds) began)))))
+               [frames why])
+        ;; Cut short: the frame being made is kept as far as it got (:partial), and the
+        ;; session is left well formed, the frame and the turn closed, so that the
+        ;; conversation can go on.
+        cut (fn [frames why n where kind header body]
+              (when (< (+ (ink/position s) 2) (:context (ink/info s)))
+                (ink/eval! s (if (= where :between) [ends] [closes ends])))
+              (done (if (and (= where :body) (seq body))
+                      (conj frames (wrote! a (assoc (made kind header body) :partial true)))
+                      frames)
+                    why n))]
+    ;; where: :between frames, :header (after <|message_model|>: a tool's name), :body.
+    (loop [n 0 where :between kind nil header [] body [] frames []]
+      (cond
+        (:stop @a) (cut frames :stopped n where kind header body)
+        (>= n max-tokens) (cut frames :limit n where kind header body)
+        (>= (ink/position s) room) (cut frames :context n where kind header body)
+
+        ;; Thinking that goes on and on (the model can circle around a detail for a whole
+        ;; step and never act): closed here, as the model would close it, so that what comes
+        ;; next is from what it has thought so far.
+        (and (= where :body) (= kind :thinking) (>= (count body) max-thinking))
+        (do (ink/eval! s [closes])
+            (recur (inc n) :between nil [] []
+                   (conj frames (wrote! a (assoc (made :thinking [] body) :cut true)))))
+
+        :else
+        (let [id (ink/sample s (assoc sampling :seed (+ seed n)))]
+          (ink/eval! s [id])
+          (cond
+            (= id ends)
+            (done frames :end-turn (inc n))
+
+            (= id opens)
+            (recur (inc n) :header nil [] [] frames)
+
+            (contains? content id)
+            (let [kind (get content id)]
+              (reset! opened-at (clock a))
+              (swap! a assoc :state kind :live {:kind kind :name (ink/detokenize m header) :text ""})
+              (recur (inc n) :body kind header [] frames))
+
+            (= id closes)
+            (if (= where :body)
+              (recur (inc n) :between nil [] [] (conj frames (wrote! a (made kind header body))))
+              (recur (inc n) :between nil [] [] frames))
+
+            (= where :header)
+            (recur (inc n) :header nil (conj header id) [] frames)
+
+            :else
+            ;; Content; outside any frame it is taken as text.
+            (let [kind (or kind :text)
+                  body (conj body id)]
+              (when (not= where :body)
+                (reset! opened-at (clock a)))
+              (when (zero? (mod (count body) 4))
+                (swap! a assoc :live {:kind kind :name (ink/detokenize m header)
+                                      :text (ink/detokenize m body)}))
+              (recur (inc n) :body kind header body frames))))))))
+
+;; A call run.
+
+(defn- result-text
+  "What a tool returned, as the model reads it: at most `limit` characters."
+  [value limit]
+  (let [text (if (string? value) value (pr-str value))
+        n (count text)]
+    (if (<= n limit)
+      text
+      (str (subs text 0 limit) "\n[cut here: " (- n limit) " more characters]"))))
+
+(defn call!
+  "A call's frame run for agent `a`: its JSON read, its tool found and called. `called` is
+  {:name :text}, the frame's name and its JSON text. Returns the entries [call result]; the
+  result's :text is what the model is given. (The turn does this by itself; it is public
+  for tests.)"
+  [a called]
+  (let [tools (:tools @a)
+        began (cpp/harness.seconds)
+        read (try
+               {:call (json/read (:text called))}
+               (catch jank.runtime.object_ref e {:error (str "the call is not valid JSON: " (ex-message e))})
+               (catch cpp/std.exception e {:error (str "the call is not valid JSON: " (cpp/.what e))}))
+        call (:call read)
+        named (or (when (map? call) (:name call)) (:name called))
+        args (or (when (map? call) (:args call)) {})
+        found (some (fn [t] (when (= (:name t) named) t)) tools)
+        outcome (cond
+                  (:error read) {:error (:error read)}
+                  (nil? found) {:error (str "there is no tool named " (pr-str named) ". The tools are: "
+                                            (str/join ", " (map :name tools)))}
+                  (not (map? args)) {:error "the call's args must be an object"}
+                  :else
+                  (let [missing (remove (fn [k] (contains? args k)) (:required found))]
+                    (if (seq missing)
+                      {:error (str "the call lacks " (str/join ", " (map (fn [k] (subs (str k) 1)) missing)))}
+                      (try
+                        ;; On a large stack: the turn's own thread has the system's small
+                        ;; one, which a tool that recurses overflows.
+                        {:value (binding [*agent* a]
+                                  (repl/on-big-stack (fn [] ((:fn found) args))))}
+                        (catch jank.runtime.object_ref e {:error (or (ex-message e) (str e))})
+                        (catch cpp/std.exception e {:error (str (cpp/.what e))})
+                        (catch :default _ {:error "the tool threw something jank does not say"})))))
+        text (if (:error outcome)
+               (str "error: " (:error outcome))
+               (result-text (:value outcome) (or (:limit found) 8000)))]
+    [{:role :call :name (str named) :args args
+      :began (:began called) :ended (:ended called)}
+     {:role :result :name (str named) :text text :error (boolean (:error outcome))
+      :seconds (- (cpp/harness.seconds) began)
+      :began (- (clock a) (- (cpp/harness.seconds) began)) :ended (clock a)}]))
+
+;; A turn.
+
+(defn- turn!
+  "The model's turn: it speaks, its calls are run and their results given to it, and it
+  speaks again, until it ends a step without calling anything."
+  [a]
+  (loop [step 0]
+    (swap! a assoc :state :thinking)
+    (let [[frames why] (speak! a)
+          ;; (A call cut short is not run.)
+          calls (filter (fn [f] (and (contains? #{:call :call-text} (:kind f)) (not (:partial f))))
+                        frames)]
+      (cond
+        (not= why :end-turn)
+        (do (entry! a {:role :stopped :why why :began (clock a) :ended (clock a)})
+            (swap! a assoc :state why))
+
+        (empty? calls)
+        (swap! a assoc :state :done)
+
+        (>= (inc step) (:max-steps @a))
+        (do (entry! a {:role :stopped :why :steps :began (clock a) :ended (clock a)})
+            (swap! a assoc :state :steps))
+
+        :else
+        (let [full (reduce
+                    (fn [full called]
+                      (if full
+                        full
+                        (do
+                          (swap! a assoc :state :tool :live {:kind :tool :name (:name called) :text (:text called)})
+                          (let [[call result] (call! a called)
+                                s (:session @a)
+                                given (vec (frame @a :tool (:name result) :text (:text result)))]
+                            (entry! a call)
+                            (entry! a result)
+                            ;; A result the session has no room for ends the turn as a full
+                            ;; session does, not as an error.
+                            (if (>= (+ (ink/position s) (count given)) (- (:context (ink/info s)) 8))
+                              true
+                              (do (ink/eval! s given)
+                                  false))))))
+                    false
+                    calls)]
+          (if full
+            (do (entry! a {:role :stopped :why :context :began (clock a) :ended (clock a)})
+                (swap! a assoc :state :context))
+            (recur (inc step))))))))
+
+(defn- failed!
+  "A turn that threw: said in the conversation, the agent left idle."
+  [a what]
+  (entry! a {:role :stopped :why :error :text (str what) :began (clock a) :ended (clock a)})
+  (swap! a assoc :state :error))
+
+(defn ask!
+  "A person's message added to the conversation and the model's turn started, on a thread of
+  its own: this returns at once. The agent's atom changes as the turn goes (:state, :live,
+  :entries); `answer` waits for its end. Throws when a turn is still going."
+  [a text]
+  (let [v @a]
+    (when (and (:turn v) (not (realized? (:turn v))))
+      (throw (ex-info "the agent's turn is still going: (h/answer a) waits for it, (h/stop! a) stops it" {})))
+    (swap! a assoc :stop false :state :reading)
+    (entry! a {:role :user :text (str text) :began (clock a) :ended (clock a)})
+    (let [turn (future
+                 (try
+                   (let [v @a
+                         said (vec (concat (when-not (:effort-said v)
+                                             (frame v :system nil :text
+                                                    (str "Thinking effort level: " (:effort v))))
+                                           (frame v :user nil :text text)))]
+                     (ink/eval! (:session v) said)
+                     (swap! a assoc :effort-said true)
+                     (turn! a))
+                   (catch jank.runtime.object_ref e (failed! a (or (ex-message e) (str e))))
+                   (catch cpp/std.exception e (failed! a (str (cpp/.what e))))
+                   (catch :default _ (failed! a "something jank does not say"))))]
+      (swap! a assoc :turn turn)
+      nil)))
+
+(defn answer
+  "Waits for the turn in progress, then gives what the model last said (nil when it said
+  nothing: see (:state @a) and (:entries @a))."
+  [a]
+  (when-let [turn (:turn @a)]
+    (deref turn))
+  (:text (last (filter (fn [e] (= (:role e) :model)) (:entries @a)))))
+
+(defn stop!
+  "The turn in progress stopped after the token being made. The conversation stays as it
+  is, and can be continued with `ask!`."
+  [a]
+  (swap! a assoc :stop true)
+  (when-let [turn (:turn @a)]
+    (deref turn))
+  (:state @a))
+
+(defn entries
+  "The conversation: a vector of entries, each a map with :role, and with :began and :ended,
+  seconds since the agent was made (for what the model wrote, the writing; for a result,
+  the tool's run).
+    {:role :user :text}       a person's message
+    {:role :thinking :text}   the model thinking (:cut when the harness closed it)
+    {:role :model :text}      the model's words
+    {:role :call :name :args} a tool called, its arguments decoded
+    {:role :result :name :text :error :seconds}  what the tool gave, as the model read it
+    {:role :stopped :why}     a turn cut short: :limit :context :steps :stopped :error"
+  [a]
+  (:entries @a))
+
+(defn recording
+  "The agent's conversation as plain data: {:entries :tools :effort :state :generated
+  :seconds}. It can be kept in a file (`save!`) and looked at again without the model
+  (harness.cards/replay!)."
+  [a]
+  (let [v @a]
+    {:entries (:entries v)
+     :tools (mapv :name (:tools v))
+     :effort (:effort v)
+     :state (:state v)
+     :generated (:generated v)
+     :seconds (:seconds v)}))
+
+(defn save!
+  "The agent's conversation written to a file, as `recording` gives it. Returns the path."
+  [a path]
+  (cpp/harness.write_file (str path) (pr-str (recording a)))
+  (str path))
+
+(defn load-recording
+  "A conversation read from a file `save!` wrote."
+  [path]
+  (read-string (slurp (str path))))
+
+(defn status
+  "Where the agent is: {:state :position :context :generated :seconds :tokens-per-second}."
+  [a]
+  (let [v @a
+        s (:session v)
+        info (when (ink/session? s) (ink/info s))]
+    {:state (:state v)
+     :position (:position info)
+     :context (:context info)
+     :generated (:generated v)
+     :seconds (:seconds v)
+     :tokens-per-second (if (pos? (:seconds v)) (/ (:generated v) (:seconds v)) 0.0)}))

@@ -1,0 +1,213 @@
+;; SPDX-License-Identifier: MIT
+;; The default tools: ordinary functions, each wrapped as a tool (harness.core/wrap). A call's
+;; arguments reach them as plain values: the text of a file to write is the text itself.
+;;
+;; `evaluate` is the one that reaches everything: it runs code in this process's own nREPL,
+;; as an evaluation from an editor would be, so the code sees the engine, the session it is
+;; being asked from (harness.core/me), and this harness.
+;;
+;; None of these is confined to a directory, and nothing is asked before they act.
+(ns harness.tools
+  (:require [clojure.string :as str]
+            [harness.core :as h]
+            ;; The process's eval operation, on a large stack and safe for evaluations at the
+            ;; same time (the window library's, which needs no window for it).
+            [cards.repl]
+            [jank.nrepl.server.handler :as handler]))
+
+(defn- plain
+  "A text without the colours it was printed with (escape sequences)."
+  [text]
+  (str/replace (str text) (re-pattern (str (char 27) "\\[[0-9;]*m")) ""))
+
+(defn- cause
+  "What an evaluation's error says: its cause without the trace, or its lines without the
+  rule above them and the link below."
+  [said]
+  (let [said (plain said)
+        at (str/index-of said ":cause \"")]
+    (if at
+      (let [from (+ at 8)
+            to (str/index-of said "\"\n" from)]
+        (if to (subs said from to) (subs said from)))
+      (let [lines (remove (fn [line]
+                            (or (str/blank? line)
+                                (str/starts-with? line "─")
+                                (str/starts-with? line "https://book.jank-lang.org")))
+                          (str/split-lines said))
+            lines (map (fn [line] (if (str/starts-with? line "error: ") (subs line 7) line)) lines)]
+        (str/join "\n" lines)))))
+
+;; The namespace the model's code is evaluated in.
+(defonce evaluation-ns (atom "user"))
+
+(defn evaluate
+  "Evaluates jank code (a Clojure dialect) in the running process and returns what it
+  printed and its value. Several forms may be given: the value is the last one's.
+  Definitions stay for later calls. clojure.core is there; inkling.core is the engine this
+  model runs on, and (harness.core/me) gives this conversation's {:model :session :agent}."
+  [code]
+  (let [answer (handler/handle-message {"op" "eval" "code" (str code) "ns" @evaluation-ns})
+        parts (if (map? answer) [answer] (remove nil? answer))
+        out (apply str (keep :out parts))
+        failed (some :ex parts)
+        value (some :value parts)
+        ;; What was written to stderr, apart from the error itself (the nREPL sends that
+        ;; there too): a C++ compiler's messages are only there.
+        err (apply str (remove (fn [text] (= text failed)) (keep :err parts)))
+        ended (fn [text] (str (plain text) (when-not (str/ends-with? text "\n") "\n")))]
+    (str (when (seq out) (ended out))
+         (when (seq (str/trim err)) (ended err))
+         (if failed
+           (str "error: " (cause failed))
+           (str "=> " value)))))
+
+(defn functions
+  "Lists what a namespace of the running process defines: a line a name, with the start of
+  its documentation. The engine this model runs on is the namespace inkling.core; this
+  harness is harness.core."
+  [namespace]
+  (let [found (find-ns (symbol (str namespace)))]
+    (when-not found
+      (throw (ex-info (str "there is no namespace " namespace " (loaded ones include inkling.core, "
+                           "harness.core, harness.tools, clojure.core, clojure.string)") {})))
+    (str/join "\n"
+              (map (fn [[sym v]]
+                     (let [said (:doc (meta v))]
+                       (str sym (when said (str "  -  " (first (str/split-lines said)))))))
+                   (sort-by (fn [[sym _]] (str sym)) (ns-publics found))))))
+
+(defn describe
+  "Describes one thing a namespace defines, by its full name (like inkling.core/routing):
+  its parameters and its documentation."
+  [name]
+  (let [sym (symbol (str name))
+        v (when (namespace sym)
+            (when-let [found (find-ns (symbol (namespace sym)))]
+              (get (ns-publics found) (symbol (clojure.core/name sym)))))]
+    (when-not v
+      (throw (ex-info (str "nothing is defined as " name ": give the full name, like inkling.core/routing") {})))
+    (let [said (meta v)]
+      (str name
+           (when (:arglists said) (str "\nparameters: " (str/join " or " (map pr-str (:arglists said)))))
+           "\n" (or (:doc said) "(no documentation)")))))
+
+(defn read-file
+  "Reads a text file and returns its contents. With from and lines, only that many lines
+  starting at line `from` (the first line is 1), each with its number."
+  [path from lines]
+  (when-not (cpp/harness.is_file (str path))
+    (throw (ex-info (str "there is no file " path) {})))
+  (let [text (slurp (str path))]
+    (if (or from lines)
+      (let [from (max 1 (or from 1))
+            all (str/split-lines text)
+            wanted (take (or lines 200) (drop (dec from) all))]
+        (str (str/join "\n" (map-indexed (fn [i line] (str (+ from i) "\t" line)) wanted))
+             "\n[lines " from " to " (+ from (count wanted) -1) " of " (count all) "]"))
+      text)))
+
+(defn write-file
+  "Writes text to a file, replacing what it had; the directories its path needs are made."
+  [path content]
+  (cpp/harness.make_parents (str path))
+  (cpp/harness.write_file (str path) (str content))
+  (str "wrote " (count (str content)) " bytes to " path))
+
+(defn- occurrences [text part]
+  (loop [n 0 from 0]
+    (let [at (str/index-of text part from)]
+      (if at
+        (recur (inc n) (+ at (count part)))
+        n))))
+
+(defn edit-file
+  "Replaces one piece of a text file: `old` must be in the file exactly once, as it is
+  written there (its line breaks and spaces included)."
+  [path old new]
+  (when-not (cpp/harness.is_file (str path))
+    (throw (ex-info (str "there is no file " path) {})))
+  (let [text (slurp (str path))
+        found (occurrences text (str old))]
+    (when (zero? found)
+      (throw (ex-info "old is not in the file as it is written there" {})))
+    (when (> found 1)
+      (throw (ex-info (str "old is in the file " found " times: give more of what is around it") {})))
+    (let [at (str/index-of text (str old))]
+      (cpp/harness.write_file (str path) (str (subs text 0 at) new (subs text (+ at (count (str old))))))
+      (str "edited " path))))
+
+(defn list-dir
+  "Lists a directory: a line an entry, directories ending in /, files with their sizes."
+  [path]
+  (let [entries (cpp/harness.list_dir (str path))]
+    (if (empty? entries)
+      "(empty)"
+      (str/join "\n" (map (fn [e] (if (:dir e) (str (:name e) "/") (str (:name e) "\t" (:bytes e) " bytes")))
+                          entries)))))
+
+(defn shell
+  "Runs a command with the shell (sh -c) and returns its output, its error output included,
+  and its exit code when that is not 0. The command has `timeout` seconds (120 when not
+  given): at that it is killed, with what it started. To leave something running, start it
+  in the background with its output sent to a file (python3 server.py > server.log 2>&1 &):
+  the command then ends at once and the server stays."
+  [command timeout]
+  (let [ran (cpp/harness.run (str command) 200000 (double (or timeout 120)))]
+    (str (:out ran)
+         (when (> (:bytes ran) (count (:out ran)))
+           (str "\n[output cut: " (:bytes ran) " bytes in all]"))
+         (when (:timed-out ran)
+           (str "\n[killed: it did not end in " (or timeout 120) " seconds]"))
+         (when (and (not (:timed-out ran)) (not (zero? (:exit ran))))
+           (str "\n[exit " (:exit ran) "]")))))
+
+(def situation
+  "What an agent with the default tools can be told first (its :system): where it is, and
+  when to look things up."
+  (str "You are running inside a jank process (jank is a Clojure dialect compiled to native "
+       "code), on the inkling inference engine, which is loaded in this same process. "
+       "Use the tools when a request needs them, and answer directly when it does not: "
+       "do not explore before a simple request. "
+       "The eval tool evaluates jank code here: definitions stay, and the code can call "
+       "anything the process has loaded. (harness.core/me) returns this conversation's "
+       "{:model :session :agent}: the model is the one you are running on and the session "
+       "holds this conversation's tokens. The engine's functions are in the namespace "
+       "inkling.core: the functions tool lists a namespace and the describe tool documents "
+       "one function. When a question is about this process, the engine or the model "
+       "itself, look it up instead of guessing. "
+       "jank is not the Clojure of the JVM: the file JANK.md, in the directory this process "
+       "runs in, says what differs and how C++ is called. Read it before writing code that "
+       "goes beyond plain Clojure functions."))
+
+(defn defaults
+  "The default tools, a vector to give an agent (or to pick from: each is a map with
+  :name). eval runs code in this process; the others are the usual ones for files and
+  commands."
+  []
+  [(h/wrap #'evaluate {:name "eval"
+                       :params {:code "the code to evaluate"}
+                       :limit 12000})
+   (h/wrap #'functions {:params {:namespace "the namespace's name, like inkling.core"}
+                        :limit 12000})
+   (h/wrap #'describe {:params {:name "the full name, like inkling.core/routing"}})
+   (h/wrap #'read-file {:name "read_file"
+                        :params {:path "the file's path"
+                                 :from {:type "integer" :doc "the first line wanted (optional)"}
+                                 :lines {:type "integer"
+                                         :doc "how many lines (optional: 200 when only from is given)"}}
+                        :optional [:from :lines]
+                        :limit 24000})
+   (h/wrap #'write-file {:name "write_file"
+                         :params {:path "the file's path" :content "the file's whole text"}})
+   (h/wrap #'edit-file {:name "edit_file"
+                        :params {:path "the file's path"
+                                 :old "the text to replace, exactly as in the file"
+                                 :new "the text to put in its place"}})
+   (h/wrap #'list-dir {:name "list_dir" :params {:path "the directory's path"}})
+   (h/wrap #'shell {:name "shell"
+                    :params {:command "the command line"
+                             :timeout {:type "number"
+                                       :doc "seconds it may take (optional: 120)"}}
+                    :optional [:timeout]
+                    :limit 12000})])

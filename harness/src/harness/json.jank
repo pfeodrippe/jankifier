@@ -1,0 +1,37 @@
+;; SPDX-License-Identifier: MIT
+;; JSON, as much as a tool call needs: read into jank values, written from them.
+(ns harness.json
+  (:refer-clojure :exclude [read])
+  (:require [clojure.string :as str]))
+
+(cpp/raw "#include <harness/native.hpp>")
+
+(defn read
+  "A JSON text as a value: objects are maps with keyword keys, arrays vectors, null nil.
+  Throws (ex-info) saying where the text is not JSON."
+  [text]
+  (cpp/harness.json_read (str text)))
+
+(defn- quoted [text]
+  (cpp/harness.json_quote (str text)))
+
+(defn- key-name [k]
+  (if (keyword? k) (subs (str k) 1) (str k)))
+
+(defn write
+  "A value as JSON on one line, an object's keys sorted: maps, vectors and other sequences,
+  strings, keywords (as their names), numbers, booleans and nil."
+  [v]
+  (cond
+    (nil? v) (str "null")
+    (true? v) (str "true")
+    (false? v) (str "false")
+    (string? v) (quoted v)
+    (keyword? v) (quoted (key-name v))
+    (number? v) (str v)
+    (map? v) (str "{"
+                  (str/join "," (map (fn [[k x]] (str (quoted k) ":" (write x)))
+                                     (sort-by first (map (fn [[k x]] [(key-name k) x]) v))))
+                  "}")
+    (or (sequential? v) (set? v)) (str "[" (str/join "," (map write v)) "]")
+    :else (quoted (str v))))
