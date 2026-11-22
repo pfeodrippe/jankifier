@@ -217,12 +217,14 @@
                         :h (let [lines (flow [{:text (:text b) :style :bold}] width)]
                              {:h (+ (* line-prose (count lines)) 8)
                               :draw (fn [x y] (draw-flow lines x (+ y 2) color))})
-                        :li (let [indent (+ 18 (* 16 (:depth b)))
-                                  lines (flow (inline (:text b)) (- width indent))
-                                  mark (:mark b)]
+                        ;; The mark ("•", "12.") with a space after it, however wide it is.
+                        :li (let [mark (:mark b)
+                                  left (+ 4 (* 16 (:depth b)))
+                                  indent (+ left (max 14 (+ (c/text-width prose mark) (c/text-width prose " "))))
+                                  lines (flow (inline (:text b)) (- width indent))]
                               {:h (+ (* line-prose (max 1 (count lines))) 2)
                                :draw (fn [x y]
-                                       (c/text! (+ x indent -16) y c/muted prose mark)
+                                       (c/text! (+ x left) y c/muted prose mark)
                                        (draw-flow lines (+ x indent) y color))})
                         :code (let [lines (vec (mapcat (fn [line] (c/wrap c/mono (- width 20) line 6)) (:lines b)))
                                     lines (if (empty? lines) [(str "")] lines)]
