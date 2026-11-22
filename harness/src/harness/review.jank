@@ -1,0 +1,165 @@
+;; SPDX-License-Identifier: MIT
+;; What went wrong across many recorded runs (harness.core/save!, harness.trials), sorted
+;; into kinds, to decide what in the harness or its tools is worth fixing. Each occurrence
+;; says its run and entry, and `look!` opens the run in the window at that entry.
+;;
+;;   (require '[harness.review :as review])
+;;   (println (review/report "../trials-out"))     ; the kinds, how often, an example of each
+;;   (review/issues "../trials-out")               ; every occurrence, as data
+;;   (review/look! "../trials-out/lru-plain-1.edn" 35)
+;;
+;; The kinds are found mechanically, from the entries: tool errors by what they say, calls
+;; repeated as they were, how long a run looked around before writing anything, thinking the
+;; harness cut, turns stopped short, checks of the gate that failed, and files read outside
+;; the run's folder. Reading the run around an example is still what says whether a kind is
+;; a problem of the harness, of the task, or of the model.
+(ns harness.review
+  (:require [clojure.string :as str]
+            [harness.core :as h]
+            [harness.cards :as hc]))
+
+;; Runs.
+
+(defn runs
+  "The recordings in a directory (files ending in .edn other than results.edn): [path ...]."
+  [dir]
+  (vec (sort (keep (fn [e]
+                     (let [n (:name e)]
+                       (when (and (not (:dir e)) (str/ends-with? n ".edn") (not= n "results.edn"))
+                         (str dir "/" n))))
+                   (cpp/harness.list_dir (str dir))))))
+
+;; Kinds of occurrence.
+
+(defn- first-line [text]
+  (let [line (first (str/split-lines (str text)))]
+    (if (> (count line) 140) (str (subs line 0 137) "...") (str line))))
+
+(defn- result-kind
+  "What a tool's result says went wrong: [kind detail], or nil. The harness's own errors (a
+  call it couldn't make) are marked as errors; a tool's are in what it said: an eval's
+  error line, a command's exit code."
+  [call result]
+  (let [text (str (:text result))
+        tool (:name result)
+        said (str tool ": " (first-line text))
+        error-line (first (filter (fn [l] (str/starts-with? l "error")) (str/split-lines text)))]
+    (cond
+      (:error result)
+      (cond
+        (str/includes? text "the call lacks") [:missing-argument said]
+        (str/includes? text "there is no tool named") [:unknown-tool said]
+        (str/includes? text "the call is not valid JSON") [:bad-json-call said]
+        :else [:tool-error said])
+
+      (and (contains? #{"eval" "load_file"} tool) error-line)
+      (let [line (str tool ": " (first-line error-line))]
+        (cond
+          (str/includes? error-line "doesn't read") [:unreadable-code line]
+          (str/includes? error-line "Unexpected closing") [:unreadable-code line]
+          (str/includes? error-line "could not be resolved") [:unresolved-symbol line]
+          (str/includes? error-line "Unable to find") [:unresolved-symbol line]
+          :else [:eval-error line]))
+
+      (and (= tool "shell") (str/includes? text "[killed: it did not end"))
+      [:timed-out (str "shell: " (first-line (:command (:args call))))]
+
+      (and (= tool "shell") (re-find #"\[exit \d+\]\s*$" text))
+      [:shell-exit (str (re-find #"\[exit \d+\]" text) " " (first-line (:command (:args call))))]
+
+      :else nil)))
+
+(defn- note-kind
+  "What a result's note says (a misnamed argument taken): [kind detail], or nil."
+  [result]
+  (let [text (str (:text result))]
+    (when (str/starts-with? text "(the call's ")
+      [:renamed-argument (str (:name result) ": " (first-line text))])))
+
+(def ^:private own-files
+  "Files a run may read without that saying anything: what it is told to read."
+  #{"JANK.md" "VERIFY.md" "examples/parking.jank"})
+
+(defn- outside-read
+  "A file a call reads outside the run's folder: the path, or nil."
+  [call]
+  (let [args (:args call)]
+    (case (:name call)
+      "read_file" (let [p (str (:path args))]
+                    (when-not (or (str/starts-with? p "work/") (contains? own-files p)) p))
+      "load_file" nil
+      "shell" (let [c (str (:command args))
+                    ;; A path a reading command names: cat, sed, head, tail, grep, less.
+                    hit (re-find #"(?:cat|sed -n [^ ]+|head|tail|grep [^/]*|less)\s+([~./A-Za-z][^ ;|&]*/[^ ;|&]+)" c)]
+                (when hit
+                  (let [p (second hit)]
+                    (when-not (or (str/starts-with? p "work/") (contains? own-files p)) p))))
+      nil)))
+
+(defn- occurrences
+  "Everything worth looking at in one run: [{:run :entry :kind :detail}]."
+  [path]
+  (let [r (h/load-recording path)
+        es (vec (:entries r))
+        n (count es)
+        at (fn [i kind detail] {:run path :entry i :kind kind :detail (str detail)})
+        first-write (first (keep-indexed (fn [i e] (when (and (= :call (:role e)) (contains? #{"write_file" "edit_file"} (:name e))) i)) es))
+        before (if first-write (subvec es 0 first-write) es)
+        looked (count (filter (fn [e] (and (= :call (:role e)) (contains? #{"read_file" "shell" "list_dir" "functions" "describe"} (:name e)))) before))]
+    (vec
+     (concat
+      (keep-indexed
+       (fn [i e]
+         (case (:role e)
+           :result (let [call (when (pos? i) (nth es (dec i)))]
+                     (or (when-let [[k d] (result-kind call e)] (at i k d))
+                         (when-let [[k d] (note-kind e)] (at i k d))))
+           :thinking (when (:cut e) (at i :thinking-cut (first-line (:text e))))
+           :stopped (at i (keyword (str "stopped-" (name (:why e)))) (first-line (:text e)))
+           :check (when-not (:passed e) (at i :gate-failed (first-line (second (str/split-lines (str (:text e)))))))
+           :call (when-let [p (outside-read e)] (at i :read-outside p))
+           nil))
+       es)
+      ;; The same call made again, as it was.
+      (loop [i 0 seen #{} out []]
+        (if (>= i n)
+          out
+          (let [e (nth es i)
+                k (when (= :call (:role e)) [(:name e) (:args e)])]
+            (cond
+              (nil? k) (recur (inc i) seen out)
+              (contains? seen k) (recur (inc i) seen (conj out (at i :repeated-call (str (:name e) " " (first-line (pr-str (:args e)))))))
+              :else (recur (inc i) (conj seen k) out)))))
+      ;; Looking around before writing anything.
+      (when (>= looked 8)
+        [(at (or first-write (dec n)) :long-look-before-writing
+             (str looked " reading calls before " (if first-write "the first write" "any write")))])))))
+
+(defn issues
+  "Every occurrence in the recordings of `dir`, or in the paths given."
+  [dir-or-paths]
+  (vec (mapcat occurrences (if (string? dir-or-paths) (runs dir-or-paths) dir-or-paths))))
+
+(defn report
+  "The occurrences by kind, the most frequent first: how many, in how many runs, and an
+  example (run and entry) for each, as text."
+  [dir-or-paths]
+  (let [all (issues dir-or-paths)
+        kinds (sort-by (fn [[_ os]] (- (count os))) (group-by :kind all))]
+    (if (empty? all)
+      "nothing found"
+      (str/join "\n"
+                (for [[kind os] kinds
+                      :let [ex (first os)
+                            nruns (count (distinct (map :run os)))]]
+                  (str (name kind) ": " (count os) " in " nruns " run" (when (> nruns 1) "s")
+                       "; e.g. " (last (str/split (:run ex) #"/")) " entry " (:entry ex) ": " (:detail ex)))))))
+
+(defn look!
+  "A recorded run opened in the window at entry `i`: replayed, stopped where that entry is
+  whole, with it at the top and its parts open."
+  [path i]
+  (let [named (str/replace (last (str/split (str path) #"/")) ".edn" "")]
+    (hc/replay! path named)
+    (hc/to-entry! named i)
+    nil))

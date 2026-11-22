@@ -357,6 +357,25 @@ its reach. The graders themselves (`src/harness/trials.jank`) are loaded
 before the model runs, so they can't be hidden; they say what the tasks
 require, not how.
 
+## What went wrong, across runs
+
+`harness.review` reads a folder of recordings (from outside the sandbox: the
+trial's process can't read `../trials-out`) and sorts what happened into kinds,
+to decide what is worth fixing: tool errors by what they say (a missing or
+misnamed argument, code that doesn't read, an unresolved symbol, a shell's
+exit code, a timeout), calls repeated as they were, long looking around before
+writing anything, thinking the harness cut, turns stopped short, failed checks
+of the gate, and files read outside the run's folder.
+
+```clojure
+(require '[harness.review :as review])
+(println (review/report "../trials-out"))   ; each kind: how often, in how many runs, an example
+(review/look! "../trials-out/lru-plain-1.edn" 35)   ; that run in the window, at entry 35
+```
+
+Reading the run around an example is still what says whether a kind is a
+problem of the harness, of the task or of the model.
+
 ## Two problems of jank's REPL this needed fixed
 
 Both are fixed in the window library (`cards.repl`, loaded here), for every
@@ -382,7 +401,8 @@ evaluation of the process, a person's included:
 | `src/harness/bench.jank` | the bench |
 | `src/harness/observe.jank` | assertions a program makes about itself |
 | `src/harness/verify.jank` | code checked against its Veil model; the `verify` tool and the gate |
-| `src/harness/trials.jank` | trials of tasks with and without the gate, graded by references |
+| `src/harness/trials.jank` | trials of tasks with and without the gate, graded by references (kept in `../harness-graders`) |
+| `src/harness/review.jank` | what went wrong across recorded runs, by kind |
 | `VERIFY.md`, `examples/parking.jank` | what the model is told of verified work, and its example |
 | `src/harness/main.jank` | the process: the window's REPL, or the bench |
 | `JANK.md` | notes on jank for the model: what differs from Clojure, calling C++ |

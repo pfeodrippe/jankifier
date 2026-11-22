@@ -372,7 +372,10 @@
                                   (mono-lines (str (subs (str k) 1) ": " (if (string? v) v (pr-str v))) (- width 40) 200))
                                 (dissoc args mk)))
         said (part (vec (concat main-lines rest-lines)) (contains? opened :args) writing)
-        failed (boolean (and result (or (:error result) (str/starts-with? (str (:text result)) "error:"))))
+        ;; Failed: the harness said so, or what the tool gave has an error line (an eval
+        ;; that printed first).
+        failed (boolean (and result (or (:error result)
+                                        (some (fn [l] (str/starts-with? l "error")) (str/split-lines (str (:text result)))))))
         out (when result (part (mono-lines (:text result) (- width 40) longest) (contains? opened :out) false))
         out-h (cond writing 0 out (max line-small (:h out)) :else line-small)
         note (if result (str (if failed "error  " "") (seconds-said (:seconds result))) (str ""))
@@ -1128,6 +1131,26 @@
         a (:agent (some (fn [w] (when (= (:name w) named) w)) @watched))
         total (if a (:total (schedule-of named (:entries @a))) 0.0)]
     (to-time! named (* total (max 0.0 (min 1.0 share))) false)
+    nil))
+
+(defn to-entry!
+  "The conversation `named` chosen and shown up to its entry `i` (its place in the
+  entries), whole, with that entry at the top of the part shown and its parts opened;
+  stopped there. A tool's call is shown with what it gave."
+  [named i]
+  (let [named (str named)
+        a (conversation named)
+        entries (:entries @a)
+        n (long (count entries))
+        sched (schedule-of named entries)
+        i (max 0 (min (dec n) (long i)))
+        ;; A result is shown with its call.
+        item (if (and (pos? i) (= :result (:role (nth entries i)))) (dec i) i)
+        through (if (and (= :call (:role (nth entries item))) (< (inc item) n)) (inc item) item)]
+    (choose! named)
+    (swap! unfolded assoc [named item] #{:text :args :out})
+    (to-time! named (:to (nth (:spans sched) through)) false)
+    (swap! pending assoc named item)
     nil))
 
 (defn follow!
