@@ -61,6 +61,10 @@ namespace cards
     /* A recording's frames: drawn into a framebuffer of its own, the size asked, whatever the
      * display gave the window (a laptop's is shorter than 1080 points, and doubles pixels). */
     int frame_width{}, frame_height{};
+    /* Pixels a point in a hidden window or a recording (2: as a Retina screen draws), and
+     * whether glyphs are put on whole pixels. Set before `open`. */
+    float frame_scale{ 1.0f };
+    bool font_snap{};
     unsigned target{}, target_color{};
     std::chrono::steady_clock::time_point recording_start;
     std::chrono::steady_clock::time_point frame_next;
@@ -131,7 +135,8 @@ namespace cards
     /* A hidden window and a recording are drawn at one pixel a point, into a framebuffer of
      * their own. */
     bool const offscreen(jank::runtime::truthy(hidden) || !path.empty());
-    auto const scale(offscreen || window_width <= 0 ? 1.0f : static_cast<float>(frame_width) / static_cast<float>(window_width));
+    auto const scale(offscreen ? s.frame_scale
+                               : (window_width <= 0 ? 1.0f : static_cast<float>(frame_width) / static_cast<float>(window_width)));
     char const *mono("/System/Library/Fonts/Menlo.ttc");
     char const *serif("/System/Library/Fonts/Supplemental/Georgia.ttf");
     for(int i{}; i < 6; ++i)
@@ -142,6 +147,7 @@ namespace cards
        * ones a little darker. */
       config.FontNo = i == 5 ? 1 : 0;
       config.RasterizerMultiply = is_mono ? 1.25f : 1.0f;
+      config.PixelSnapH = s.font_snap;
       s.fonts[i] = io.Fonts->AddFontFromFileTTF(is_mono ? mono : serif, s.sizes[i] * scale, &config);
       if(!s.fonts[i])
       {
@@ -153,8 +159,8 @@ namespace cards
     ImGui_ImplOpenGL2_Init();
     if(offscreen)
     {
-      s.frame_width = static_cast<int>(num(width));
-      s.frame_height = static_cast<int>(num(height));
+      s.frame_width = static_cast<int>(num(width) * s.frame_scale);
+      s.frame_height = static_cast<int>(num(height) * s.frame_scale);
       glGenTextures(1, &s.target_color);
       glBindTexture(GL_TEXTURE_2D, s.target_color);
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, s.frame_width, s.frame_height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
@@ -178,6 +184,15 @@ namespace cards
       s.recording = popen(command, "w");
     }
     return true;
+  }
+
+  /* How a hidden window or a recording is drawn: `scale` pixels a point, glyphs on whole
+   * pixels or not. Before `open`. */
+  inline void set_rendering(obj const scale, obj const snap)
+  {
+    auto &s(get());
+    s.frame_scale = static_cast<float>(num(scale));
+    s.font_snap = jank::runtime::truthy(snap);
   }
 
   inline bool alive()
@@ -220,8 +235,9 @@ namespace cards
     ImGui_ImplGlfw_NewFrame();
     if(s.target)
     {
-      ImGui::GetIO().DisplaySize = ImVec2(static_cast<float>(s.frame_width), static_cast<float>(s.frame_height));
-      ImGui::GetIO().DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+      ImGui::GetIO().DisplaySize = ImVec2(static_cast<float>(s.frame_width) / s.frame_scale,
+                                          static_cast<float>(s.frame_height) / s.frame_scale);
+      ImGui::GetIO().DisplayFramebufferScale = ImVec2(s.frame_scale, s.frame_scale);
     }
     /* A window behind another one (the editor just typed in) is told when the wheel turns
      * over it, but not where the mouse is: asked here, so that what is under it answers. */
@@ -276,6 +292,19 @@ namespace cards
       s.pointer_events.clear();
     }
     ImGui::NewFrame();
+    /* ImGui 1.92 rasterizes glyphs at the screen's density (2 on a Retina screen) only for
+     * the font it calls current; every other font stays at 1, its glyphs drawn at half the
+     * screen's pixels and stretched: blurred. All of ours drawn at the screen's density. */
+    {
+      auto const density(ImGui::GetMainViewport()->FramebufferScale.x);
+      for(auto *const font : s.fonts)
+      {
+        if(font && density > 0.0f)
+        {
+          font->CurrentRasterizerDensity = density;
+        }
+      }
+    }
     /* One window over everything, nothing of its own drawn: the primitives' canvas. */
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);

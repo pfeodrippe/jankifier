@@ -12,6 +12,7 @@ that isn't about determinismo, with ways for a project to add its own cards.
 
 ```sh
 ./cards.sh                                  # the window; its nREPL port in .nrepl-port
+./cards.sh --hidden --scale 2               # drawn as a Retina screen draws (for pictures, videos)
 ./cards.sh --hidden --record take.mp4       # no window: its frames to a video
 ```
 

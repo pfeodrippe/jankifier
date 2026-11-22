@@ -22,13 +22,16 @@
 
 (defn options
   "The command line's: --hidden, --record <video>, --width <points>, --height <points>,
+  --scale <pixels a point> and --snap (how a hidden window or a recording is drawn),
   --announce (each evaluation said on stderr, for a script driving the REPL)."
   [args]
   {:hidden (boolean (some (fn [arg] (= arg "--hidden")) args))
    :announce (boolean (some (fn [arg] (= arg "--announce")) args))
    :record (after "--record" args)
    :width (when-let [w (after "--width" args)] (parse-long w))
-   :height (when-let [h (after "--height" args)] (parse-long h))})
+   :height (when-let [h (after "--height" args)] (parse-long h))
+   :scale (when-let [s (after "--scale" args)] (parse-double s))
+   :snap (boolean (some (fn [arg] (= arg "--snap")) args))})
 
 (defonce ^:private quiet (atom #{}))
 

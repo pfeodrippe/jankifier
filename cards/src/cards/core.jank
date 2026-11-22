@@ -948,8 +948,11 @@
 
 (defn open!
   "The window. :hidden draws without showing it (for `snapshot!`), :record is a video's path
-  (needs ffmpeg), :title its name, :announce says each evaluation on stderr (`announce!`)."
-  [{:keys [width height hidden record title announce]}]
+  (needs ffmpeg), :title its name, :announce says each evaluation on stderr (`announce!`),
+  :scale the pixels a point of a hidden window or a recording (2: as a Retina screen),
+  :snap glyphs put on whole pixels."
+  [{:keys [width height hidden record title announce scale snap]}]
+  (cpp/cards.set_rendering (or scale 1.0) (boolean snap))
   (when title
     (swap! state assoc :title title))
   (when announce
