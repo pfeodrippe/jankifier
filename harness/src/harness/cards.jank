@@ -1,0 +1,828 @@
+;; SPDX-License-Identifier: MIT
+;; Agents in the window (cards.core): above the cards, a line for each conversation watched,
+;; and the one chosen written out as a conversation: the person's messages, the model's
+;; thinking folded, each tool's call folded with its result, and what the model said, with
+;; its headings, lists, tables, code and bold drawn. Clicking a conversation's line chooses
+;; it; clicking a folded entry opens it. The wheel looks back; without it the end is followed.
+;;
+;; Under the conversation is its timeline: a mark for each entry, where the conversation is
+;; shown up to, the time since it began and what was going on then. While a turn runs the
+;; end is followed as it is written (a click at the line's end, or play reaching it, follows
+;; it again). A click on the timeline goes to that moment; play goes on from there at
+;; the pace things were written (or 2, 4, 8 times it), with the waits (a tool running, a
+;; result being read) shown short and marked. A conversation kept in a file
+;; (harness.core/save!) is played the same way, without the model: `replay!`.
+;;
+;;   (def a (hc/watch! (h/agent m {:tools (tools/defaults)}) "a question"))
+;;   (h/ask! a "...")
+;;
+;; What the agent evaluates (the eval tool) is a card below like any evaluation.
+(ns harness.cards
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [cards.main :as window]
+            [harness.core :as h]
+            [harness.json :as json]))
+
+;; What is watched and how it is looked at.
+(defonce ^:private watched (atom []))       ; [{:name :agent}], in the order they were watched
+(defonce ^:private chosen (atom nil))       ; the name of the conversation written out
+(defonce ^:private opened (atom #{}))       ; [name index]: the entries opened
+(defonce ^:private back (atom {}))          ; name -> points looked back from the end
+(defonce ^:private built (atom {}))         ; [name index] -> {:entry :width :open :item}
+(defonce ^:private frame-panel (atom nil))  ; {:frame :width :panel}: once a frame
+(defonce ^:private drawn (atom nil))        ; where the last frame drew the panel's parts
+(defonce ^:private plays (atom {}))         ; name -> {:mode :live|:paused|:playing :t :at :speed}
+(defonce ^:private scheduled (atom {}))     ; name -> {:entries :schedule}
+
+;; Sizes, in points.
+(def ^:private line-prose 22)
+(def ^:private line-mono 19)
+(def ^:private line-small 16)
+(def ^:private row 28)
+(def ^:private most 640)
+(def ^:private bar 38)
+;; A wait (a tool running, a result being read) is shown at most this long in a replay.
+(def ^:private wait-shown 1.2)
+
+;; Text into lines.
+
+(defn- cut-word
+  "A word wider than `width`: its pieces, each as wide as fits."
+  [size width word]
+  (c/wrap size width word 50))
+
+(defn- flow
+  "Runs of text ([{:text :style}], styles :plain :bold :code) as lines of at most `width`
+  points: [[{:x :text :style} ...] ...]. Words are kept whole when they fit a line."
+  [runs width]
+  (let [size-of (fn [style] (if (= style :code) c/mono c/serif))
+        gap (c/text-width c/serif " ")
+        words (mapcat (fn [run]
+                        (mapcat (fn [word]
+                                  (let [size (size-of (:style run))]
+                                    (if (> (c/text-width size word) width)
+                                      (map (fn [piece] {:text piece :style (:style run)})
+                                           (cut-word size width word))
+                                      [{:text word :style (:style run)}])))
+                                (remove empty? (str/split (str (:text run)) #" "))))
+                      runs)]
+    (loop [words words x 0.0 line [] lines []]
+      (if (empty? words)
+        (if (seq line) (conj lines line) lines)
+        (let [word (first words)
+              w (c/text-width (size-of (:style word)) (:text word))]
+          (if (and (seq line) (> (+ x w) width))
+            (recur words 0.0 [] (conj lines line))
+            (recur (rest words) (+ x w gap) (conj line (assoc word :x x)) lines)))))))
+
+(defn- draw-flow
+  "Lines of `flow` drawn from (x, y), `color` for plain and bold text."
+  [lines x y color]
+  (doseq [[i line] (map-indexed vector lines)]
+    (doseq [word line]
+      (let [wx (+ x (:x word))
+            wy (+ y (* line-prose i))]
+        (case (:style word)
+          :code (c/text! wx (+ wy 1) c/purple c/mono (:text word))
+          :bold (do (c/text! wx wy color c/serif (:text word))
+                    (c/text! (+ wx 0.6) wy color c/serif (:text word)))
+          (c/text! wx wy color c/serif (:text word)))))))
+
+;; Markdown, as much as a model's answer has.
+
+(defn- inline
+  "A line's runs: `code` between backticks, **bold** between pairs of asterisks."
+  [text]
+  (vec (mapcat (fn [[i part]]
+                 (if (odd? i)
+                   [{:text part :style :code}]
+                   (map (fn [[j piece]] {:text piece :style (if (odd? j) :bold :plain)})
+                        (map-indexed vector (str/split part #"\*\*")))))
+               (map-indexed vector (str/split (str text) #"`")))))
+
+(defn- bullet
+  "A list item's [marker rest] when the line is one, else nil."
+  [line]
+  (let [t (str/triml line)]
+    (cond
+      (or (str/starts-with? t "- ") (str/starts-with? t "* ")) ["•" (subs t 2)]
+      :else
+      (let [dot (str/index-of t ". ")]
+        (when (and dot (pos? dot) (<= dot 3) (some? (parse-long (subs t 0 dot))))
+          [(subs t 0 (inc dot)) (subs t (+ dot 2))])))))
+
+(defn- blocks
+  "A text's blocks: {:kind :p|:h|:li|:code|:table|:rule ...}."
+  [text]
+  (loop [lines (str/split-lines (str text)) para [] code nil out []]
+    (let [flush (fn [out] (if (seq para) (conj out {:kind :p :text (str/join " " para)}) out))]
+      (if (empty? lines)
+        (let [out (flush out)]
+          (if code (conj out {:kind :code :lines code}) out))
+        (let [line (first lines)
+              t (str/trim line)]
+          (cond
+            code
+            (if (str/starts-with? t "```")
+              (recur (rest lines) [] nil (conj out {:kind :code :lines code}))
+              (recur (rest lines) [] (conj code line) out))
+
+            (str/starts-with? t "```")
+            (recur (rest lines) [] [] (flush out))
+
+            (empty? t)
+            (recur (rest lines) [] nil (flush out))
+
+            (str/starts-with? t "#")
+            (recur (rest lines) [] nil
+                   (conj (flush out) {:kind :h :text (str/trim (str/replace t "#" ""))}))
+
+            (or (= t "---") (= t "***"))
+            (recur (rest lines) [] nil (conj (flush out) {:kind :rule}))
+
+            ;; A table's row: its cells, added to the table before it. The row of dashes
+            ;; under the headings is not one.
+            (str/starts-with? t "|")
+            (let [out (flush out)
+                  cells (mapv (fn [cell] (str/trim (str/replace (str/replace cell "**" "") "`" "")))
+                              (rest (str/split t #"\|")))
+                  dashes (every? (fn [cell] (and (seq cell)
+                                                 (empty? (str/replace (str/replace cell "-" "") ":" ""))))
+                                 cells)
+                  before (peek out)]
+              (recur (rest lines) [] nil
+                     (cond
+                       dashes out
+                       (= (:kind before) :table) (conj (pop out) (assoc before :rows (conj (:rows before) cells)))
+                       :else (conj out {:kind :table :rows [cells]}))))
+
+            (bullet line)
+            (let [[mark said] (bullet line)
+                  depth (quot (- (count line) (count (str/triml line))) 2)]
+              (recur (rest lines) [] nil (conj (flush out) {:kind :li :mark mark :text said :depth depth})))
+
+            :else
+            (recur (rest lines) (conj para t) nil out)))))))
+
+;; Items: a piece of the conversation with its height and how it is drawn.
+
+(defn- prose-item
+  "A text as markdown, `color` its ink."
+  [text width color]
+  (let [parts (mapv (fn [b]
+                      (case (:kind b)
+                        :p (let [lines (flow (inline (:text b)) width)]
+                             {:h (+ (* line-prose (count lines)) 6)
+                              :draw (fn [x y] (draw-flow lines x y color))})
+                        :h (let [lines (flow [{:text (:text b) :style :bold}] width)]
+                             {:h (+ (* line-prose (count lines)) 8)
+                              :draw (fn [x y] (draw-flow lines x (+ y 2) color))})
+                        :li (let [indent (+ 18 (* 16 (:depth b)))
+                                  lines (flow (inline (:text b)) (- width indent))
+                                  mark (:mark b)]
+                              {:h (+ (* line-prose (max 1 (count lines))) 2)
+                               :draw (fn [x y]
+                                       (c/text! (+ x indent -16) y c/muted c/serif mark)
+                                       (draw-flow lines (+ x indent) y color))})
+                        :code (let [lines (vec (mapcat (fn [line] (c/wrap c/mono (- width 20) line 6)) (:lines b)))
+                                    lines (if (empty? lines) [(str "")] lines)]
+                                {:h (+ (* line-mono (count lines)) 18)
+                                 :draw (fn [x y]
+                                         (c/rect! x y (+ x width) (+ y (* line-mono (count lines)) 10) c/rule 0.28 5.0)
+                                         (doseq [[i line] (map-indexed vector lines)]
+                                           (c/text! (+ x 10) (+ y 5 (* line-mono i)) c/ink c/mono line)))})
+                        :rule {:h 12 :draw (fn [x y] (c/line! x (+ y 5) (+ x width) (+ y 5) c/rule 1.0))}
+                        ;; Columns as wide as their widest cell, all narrowed alike when
+                        ;; they don't fit; the first row is the headings.
+                        :table (let [rows (:rows b)
+                                     n (apply max 1 (map count rows))
+                                     natural (mapv (fn [col]
+                                                     (+ 18 (apply max 20 (map (fn [r] (c/text-width c/serif (str (get r col ""))))
+                                                                              rows))))
+                                                   (range n))
+                                     all (apply + natural)
+                                     scale (if (> all width) (/ width all) 1.0)
+                                     widths (mapv (fn [w] (* w scale)) natural)
+                                     lefts (vec (reductions + 0 widths))
+                                     right (last lefts)]
+                                 {:h (+ (* 24 (count rows)) 12)
+                                  :draw (fn [x y]
+                                          (doseq [[r cells] (map-indexed vector rows)]
+                                            (let [ry (+ y (* 24 r))]
+                                              (when (zero? r)
+                                                (c/rect! x ry (+ x right) (+ ry 24) c/rule 0.3 3.0))
+                                              (c/line! x (+ ry 24) (+ x right) (+ ry 24) c/rule 1.0)
+                                              (doseq [col (range n)]
+                                                (let [cell (c/clip c/serif (- (nth widths col) 14) (str (get cells col "")))
+                                                      cx (+ x (nth lefts col) 8)]
+                                                  (c/text! cx (+ ry 3) color c/serif cell)
+                                                  (when (zero? r)
+                                                    (c/text! (+ cx 0.6) (+ ry 3) color c/serif cell)))))))})
+                        {:h 0 :draw (fn [x y] nil)}))
+                    (blocks text))
+        tops (vec (reductions + 0 (map :h parts)))]
+    {:h (last tops)
+     :draw (fn [x y w]
+             (doseq [[i part] (map-indexed vector parts)]
+               ((:draw part) x (+ y (nth tops i)))))}))
+
+(defn- mono-lines
+  "A text as wrapped lines of small mono, at most `limit` of them."
+  [text width limit]
+  (let [all (c/wrap c/small width (str text) (inc limit))]
+    (if (> (count all) limit)
+      (conj (vec (take limit all)) (str "[more]"))
+      (vec all))))
+
+(defn- first-line [text]
+  (str (first (str/split-lines (str/trim (str text))))))
+
+(defn- fold-item
+  "A folded entry: a line with a triangle, `label` in `color` and `summary` after it, `note`
+  on the right. Opened, `body` (lines of small mono, with `body-color`) is under it.
+  Clicking the line asks `toggle`."
+  [width open label color summary note body body-color]
+  (let [body (if open body [])
+        label-w (+ (c/text-width c/mono label) 10)]
+    {:h (+ 24 (if (seq body) (+ (* line-small (count body)) 12) 0))
+     :fold true
+     :draw (fn [x y w]
+             (let [cx (+ x 6)
+                   cy (+ y 11)]
+               (when (c/inside? x y (+ x w) (+ y 22))
+                 (c/rect! x y (+ x w) (+ y 22) c/rule 0.22 4.0))
+               (if open
+                 (c/triangle! (- cx 4) (- cy 3) (+ cx 4) (- cy 3) cx (+ cy 4) c/muted 1.0)
+                 (c/triangle! (- cx 3) (- cy 4) (- cx 3) (+ cy 4) (+ cx 4) cy c/muted 1.0))
+               (c/text! (+ x 18) (+ y 3) color c/mono label)
+               (c/text! (+ x 18 label-w) (+ y 4) c/muted c/small
+                        (c/clip c/small (- w 28 label-w (c/text-width c/small note) 12) summary))
+               (c/text! (- (+ x w) (c/text-width c/small note) 4) (+ y 4) c/muted c/small note)
+               (when (seq body)
+                 (c/rect! (+ x 18) (+ y 24) (+ x w) (+ y 24 (* line-small (count body)) 8) c/rule 0.2 4.0)
+                 (doseq [[i line] (map-indexed vector body)]
+                   (c/text! (+ x 26) (+ y 28 (* line-small i)) body-color c/small line)))))}))
+
+(defn- seconds-said [s]
+  (if (and s (>= s 0.05)) (str (c/fixed s 1) " s") (str "")))
+
+(defn- entry-item
+  "An entry's item. `result` is the entry after a call's (what the tool gave), or nil."
+  [entry result width open]
+  (case (:role entry)
+    :user
+    (let [inner (prose-item (:text entry) (- width 24) c/ink)]
+      {:h (+ (:h inner) 34)
+       :draw (fn [x y w]
+               (c/rect! x y (+ x w) (+ y (:h inner) 26) c/rule 0.3 8.0)
+               (c/text! (+ x 12) (+ y 5) c/muted c/small "you")
+               ((:draw inner) (+ x 12) (+ y 22) (- w 24)))})
+
+    :thinking
+    (fold-item width open (str "thought") c/muted
+               (first-line (:text entry))
+               (str (count (str/split (str (:text entry)) #" ")) " words"
+                    (when (:cut entry) (str ", cut")))
+               (mono-lines (:text entry) (- width 44) 60) c/muted)
+
+    :call
+    (let [args (:args entry)
+          main (or (:code args) (:command args) (:path args) (:name args) (:namespace args)
+                   (first (vals args)))
+          failed (and result (or (:error result) (str/starts-with? (str (:text result)) "error:")))
+          body (vec (concat
+                     (mapcat (fn [[k v]]
+                               (concat [(str (subs (str k) 1) ":")]
+                                       (map (fn [line] (str "  " line))
+                                            (mono-lines (if (string? v) v (pr-str v)) (- width 60) 40))))
+                             args)
+                     (when result
+                       (concat [(str "gave:")]
+                               (map (fn [line] (str "  " line))
+                                    (mono-lines (:text result) (- width 60) 40))))))]
+      (fold-item width open (:name entry) (if failed c/red c/orange)
+                 (first-line main)
+                 (str (if failed "error  " "") (seconds-said (:seconds result)))
+                 body c/ink))
+
+    :model
+    (let [inner (prose-item (:text entry) width c/ink)]
+      {:h (+ (:h inner) 8) :draw (fn [x y w] ((:draw inner) x (+ y 2) w))})
+
+    :stopped
+    {:h 24
+     :draw (fn [x y w]
+             (c/text! x (+ y 3) c/red c/small
+                      (str "stopped: " (subs (str (:why entry)) 1)
+                           (when (:text entry) (str ": " (first-line (:text entry)))))))}
+
+    {:h 0 :draw (fn [x y w] nil)}))
+
+(defn- live-item
+  "What is being made right now."
+  [live state width]
+  (cond
+    (nil? live)
+    (if (contains? #{:reading :thinking} state)
+      {:h 22 :draw (fn [x y w] (c/text! x (+ y 3) c/muted c/small (str "...")))}
+      nil)
+
+    (= (:kind live) :text)
+    (let [inner (prose-item (:text live) width c/ink)]
+      {:h (+ (:h inner) 8) :draw (fn [x y w] ((:draw inner) x (+ y 2) w))})
+
+    :else
+    (let [label (case (:kind live)
+                  :thinking (str "thinking")
+                  :tool (str "running " (:name live))
+                  (str "calling " (:name live)))
+          lines (let [all (c/wrap c/small (- width 26) (str (:text live)) 400)]
+                  (vec (drop (max 0 (- (count all) 5)) all)))]
+      {:h (+ 24 (* line-small (count lines)) 4)
+       :draw (fn [x y w]
+               (c/text! (+ x 18) (+ y 3) c/orange c/mono label)
+               (doseq [[i line] (map-indexed vector lines)]
+                 (c/text! (+ x 26) (+ y 24 (* line-small i)) c/muted c/small line)))})))
+
+(defn- items
+  "The conversation's items for an agent's value `v`: [{:h :draw :key}], an entry's item
+  built once and kept until the entry, the width or its being open changes."
+  [named v width]
+  (let [entries (:entries v)
+        n (count entries)
+        made (loop [i 0 out []]
+               (if (>= i n)
+                 out
+                 (let [entry (nth entries i)
+                       result (when (and (= (:role entry) :call) (< (inc i) n)
+                                         (= (:role (nth entries (inc i))) :result))
+                                (nth entries (inc i)))]
+                   (if (= (:role entry) :result)
+                     (recur (inc i) out)
+                     (let [key [named i]
+                           open (contains? @opened key)
+                           kept (get @built key)
+                           item (if (and kept (identical? (:entry kept) entry) (identical? (:result kept) result)
+                                         (= (:width kept) width) (= (:open kept) open))
+                                  (:item kept)
+                                  (let [item (entry-item entry result width open)]
+                                    (swap! built assoc key {:entry entry :result result :width width
+                                                            :open open :item item})
+                                    item))]
+                       (recur (inc i) (conj out (assoc item :key key))))))))
+        live (live-item (:live v) (:state v) width)]
+    (if live (conj made live) made)))
+
+;; The panel: the conversations' lines, then the chosen one.
+
+(def ^:private state-said
+  {:idle "idle" :reading "reading" :thinking "thinking" :text "answering" :call "calling a tool"
+   :call-text "calling a tool" :tool "running a tool" :tool-error "a tool error" :done "done"
+   :limit "stopped: the step's tokens ran out" :context "stopped: the session is full"
+   :steps "stopped: too many steps" :stopped "stopped" :error "stopped: an error"})
+
+(defn- going? [state]
+  (contains? #{:reading :thinking :text :call :call-text :tool :tool-error} state))
+
+;; A conversation in time.
+
+(defn- written? [role]
+  (contains? #{:thinking :model :call} role))
+
+(defn- main-of
+  "The argument of a call that says most: its code, its command, its path."
+  [args]
+  (str (or (:code args) (:command args) (:path args) (:name args) (:namespace args)
+           (first (vals args)))))
+
+(defn- schedule
+  "When each entry is shown in a replay: {:spans [{:from :to :real-from :real-to :cut}]
+  :total}, in seconds. What the model wrote takes the time it took to write; a wait before
+  an entry and a tool's run take at most `wait-shown`, and are marked :cut when they were
+  longer. An entry without times (an old recording) gets a time from its length."
+  [entries]
+  (loop [i 0 shown 0.0 real nil out []]
+    (if (>= i (count entries))
+      {:spans out :total shown}
+      (let [e (nth entries i)
+            role (:role e)
+            began (or (:began e) real 0.0)
+            ended (or (:ended e)
+                      (+ began (if (written? role) (/ (count (str (:text e) (main-of (:args e)))) 120.0) 0.0)))
+            real (or real began)
+            wait (max 0.0 (- began real))
+            from (+ shown (min wait wait-shown))
+            took (max 0.0 (- ended began))
+            lasts (cond
+                    (written? role) took
+                    (= role :result) (min took wait-shown)
+                    :else 0.6)]
+        (recur (inc i) (+ from lasts) (max real ended)
+               (conj out {:from from :to (+ from lasts)
+                          ;; (A step's second call was written before the first one ran: its
+                          ;; time is not let go back.)
+                          :real-from (max real began) :real-to (max real ended)
+                          :cut (or (> wait wait-shown) (and (= role :result) (> took wait-shown)))}))))))
+
+(defn- schedule-of
+  "The schedule of a conversation's entries, made again only when they change."
+  [named entries]
+  (let [kept (get @scheduled named)]
+    (if (and kept (identical? (:entries kept) entries))
+      (:schedule kept)
+      (let [made (schedule entries)]
+        (swap! scheduled assoc named {:entries entries :schedule made})
+        made))))
+
+(defn- advance!
+  "Where the conversation is shown up to, this frame: {:mode :t :speed}. Playing moves with
+  the clock; at the end it follows a turn that is still going (:live), or stops."
+  [named v sched]
+  (let [p (get @plays named {:mode :live :speed 1.0})
+        total (:total sched)
+        now (c/seconds)]
+    (case (:mode p)
+      :playing (let [t (+ (:t p) (* (get p :speed 1.0) (- now (:at p))))
+                     p (cond
+                         (< t total) (assoc p :t t :at now)
+                         (going? (:state v)) {:mode :live :speed (get p :speed 1.0)}
+                         :else (assoc p :mode :paused :t total))]
+                 (swap! plays assoc named p)
+                 (assoc p :t (min total (get p :t total))))
+      :paused (assoc p :t (min total (:t p)))
+      (assoc p :t total))))
+
+(defn- at-time
+  "The agent's value `v` as it was when the conversation had been shown up to `t`: the
+  entries shown whole, and the one being written then as far as it had got."
+  [v t sched]
+  (let [entries (:entries v)
+        spans (:spans sched)
+        n (count entries)
+        k (loop [i 0] (if (and (< i n) (<= (:to (nth spans i)) t)) (recur (inc i)) i))
+        current (when (< k n) (nth entries k))
+        span (when (< k n) (nth spans k))
+        in (boolean (and span (>= t (:from span))))
+        f (if (and in (> (:to span) (:from span)))
+            (/ (- t (:from span)) (- (:to span) (:from span)))
+            0.0)
+        part (fn [text] (cpp/harness.prefix (str text) (long (* f (count (str text))))))
+        live (when in
+               (case (:role current)
+                 :thinking {:kind :thinking :name (str "") :text (part (:text current))}
+                 :model {:kind :text :name (str "") :text (part (:text current))}
+                 :call {:kind :call :name (:name current) :text (part (main-of (:args current)))}
+                 :result {:kind :tool :name (:name current) :text (str "")}
+                 nil))
+        ;; A person's message, or a stop, is there whole from its start.
+        whole (if (and in (nil? live)) (inc k) k)]
+    (assoc v
+           :entries (subvec entries 0 whole)
+           :live live
+           :state (cond live (:kind live)
+                        (>= whole n) (:state v)
+                        :else :reading))))
+
+(defn- real-at
+  "The time since the conversation began, when it had been shown up to `t`."
+  [sched t]
+  (let [spans (:spans sched)
+        s (last (filter (fn [s] (<= (:from s) t)) spans))]
+    (if (nil? s)
+      0.0
+      (let [f (if (> (:to s) (:from s)) (min 1.0 (/ (- t (:from s)) (- (:to s) (:from s)))) 1.0)]
+        (- (+ (:real-from s) (* f (- (:real-to s) (:real-from s))))
+           (:real-from (first spans)))))))
+
+(defn- minutes
+  "Seconds as m:ss."
+  [seconds]
+  (let [whole (long (max 0.0 seconds))
+        secs (mod whole 60)]
+    (str (quot whole 60) ":" (when (< secs 10) "0") secs)))
+
+(defn- doing-at
+  "What was going on when the conversation had been shown up to `t`."
+  [v sched t]
+  (let [entries (:entries v)
+        spans (:spans sched)
+        at (first (filter (fn [i] (let [s (nth spans i)] (and (>= t (:from s)) (< t (:to s)))))
+                          (range (count spans))))
+        e (when at (nth entries at))]
+    (cond
+      (nil? e) (if (>= t (:total sched)) (get state-said (:state v) (str (:state v))) (str "waiting"))
+      (= (:role e) :user) (str "a message")
+      (= (:role e) :thinking) (str "thinking")
+      (= (:role e) :model) (str "answering")
+      (= (:role e) :call) (str "calling " (:name e))
+      (= (:role e) :result) (str "running " (:name e))
+      :else (str (subs (str (:role e)) 1)))))
+
+(defn- panel
+  "What is drawn this frame for `width`: {:rows :items :tall :shown :value :sched :play
+  :height}."
+  [width]
+  (let [kept @frame-panel
+        frame (c/frames)]
+    (if (and kept (= (:frame kept) frame) (= (:width kept) width))
+      (:panel kept)
+      (let [all @watched
+            named @chosen
+            one (some (fn [w] (when (= (:name w) named) w)) all)
+            v (when one @(:agent one))
+            sched (when one (schedule-of named (:entries v)))
+            play (when one (advance! named v sched))
+            ;; Following the end, the conversation as it is; else as it was at that time.
+            seen (when one (if (= (:mode play) :live) v (at-time v (:t play) sched)))
+            its (when one (items named seen (- width 28)))
+            tall (if its (apply + 0 (map :h its)) 0)
+            rows-h (* row (count all))
+            shown (if one (min tall (max 60 (- most rows-h 20 bar))) 0)
+            made {:rows all :one one :items its :tall tall :shown shown
+                  :value v :sched sched :play play
+                  :height (if (empty? all) 0 (+ rows-h (if one (+ shown 22 bar) 0) 8))}]
+        (reset! frame-panel {:frame frame :width width :panel made})
+        made))))
+
+(defn- draw-row [w x y width picked]
+  (let [v @(:agent w)
+        state (:state v)
+        dot (cond (going? state) c/orange
+                  (contains? #{:done :idle} state) c/green
+                  :else c/red)
+        speed (if (pos? (:seconds v)) (/ (:generated v) (:seconds v)) 0.0)
+        right (str (:generated v) " tokens" (when (pos? speed) (str ", " (c/fixed speed 1) " a second")))]
+    (when (or picked (c/inside? x y (+ x width) (+ y row -2)))
+      (c/rect! x y (+ x width) (+ y row -2) c/rule (if picked 0.45 0.2) 5.0))
+    (c/circle! (+ x 14) (+ y 13) 5.0 dot 1.0)
+    (c/text! (+ x 28) (+ y 5) c/ink c/mono (:name w))
+    (c/text! (+ x 36 (c/text-width c/mono (:name w))) (+ y 7) c/muted c/small
+             (get state-said state (str state)))
+    (c/text! (- (+ x width) (c/text-width c/small right) 10) (+ y 7) c/muted c/small right)
+    (when (c/clicked? x y (+ x width) (+ y row -2))
+      (reset! chosen (if picked nil (:name w))))))
+
+(defn- to-time!
+  "The conversation `named` shown up to `t`, playing on from there or not."
+  [named t playing]
+  (swap! plays (fn [all]
+                 (let [p (get all named {:speed 1.0})]
+                   (assoc all named {:mode (if playing :playing :paused) :t t :at (c/seconds)
+                                     :speed (get p :speed 1.0)})))))
+
+(defn- live!
+  "The conversation `named` shown as it is now, following its turn."
+  [named]
+  (swap! plays (fn [all] (assoc all named {:mode :live :speed (get (get all named) :speed 1.0)}))))
+
+(defn- draw-bar
+  "The timeline of the conversation `named`, its top left at (x, y): play or pause, from
+  the start, to the next entry's end, the line with a mark an entry and where it is shown
+  up to, the time since it began with what was going on, and the pace. Returns where its
+  parts are, for a script."
+  [named v sched play x y width]
+  (let [total (max 0.001 (:total sched))
+        t (min total (:t play))
+        mode (:mode play)
+        live (= mode :live)
+        running (going? (:state v))
+        following (and live running)
+        speed (get play :speed 1.0)
+        cy (+ y 18)
+        b1 (+ x 16)
+        b2 (+ x 44)
+        b3 (+ x 72)
+        x1 (+ x 104)
+        x2 (- (+ x width) 232)
+        at (+ x1 (* (- x2 x1) (/ t total)))
+        spans (:spans sched)
+        entries (:entries v)
+        pace-x (- (+ x width) 34)
+        hot (fn [bx] (c/inside? (- bx 12) (- cy 12) (+ bx 12) (+ cy 12)))
+        hit (fn [bx] (c/clicked? (- bx 12) (- cy 12) (+ bx 12) (+ cy 12)))
+        shade (fn [bx] (when (hot bx) (c/rect! (- bx 12) (- cy 12) (+ bx 12) (+ cy 12) c/rule 0.35 5.0)))]
+    (c/line! (+ x 10) y (- (+ x width) 10) y c/rule 1.0)
+    ;; Play, or pause while playing.
+    (shade b1)
+    (if (or (= mode :playing) following)
+      (do (c/rect! (- b1 5) (- cy 6) (- b1 1) (+ cy 6) c/ink 1.0 1.0)
+          (c/rect! (+ b1 2) (- cy 6) (+ b1 6) (+ cy 6) c/ink 1.0 1.0))
+      (c/triangle! (- b1 4) (- cy 7) (- b1 4) (+ cy 7) (+ b1 7) cy c/ink 1.0))
+    (when (hit b1)
+      (cond
+        (or (= mode :playing) following) (to-time! named t false)
+        ;; At the end: on with the turn when one goes, else from the start again.
+        (>= t (- total 0.01)) (if running (live! named) (to-time! named 0.0 true))
+        :else (to-time! named t true)))
+    ;; From the start.
+    (shade b2)
+    (c/rect! (- b2 6) (- cy 6) (- b2 3) (+ cy 6) c/ink 1.0 1.0)
+    (c/triangle! (+ b2 6) (- cy 7) (+ b2 6) (+ cy 7) (- b2 3) cy c/ink 1.0)
+    (when (hit b2)
+      (to-time! named 0.0 true))
+    ;; To the end of the next entry, and stop there.
+    (shade b3)
+    (c/triangle! (- b3 6) (- cy 7) (- b3 6) (+ cy 7) (+ b3 3) cy c/ink 1.0)
+    (c/rect! (+ b3 3) (- cy 6) (+ b3 6) (+ cy 6) c/ink 1.0 1.0)
+    (when (hit b3)
+      (let [after (first (filter (fn [s] (> (:to s) (+ t 0.01))) spans))]
+        (to-time! named (if after (:to after) total) false)))
+    ;; The line: what is shown so far darker, a mark an entry, a gap where a wait was cut.
+    (c/line! x1 cy x2 cy c/rule 2.0)
+    (c/line! x1 cy at cy c/ink 2.0)
+    (doseq [[i s] (map-indexed vector spans)]
+      (let [mx (+ x1 (* (- x2 x1) (/ (:from s) total)))
+            role (:role (nth entries i))
+            tall (get {:user 9 :model 8 :call 6 :thinking 3 :stopped 9} role 0)
+            color (get {:user c/ink :model c/blue :call c/orange :thinking c/muted :stopped c/red} role c/muted)]
+        (when (:cut s)
+          (c/rect! (- mx 4) (- cy 2) (- mx 1) (+ cy 2) c/card 1.0 0.0)
+          (c/line! (- mx 5) (+ cy 4) (- mx 2) (- cy 4) c/muted 1.0)
+          (c/line! (- mx 3) (+ cy 4) mx (- cy 4) c/muted 1.0))
+        (when (pos? tall)
+          (c/line! mx (- cy tall) mx (+ cy tall) color 2.0))))
+    (c/circle! at cy 5.0 (if live c/orange c/ink) 1.0)
+    ;; A click on the line, or the mouse held and moved along it, goes to that time.
+    (when (and (c/inside? (- x1 6) (- cy 12) (+ x2 6) (+ cy 12))
+               (or (c/down?) (c/clicked? (- x1 6) (- cy 12) (+ x2 6) (+ cy 12))))
+      (let [share (max 0.0 (min 1.0 (/ (- (c/mouse-x) x1) (- x2 x1))))]
+        ;; (The line's end, while a turn goes, is now.)
+        (if (and running (> share 0.985))
+          (live! named)
+          (to-time! named (* total share) false))))
+    ;; The time since the conversation began, and what was going on.
+    (let [since (if (and live (:born v) (going? (:state v)) (seq spans))
+                  (- (cpp/harness.seconds) (:born v) (:real-from (first spans)))
+                  (real-at sched t))
+          now-said (get state-said (:state v) (str (:state v)))
+          said (cond following (str "live, " now-said)
+                     live now-said
+                     :else (doing-at v sched t))]
+      (c/text! (+ x2 16) (- cy 8) c/ink c/mono (minutes since))
+      (c/text! (+ x2 22 (c/text-width c/mono (minutes since))) (- cy 6) c/muted c/small
+               (c/clip c/small (- pace-x x2 44 (c/text-width c/mono (minutes since))) said)))
+    ;; The pace of playing: a click doubles it, up to 8, then 1 again.
+    (shade pace-x)
+    (c/text! (- pace-x 9) (- cy 7) c/muted c/small (str (long speed) "x"))
+    (when (hit pace-x)
+      (swap! plays (fn [all]
+                     (let [p (get all named {:mode :live})
+                           faster (if (>= speed 8.0) 1.0 (* 2.0 speed))]
+                       (assoc all named (assoc p :speed faster :at (c/seconds)))))))
+    {:y cy :play b1 :start b2 :next b3 :x1 x1 :x2 x2 :pace pace-x :total total :t t
+     :mode (subs (str mode) 1)}))
+
+(defn- draw-panel [x y width]
+  (let [p (panel width)
+        rows (:rows p)]
+    (when (seq rows)
+      (c/rect! x y (+ x width) (+ y (:height p)) c/card 1.0 6.0)
+      (c/frame! x y (+ x width) (+ y (:height p)) c/rule 1.0)
+      (doseq [[i w] (map-indexed vector rows)]
+        (draw-row w (+ x 4) (+ y 4 (* row i)) (- width 8) (= (:name w) @chosen)))
+      (when (:one p)
+        (let [named (:name (:one p))
+              top (+ y 4 (* row (count rows)) 10)
+              shown (:shown p)
+              tall (:tall p)
+              furthest (max 0.0 (- tall shown))
+              over (c/inside? x top (+ x width) (+ top shown))
+              was (get @back named 0.0)
+              now (max 0.0 (min furthest (+ was (if over (* 48.0 (c/wheel)) 0.0))))
+              start (- top (- furthest now))]
+          (when (not= now was)
+            (swap! back assoc named now))
+          (c/line! (+ x 10) (- top 6) (- (+ x width) 10) (- top 6) c/rule 1.0)
+          (c/clip-begin! x top (+ x width) (+ top shown))
+          (let [folds
+                (loop [its (:items p) at start folds []]
+                  (if (empty? its)
+                    folds
+                    (let [item (first its)
+                          h (:h item)
+                          seen (and (> (+ at h) top) (< at (+ top shown)))]
+                      (when seen
+                        ((:draw item) (+ x 14) at (- width 28))
+                        (when (and (:fold item) (:key item) over
+                                   (c/clicked? (+ x 14) (max at top) (- (+ x width) 14) (min (+ at 22) (+ top shown))))
+                          (swap! opened (fn [s] (if (contains? s (:key item)) (disj s (:key item)) (conj s (:key item)))))))
+                      (recur (rest its) (+ at h)
+                             ;; A fold whose line is whole in the part shown: where a click opens it.
+                             (if (and seen (:fold item) (:key item) (>= at top) (<= (+ at 22) (+ top shown)))
+                               (conj folds {:entry (second (:key item)) :y (+ at 11)
+                                            :open (contains? @opened (:key item))})
+                               folds)))))
+                _ (c/clip-end!)
+                timeline (draw-bar named (:value p) (:sched p) (:play p) x (+ top shown 8) width)
+                now-drawn {:x x :width width :top top :shown shown :tall tall :folds folds
+                           :bar timeline
+                           :rows (vec (map-indexed (fn [i w] {:name (:name w) :y (+ y 4 (* row i) (quot row 2))}) rows))}]
+            (when (not= now-drawn @drawn)
+              (reset! drawn now-drawn)))
+          (when (pos? furthest)
+            ;; Where the part shown is, of the whole.
+            (let [bar (max 24.0 (* shown (/ shown tall)))
+                  free (- shown bar)
+                  at (+ top (* free (/ (- furthest now) furthest)))]
+              (c/rect! (- (+ x width) 6) at (- (+ x width) 3) (+ at bar) c/muted 0.5 2.0))))))))
+
+(c/header! {:height (fn [width] (:height (panel width)))
+            :draw draw-panel})
+
+(defn watch!
+  "The agent in the window, as the conversation called `named` (\"agent\" when not given):
+  a line above the cards, and the conversation written out when it is the one chosen (it is
+  now). Returns the agent."
+  ([a] (watch! a "agent"))
+  ([a named]
+   (let [named (str named)]
+     (swap! watched (fn [all] (conj (vec (remove (fn [w] (= (:name w) named)) all)) {:name named :agent a})))
+     (reset! chosen named)
+     a)))
+
+(defn unwatch!
+  "A conversation's line removed (all of them with no name)."
+  ([] (reset! watched []) (reset! chosen nil) nil)
+  ([named]
+   (swap! watched (fn [all] (vec (remove (fn [w] (= (:name w) (str named))) all))))
+   (when (= @chosen (str named))
+     (reset! chosen nil))
+   nil))
+
+(defn choose!
+  "The conversation written out: its name, or nil for the lines alone."
+  [named]
+  (reset! chosen (when named (str named)))
+  nil)
+
+(defn open!
+  "Entries of a conversation opened or closed as by a click: `which` is :all, :none, or
+  the numbers of the entries (their places in (h/entries a))."
+  [named which]
+  (let [named (str named)
+        a (:agent (some (fn [w] (when (= (:name w) named) w)) @watched))
+        n (if a (count (h/entries a)) 0)]
+    (swap! opened
+           (fn [s]
+             (let [without (set (remove (fn [[at _]] (= at named)) s))]
+               (cond
+                 (= which :none) without
+                 (= which :all) (into without (map (fn [i] [named i]) (range n)))
+                 :else (into without (map (fn [i] [named i]) which))))))
+    nil))
+
+(defn replay!
+  "A conversation that was kept, shown and played from its start: `recording` is what
+  harness.core/recording gives, or the path of a file harness.core/save! wrote. The model
+  is not needed. Returns the atom holding it."
+  ([recording] (replay! recording "a recording"))
+  ([recording named]
+   (let [r (if (string? recording) (h/load-recording recording) recording)
+         a (atom (assoc r
+                        :live nil
+                        :state (or (:state r) :done)
+                        :generated (or (:generated r) 0)
+                        :seconds (or (:seconds r) 0.0)))]
+     (watch! a named)
+     (to-time! (str named) 0.0 true)
+     a)))
+
+(defn play!
+  "The conversation `named` played from where it is shown up to (from its start when that
+  is its end)."
+  [named]
+  (let [named (str named)
+        p (get @plays named {:mode :live})]
+    (to-time! named (if (= (:mode p) :paused) (:t p) 0.0) true)
+    nil))
+
+(defn seek!
+  "The conversation `named` shown up to a share of its length (0 its start, 1 its end), and
+  stopped there."
+  [named share]
+  (let [named (str named)
+        a (:agent (some (fn [w] (when (= (:name w) named) w)) @watched))
+        total (if a (:total (schedule-of named (:entries @a))) 0.0)]
+    (to-time! named (* total (max 0.0 (min 1.0 share))) false)
+    nil))
+
+(defn follow!
+  "The conversation `named` shown as it is now, following a turn in progress."
+  [named]
+  (live! (str named))
+  nil)
+
+(defn layout
+  "Where the chosen conversation was drawn in the last frame, as JSON text, for a script
+  that points at its parts (cards.core/click!, wheel!): {x, width, top, shown, tall, rows:
+  [{name, y}], folds: [{entry, y, open}], bar: {y, play, start, next, x1, x2, pace, total,
+  t, mode}}, in the window's points. `folds` are the folded entries whose line is in view,
+  by their place in (h/entries a): a click at (x + 100, y) opens or closes one. `bar` is
+  the timeline: its buttons are at (play, y), (start, y), (next, y), its line from x1 to
+  x2."
+  []
+  (json/write (or @drawn {})))
+
+;; A script's look at the layout is not an evaluation to show.
+(window/quiet! "harness.cards/layout")
