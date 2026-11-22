@@ -1,0 +1,192 @@
+;; SPDX-License-Identifier: MIT
+;; The graders of harness.trials' tasks: each runs random operations on the code a run wrote
+;; against a reference, and says what went wrong, or nil. Kept out of the harness and where
+;; the sandbox hides them (HARNESS_HIDE), and sent to the process only after a run ends
+;; (see harness.trials): the model can evaluate code in the process, so anything loaded there
+;; while it works is within its reach.
+(ns harness-graders
+  (:require [clojure.string :as str]
+            [harness.verify :as verify]
+            [cards.repl :as repl]))
+
+(def dir "work/.grading")
+
+;; Loading a file's namespace and its functions.
+
+(defn- load-file!
+  "The file's text evaluated; nil, or what failed."
+  [path]
+  (let [text (verify/attempt (fn [] (slurp path)))]
+    (if (:threw text)
+      (str "no file: " (:threw text))
+      (let [r (repl/evaluate text "user" path 1 1 false)]
+        (when-not (:ok r) (str (:error r)))))))
+
+(defn- fn-in [ns-sym name]
+  (when-let [n (find-ns ns-sym)]
+    (when-let [v (ns-resolve n (symbol name))]
+      (deref v))))
+
+;; The LRU cache: a reference, and the grade.
+
+(defn- ref-lookup [entries k]
+  (some (fn [[ek ev]] (when (= ek k) ev)) entries))
+
+(defn- ref-touch
+  "Entries (most recent first) with k most recent, given v."
+  [entries k v]
+  (vec (cons [k v] (remove (fn [[ek _]] (= ek k)) entries))))
+
+(defn- grade-lru
+  "The cache in work/lru.jank against the reference: nil, or what went wrong."
+  [path]
+  (or (load-file! path)
+      (let [fs (into {} (map (fn [n] [n (fn-in 'lru n)]) ["new-cache" "lookup" "store!" "cached-keys"]))
+            missing (keep (fn [[n f]] (when-not (fn? f) n)) fs)]
+        (if (seq missing)
+          (str "missing functions: " (str/join ", " missing))
+          (let [new-cache (get fs "new-cache") lookup (get fs "lookup")
+                store! (get fs "store!") cached-keys (get fs "cached-keys")]
+            (loop [cases (for [capacity [1 2 3] round (range 4)] [capacity round])]
+              (if (empty? cases)
+                nil
+                (let [[capacity round] (first cases)
+                      c (new-cache capacity)
+                      said (loop [i 0 entries [] done []]
+                             (if (>= i 60)
+                               nil
+                               (let [k (rand-int 5)
+                                     op (if (< (rand-int 10) 5) :store :lookup)
+                                     v (str "v" (rand-int 100))]
+                                 (if (= op :store)
+                                   (let [r (verify/attempt (fn [] (store! c k v)))
+                                         entries (vec (take capacity (ref-touch entries k v)))
+                                         done (conj done (str "(store! c " k " " (pr-str v) ")"))
+                                         ks (verify/attempt (fn [] (vec (cached-keys c))))]
+                                     (cond
+                                       (:threw r) (str (last done) " threw: " (:threw r))
+                                       (:threw ks) (str "(cached-keys c) threw: " (:threw ks))
+                                       (not= ks (mapv first entries))
+                                       (str "after " (str/join " " (take-last 6 done)) ": (cached-keys c) gave "
+                                            (pr-str ks) ", expected " (pr-str (mapv first entries)))
+                                       :else (recur (inc i) entries done)))
+                                   (let [got (verify/attempt (fn [] (lookup c k)))
+                                         want (ref-lookup entries k)
+                                         entries (if (some? want) (ref-touch entries k want) entries)
+                                         done (conj done (str "(lookup c " k ")"))
+                                         ks (verify/attempt (fn [] (vec (cached-keys c))))]
+                                     (cond
+                                       (and (map? got) (:threw got)) (str (last done) " threw: " (:threw got))
+                                       (not= got want) (str "after " (str/join " " (take-last 6 done)) ": gave "
+                                                            (pr-str got) ", expected " (pr-str want))
+                                       (:threw ks) (str "(cached-keys c) threw: " (:threw ks))
+                                       (not= ks (mapv first entries))
+                                       (str "after " (str/join " " (take-last 6 done)) ": (cached-keys c) gave "
+                                            (pr-str ks) ", expected " (pr-str (mapv first entries)))
+                                       :else (recur (inc i) entries done)))))))]
+                  (if said
+                    (str "capacity " capacity ": " said)
+                    (recur (rest cases)))))))))))
+
+;; The key-value store with its log: a reference, and the grade.
+
+(defn- fresh-dir! [d]
+  (cpp/harness.run (str "rm -rf '" d "' && mkdir -p '" d "'") 10000 10.0)
+  d)
+
+(defn- dir-bytes
+  "The bytes of the files in a directory, all together."
+  [d]
+  (let [out (:out (cpp/harness.run (str "cat '" d "'/* 2>/dev/null | wc -c") 100000 10.0))]
+    (or (parse-long (str/trim (str out))) 0)))
+
+(defn- kv-step
+  "One random operation of the store's grade. Returns {:wrong text} or the next state
+  {:s :known :before :done}."
+  [fs d {:keys [s known before done] :as st}]
+  (let [{:keys [open put! del! fetch crash!]} fs
+        k (rand-int 4)
+        pick (rand-int 12)
+        v (if (< (rand-int 2) 1) (rand-int 50) (str "s " (rand-int 50)))
+        last-done (fn [done] (str/join " " (take-last 6 done)))]
+    (cond
+      ;; A write: what was known before it is kept, for a crash that would tear it.
+      (< pick 5)
+      (let [said (str "(put! s " k " " (pr-str v) ")")
+            size (dir-bytes d)
+            r (verify/attempt (fn [] (put! s k v)))]
+        (if (and (map? r) (:threw r))
+          {:wrong (str said " threw: " (:threw r))}
+          {:s s :known (assoc known k v) :before known :done (conj done said)
+           :record (- (dir-bytes d) size)}))
+
+      (< pick 7)
+      (let [said (str "(del! s " k ")")
+            size (dir-bytes d)
+            r (verify/attempt (fn [] (del! s k)))]
+        (if (and (map? r) (:threw r))
+          {:wrong (str said " threw: " (:threw r))}
+          {:s s :known (dissoc known k) :before known :done (conj done said)
+           :record (- (dir-bytes d) size)}))
+
+      ;; A crash, only right after a write: torn (none of its record kept, a byte, half of it,
+      ;; all but its last byte) or whole. The record's length is how much the directory grew.
+      (and (< pick 9) before)
+      (let [n (long (or (:record st) 0))
+            keep (rand-nth (if (> n 2) [0 1 (quot n 2) (dec n) 1000000] [0 1000000]))
+            r (verify/attempt (fn [] (crash! s keep)))
+            known (if (= keep 1000000) known before)
+            done (conj done (str "(crash! s " keep ")") "(open-store dir)")
+            s2 (verify/attempt (fn [] (open d)))]
+        (cond
+          (and (map? r) (:threw r)) {:wrong (str "(crash! s " keep ") threw: " (:threw r))}
+          (and (map? s2) (:threw s2)) {:wrong (str "after " (last-done done) ", (open-store dir) threw: " (:threw s2))}
+          :else
+          (let [wrong (some (fn [key]
+                              (let [got (verify/attempt (fn [] (fetch s2 key)))]
+                                (when (not= got (get known key))
+                                  (str "after " (last-done done) ": (fetch s " key ") gave "
+                                       (pr-str got) ", expected " (pr-str (get known key))))))
+                            (range 4))]
+            (if wrong
+              {:wrong wrong}
+              {:s s2 :known known :before nil :done done}))))
+
+      :else
+      (let [got (verify/attempt (fn [] (fetch s k)))]
+        (if (not= got (get known k))
+          {:wrong (str "after " (last-done done) ": (fetch s " k ") gave "
+                       (pr-str got) ", expected " (pr-str (get known k)))}
+          {:s s :known known :before before :done done})))))
+
+(defn- grade-kv
+  "The store in work/kv.jank against the reference: nil, or what went wrong."
+  [path]
+  (or (load-file! path)
+      (let [names {:open "open-store" :put! "put!" :del! "del!" :fetch "fetch" :crash! "crash!"}
+            fs (into {} (map (fn [[k n]] [k (fn-in 'kv n)]) names))
+            missing (keep (fn [[k f]] (when-not (fn? f) (get names k))) fs)]
+        (if (seq missing)
+          (str "missing functions: " (str/join ", " missing))
+          (loop [round 0]
+            (if (>= round 6)
+              nil
+              (let [d (fresh-dir! (str dir "/kv-" round))
+                    s0 (verify/attempt (fn [] ((:open fs) d)))
+                    said (if (and (map? s0) (:threw s0))
+                           (str "(open-store dir) threw: " (:threw s0))
+                           (loop [i 0 st {:s s0 :known {} :before nil :done []}]
+                             (if (>= i 80)
+                               nil
+                               (let [r (kv-step fs d st)]
+                                 (if (:wrong r) (:wrong r) (recur (inc i) r))))))]
+                (if said
+                  (str "round " round ": " said)
+                  (recur (inc round))))))))))
+
+(defn grade
+  "The grade of `task`'s file (:lru or :kv): nil when it is right, else what went wrong."
+  [task path]
+  (case task
+    :lru (grade-lru path)
+    :kv (grade-kv path)))

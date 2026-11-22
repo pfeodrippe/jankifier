@@ -9,13 +9,20 @@
 ;;
 ;; The code is then graded by a reference the model never sees: random operations on its
 ;; functions against a reference implementation. That grade, not any check the model ran,
-;; says whether the code is right.
+;; says whether the code is right. The graders are kept apart (../harness-graders, hidden by
+;; the sandbox), loaded only once a run has ended, then removed: see `grade!`.
 ;;
 ;;   (def m (ink/open "../inkling/models/inkling-2-mini.ink"))
-;;   (trials/run! m {:tasks [:lru] :modes [:plain :verified] :seeds [1 2 3]})
+;;   (def r (trials/trial m :lru :verified 1))     ; a run, not graded yet
+;;   ;; then, from outside the sandbox, the graders' text sent and run:
+;;   ;; (trials/grade! r "<the text of ../harness-graders/graders.jank>")
 ;;   (trials/summary)
 ;;
-;; Each run's conversation is kept in work/trials/ (harness.cards/replay! plays it).
+;; Each run's conversation is kept in ../trials-out/ (harness.cards/replay! plays it). Each run
+;; starts with work/ empty. The model must not see what it is graded against, nor other runs:
+;; run the process with trials-out hidden from it (sandbox.sh's HARNESS_HIDE), and keep
+;; references anywhere the model can't read. (This file, the graders, is loaded before the
+;; model runs, so it can't be hidden: it says what the tasks require, not how.)
 (ns harness.trials
   (:refer-clojure :exclude [run!])
   (:require [clojure.string :as str]
@@ -25,186 +32,12 @@
             [harness.verify :as verify]
             [cards.repl :as repl]))
 
-(def dir "work/trials")
-
-;; Loading a file's namespace and its functions.
-
-(defn- load-file!
-  "The file's text evaluated; nil, or what failed."
-  [path]
-  (let [text (verify/attempt (fn [] (slurp path)))]
-    (if (:threw text)
-      (str "no file: " (:threw text))
-      (let [r (repl/evaluate text "user" path 1 1 false)]
-        (when-not (:ok r) (str (:error r)))))))
-
-(defn- fn-in [ns-sym name]
-  (when-let [n (find-ns ns-sym)]
-    (when-let [v (ns-resolve n (symbol name))]
-      (deref v))))
-
-;; The LRU cache: a reference, and the grade.
-
-(defn- ref-lookup [entries k]
-  (some (fn [[ek ev]] (when (= ek k) ev)) entries))
-
-(defn- ref-touch
-  "Entries (most recent first) with k most recent, given v."
-  [entries k v]
-  (vec (cons [k v] (remove (fn [[ek _]] (= ek k)) entries))))
-
-(defn- grade-lru
-  "The cache in work/lru.jank against the reference: nil, or what went wrong."
-  [path]
-  (or (load-file! path)
-      (let [fs (into {} (map (fn [n] [n (fn-in 'lru n)]) ["new-cache" "lookup" "store!" "cached-keys"]))
-            missing (keep (fn [[n f]] (when-not (fn? f) n)) fs)]
-        (if (seq missing)
-          (str "missing functions: " (str/join ", " missing))
-          (let [new-cache (get fs "new-cache") lookup (get fs "lookup")
-                store! (get fs "store!") cached-keys (get fs "cached-keys")]
-            (loop [cases (for [capacity [1 2 3] round (range 4)] [capacity round])]
-              (if (empty? cases)
-                nil
-                (let [[capacity round] (first cases)
-                      c (new-cache capacity)
-                      said (loop [i 0 entries [] done []]
-                             (if (>= i 60)
-                               nil
-                               (let [k (rand-int 5)
-                                     op (if (< (rand-int 10) 5) :store :lookup)
-                                     v (str "v" (rand-int 100))]
-                                 (if (= op :store)
-                                   (let [r (verify/attempt (fn [] (store! c k v)))
-                                         entries (vec (take capacity (ref-touch entries k v)))
-                                         done (conj done (str "(store! c " k " " (pr-str v) ")"))
-                                         ks (verify/attempt (fn [] (vec (cached-keys c))))]
-                                     (cond
-                                       (:threw r) (str (last done) " threw: " (:threw r))
-                                       (:threw ks) (str "(cached-keys c) threw: " (:threw ks))
-                                       (not= ks (mapv first entries))
-                                       (str "after " (str/join " " (take-last 6 done)) ": (cached-keys c) gave "
-                                            (pr-str ks) ", expected " (pr-str (mapv first entries)))
-                                       :else (recur (inc i) entries done)))
-                                   (let [got (verify/attempt (fn [] (lookup c k)))
-                                         want (ref-lookup entries k)
-                                         entries (if (some? want) (ref-touch entries k want) entries)
-                                         done (conj done (str "(lookup c " k ")"))
-                                         ks (verify/attempt (fn [] (vec (cached-keys c))))]
-                                     (cond
-                                       (and (map? got) (:threw got)) (str (last done) " threw: " (:threw got))
-                                       (not= got want) (str "after " (str/join " " (take-last 6 done)) ": gave "
-                                                            (pr-str got) ", expected " (pr-str want))
-                                       (:threw ks) (str "(cached-keys c) threw: " (:threw ks))
-                                       (not= ks (mapv first entries))
-                                       (str "after " (str/join " " (take-last 6 done)) ": (cached-keys c) gave "
-                                            (pr-str ks) ", expected " (pr-str (mapv first entries)))
-                                       :else (recur (inc i) entries done)))))))]
-                  (if said
-                    (str "capacity " capacity ": " said)
-                    (recur (rest cases)))))))))))
-
-;; The key-value store with its log: a reference, and the grade.
-
-(defn- fresh-dir! [d]
-  (cpp/harness.run (str "rm -rf '" d "' && mkdir -p '" d "'") 10000 10.0)
-  d)
-
-(defn- dir-bytes
-  "The bytes of the files in a directory, all together."
-  [d]
-  (let [out (:out (cpp/harness.run (str "cat '" d "'/* 2>/dev/null | wc -c") 100000 10.0))]
-    (or (parse-long (str/trim (str out))) 0)))
-
-(defn- kv-step
-  "One random operation of the store's grade. Returns {:wrong text} or the next state
-  {:s :known :before :done}."
-  [fs d {:keys [s known before done] :as st}]
-  (let [{:keys [open put! del! fetch crash!]} fs
-        k (rand-int 4)
-        pick (rand-int 12)
-        v (if (< (rand-int 2) 1) (rand-int 50) (str "s " (rand-int 50)))
-        last-done (fn [done] (str/join " " (take-last 6 done)))]
-    (cond
-      ;; A write: what was known before it is kept, for a crash that would tear it.
-      (< pick 5)
-      (let [said (str "(put! s " k " " (pr-str v) ")")
-            size (dir-bytes d)
-            r (verify/attempt (fn [] (put! s k v)))]
-        (if (and (map? r) (:threw r))
-          {:wrong (str said " threw: " (:threw r))}
-          {:s s :known (assoc known k v) :before known :done (conj done said)
-           :record (- (dir-bytes d) size)}))
-
-      (< pick 7)
-      (let [said (str "(del! s " k ")")
-            size (dir-bytes d)
-            r (verify/attempt (fn [] (del! s k)))]
-        (if (and (map? r) (:threw r))
-          {:wrong (str said " threw: " (:threw r))}
-          {:s s :known (dissoc known k) :before known :done (conj done said)
-           :record (- (dir-bytes d) size)}))
-
-      ;; A crash, only right after a write: torn (none of its record kept, a byte, half of it,
-      ;; all but its last byte) or whole. The record's length is how much the directory grew.
-      (and (< pick 9) before)
-      (let [n (long (or (:record st) 0))
-            keep (rand-nth (if (> n 2) [0 1 (quot n 2) (dec n) 1000000] [0 1000000]))
-            r (verify/attempt (fn [] (crash! s keep)))
-            known (if (= keep 1000000) known before)
-            done (conj done (str "(crash! s " keep ")") "(open-store dir)")
-            s2 (verify/attempt (fn [] (open d)))]
-        (cond
-          (and (map? r) (:threw r)) {:wrong (str "(crash! s " keep ") threw: " (:threw r))}
-          (and (map? s2) (:threw s2)) {:wrong (str "after " (last-done done) ", (open-store dir) threw: " (:threw s2))}
-          :else
-          (let [wrong (some (fn [key]
-                              (let [got (verify/attempt (fn [] (fetch s2 key)))]
-                                (when (not= got (get known key))
-                                  (str "after " (last-done done) ": (fetch s " key ") gave "
-                                       (pr-str got) ", expected " (pr-str (get known key))))))
-                            (range 4))]
-            (if wrong
-              {:wrong wrong}
-              {:s s2 :known known :before nil :done done}))))
-
-      :else
-      (let [got (verify/attempt (fn [] (fetch s k)))]
-        (if (not= got (get known k))
-          {:wrong (str "after " (last-done done) ": (fetch s " k ") gave "
-                       (pr-str got) ", expected " (pr-str (get known k)))}
-          {:s s :known known :before before :done done})))))
-
-(defn- grade-kv
-  "The store in work/kv.jank against the reference: nil, or what went wrong."
-  [path]
-  (or (load-file! path)
-      (let [names {:open "open-store" :put! "put!" :del! "del!" :fetch "fetch" :crash! "crash!"}
-            fs (into {} (map (fn [[k n]] [k (fn-in 'kv n)]) names))
-            missing (keep (fn [[k f]] (when-not (fn? f) (get names k))) fs)]
-        (if (seq missing)
-          (str "missing functions: " (str/join ", " missing))
-          (loop [round 0]
-            (if (>= round 6)
-              nil
-              (let [d (fresh-dir! (str dir "/kv-grade-" round))
-                    s0 (verify/attempt (fn [] ((:open fs) d)))
-                    said (if (and (map? s0) (:threw s0))
-                           (str "(open-store dir) threw: " (:threw s0))
-                           (loop [i 0 st {:s s0 :known {} :before nil :done []}]
-                             (if (>= i 80)
-                               nil
-                               (let [r (kv-step fs d st)]
-                                 (if (:wrong r) (:wrong r) (recur (inc i) r))))))]
-                (if said
-                  (str "round " round ": " said)
-                  (recur (inc round))))))))))
+(def dir "../trials-out")
 
 ;; The tasks.
 
 (def tasks
   {:lru {:file "work/lru.jank"
-         :grade grade-lru
          :ask (str "Write the file work/lru.jank, a jank namespace `lru` with an LRU cache:\n"
                    "- (new-cache capacity): a cache holding at most `capacity` entries (capacity >= 1).\n"
                    "- (lookup cache k): the value for k, or nil. A key found becomes the most recently used.\n"
@@ -213,7 +46,6 @@
                    "- (cached-keys cache): the keys held, most recently used first, as a vector.\n"
                    "Keys and values are any jank values.")}
    :kv {:file "work/kv.jank"
-        :grade grade-kv
         :ask (str "Write the file work/kv.jank, a jank namespace `kv` with a key-value store kept in a log "
                   "file in a directory:\n"
                   "- (open-store dir): the store kept in the directory `dir` (made if missing). It recovers "
@@ -243,10 +75,14 @@
 (defonce results (atom []))
 
 ;; (fn [agent name]) called with each trial's agent as it starts: harness.cards/watch! shows
-;; it in the window as it goes.
+;; it in the window as it goes (unwatch the earlier ones first: their conversations stay
+;; reachable from the process, and the model can evaluate code in it).
 (defonce watcher (atom nil))
 
 (defn- path [& parts] (str dir "/" (str/join "" parts)))
+
+(defn- save-results! []
+  (spit (path "results.edn") (pr-str @results)))
 
 (defn trial
   "One run of `task` in `mode` (:plain or :verified), sampled with `seed`. Returns
@@ -254,7 +90,8 @@
   [m task mode seed]
   (let [t (get tasks task)
         file (:file t)
-        _ (cpp/harness.run (str "mkdir -p " dir " && rm -f " file) 10000 10.0)
+        ;; A clean start: nothing in work/ from earlier runs.
+        _ (cpp/harness.run (str "mkdir -p " dir " work && find work -mindepth 1 -delete") 10000 10.0)
         verified (= mode :verified)
         system (str tools/situation
                     (when verified (str "\n\n" (slurp "VERIFY.md"))))
@@ -271,26 +108,36 @@
         seconds (- (cpp/harness.seconds) began)
         recording (path (name task) "-" (name mode) "-" seed ".edn")
         _ (h/save! a recording)
-        grade (verify/attempt (fn [] ((:grade t) file)))
-        grade (if (and (map? grade) (:threw grade)) (str "the grader threw: " (:threw grade)) grade)
         check (when verified (verify/attempt (fn [] (verify/check file))))
         st (h/status a)
         r {:task task :mode mode :seed seed
-           :right (nil? grade) :grade grade
+           :right nil :grade :not-graded :file file
            :verified (when verified (boolean (:ok check)))
            :checks (count (filter (fn [e] (= :check (:role e))) (h/entries a)))
            :tokens (:generated st) :seconds seconds :state (:state st)
            :recording recording}]
     (h/close! a)
     (swap! results conj r)
-    (spit (path "results.edn") (pr-str @results))
+    (save-results!)
     r))
 
-(defn run!
-  "Trials of each task, mode and seed, one after the other. Returns their results."
-  [m {:keys [tasks modes seeds] :or {tasks [:lru :kv] modes [:plain :verified] seeds [1 2 3]}}]
-  (vec (for [task tasks seed seeds mode modes]
-         (trial m task mode seed))))
+(defn grade!
+  "A run graded: the graders' text (../harness-graders/graders.jank, which the sandbox hides,
+  read by whoever runs the trials) loaded, the run's file graded, the graders removed again
+  so that the next run can't reach them. Returns the run's result, with its grade."
+  [run graders-text]
+  (let [loaded (repl/evaluate (str graders-text) "user" "graders.jank" 1 1 false)
+        grade (if (:ok loaded)
+                (let [g (verify/attempt (fn [] ((deref (ns-resolve (find-ns 'harness-graders) 'grade))
+                                                 (:task run) (:file run))))]
+                  (if (and (map? g) (:threw g)) (str "the grader threw: " (:threw g)) g))
+                (str "the graders didn't load: " (:error loaded)))
+        graded (assoc run :right (nil? grade) :grade grade)]
+    (remove-ns 'harness-graders)
+    (cpp/harness.run "rm -rf work/.grading" 10000 10.0)
+    (swap! results (fn [rs] (mapv (fn [r] (if (= (:recording r) (:recording run)) graded r)) rs)))
+    (save-results!)
+    graded))
 
 (defn summary
   "The results so far as text: for each task and mode, how many runs were right."
