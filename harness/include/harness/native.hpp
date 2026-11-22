@@ -3,6 +3,8 @@
 // arguments), a JSON string written (a tool's declaration), and what the default tools need
 // of the system (a command run, a directory listed).
 #pragma once
+#include <sandbox.h>
+#include <climits>
 
 #include <algorithm>
 #include <array>
@@ -705,6 +707,69 @@ namespace harness
       finish(n);
     }
     return str(out);
+  }
+
+  /* The process's working directory changed: "" or what failed. */
+  inline object_ref change_dir(object_ref const path)
+  {
+    auto const p(to_std(path));
+    if(::chdir(p.c_str()) != 0)
+    {
+      return str(std::string{ "can't go to " } + p + ": " + std::strerror(errno));
+    }
+    return str("");
+  }
+
+  /* A path made absolute and without links or ".." (a path that isn't there yet: its
+   * nearest existing directory's, with the rest added). */
+  inline object_ref real_path(object_ref const path)
+  {
+    std::string p(to_std(path));
+    std::string rest;
+    while(!p.empty())
+    {
+      char resolved[PATH_MAX];
+      if(::realpath(p.c_str(), resolved))
+      {
+        return str(std::string{ resolved } + rest);
+      }
+      auto const slash(p.find_last_of('/'));
+      if(slash == std::string::npos)
+      {
+        char here[PATH_MAX];
+        if(::getcwd(here, sizeof(here)))
+        {
+          return str(std::string{ here } + "/" + p + rest);
+        }
+        return str(p + rest);
+      }
+      rest = p.substr(slash) + rest;
+      p = p.substr(0, slash);
+      if(p.empty())
+      {
+        return str(rest);
+      }
+    }
+    return str(rest);
+  }
+
+  /* This process sandboxed from now on by a profile (SBPL text): "" or what failed. macOS
+   * lets a process do this once, and not when it was started inside a sandbox; what it
+   * starts afterwards is sandboxed too. */
+  inline object_ref sandbox_self(object_ref const profile)
+  {
+    char *error{};
+    auto const text(to_std(profile));
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    int const failed{ ::sandbox_init(text.c_str(), 0, &error) };
+    std::string said{ failed != 0 ? (error ? error : "sandbox_init failed") : "" };
+    if(error)
+    {
+      ::sandbox_free_error(error);
+    }
+#pragma clang diagnostic pop
+    return str(said);
   }
 
   inline void say(object_ref const text)

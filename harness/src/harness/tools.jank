@@ -39,6 +39,19 @@
             lines (map (fn [line] (if (str/starts-with? line "error: ") (subs line 7) line)) lines)]
         (str/join "\n" lines)))))
 
+;; Directories the file tools refuse (read_file, list_dir, load_file, write_file,
+;; edit_file): what a run mustn't look at.
+;; (Not a sandbox: eval and the shell can still reach them.)
+(defonce hidden-paths (atom []))
+
+(defn- check-path!
+  "Throws when `path` is in a hidden directory."
+  [path]
+  (let [real (str (cpp/harness.real_path (str path)))]
+    (when (some (fn [d] (or (= real d) (str/starts-with? real (str d "/")))) @hidden-paths)
+      (throw (ex-info (str path " is not available to this run") {})))
+    path))
+
 ;; The namespace the model's code is evaluated in.
 (defonce evaluation-ns (atom "user"))
 
@@ -127,6 +140,7 @@
   Says what it printed and the namespace it is in, or what failed, with its line."
   [path]
   (prepare!)
+  (check-path! path)
   (when-not (cpp/harness.is_file (str path))
     (throw (ex-info (str "there is no file " path) {})))
   (let [text (slurp (str path))
@@ -173,6 +187,7 @@
   "Reads a text file and returns its contents. With from and lines, only that many lines
   starting at line `from` (the first line is 1), each with its number."
   [path from lines]
+  (check-path! path)
   (when-not (cpp/harness.is_file (str path))
     (throw (ex-info (str "there is no file " path) {})))
   (let [text (slurp (str path))]
@@ -187,6 +202,7 @@
 (defn write-file
   "Writes text to a file, replacing what it had; the directories its path needs are made."
   [path content]
+  (check-path! path)
   (cpp/harness.make_parents (str path))
   (cpp/harness.write_file (str path) (str content))
   (str "wrote " (count (str content)) " bytes to " path))
@@ -202,6 +218,7 @@
   "Replaces one piece of a text file: `old` must be in the file exactly once, as it is
   written there (its line breaks and spaces included)."
   [path old new]
+  (check-path! path)
   (when-not (cpp/harness.is_file (str path))
     (throw (ex-info (str "there is no file " path) {})))
   (let [text (slurp (str path))
@@ -217,6 +234,7 @@
 (defn list-dir
   "Lists a directory: a line an entry, directories ending in /, files with their sizes."
   [path]
+  (check-path! path)
   (let [entries (cpp/harness.list_dir (str path))]
     (if (empty? entries)
       "(empty)"
@@ -256,6 +274,32 @@
        "jank is not the Clojure of the JVM: the file JANK.md, in the directory this process "
        "runs in, says what differs and how C++ is called. Read it before writing code that "
        "goes beyond plain Clojure functions."))
+
+(defn confine!
+  "This process sandboxed from now on (macOS; once, and only when it wasn't started inside a
+  sandbox): for running a model's code once the harness is loaded, so that its tools and
+  everything they start can't read what the harness could. Under `home` (the user's home
+  directory) only `read`'s directories can be read; `hide` can't be read anywhere; files can
+  be written only in `write` (and outside `home` and the system's directories); the
+  network reaches only this machine. Each is a list of absolute paths. Returns the
+  profile applied."
+  [{:keys [home read write hide]}]
+  (let [real (fn [p] (str (cpp/harness.real_path (str p))))
+        paths (fn [ps] (str/join " " (map (fn [p] (str "(subpath " (pr-str (real p)) ")")) ps)))
+        profile (str "(version 1)\n(allow default)\n"
+                     "(deny file-read-data (subpath " (pr-str (real home)) "))\n"
+                     (when (seq read) (str "(allow file-read-data " (paths read) ")\n"))
+                     (when (seq hide) (str "(deny file-read-data " (paths hide) ")\n"))
+                     "(deny file-write* (subpath " (pr-str (real home)) ") (subpath \"/opt/homebrew\") "
+                     "(subpath \"/usr/local\") (subpath \"/Applications\") (subpath \"/Library\"))\n"
+                     (when (seq write) (str "(allow file-write* " (paths write) ")\n"))
+                     "(deny network*)\n"
+                     "(allow network* (local ip \"localhost:*\") (remote ip \"localhost:*\") "
+                     "(local unix-socket) (remote unix-socket))\n")
+        failed (str (cpp/harness.sandbox_self profile))]
+    (when (seq failed)
+      (throw (ex-info (str "the sandbox wasn't applied: " failed) {:profile profile})))
+    profile))
 
 (defn defaults
   "The default tools, a vector to give an agent (or to pick from: each is a map with

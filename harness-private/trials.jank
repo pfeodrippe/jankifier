@@ -9,13 +9,13 @@
 ;;
 ;; The code is then graded by a reference the model never sees: random operations on its
 ;; functions against a reference implementation. That grade, not any check the model ran,
-;; says whether the code is right. The graders are kept apart (../harness-graders, hidden by
+;; says whether the code is right. The graders are kept apart (../harness-private, hidden by
 ;; the sandbox), loaded only once a run has ended, then removed: see `grade!`.
 ;;
 ;;   (def m (ink/open "../inkling/models/inkling-2-mini.ink"))
 ;;   (def r (trials/trial m :lru :verified 1))     ; a run, not graded yet
 ;;   ;; then, from outside the sandbox, the graders' text sent and run:
-;;   ;; (trials/grade! r "<the text of ../harness-graders/graders.jank>")
+;;   ;; (trials/grade! r "<the text of ../harness-private/graders.jank>")
 ;;   (trials/summary)
 ;;
 ;; Each run's conversation is kept in ../trials-out/ (harness.cards/replay! plays it). Each run
@@ -32,7 +32,9 @@
             [harness.verify :as verify]
             [cards.repl :as repl]))
 
-(def dir "../trials-out")
+;; Where results and recordings go: ../trials-out, made absolute when this is loaded (a run
+;; works from a directory of its own, see agent-home!).
+(def dir (str (cpp/harness.real_path "../trials-out")))
 
 ;; The tasks.
 
@@ -99,6 +101,23 @@
 
 (defn- path [& parts] (str dir "/" (str/join "" parts)))
 
+(defn agent-home!
+  "Runs work from `home` from now on: the process's working directory becomes it, so that a
+  run's relative paths and its looking around (ls, grep -r .) see only what is there, and
+  the file tools refuse the directories in `hide` (the harness's own project, whose sources
+  and notes describe the trials). `home` holds what a run is meant to read: JANK.md,
+  VERIFY.md, examples/, and its work/ (the sandbox's work directory: sandbox.sh's
+  HARNESS_WORK). Load everything first: modules are read from where they were before.
+  Returns `home`'s real path."
+  [home hide]
+  ;; Veil's project, found from here before leaving.
+  (reset! verify/lake-project (str (cpp/harness.real_path @verify/lake-project)))
+  (let [failed (str (cpp/harness.change_dir (str home)))]
+    (when (seq failed)
+      (throw (ex-info failed {})))
+    (reset! tools/hidden-paths (mapv (fn [d] (str (cpp/harness.real_path (str d)))) hide))
+    (str (cpp/harness.real_path "."))))
+
 (defn- save-results! []
   (spit (path "results.edn") (pr-str @results)))
 
@@ -144,7 +163,7 @@
     r))
 
 (defn grade!
-  "A run graded: the graders' text (../harness-graders/graders.jank, which the sandbox hides,
+  "A run graded: the graders' text (../harness-private/graders.jank, which the sandbox hides,
   read by whoever runs the trials) loaded, the run's file graded, the graders removed again
   so that the next run can't reach them. Returns the run's result, with its grade."
   [run graders-text]

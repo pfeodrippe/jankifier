@@ -330,39 +330,38 @@ goes on (`:max-checks` times at most). The checks are shown in the
 conversation, in green or red. `VERIFY.md` is what the model is told, and
 `examples/parking.jank` the example it reads.
 
-`harness.trials` measures whether this makes code right more often: each task
-is asked several times, sampled, with and without the gate, and the code is
-graded by a reference the model never sees (random operations against a
-reference implementation). The tasks: an LRU cache, a key-value store kept
-in a log file that recovers from a crash tearing its last record, and a
-bounded queue used by several threads at once (its grader runs producers and
-consumers together and checks nothing is lost, given twice or out of order).
+The trials (`../harness-private/trials.jank`, beside their graders) measure
+whether this makes code right more often: each task is asked several times,
+sampled, with and without the gate, and the code is graded by a reference the
+model never sees (random operations against a reference implementation). The
+tasks: an LRU cache, a key-value store kept in a log file that recovers from a
+crash tearing its last record, and a bounded queue used by several threads at
+once (its grader runs producers and consumers together and checks nothing is
+lost, given twice or out of order).
 
-```clojure
-(require '[harness.trials :as trials])
-(trials/run! m {:tasks [:lru :kv] :modes [:plain :verified] :seeds [1 2 3]})
-(trials/summary)                            ; right runs per task and mode
-```
+A trial must not let the model see what it is graded against, other runs, or
+that it is a trial. So:
 
-A run in progress is kept in `../trials-out/live.edn` as it goes; another
-window follows it: `(hc/follow-file! "../trials-out/live.edn" "live")` reads
-it again whenever it changes and follows the end (an entry shows once it is
-whole).
+- the trials' code and graders are kept outside the harness's sources
+  (`../harness-private`) and sent to the process over its REPL by whoever
+  runs them (the graders only once a run has ended, and removed again before
+  the next);
+- a run works from a directory of its own outside the project
+  (`agent-home!`: its working directory, with copies of JANK.md, VERIFY.md
+  and examples/, and its work/), and the file tools refuse the project;
+- once everything is loaded (the engine, Veil's session, the trials' code),
+  the process sandboxes itself (`harness.tools/confine!`, macOS's
+  `sandbox_init`): it can read, under the home directory, only what compiling
+  needs (the build's cache and headers, Lean's toolchain), not the harness's
+  sources or notes; it writes only to the run's directory, `../trials-out` and
+  the caches; and it reaches only this machine. Everything the model's tools
+  start is inside the same sandbox.
 
-Each run starts with `work/` empty, and its conversation is kept in
-`../trials-out/` for `hc/replay!`. The model must not see what it is graded
-against, or earlier runs: start the process with those hidden from it,
-
-```sh
-HARNESS_PROFILES=extras HARNESS_HIDE="$PWD/../trials-out:/where/the/references/are" ./sandbox.sh
-```
-
-(`HARNESS_HIDE`: directories the sandboxed process can't read but can
-write; not inside the project, whose files the build reads), and show the window only the run in progress: the model can
-evaluate code in the process, so earlier conversations kept there are within
-its reach. The graders themselves (`src/harness/trials.jank`) are loaded
-before the model runs, so they can't be hidden; they say what the tasks
-require, not how.
+The process is started outside a sandbox for this (`./harness.sh`):
+`sandbox.sh` applies one from the start, which the process then can't
+tighten, and it must read its own sources to load. A run in progress is kept in
+`../trials-out/live.edn` as it goes; another window follows it:
+`(hc/follow-file! "../trials-out/live.edn" "live")`.
 
 ## What went wrong, across runs
 
@@ -408,7 +407,6 @@ evaluation of the process, a person's included:
 | `src/harness/bench.jank` | the bench |
 | `src/harness/observe.jank` | assertions a program makes about itself |
 | `src/harness/verify.jank` | code checked against its Veil model; the `verify` tool and the gate |
-| `src/harness/trials.jank` | trials of tasks with and without the gate, graded by references (kept in `../harness-graders`) |
 | `src/harness/review.jank` | what went wrong across recorded runs, by kind |
 | `VERIFY.md`, `examples/parking.jank` | what the model is told of verified work, and its example |
 | `src/harness/main.jank` | the process: the window's REPL, or the bench |

@@ -3,8 +3,8 @@
 # sandboxing that is left to whoever starts the process: the model's tools (eval, the shell,
 # the file tools) and everything they start can write only in the work directory
 # (HARNESS_WORK, ./work when not set) and reach only this machine over the network.
-# HARNESS_HIDE, directories separated by ':', can't be read at all (their files and
-# listings) but can be written: what the model mustn't see, such as the answers a trial
+# HARNESS_HIDE, directories and files separated by ':', can't be read at all (a directory's
+# files and listing; a directory can still be written): what the model mustn't see, such as the answers a trial
 # grades it against, and where trials keep their results. sandbox.sb has the rules. macOS only (sandbox-exec).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -22,9 +22,15 @@ if [ -n "${HARNESS_HIDE:-}" ]; then
   IFS=':' read -r -a hidden <<< "$HARNESS_HIDE"
   for d in "${hidden[@]}"; do
     [ -z "$d" ] && continue
-    mkdir -p "$d"
-    real=$(cd "$d" && pwd -P)
-    printf '(deny file-read-data (subpath "%s"))\n(allow file-write* (subpath "%s"))\n' "$real" "$real" >> "$profile"
+    if [ -f "$d" ]; then
+      # A file: hidden, and left as it is.
+      real="$(cd "$(dirname "$d")" && pwd -P)/$(basename "$d")"
+      printf '(deny file-read-data (literal "%s"))\n' "$real" >> "$profile"
+    else
+      mkdir -p "$d"
+      real=$(cd "$d" && pwd -P)
+      printf '(deny file-read-data (subpath "%s"))\n(allow file-write* (subpath "%s"))\n' "$real" "$real" >> "$profile"
+    fi
   done
 fi
 exec sandbox-exec \

@@ -1,12 +1,12 @@
 ;; SPDX-License-Identifier: MIT
-;; What went wrong across many recorded runs (harness.core/save!, harness.trials), sorted
+;; What went wrong across many recorded runs (harness.core/save!), sorted
 ;; into kinds, to decide what in the harness or its tools is worth fixing. Each occurrence
 ;; says its run and entry, and `look!` opens the run in the window at that entry.
 ;;
 ;;   (require '[harness.review :as review])
-;;   (println (review/report "../trials-out"))     ; the kinds, how often, an example of each
-;;   (review/issues "../trials-out")               ; every occurrence, as data
-;;   (review/look! "../trials-out/lru-plain-1.edn" 35)
+;;   (println (review/report "runs"))              ; the kinds, how often, an example of each
+;;   (review/issues "runs")                        ; every occurrence, as data
+;;   (review/look! "runs/first.edn" 35)
 ;;
 ;; The kinds are found mechanically, from the entries: tool errors by what they say, calls
 ;; repeated as they were, how long a run looked around before writing anything, thinking the

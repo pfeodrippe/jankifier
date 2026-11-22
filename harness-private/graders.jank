@@ -1,9 +1,9 @@
 ;; SPDX-License-Identifier: MIT
-;; The graders of harness.trials' tasks: each runs random operations on the code a run wrote
-;; against a reference, and says what went wrong, or nil. Kept out of the harness and where
-;; the sandbox hides them (HARNESS_HIDE), and sent to the process only after a run ends
-;; (see harness.trials): the model can evaluate code in the process, so anything loaded there
-;; while it works is within its reach.
+;; The graders of the trials' tasks (trials.jank, beside this): each runs random operations on
+;; the code a run wrote against a reference, and says what went wrong, or nil. Kept out of the
+;; harness and where the sandbox hides them (HARNESS_HIDE), and sent to the process only after
+;; a run ends: the model can evaluate code in the process, so anything loaded there while it
+;; works is within its reach.
 (ns harness-graders
   (:require [clojure.string :as str]
             [harness.verify :as verify]

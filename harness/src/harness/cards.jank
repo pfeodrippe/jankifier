@@ -1136,8 +1136,8 @@
 (defonce ^:private followed (atom {}))   ; name -> the file being followed
 
 (defn follow-file!
-  "A recording that is still being written (harness.trials keeps the run in progress in
-  ../trials-out/live.edn) shown as `named`, and kept up to date: the file is read again
+  "A recording that is still being written (h/save! after each entry, by an :on-entry)
+  shown as `named`, and kept up to date: the file is read again
   every two seconds when it changed, and the end followed, as a live conversation is (an
   entry shows once it is whole). Stops when `unwatch!`ed or followed again under that name."
   ([path] (follow-file! path "following"))
