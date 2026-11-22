@@ -292,6 +292,57 @@ Two parts (`src/harness/bench.jank`):
 A task passing says the model and the harness did it once, with greedy
 sampling. It doesn't say how often a sampled run would.
 
+## Work checked against its model
+
+The harness can refuse to take the model's word that its code works. With
+`HARNESS_PROFILES=extras` (Veil in the process):
+
+```clojure
+(require '[harness.verify :as verify])
+(verify/report (verify/check "examples/parking.jank"))   ; a file that passes
+
+(def a (h/agent m {:tools (conj (tools/defaults) (verify/tool))
+                   :system (str tools/situation "\n\n" (slurp "VERIFY.md"))
+                   :obligations (verify/gate "work/lru.jank")}))
+```
+
+A file checked is a namespace with the code, a Veil model of it
+(`veil/defmodel`), assertions (`harness.observe`: `always!`, `sometimes!`,
+`reachable!`, `unreachable!`) and a map `verification` tying them: the
+model's types' sizes, states the code must be able to reach, how to start a
+real system, how each of the model's actions is done on it, and how its state
+is seen as the model's. `verify/check` then asks:
+
+1. the model elaborates, keeps its safety properties as far as the checker
+   looks, and reaches each state it must;
+2. random runs of the real code match the model step by step: each step is one
+   the model allows, and after it the real state, seen as the model's, is one
+   the model reaches by that step (Veil's executable system says which);
+3. the model's own runs to those states, done on the real code, match too;
+4. the code's assertions held;
+5. copies of the code with a deliberate bug (a comparison turned, `inc` made
+   `dec`, a `when` inverted) fail the same checks, at least half of them.
+
+`:obligations` makes this the end of a turn: when the model answers, the gate
+checks the file, and if it fails, what failed is said to the model and the turn
+goes on (`:max-checks` times at most). The checks are shown in the
+conversation, in green or red. `VERIFY.md` is what the model is told, and
+`examples/parking.jank` the example it reads.
+
+`harness.trials` measures whether this makes code right more often: each task
+is asked several times, sampled, with and without the gate, and the code is
+graded by a reference the model never sees (random operations against a
+reference implementation). The tasks: an LRU cache, and a key-value store kept
+in a log file that recovers from a crash tearing its last record.
+
+```clojure
+(require '[harness.trials :as trials])
+(trials/run! m {:tasks [:lru :kv] :modes [:plain :verified] :seeds [1 2 3]})
+(trials/summary)                            ; right runs per task and mode
+```
+
+Each run's conversation is kept in `work/trials/` for `hc/replay!`.
+
 ## Two problems of jank's REPL this needed fixed
 
 Both are fixed in the window library (`cards.repl`, loaded here), for every
@@ -315,6 +366,10 @@ evaluation of the process, a person's included:
 | `src/harness/json.jank`, `include/harness/native.hpp` | JSON, a command run, a directory listed |
 | `src/harness/cards.jank` | the conversations in the window |
 | `src/harness/bench.jank` | the bench |
+| `src/harness/observe.jank` | assertions a program makes about itself |
+| `src/harness/verify.jank` | code checked against its Veil model; the `verify` tool and the gate |
+| `src/harness/trials.jank` | trials of tasks with and without the gate, graded by references |
+| `VERIFY.md`, `examples/parking.jank` | what the model is told of verified work, and its example |
 | `src/harness/main.jank` | the process: the window's REPL, or the bench |
 | `JANK.md` | notes on jank for the model: what differs from Clojure, calling C++ |
 | `sandbox.sh`, `sandbox.sb` | the process inside a macOS sandbox |
