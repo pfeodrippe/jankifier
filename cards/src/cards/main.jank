@@ -1,0 +1,86 @@
+;; SPDX-License-Identifier: MIT
+;; The cards' process: jank's nREPL server on a thread of its own (its port in .nrepl-port, as
+;; `jank repl` writes it), the window's frames on the main thread, where macOS wants them. A
+;; REPL connected to it works as anywhere, and the window follows: each evaluation is told to
+;; it with its value.
+;;
+;; A project has a -main of its own that requires what defines its cards and calls `run!`.
+;; This one shows the generic cards alone:
+;;   lein run --disable-sandbox                              the window
+;;   lein run --disable-sandbox -- --hidden --record a.mp4   its frames to a video, nothing shown
+(ns cards.main
+  (:refer-clojure :exclude [run!])
+  (:require [clojure.string :as str]
+            [jank.nrepl.server.core :as nrepl]
+            [jank.nrepl.server.handler :as handler]
+            ;; The eval operation on a large stack, its output captured safely.
+            [cards.repl]
+            [cards.core :as cards]))
+
+(defn- after [flag args]
+  (second (drop-while (fn [arg] (not= arg flag)) args)))
+
+(defn options
+  "The command line's: --hidden, --record <video>, --width <points>, --height <points>,
+  --announce (each evaluation said on stderr, for a script driving the REPL)."
+  [args]
+  {:hidden (boolean (some (fn [arg] (= arg "--hidden")) args))
+   :announce (boolean (some (fn [arg] (= arg "--announce")) args))
+   :record (after "--record" args)
+   :width (when-let [w (after "--width" args)] (parse-long w))
+   :height (when-let [h (after "--height" args)] (parse-long h))})
+
+(defonce ^:private quiet (atom #{}))
+
+(defn quiet!
+  "Evaluations whose code has `part` are not told to the window: no card, no count. For a
+  library's calls that a script makes to look at the window (a video's take asking where
+  something was drawn)."
+  [part]
+  (swap! quiet conj (str part))
+  nil)
+
+(defn- tooling?
+  "What an editor evaluates for itself on connecting, and the window's own calls: not a
+  person's work."
+  [code]
+  (or (some (fn [part] (str/includes? code part)) @quiet)
+      (str/includes? code "cider") (str/includes? code "clojure.main/repl-requires")
+      (str/includes? code "clojure.stacktrace")
+      (str/includes? code "cards.core/snapshot!") (str/includes? code "cards.core/stop!")
+      (str/includes? code "cards.core/evaluations") (str/includes? code "cards.core/newest-box")
+      (str/includes? code "cards.core/pointer") (str/includes? code "cards.core/click!")
+      (str/includes? code "cards.core/wheel!")
+      (str/starts-with? code "(in-ns ") (str/starts-with? code "(ns ")
+      ;; A client's probe on connecting.
+      (= code "1")))
+
+(defn- tell-evaluations!
+  "nREPL's eval as it was, its value (*1) or its error then told to the window."
+  []
+  (let [evaluate (get-method handler/handle-message :eval)]
+    (defmethod handler/handle-message :eval [message]
+      (let [answer (evaluate message)
+            parts (if (map? answer) [answer] (remove nil? answer))
+            error (some :ex parts)
+            code (str/trim (get message "code" ""))]
+        (when-not (tooling? code)
+          (try
+            (cards/evaluated! code (when-not error *1) error)
+            (catch :default e
+              (println "cards:" e))))
+        answer))))
+
+(defn run!
+  "The REPL's server, then the window until it closes; the process ends there. `opts` as
+  `cards.core/open!` takes them."
+  [opts]
+  (deref (nrepl/background-main))
+  (tell-evaluations!)
+  (cards/open! opts)
+  (cards/loop!)
+  ;; Gone at once, nothing torn down under a REPL thread still compiling (cards::quit).
+  (cpp/cards.quit))
+
+(defn -main [& args]
+  (run! (options args)))

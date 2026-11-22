@@ -1,0 +1,944 @@
+;; SPDX-License-Identifier: MIT
+;; A window of cards following a jank REPL: each evaluation becomes a card, drawn by what its
+;; value is. Text as lines, a flat map as its keys and values, rows as a table, numbers as bars
+;; or a series, a matrix as a heat map, anything else as it prints; none for nil. A project
+;; adds its own kinds of card with `defview!`, and a header with `header!`.
+;;
+;; A value can also say how it is drawn. Metadata chooses its kind and its title:
+;;   (as :table rows)          (with-meta rows {:cards/view :table :cards/title "tensors"})
+;; and a layout is data: nodes around any values, each value drawn by its own kind:
+;;   (layout [:row [:col [:text {:size :big} "Next"] (top s 5)]
+;;                 {:shape [24 13] :values weights}])
+;; and a handler, a map, says how the values it matches are drawn: by an attribute (in a
+;; value's metadata or, for a map, among its keys), by a filter on the value, or both:
+;;   (handle! {:attr :dtype
+;;             :render (fn [tensor] [:row [:text {:size :big} (:name tensor)] (:shape tensor)])})
+;;   (handle! {:attr :kind :equals :route :render (fn [route] ...)})
+;;   (handle! {:id :long-text
+;;             :filter (fn [v] (and (string? v) (> (count v) 500)))
+;;             :render (fn [text] ...)})
+;;
+;; `pin!` keeps a card first, above the others, by name. Pin an atom and the card is made
+;; again whenever the atom holds another value, whoever changed it (a future, a callback):
+;;   (def progress (atom {:done 0 :of 100}))
+;;   (pin! "progress" progress (fn [p] [:text {:size :big} (str (:done p) " of " (:of p))]))
+;; A pinned function is called again after every evaluation.
+;;
+;; The drawing is plain jank over a few native primitives (include/cards/cards.hpp), in points
+;; from the window's top left: change a draw function, evaluate it, and the next frame uses it.
+;; Cards are made on the REPL's thread (`evaluated!`, `show`) and drawn on the main thread
+;; (`loop!`), so a card holds plain data only.
+(ns cards.core
+  (:include "cards/cards.hpp")
+  (:require [clojure.string :as str]))
+
+;; Colours (0xRRGGBB).
+(def paper 0xfdf6d8)
+(def card 0xfffbe6)
+(def ink 0x1c1b18)
+(def muted 0x7a7466)
+(def rule 0xcfc49a)
+(def red 0xb3261e)
+(def green 0x2e7d32)
+(def blue 0x1a4f8b)
+(def orange 0xb86b00)
+(def purple 0x6a1b9a)
+
+;; Text sizes: mono small, normal, large; serif normal, large.
+(def small 0)
+(def mono 1)
+(def big 2)
+(def serif 3)
+(def title 4)
+
+;; Native primitives, by name.
+(defn text! [x y color size what] (cpp/cards.text x y color size what))
+(defn text-width [size what] (cpp/cards.text_width size what))
+(defn line! [x1 y1 x2 y2 color thickness] (cpp/cards.line x1 y1 x2 y2 color thickness))
+(defn curve! [x1 y1 x2 y2 color thickness] (cpp/cards.curve x1 y1 x2 y2 color thickness))
+(defn rect! [x1 y1 x2 y2 color alpha rounding] (cpp/cards.rect x1 y1 x2 y2 color alpha rounding))
+(defn frame! [x1 y1 x2 y2 color thickness] (cpp/cards.frame x1 y1 x2 y2 color thickness))
+(defn circle! [x y radius color alpha] (cpp/cards.circle x y radius color alpha))
+(defn ring! [x y radius color thickness] (cpp/cards.ring x y radius color thickness))
+(defn triangle! [x1 y1 x2 y2 x3 y3 color alpha] (cpp/cards.triangle x1 y1 x2 y2 x3 y3 color alpha))
+(defn clip-begin! [x1 y1 x2 y2] (cpp/cards.clip_begin x1 y1 x2 y2))
+(defn clip-end! [] (cpp/cards.clip_end))
+(defn cursor!
+  "Where ImGui's own widgets go next: a draw function calls this, then ImGui itself
+  ((cpp/ImGui.Text \"...\"), (cpp/ImGui.Button \"...\"), ...)."
+  [x y]
+  (cpp/cards.cursor x y))
+(defn mouse-x [] (cpp/cards.mouse_x))
+(defn mouse-y [] (cpp/cards.mouse_y))
+
+;; A scripted mouse, for a window nobody points at (a hidden one: a test, a video). It is
+;; drawn as an arrow while it is there.
+(defn pointer!
+  "The mouse moved to (x, y) by the program: what is under it answers as to a real one."
+  [x y]
+  (cpp/cards.pointer x y))
+(defn click!
+  "The mouse moved to (x, y), pressed and released there."
+  [x y]
+  (cpp/cards.press x y))
+(defn pointer-off!
+  "The scripted mouse gone."
+  []
+  (cpp/cards.pointer_off))
+(defn wheel!
+  "The scripted mouse's wheel turned by `amount` (up is positive), where the mouse is."
+  [amount]
+  (cpp/cards.turn amount))
+
+;; For a draw function that makes parts of its drawing answer the mouse.
+(defn wheel "How far the wheel turned this frame (up is positive)." [] (cpp/cards.wheel))
+(defn inside?
+  "Whether the mouse is in the rectangle."
+  [x1 y1 x2 y2]
+  (cpp/cards.inside x1 y1 x2 y2))
+(defn down? "Whether the mouse's button is held down." [] (cpp/cards.down))
+(defn clicked?
+  "Whether the rectangle was clicked: pressed and released in it, said in the frame of the
+  release. Asked from a draw function, every frame."
+  [x1 y1 x2 y2]
+  (cpp/cards.clicked x1 y1 x2 y2))
+(defn seconds "Seconds since the window opened." [] (cpp/cards.seconds))
+
+;; Arrays of numbers kept on the native side (a card's thousands of values are copied there
+;; once and drawn from C++): `array!` gives an array's number.
+(defn array! [numbers] (cpp/cards.array_new numbers))
+(defn array-at [id index] (cpp/cards.array_at id index))
+(defn heat!
+  "The array as a matrix [rows, cols] in the rectangle: positive values in one colour, negative
+  ones in another, each as strong as its magnitude over the largest."
+  [id x y width height rows cols positive negative]
+  (cpp/cards.heat id x y width height rows cols positive negative))
+(defn series! [id x y width height color] (cpp/cards.series id x y width height color))
+
+(defn guarded
+  "What `f` returns; nil when it throws."
+  [f]
+  ;; jank binds nil in (catch :default e): a thrown value is caught by its type.
+  (try
+    (f)
+    (catch jank.runtime.object_ref e nil)
+    (catch cpp/std.exception e nil)
+    (catch :default _ nil)))
+
+;; Saying values.
+
+(defn fixed
+  "A number with `places` decimals (up to 6)."
+  [x places]
+  (let [scale (nth [1.0 10.0 100.0 1000.0 10000.0 100000.0 1000000.0] places)
+        negative (neg? x)
+        scaled (long (+ 0.5 (* (if negative (- 0.0 x) x) scale)))
+        unit (long scale)]
+    (str (if (and negative (pos? scaled)) "-" "")
+         (quot scaled unit)
+         (if (pos? places) (str "." (subs (str (+ unit (mod scaled unit))) 1)) ""))))
+
+(defn said
+  "A value as a card says it: text and whole numbers as they are, other numbers with a few
+  decimals, anything else as it prints."
+  [v]
+  (cond
+    (string? v) v
+    (keyword? v) (name v)
+    (integer? v) (str v)
+    (number? v) (let [size (if (neg? v) (- 0.0 v) v)]
+                  (cond
+                    (and (< size 1.0e15) (= (* 1.0 (long v)) (* 1.0 v))) (str (long v))
+                    (>= size 1000.0) (fixed v 1)
+                    (>= size 1.0) (fixed v 3)
+                    :else (fixed v 4)))
+    :else (pr-str v)))
+
+(defn plain?
+  "A value that isn't a collection."
+  [v]
+  (or (nil? v) (string? v) (number? v) (keyword? v) (boolean? v) (symbol? v)))
+
+(defn cell?
+  "A value a table's cell holds: a plain one, or a few of them (a shape, a pair)."
+  [v]
+  (or (plain? v)
+      (and (sequential? v) (<= (count v) 8) (every? plain? v))))
+
+(defn- one-line
+  "`text` on one line, its runs of white space a space each. (Without a character class or
+  \\s: with either, jank 0.1's regex also takes the bytes of an accented letter.)"
+  [text]
+  (-> text
+      (str/replace "\n" " ")
+      (str/replace "\r" " ")
+      (str/replace "\t" " ")
+      (str/replace #" +" " ")))
+
+(defn- fit
+  "How many bytes of `what` fit in `width` points at size `size`, whole characters; nil
+  when all of it fits."
+  [size what width]
+  (let [n (long (cpp/cards.fit size what width))]
+    (when-not (neg? n) n)))
+
+(defn clip
+  "`what` cut to `width` points at size `size`, with an ellipsis where it was cut."
+  [size width what]
+  (let [what (str what)]
+    (if (<= (text-width size what) width)
+      what
+      (let [at (fit size what (- width (text-width size "…")))]
+        (if at (str (subs what 0 at) "…") what)))))
+
+(defn wrap
+  "`what` as lines of at most `width` points at size `size`, cut between characters; at
+  most `limit` lines."
+  [size width what limit]
+  (loop [out [] lines (str/split-lines (str what))]
+    (if (or (empty? lines) (>= (count out) limit))
+      (vec (take limit out))
+      (let [line (first lines)
+            at (fit size line width)]
+        (if at
+          (recur (conj out (subs line 0 at)) (cons (subs line at) (rest lines)))
+          (recur (conj out line) (rest lines)))))))
+
+;; The window's state: the cards, oldest first.
+(defonce state (atom {:cards [] :pinned [] :title "cards"}))
+
+;; Kinds of card: kind -> {:height f :draw f}; and how values become cards, tried in order.
+(defonce ^:private views (atom {}))
+(defonce ^:private shapes (atom []))
+(defonce ^:private told (atom []))
+(defonce ^:private header (atom nil))
+
+(defn defview!
+  "A kind of card. `shape` (fn [value]) gives a card's data (a map) for the values this kind
+  draws, nil for any other; kinds defined later are asked first. A shape alone can also turn
+  a value into another one's card: (fn [v] (when (mine? v) (shaped (as-a-map v)))). `height` (fn [card width])
+  is its body's height, and `draw` (fn [card x y width]) draws the body with its top left at
+  (x, y). `shape` runs on the REPL's thread, the other two on the main thread, every frame."
+  [kind {:keys [shape height draw]}]
+  (swap! views assoc kind {:height height :draw draw})
+  (when shape
+    (swap! shapes (fn [all] (vec (cons [kind shape] (remove (fn [[k _]] (= k kind)) all))))))
+  kind)
+
+(defn header!
+  "What is drawn above the cards: `height` (fn [width]) and `draw` (fn [x y width]). nil for
+  none."
+  [drawn]
+  (reset! header drawn)
+  nil)
+
+(defn on-evaluation!
+  "`f` (fn [code value error]) is called after each of the REPL's evaluations, on its thread,
+  before the card is made."
+  [f]
+  (swap! told conj f)
+  nil)
+
+(defn- shape-of [kind]
+  (some (fn [[k shape]] (when (= k kind) shape)) @shapes))
+
+(defn- atom? [x]
+  (= "atom" (str (type x))))
+
+(defn shaped
+  "A value's card: its data and its kind (:view). nil for nil. An atom's card is that of
+  what it holds now. The value's metadata may choose: :cards/view a kind (asked first; the
+  others if it gives nothing), :cards/title what the card is called."
+  [value]
+  (when (some? value)
+    (let [value (if (atom? value) (deref value) value)
+          wanted (:cards/view (meta value))
+          named (:cards/title (meta value))
+          by (fn [kind shape]
+               (when-let [made (guarded (fn [] (shape value)))]
+                 ;; A shape may hand a value on as another kind's card (its own :view).
+                 (if (:view made) made (assoc made :view kind))))
+          made (or (when-let [shape (and wanted (shape-of wanted))] (by wanted shape))
+                   (some (fn [[kind shape]] (by kind shape)) @shapes))]
+      (if (and made named) (assoc made :title (str named)) made))))
+
+(defn as
+  "`value` to be drawn as a card of `kind` (and called `title`): its metadata says so."
+  ([kind value] (with-meta value (assoc (meta value) :cards/view kind)))
+  ([kind title value] (with-meta value (assoc (meta value) :cards/view kind :cards/title title))))
+
+(defn layout
+  "`tree` as a layout's card. A node is a vector: [:col & parts] one under the other,
+  [:row & parts] side by side ([:row {:widths [2 1]} a b] shares the width 2 to 1),
+  [:text \"...\"] ([:text {:size :big :color :red} \"...\"]: sizes :small :mono :big :serif
+  :title; colours :ink :muted :red :green :blue :orange :purple), [:space points],
+  [:draw height (fn [x y width])] for drawing of one's own with this namespace's
+  primitives (and `build`, `height-of` and `draw-built!` for values and layouts inside it).
+  A function of no arguments anywhere in the tree is called when the card is made, and what
+  it returns (a value or a tree) is drawn in its place. Anything else is a value, drawn by
+  its own kind of card."
+  [tree]
+  (with-meta tree (assoc (meta tree) :cards/view :layout)))
+
+(defn- release!
+  "A card's arrays let go (its own and its layout's parts')."
+  [made]
+  (when (:array made)
+    (cpp/cards.array_free (:array made)))
+  (doseq [part (:parts made)]
+    (release! part)))
+
+;; The newest card is kept whole at the bottom; the wheel looks back.
+(defonce ^:private roll (atom {:shift 0.0 :at 0.0 :total 0 :back 0.0}))
+
+(defn- add-card! [made]
+  (let [cards (conj (:cards @state) made)
+        dropped (max 0 (- (count cards) 200))]
+    (doseq [old (take dropped cards)]
+      (release! old))
+    (swap! state assoc :cards (vec (drop dropped cards))))
+  (swap! roll assoc :back 0.0)
+  nil)
+
+;; Pinned cards: [name source view], in the order they are shown. A source is a value, a
+;; function called for one (on the REPL's thread), or an atom, looked at every frame.
+(defonce ^:private pins (atom []))
+;; What each pinned atom held when its card was made.
+(defonce ^:private held (atom {}))
+
+
+(defn- pinned-card [what source view]
+  (let [value (cond
+                (fn? source) (guarded source)
+                (atom? source) (deref source)
+                :else source)
+        value (if (and view (some? value)) (guarded (fn [] (view value))) value)
+        made (or (shaped value) {:view :text :text (pr-str value)})]
+    (assoc made :code (or (:title made) what) :pin what)))
+
+(defn- repin!
+  "Every pinned card made again from what was pinned."
+  []
+  (let [all @pins
+        made (mapv (fn [[what source view]] (pinned-card what source view)) all)]
+    (reset! held (into {} (keep (fn [[what source _]] (when (atom? source) [what (deref source)])) all)))
+    (doseq [old (:pinned @state)]
+      (release! old))
+    (swap! state assoc :pinned made)
+    nil))
+
+(defn- follow-pins!
+  "The pinned atoms looked at (every frame, on the main thread): a card is made again when
+  its atom holds another value than when it was made."
+  []
+  (doseq [[what source view] @pins]
+    (when (atom? source)
+      (let [now (deref source)]
+        (when-not (identical? now (get @held what ::nothing))
+          (swap! held assoc what now)
+          (let [made (pinned-card what source view)]
+            (doseq [old (filter (fn [c] (= what (:pin c))) (:pinned @state))]
+              (release! old))
+            (swap! state (fn [s] (assoc s :pinned (mapv (fn [c] (if (= what (:pin c)) made c)) (:pinned s)))))))))))
+
+(defn refresh!
+  "The pinned functions called again and their cards replaced: for work on the REPL's
+  thread that wants its card to follow it between evaluations."
+  []
+  (repin!))
+
+(defn pin!
+  "A card kept first, above the others, called `what`, while the others scroll under it as
+  they come. Pinning the same name again replaces its card in place. What is pinned:
+  - a value: its card;
+  - an atom: its value's card, made again whenever the atom holds another value (the window
+    looks every frame), with nothing to call;
+  - a function of no arguments: what it returns, called now, after every evaluation and at
+    each `refresh!`, on the REPL's thread (for what only that thread may read).
+  `view` (fn [value]) turns the value into what is drawn: a value or a layout's tree. For an
+  atom it runs on the main thread, so it only reads its argument."
+  ([what source] (pin! what source nil))
+  ([what source view]
+   (swap! pins (fn [all] (conj (vec (remove (fn [[k _ _]] (= k what)) all)) [what source view])))
+   (repin!)))
+
+(defn unpin!
+  "The pinned card called `what` removed; all of them with no name."
+  ([] (reset! pins []) (repin!))
+  ([what] (swap! pins (fn [all] (vec (remove (fn [[k _ _]] (= k what)) all)))) (repin!)))
+
+;; How many evaluations the window was told of.
+(defonce ^:private told-count (atom 0))
+
+(defn evaluations
+  "How many of the REPL's evaluations the window was told of so far, those with no card
+  too: a script driving the REPL waits on this."
+  []
+  @told-count)
+
+(defonce ^:private announcing (atom false))
+
+(defn announce!
+  "Whether each evaluation is also said on stderr, as \"[cards] evaluated <n>\" (and
+  \" error\" when it threw): a script driving the REPL (a video's take) reads the process's
+  log to know a form has ended."
+  [on?]
+  (reset! announcing (boolean on?))
+  nil)
+
+(defn evaluated!
+  "An evaluation ended: its card, last."
+  [code value error]
+  (let [n (swap! told-count inc)]
+    (when @announcing
+      (cpp/cards.say (str "[cards] evaluated " n (when error " error")))))
+  (let [value (if (var? value) (deref value) value)]
+    (doseq [f @told]
+      (guarded (fn [] (f code value error))))
+    (when (some (fn [[_ source _]] (fn? source)) @pins)
+      (repin!))
+    (when-not (str/blank? code)
+      (cond
+        ;; (Without the colours an error is printed with: escape sequences.)
+        error (add-card! {:view :error :code code
+                          :said (str/replace (str error) (re-pattern (str (char 27) "\\[[0-9;]*m")) "")})
+        (fn? value) nil
+        :else (when-let [made (shaped value)]
+                (add-card! (assoc made :code code)))))
+    nil))
+
+(defn show
+  "A value on a card of its own, called `what` (the REPL's results go on cards by
+  themselves). Returns nil, so a value too long to print in the editor can be shown from the
+  REPL's top level: (show \"the logits\" (logits s))."
+  ([value] (show "value" value))
+  ([what value]
+   (when-let [made (shaped value)]
+     (add-card! (assoc made :code what)))
+   nil))
+
+(defn clear!
+  "No cards (the pinned ones stay)."
+  []
+  (doseq [old (:cards @state)]
+    (release! old))
+  (swap! state assoc :cards [])
+  nil)
+
+;; The generic kinds.
+
+(defn- text-lines [c width]
+  (wrap mono width (:text c) 24))
+
+(defn- flat-map? [value]
+  (and (map? value) (seq value) (every? cell? (vals value))))
+
+(defn- rows? [value]
+  (and (sequential? value) (seq value) (every? map? value)
+       (every? (fn [row] (every? cell? (vals row))) (take 50 value))))
+
+(defn- numbers? [value]
+  (and (sequential? value) (seq value) (every? number? (take 200 value))))
+
+(defn- draw-numbers
+  "Up to 48 numbers as bars with their values; more as a series. The value under the mouse
+  is said on the right."
+  [c x y width]
+  (let [n (:n c)
+        id (:array c)
+        top (+ y 20)
+        tall 90.0]
+    (text! x y muted small
+           (str n " numbers, " (said (:lo c)) " to " (said (:hi c)) ", sum " (said (:sum c))
+                ", largest at " (:argmax c)))
+    (series! id x top width tall blue)
+    (let [mx (mouse-x)
+          my (mouse-y)]
+      (when (and (>= mx x) (< mx (+ x width)) (>= my top) (<= my (+ top tall)))
+        (let [index (min (dec n) (long (/ (* (- mx x) n) width)))
+              what (str "[" index "] " (said (array-at id index)))]
+          (text! (- (+ x width) (text-width small what)) y ink small what))))
+    (when (<= n 48)
+      (let [slot (/ width n)]
+        (doseq [i (range n)]
+          (text! (+ x (* slot i)) (+ top tall 4) ink small
+                 (clip small (- slot 2) (said (array-at id i)))))))))
+
+(defn- matrix-cell
+  "The height of a matrix's rows, in points."
+  [rows]
+  (max 2.0 (min 18.0 (/ 600.0 rows))))
+
+(defn- draw-matrix
+  "A matrix as a heat map: positive values blue, negative ones red. With :row-labels, each
+  row's on the left when the rows are tall enough. The cell under the mouse is said on top."
+  [c x y width]
+  (let [rows (:rows c)
+        cols (:cols c)
+        id (:array c)
+        labels (:row-labels c)
+        cell (matrix-cell rows)
+        gutter (if (and labels (>= cell 12.0)) 120.0 0.0)
+        left (+ x gutter)
+        ;; A column is up to 18 points wide; up to 48 when there are few, so that a matrix of
+        ;; a few columns is not a thin strip.
+        wide (min (- width gutter) (* cols (if (<= cols 8) 48.0 18.0)))
+        top (+ y 20)
+        tall (* cell rows)]
+    (text! x y muted small
+           (str (when (:name c) (str (:name c) "  ")) rows " x " cols ", " (said (:lo c)) " to " (said (:hi c))))
+    (frame! (- left 1) (- top 1) (+ left wide 1) (+ top tall 1) rule 1.0)
+    (heat! id left top wide tall rows cols blue red)
+    (when (pos? gutter)
+      (doseq [r (range rows)]
+        (text! x (+ top (* cell r) (/ (- cell 12.0) 2.0)) muted small
+               (clip small (- gutter 8) (nth labels r)))))
+    (let [mx (mouse-x)
+          my (mouse-y)]
+      (when (and (>= mx left) (< mx (+ left wide)) (>= my top) (< my (+ top tall)))
+        (let [r (min (dec rows) (long (/ (- my top) cell)))
+              col (min (dec cols) (long (/ (* (- mx left) cols) wide)))
+              what (str (if labels (nth labels r) (str (or (:row-name c) "row") " " r)) ", "
+                        (or (:column-name c) "column") " " col ": "
+                        (said (array-at id (+ (* r cols) col))))]
+          (text! (- (+ x width) (text-width small what)) y ink small what))))))
+
+(defn- draw-table
+  "Rows under their columns' names, each column as wide as what it holds; rows beyond the
+  first 12 counted."
+  [c x y width]
+  (let [rows (:table c)
+        columns (:columns c)
+        natural (mapv (fn [column]
+                        (+ 18 (apply max (text-width small (said column))
+                                     (map (fn [row] (min 600.0 (text-width mono (said (get row column))))) rows))))
+                      columns)
+        total (apply + natural)
+        widths (if (> total width) (mapv (fn [w] (/ (* w width) total)) natural) natural)
+        offsets (vec (reductions + 0 widths))]
+    (doseq [[i column] (map-indexed vector columns)]
+      (text! (+ x (nth offsets i)) y muted small (clip small (- (nth widths i) 8) (said column))))
+    (doseq [[r row] (map-indexed vector rows)
+            [i column] (map-indexed vector columns)]
+      (text! (+ x (nth offsets i)) (+ y 20 (* 20 r)) ink mono
+             (clip mono (- (nth widths i) 10) (said (get row column)))))
+    (when (> (:count c) (count rows))
+      (text! x (+ y 20 (* 20 (count rows))) muted small (str "… " (- (:count c) (count rows)) " more")))))
+
+(defn- matrix-of
+  "A matrix card's data: `values` row by row."
+  [value rows cols values]
+  (let [id (array! values)]
+    {:array id :rows rows :cols cols :name (:name value) :row-labels (:row-labels value)
+     :row-name (:row-name value) :column-name (:column-name value)
+     :lo (cpp/cards.array_min id) :hi (cpp/cards.array_max id)}))
+
+(defn- numbers-of [value values]
+  (let [id (array! values)]
+    {:array id :n (long (cpp/cards.array_size id)) :name (:name value)
+     :lo (cpp/cards.array_min id) :hi (cpp/cards.array_max id) :sum (cpp/cards.array_sum id)
+     :argmax (long (cpp/cards.array_argmax id))}))
+
+;; Anything: as it prints.
+(defview! :text
+  {:shape (fn [value]
+            (let [text (if (string? value) value (pr-str value))]
+              {:text (if (> (count text) 6000) (str (subs text 0 6000) " …") text)}))
+   :height (fn [c width] (* 20 (max 1 (count (text-lines c width)))))
+   :draw (fn [c x y width]
+           (doseq [[i line] (map-indexed vector (text-lines c width))]
+             (text! x (+ y (* 20 i)) ink mono line)))})
+
+;; A flat map: its keys and values.
+(defview! :map
+  {:shape (fn [value]
+            (when (flat-map? value)
+              {:pairs (mapv (fn [[k v]] [(said k) (said v)]) (take 20 value)) :count (count value)}))
+   :height (fn [c width] (* 20 (+ (count (:pairs c)) (if (> (:count c) (count (:pairs c))) 1 0))))
+   :draw (fn [c x y width]
+           (let [pairs (:pairs c)
+                 wide (min (* 0.5 width) (+ 16 (apply max 0 (map (fn [[k _]] (text-width mono k)) pairs))))]
+             (doseq [[i [k v]] (map-indexed vector pairs)]
+               (text! x (+ y (* 20 i)) muted mono k)
+               (text! (+ x wide) (+ y (* 20 i)) ink mono (clip mono (- width wide) v)))
+             (when (> (:count c) (count pairs))
+               (text! x (+ y (* 20 (count pairs))) muted small (str "… " (- (:count c) (count pairs)) " more")))))})
+
+;; Rows (maps of plain values): a table.
+(defview! :table
+  {:shape (fn [value]
+            (when (rows? value)
+              {:table (vec (take 12 value)) :columns (vec (take 8 (keys (first value)))) :count (count value)}))
+   :height (fn [c width] (* 20 (+ 1 (count (:table c)) (if (> (:count c) (count (:table c))) 1 0))))
+   :draw draw-table})
+
+;; Numbers: bars, or a series when they are many.
+(defview! :numbers
+  {:shape (fn [value]
+            (cond
+              (numbers? value) (numbers-of {} value)
+              ;; A named array of one dimension: {:shape [n] :values [...]}.
+              (and (map? value) (= 1 (count (:shape value))) (numbers? (:values value)))
+              (numbers-of value (:values value))))
+   :height (fn [c width] (if (<= (:n c) 48) 134 114))
+   :draw draw-numbers})
+
+;; A matrix: {:shape [rows cols] :values [...]} (and :name, :row-labels, and :row-name and
+;; :column-name: what a row and a column are called under the mouse), or rows of numbers.
+(defview! :matrix
+  {:shape (fn [value]
+            (cond
+              (and (map? value) (= 2 (count (:shape value))) (numbers? (:values value)))
+              (matrix-of value (first (:shape value)) (second (:shape value)) (:values value))
+              (and (sequential? value) (seq value) (every? numbers? (take 50 value))
+                   (apply = (map count (take 50 value))))
+              (matrix-of {} (count value) (count (first value)) (apply concat value))))
+   :height (fn [c width] (+ 26 (* (matrix-cell (:rows c)) (:rows c))))
+   :draw draw-matrix})
+
+(defview! :error
+  {:height (fn [c width] (* 20 (max 1 (count (wrap mono width (:said c) 8)))))
+   :draw (fn [c x y width]
+           (doseq [[i line] (map-indexed vector (wrap mono width (:said c) 8))]
+             (text! x (+ y (* 20 i)) red mono line)))})
+
+;; A card's body, of any kind.
+
+(defn- body-height [c width]
+  (let [height (:height (get @views (:view c)))]
+    (or (when height (guarded (fn [] (height c width)))) 20)))
+
+(defn- failure
+  "nil when `f` runs; what it threw otherwise."
+  [f]
+  (try
+    (f)
+    nil
+    (catch jank.runtime.object_ref e (or (ex-message e) (str e)))
+    (catch cpp/std.exception e (str (cpp/.what e)))
+    (catch :default _ "an error jank does not say")))
+
+(defn- draw-body
+  "A card's body. Drawing that throws is said in the card, in red: the other cards are
+  drawn as usual."
+  [c x y width]
+  (when-let [draw (:draw (get @views (:view c)))]
+    (when-let [said (failure (fn [] (draw c x y width)))]
+      (text! x y red small (clip small width (str "this card's drawing failed: " said))))))
+
+;; A layout: nodes around values (see `layout`). Built on the REPL's thread into parts, each
+;; a node ({:node kind :attrs {...} :parts [...]}) or a value's card.
+
+(def ^:private node-kinds #{:col :row :text :space :draw})
+(def ^:private sizes-by-name {:small small :mono mono :big big :serif serif :title title})
+(def ^:private colors-by-name {:ink ink :muted muted :red red :green green :blue blue :orange orange :purple purple})
+(def ^:private line-heights {0 16 1 20 2 26 3 22 4 34})
+
+(defn- node? [v]
+  (and (vector? v) (contains? node-kinds (first v))))
+
+(defn build
+  "A node, a value or a function of no arguments (called now) made ready to draw: what
+  `height-of` and `draw-built!` take. On the REPL's thread: a value's numbers are copied to
+  the native side here, once."
+  [v]
+  (cond
+    (fn? v) (let [made (guarded v)]
+              (if (some? made) (build made) {:view :error :said "the function gave nothing (or threw)"}))
+    (node? v) (let [kind (first v)
+                    attrs (if (map? (second v)) (second v) {})
+                    more (if (map? (second v)) (drop 2 v) (rest v))]
+                (cond
+                  (= kind :text) {:node :text :attrs attrs :said (apply str more)}
+                  (= kind :space) {:node :space :tall (or (first more) 10)}
+                  (= kind :draw) {:node :draw :tall (first more) :fn (second more)}
+                  :else {:node kind :attrs attrs :parts (mapv build more)}))
+    :else (or (shaped v) {:view :text :text (pr-str v)})))
+
+(defn- shares
+  "Each of a row's parts' x offset and width: `width` shared by the row's :widths (equal
+  without them), 16 points between two."
+  [part width]
+  (let [n (count (:parts part))
+        weights (or (:widths (:attrs part)) (repeat n 1))
+        total (* 1.0 (apply + (take n weights)))
+        room (- width (* 16 (max 0 (dec n))))]
+    (loop [i 0 at 0.0 out []]
+      (if (= i n)
+        out
+        (let [wide (/ (* room (nth weights i)) total)]
+          (recur (inc i) (+ at wide 16) (conj out [at wide])))))))
+
+(defn- part-height [part width]
+  (let [kind (:node part)]
+    (cond
+      (nil? kind) (body-height part width)
+      (= kind :text) (let [size (get sizes-by-name (:size (:attrs part)) mono)]
+                       (* (get line-heights size 20) (max 1 (count (wrap size width (:said part) 40)))))
+      (= kind :space) (:tall part)
+      (= kind :draw) (:tall part)
+      (= kind :col) (+ (apply + 0 (map (fn [p] (part-height p width)) (:parts part)))
+                       (* 10 (max 0 (dec (count (:parts part))))))
+      :else (apply max 0 (map (fn [p [_ wide]] (part-height p wide)) (:parts part) (shares part width))))))
+
+(defn- draw-part [part x y width]
+  (let [kind (:node part)]
+    (cond
+      (nil? kind) (draw-body part x y width)
+      (= kind :text) (let [size (get sizes-by-name (:size (:attrs part)) mono)
+                           color (get colors-by-name (:color (:attrs part)) ink)
+                           tall (get line-heights size 20)]
+                       (doseq [[i line] (map-indexed vector (wrap size width (:said part) 40))]
+                         (text! x (+ y (* tall i)) color size line)))
+      (= kind :space) nil
+      (= kind :draw) (when (:fn part)
+                       (when-let [said (failure (fn [] ((:fn part) x y width)))]
+                         (text! x y red small (clip small width (str "this drawing failed: " said)))))
+      (= kind :col) (loop [parts (:parts part) at y]
+                      (when (seq parts)
+                        (draw-part (first parts) x at width)
+                        (recur (rest parts) (+ at 10 (part-height (first parts) width)))))
+      :else (doseq [[p [at wide]] (map vector (:parts part) (shares part width))]
+              (draw-part p (+ x at) y wide)))))
+
+(defn height-of
+  "The height of what `build` made, drawn `width` points wide."
+  [made width]
+  (part-height made width))
+
+(defn draw-built!
+  "What `build` made, drawn with its top left at (x, y), `width` points wide: for a :draw
+  function that places values and layouts itself."
+  [made x y width]
+  (draw-part made x y width))
+
+(defview! :layout
+  {:shape (fn [value]
+            ;; A tree marked by `layout`, or a vector that is a node ([:row ...]).
+            (when (and (vector? value) (or (= :layout (:cards/view (meta value))) (node? value)))
+              (let [root (build (if (node? value) value (into [:col] value)))]
+                ;; The root's parts, for `release!`.
+                {:root root :parts [root]})))
+   :height (fn [c width] (part-height (:root c) width))
+   :draw (fn [c x y width] (draw-part (:root c) x y width))})
+
+;; Handlers: maps saying how the values they match are drawn. The newest is asked first.
+(defonce ^:private handlers (atom []))
+;; The handlers under way on this thread: one isn't asked again about what it returned.
+(def ^:dynamic ^:private *handling* #{})
+
+(defn attr-of
+  "A value's attribute `attr`: from its metadata, else from the value when it is a map."
+  [value attr]
+  (let [marked (get (meta value) attr)]
+    (if (some? marked)
+      marked
+      (when (map? value) (get value attr)))))
+
+(defn- handler-of [id]
+  (some (fn [h] (when (= id (:id h)) h)) @handlers))
+
+(defn handle!
+  "How some values are drawn: a map.
+
+  Which values (every condition given must hold; at least one of :attr and :filter):
+    :attr    a keyword the value has, in its metadata or, for a map, among its keys
+    :equals  what that attribute must equal (without it: be there, and not false)
+    :filter  (fn [value]) returning true for the values to draw: any data can be matched
+
+  How (one of the two):
+    :render  (fn [value]) returning what is drawn in the value's place: a value, or a
+             layout's tree. Called once, on the REPL's thread, when the card is made.
+    :draw    (fn [value x y width]) painting the card's body with the primitives, with
+             :height (fn [value width]) (20 points without it). Called every frame on the
+             main thread, so they only read the value.
+
+  And :id, its name: a handler registered again under the same id replaces the old one.
+  Without it the id is the :attr (or [attr equals]); a handler with no :attr needs one.
+  The newest handler is asked first."
+  [handler]
+  (let [attr (:attr handler)
+        by-attr (contains? handler :attr)
+        by-value (contains? handler :equals)
+        wanted (:equals handler)
+        choose (:filter handler)
+        id (cond
+             (contains? handler :id) (:id handler)
+             (and by-attr by-value) [attr wanted]
+             by-attr attr
+             :else nil)
+        matches (fn [value]
+                  (and (or (not by-attr)
+                           (let [found (attr-of value attr)]
+                             (if by-value (= wanted found) (boolean found))))
+                       (or (nil? choose)
+                           (boolean (guarded (fn [] (choose value)))))))]
+    (when-not (or by-attr choose)
+      (throw (ex-info "cards: a handler needs :attr or :filter" {})))
+    (when-not (or (:render handler) (:draw handler))
+      (throw (ex-info "cards: a handler needs :render or :draw" {})))
+    (when (nil? id)
+      (throw (ex-info "cards: a handler without :attr needs an :id" {})))
+    (swap! handlers (fn [all] (vec (cons (assoc handler :id id :matches matches)
+                                         (remove (fn [h] (= id (:id h))) all)))))
+    id))
+
+(defn unhandle!
+  "The handler called `id` removed; all of them with no argument."
+  ([] (reset! handlers []) nil)
+  ([id]
+   (swap! handlers (fn [all] (vec (remove (fn [h] (= id (:id h))) all))))
+   nil))
+
+(defview! :handled
+  {:shape (fn [value]
+            (when-let [handler (some (fn [h]
+                                       (when (and (not (contains? *handling* (:id h))) ((:matches h) value)) h))
+                                     @handlers)]
+              (if (:render handler)
+                (let [root (binding [*handling* (conj *handling* (:id handler))]
+                             (build ((:render handler) value)))]
+                  {:view :layout :root root :parts [root]})
+                ;; Painted by the handler itself, looked up by its id every frame: evaluating
+                ;; the handler again changes the cards already there.
+                {:view :handled :value value :handler (:id handler)})))
+   :height (fn [c width]
+             (let [height (:height (handler-of (:handler c)))]
+               (if height (height (:value c) width) 20)))
+   :draw (fn [c x y width]
+           (if-let [draw (:draw (handler-of (:handler c)))]
+             (draw (:value c) x y width)
+             ;; Its handler was removed: the value as it prints.
+             (text! x y muted mono (clip mono width (pr-str (:value c))))))})
+
+;; The feed.
+
+(defn- draw-card
+  "One card at (x, y): its title (else what was evaluated) over a rule, then its body. The
+  older ones dimmed; a pinned one marked on its left."
+  [c x y width height dim]
+  (let [inner (- width 28)]
+    (rect! x y (+ x width) (+ y height) card (if dim 0.6 1.0) 6.0)
+    (frame! x y (+ x width) (+ y height) (if dim rule ink) 1.0)
+    (when (:pin c)
+      (rect! x (+ y 6) (+ x 4) (- (+ y height) 6) orange 0.9 2.0))
+    (text! (+ x 14) (+ y 9) (if dim muted ink) mono
+           (clip mono inner (one-line (str (or (:title c) (:code c))))))
+    (line! (+ x 14) (+ y 32) (- (+ x width) 14) (+ y 32) rule 1.0)
+    (draw-body c (+ x 14) (+ y 42) inner)))
+
+(defn- draw-pinned
+  "The pinned cards from `y` down, whole. Returns where they end."
+  [s x y width]
+  (loop [cards (:pinned s) at y]
+    (if (empty? cards)
+      at
+      (let [c (first cards)
+            height (+ 52 (body-height c (- width 28)))]
+        (draw-card c x at width height false)
+        (recur (rest cards) (+ at height 12))))))
+
+(defonce ^:private newest-body (atom nil))
+
+(defn- remember-newest! [x y width height]
+  (let [box {:x x :y y :width width :height height}]
+    (when (not= box @newest-body)
+      (reset! newest-body box))))
+
+(defn newest-box
+  "Where the newest card's body was drawn in the last frame: {:x :y :width :height}, in
+  points. For a script that points at something in it (`pointer!`, `click!`)."
+  []
+  @newest-body)
+
+(defn- draw-feed
+  "The cards from `y` down, the newest last and whole: once they pass the bottom they are
+  shifted up, the shift eased so that they roll. The wheel looks back at the older ones."
+  [s x y width bottom]
+  (let [cards (:cards s)
+        inner (- width 28)
+        heights (mapv (fn [c] (+ 52 (body-height c inner) 12)) cards)
+        total (apply + 0 heights)
+        was @roll
+        fits (- bottom y)
+        back (max 0.0 (min (max 0.0 (- total fits)) (+ (:back was) (* 60.0 (cpp/cards.wheel)))))
+        target (max 0.0 (- total fits back))
+        now (seconds)
+        dt (max 0.0 (min 0.1 (- now (:at was))))
+        left (- target (:shift was))
+        ;; Fewer cards (cleared), or looking back: where they are at once.
+        shift (if (or (< total (:total was)) (pos? back) (< (if (neg? left) (- left) left) 0.5))
+                target
+                (+ (:shift was) (* left (min 1.0 (* 7.0 dt)))))
+        newest (dec (count cards))]
+    (reset! roll {:shift shift :at now :total total :back back})
+    (clip-begin! x (- y 6) (+ x width 2) bottom)
+    (loop [i 0 at (- y shift)]
+      (when (< i (count cards))
+        (let [height (nth heights i)]
+          (when (and (> (+ at height) (- y 6)) (< at bottom))
+            (draw-card (nth cards i) x at width (- height 12) (not= i newest)))
+          (when (= i newest)
+            (remember-newest! (+ x 14) (+ at 42) inner (- height 64)))
+          (recur (inc i) (+ at height)))))
+    (clip-end!)))
+
+(defn draw
+  "One frame of `s`."
+  [s]
+  (let [width (cpp/cards.width)
+        height (cpp/cards.height)
+        top @header
+        tall (or (when top (guarded (fn [] ((:height top) (- width 64))))) 0)]
+    (follow-pins!)
+    (text! 32 18 ink title (str (:title s)))
+    (when (and top (pos? tall))
+      (guarded (fn [] ((:draw top) 32 62 (- width 64)))))
+    (let [y (draw-pinned s 32 (+ 70 tall (if (pos? tall) 12 0)) (- width 64))]
+      (if (empty? (:cards s))
+        (text! 32 y muted serif "Evaluate something in the REPL: it is shown here.")
+        (draw-feed s 32 y (- width 64) (- height 20))))
+    (cpp/cards.pointer_draw)))
+
+;; The window.
+
+(defn frames "Frames drawn so far." [] (cpp/cards.frames))
+
+(defn snapshot!
+  "The next frame also written to `path`, a PPM image."
+  [path]
+  (cpp/cards.snapshot path))
+
+(defn open!
+  "The window. :hidden draws without showing it (for `snapshot!`), :record is a video's path
+  (needs ffmpeg), :title its name, :announce says each evaluation on stderr (`announce!`)."
+  [{:keys [width height hidden record title announce]}]
+  (when title
+    (swap! state assoc :title title))
+  (when announce
+    (announce! true))
+  (cpp/cards.open (or width 960) (or height 1080) (boolean hidden) (or record "") (or title "cards")))
+
+(defn stop!
+  "Closes the window: `loop!` returns."
+  []
+  (cpp/cards.stop))
+
+(defonce ^{:doc "The last error a frame's drawing threw (it is drawn in red too)."} draw-error (atom nil))
+
+(defn- frame-failed! [what]
+  (reset! draw-error what)
+  (text! 32 50 red mono (str "draw: " what)))
+
+(defn loop!
+  "Frames until the window closes: on the main thread."
+  []
+  (while (cpp/cards.alive)
+    (cpp/cards.frame_begin paper)
+    (try
+      (draw @state)
+      (catch jank.runtime.object_ref e (frame-failed! (or (ex-message e) (str e))))
+      (catch cpp/std.exception e (frame-failed! (str (cpp/.what e))))
+      (catch :default _ (frame-failed! "an error jank does not say")))
+    (cpp/cards.frame_end))
+  (cpp/cards.close))

@@ -1,0 +1,238 @@
+(ns tutorial
+  "The cards library from a REPL, a form at a time: how values are drawn, how a value says
+  how it is drawn (metadata, layouts, functions), drawing with ImGui itself, handlers,
+  pinned cards, and a kind of card of one's own."
+  (:require [cards.core :as c]))
+
+;;;; cards, a form at a time
+;;
+;; This file is read and run in the REPL that has the window: start it in this directory and
+;; connect an editor to the port in .nrepl-port (CIDER: cider-connect-clj).
+;;
+;;   ./cards.sh
+;;
+;; Evaluate the forms in order, from this file's buffer. They are in (comment ...) blocks;
+;; each evaluation appears in the window as a card, the newest last. What a form returns is
+;; noted as `;=>` only where the window doesn't already say it.
+
+;;;; 1. How a value is drawn
+;;
+;; A card is chosen by what the value is.
+
+(comment
+  ;; Text, and anything with no kind of its own: as it prints.
+  (str "Text is shown " "as it prints.")
+
+  ;; A map of plain values: its keys and values.
+  {:name "inkling" :layers 24 :hidden 2304 :gpu true}
+
+  ;; A sequence of such maps: a table.
+  [{:name "embed" :dtype :bf16 :shape [201024 2304]}
+   {:name "norm" :dtype :bf16 :shape [2304]}
+   {:name "experts" :dtype :u32 :shape [128 2304 288]}]
+
+  ;; Numbers: bars with their values up to 48, a series beyond. The line above them has
+  ;; their count, range, sum and where the largest is.
+  (mapv (fn [i] (- (mod (* i 37) 23) 9)) (range 30))
+  (mapv (fn [i] (* (mod i 97) (mod i 13))) (range 600))
+
+  ;; A matrix, {:shape [rows cols] :values [...]} or rows of numbers: a heat map, blue above
+  ;; zero and red below. The cell under the mouse is named on the right.
+  {:name "a matrix"
+   :shape [6 40]
+   :values (mapv (fn [i] (- (mod (* i 7) 13) 5.5)) (range 240))}
+  [[1 2 3 4] [4 3 2 1] [0 5 0 5]]
+
+  ;; nil and functions have no card. show puts a value on a card with a name and returns
+  ;; nil: for a value too long to print in the editor. clear! removes the cards.
+  (c/show "a thousand numbers" (mapv (fn [i] (mod (* i i) 211)) (range 1000)))
+  (c/clear!)
+  )
+
+;;;; 2. A value saying how it is drawn
+;;
+;; A value's own metadata chooses its kind of card and its title. c/as writes that metadata.
+
+(comment
+  (with-meta [{:a 1 :b 2} {:a 3 :b 4}]
+    {:cards/view :table :cards/title "chosen by metadata"})
+  (c/as :numbers "the same, with c/as" [3 1 4 1 5 9 2 6])
+  (meta (c/as :numbers "the same, with c/as" [3 1 4 1 5 9 2 6]))
+  ;=> {:cards/view :numbers, :cards/title "the same, with c/as"}
+  )
+
+;; A layout is data: nodes around any values, each value drawn by its own kind of card.
+;; [:col ...] puts its parts one under the other, [:row ...] side by side. A function of no
+;; arguments in a layout is called when the card is made, and what it returns is drawn in
+;; its place.
+
+(comment
+  [:row {:widths [1 2]}
+   [:col
+    [:text {:size :big :color :blue} "A layout"]
+    [:text "Text is wrapped to its part's width, whatever that is."]
+    (fn [] {:made "by a function" :cards (count (:cards @c/state))})]
+   [:col
+    [:text {:size :small :color :muted} "a matrix"]
+    [[1 2 3 4] [4 3 2 1] [0 5 0 5]]
+    [:text {:size :small :color :muted} "numbers"]
+    [3 1 4 1 5 9 2 6]]]
+  )
+
+;; [:draw height f] is a part a function paints: f gets the part's top left and width, and
+;; draws with the library's primitives.
+
+(comment
+  [:col
+   [:text "Painted by a function:"]
+   [:draw 60 (fn [x y width]
+               (c/rect! x y (+ x width) (+ y 50) c/orange 0.3 6.0)
+               (doseq [i (range 12)]
+                 (c/circle! (+ x 30 (* 40 i)) (+ y 25) (+ 4 i) c/red 0.8))
+               (c/text! (+ x width -150) (+ y 16) c/ink c/mono "twelve circles"))]]
+  )
+
+;;;; 3. ImGui itself
+;;
+;; A draw function runs inside the window's ImGui frame, so it can call anything of ImGui's
+;; through jank's C++ interop. c/cursor! says where ImGui's next widget goes.
+
+(comment
+  [:col
+   [:text "ImGui's own widgets:"]
+   [:draw 96 (fn [x y width]
+               (c/cursor! x y)
+               (cpp/ImGui.Text "ImGui.Text")
+               (c/cursor! x (+ y 24))
+               (cpp/ImGui.SmallButton "ImGui.SmallButton")
+               (c/cursor! x (+ y 56))
+               (cpp/ImGui.ProgressBar 0.6 (cpp/ImVec2 300.0 18.0)))]]
+
+  ;; The widgets answer as they do anywhere: a button says when it was clicked, and the
+  ;; function keeps what it needs in an atom.
+  (def clicks (atom 0))
+  [:draw 30 (fn [x y width]
+              (c/cursor! x y)
+              (when (cpp/ImGui.Button "Count a click")
+                (swap! clicks inc))
+              (c/text! (+ x 130) (+ y 4) c/ink c/mono (str @clicks " clicks")))]
+
+  ;; A widget that keeps its state through a pointer (a slider, a checkbox) gets a native
+  ;; value, made once and kept in a box. The value is read back with cpp/*.
+  (def level (cpp/box (cpp/new cpp/float 0.25)))
+  [:draw 30 (fn [x y width]
+              (c/cursor! x y)
+              (cpp/ImGui.SetNextItemWidth 300.0)
+              (cpp/ImGui.SliderFloat "level" (cpp/unbox (:* float) level) 0.0 1.0))]
+  (cpp/* (cpp/unbox (:* float) level))
+  ;=> 0.25, or where the slider was left
+  )
+
+;;;; 4. Handlers
+;;
+;; A handler is a map saying how the values it matches are drawn. :attr matches a key of a
+;; map or a key of any value's metadata. :render returns what is drawn in the value's place.
+
+(comment
+  (c/handle! {:attr :dtype
+              :render (fn [t]
+                        [:row {:widths [2 1]}
+                         [:col
+                          [:text {:size :big} (:name t)]
+                          [:text {:color :muted} (str "stored as " (name (:dtype t)))]]
+                         [:text {:size :big :color :blue} (str (:shape t))]])})
+  ;=> :dtype
+  {:name "norm.weight" :dtype :bf16 :shape [2304]}
+
+  ;; :equals narrows it to one value of the attribute.
+  (c/handle! {:attr :kind
+              :equals :route
+              :render (fn [r]
+                        [:text {:size :big :color :purple}
+                         (str "a route to expert " (:expert r))])})
+  ;=> [:kind :route]
+  {:kind :route :expert 92}
+  {:kind :other :expert 1}                 ; not matched: an ordinary map
+
+  ;; :filter is a function of the value, so any data can be matched. A handler without :attr
+  ;; needs an :id.
+  (c/handle! {:id :big-number
+              :filter (fn [v] (and (number? v) (> v 1000000)))
+              :render (fn [n]
+                        [:row
+                         [:text {:size :title} (str n)]
+                         [:text {:color :muted} (str (quot n 1000000) " million")]])})
+  ;=> :big-number
+  (* 3 41152263)
+  (* 6 7)                                  ; not matched
+
+  ;; :draw paints the card itself instead of returning data. Its functions get the value;
+  ;; c/attr-of reads an attribute wherever it is, here in the metadata.
+  (c/handle! {:attr :rgb
+              :height (fn [v width] 44)
+              :draw (fn [v x y width]
+                      (c/rect! x y (+ x width) (+ y 36) (c/attr-of v :rgb) 1.0 6.0)
+                      (c/text! (+ x 12) (+ y 10) c/paper c/mono (pr-str v)))})
+  ;=> :rgb
+  {:rgb 0x2e7d32 :label "a map with :rgb"}
+  (with-meta [1 2 3] {:rgb 0x6a1b9a})
+
+  (c/unhandle!)                            ; all of them removed
+  (c/clear!)
+  )
+
+;;;; 5. Pinned cards
+;;
+;; A pinned card stays first while the others scroll under it. Pin an atom and the card is
+;; made again whenever the atom holds another value, with nothing to call: here a future
+;; changes it forty times.
+
+(comment
+  (def progress (atom {:done 0 :of 40 :squares []}))
+  (c/pin! "progress" progress
+          (fn [p]
+            [:row {:widths [1 3]}
+             [:text {:size :big} (str (:done p) " of " (:of p))]
+             (if (seq (:squares p))
+               (:squares p)
+               [:text {:color :muted} "nothing yet"])]))
+  (defn step [p i]
+    (assoc p :done (inc i) :squares (conj (:squares p) (* (inc i) (inc i)))))
+  (def worker
+    (future
+      (dotimes [i 40]
+        (cpp/usleep 150000)
+        (swap! progress step i))))
+
+  ;; A pinned function is called again after every evaluation.
+  (c/pin! "cards so far" (fn [] {:cards (count (:cards @c/state))}))
+  (+ 1 2)
+  (* 6 7)
+
+  (c/unpin! "progress")
+  (c/unpin!)                               ; the rest
+  )
+
+;;;; 6. A kind of card of one's own
+;;
+;; When a value needs its own drawing every time, a kind is defined once: :shape says which
+;; values it draws and keeps what the drawing needs, :height and :draw draw it.
+
+(comment
+  (defn draw-step [x y width step done]
+    (c/rect! x y (+ x width) (+ y 36) (if done c/green c/rule) 0.8 6.0)
+    (c/text! (+ x 10) (+ y 10) (if done c/paper c/ink) c/mono (str step)))
+
+  (c/defview! :tutorial/steps
+    {:shape (fn [value]
+              (when (and (map? value) (vector? (:steps value)))
+                {:steps (:steps value) :at (:at value)}))
+     :height (fn [card width] 46)
+     :draw (fn [card x y width]
+             (let [slot (/ width (count (:steps card)))]
+               (doseq [[i step] (map-indexed vector (:steps card))]
+                 (draw-step (+ x (* slot i)) y (- slot 6) step (< i (:at card))))))})
+  ;=> :tutorial/steps
+  {:steps ["build" "convert" "open" "eval"] :at 2}
+  {:steps ["build" "convert" "open" "eval"] :at 4}
+  )
