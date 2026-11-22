@@ -1,0 +1,105 @@
+(ns demo
+  "Five sessions with the harness, one after the other: a question the model answers by
+  looking at itself, a simple task, a web server in jank, a web server in Python checked
+  from inside a sandbox, and a Veil model of jank's small maps, checked and then replayed on
+  real maps. Each is an agent of its own, a line above the cards.
+
+  Start the process inside the sandbox, with what the last sessions need:
+
+    HARNESS_PROFILES=extras ./sandbox.sh
+
+  Evaluate the forms in order. ask! returns at once and the window follows the turn; answer
+  waits for its end."
+  (:require [veil.core :as veil]
+            [inkling.core :as ink]
+            [harness.core :as h]
+            [harness.tools :as tools]
+            [harness.cards :as hc]))
+
+(def m (ink/open "../inkling/models/inkling-2-mini.ink"))
+
+;; An agent with the default tools, shown above the cards as the conversation `named`.
+(defn session [named]
+  (hc/watch! (h/agent m {:tools (tools/defaults)
+                         :system tools/situation
+                         :context 32768
+                         :max-steps 48})
+             named))
+
+;; 1. A question about the model itself.
+
+(def question (session "a question"))
+
+(h/ask! question
+  (str "Which layers of the model you run on are visited more than once in "
+       "a forward pass, and how many visits are there in all? Find out; do "
+       "not guess."))
+
+(h/answer question)
+
+;; 2. A simple task.
+
+(def task (session "a simple task"))
+
+(h/ask! task
+  (str "Compute the prime numbers below 100 with the eval tool, write them "
+       "to the file work/primes.txt, one per line, and tell me how many "
+       "there are."))
+
+(h/answer task)
+
+;; 3. A web server in jank, in this process.
+
+(def jank-server (session "a web server in jank"))
+
+(h/ask! jank-server
+  (str "Make a small web server in jank, running in this process on port "
+       "8123. GET /hello must answer with the text hello from jank, and "
+       "GET /count must answer with a number that goes up by one on every "
+       "request to it, kept in a jank atom. The requests must be answered "
+       "by a jank function. Check both with curl, and tell me what curl "
+       "printed."))
+
+(h/answer jank-server)
+
+;; 4. A web server in Python, from inside the sandbox.
+
+(def python-server (session "a web server in Python"))
+
+(h/ask! python-server
+  (str "This process runs inside a sandbox: you can write only under the "
+       "directory work/ and reach only this machine over the network. In "
+       "work/, write a small web server in Python (standard library only) "
+       "that listens on 127.0.0.1 port 8124: GET /health answers with the "
+       "JSON {\"ok\": true}, and GET /square?n=7 answers with the JSON "
+       "{\"n\": 7, \"square\": 49} for any integer n, and with status 400 "
+       "when n is not an integer. Start it in the background, check all "
+       "three cases with curl, and tell me what curl printed. Then try to "
+       "write a file named outside.txt in my home directory and tell me "
+       "what happened."))
+
+(h/answer python-server)
+
+;; 5. A Veil model of a part of jank, checked, then replayed on jank itself.
+
+(def veil-model (session "a Veil model of jank's small maps"))
+
+(h/ask! veil-model
+  (str "jank stores a map of up to 8 entries as an array map: the map "
+       "points to an array of key and value slots. (transient m) makes a "
+       "transient that points to the same array as m instead of copying "
+       "it. (assoc! t k v), for a key that is already there, overwrites "
+       "the slot in that array. (persistent! t) gives a map that points to "
+       "the transient's array. Model this storage in Veil, with veil.core "
+       "in this process (JANK.md says how to start a session; the describe "
+       "tool on veil.core/defmodel has the notation): maps and transients "
+       "that point to arrays, arrays that hold a value for a key, the "
+       "actions above, and the safety property that a persistent map keeps "
+       "the value it was made with. Model-check a small instance with "
+       "veil/model-check and show me the steps of the counterexample. Then "
+       "do the same steps on real jank maps with the eval tool, and tell "
+       "me whether jank does what the model says."))
+
+(h/answer veil-model)
+
+(ink/close! m)

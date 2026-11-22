@@ -1,0 +1,227 @@
+(ns tutorial
+  "The harness from a REPL, a form at a time: tools as functions, an agent and its turn, the
+  default tools, the model looking at itself, turns cut short, and what the model is
+  actually given."
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [inkling.core :as ink]
+            [harness.core :as h]
+            [harness.tools :as tools]
+            [harness.cards :as hc]))
+
+;;;; The harness, a form at a time
+;;
+;; This file is read and run in the REPL that has the window: start it in this directory and
+;; connect an editor to the port in .nrepl-port once the window is open.
+;;
+;;   ./harness.sh
+;;
+;; Evaluate the forms in order, from this file's buffer. They are in (comment ...) blocks,
+;; with what they gave on an M3 Max as `;=>` notes. What the model says is its own: it can
+;; differ on another machine, and it is not always right.
+;;
+;; Nothing here is sandboxed. A tool runs with this process's rights, and the eval tool runs
+;; whatever code the model writes.
+
+;; The model file, from where the REPL was started.
+(def model-file "../inkling/models/inkling-2-mini.ink")
+
+;;;; 1. A tool is a function
+;;
+;; Any function can be a tool. h/wrap takes its var: the function's name, docstring and
+;; parameters become the tool's. A parameter is a string unless it is tagged.
+
+(defn add
+  "Adds two integers and returns their sum."
+  [^long a ^long b]
+  (+ a b))
+
+(comment
+  (def add-tool (h/wrap #'add))
+  (select-keys add-tool [:name :doc :params :required])
+  ;=> {:name "add", :doc "Adds two integers and returns their sum.",
+  ;    :params {:a {:type "integer"}, :b {:type "integer"}}, :required [:a :b]}
+
+  ;; The model calls a tool with JSON arguments. The harness decodes them and calls the
+  ;; function with plain values: this is what a call does.
+  ((:fn add-tool) {:a 2 :b 3})
+  ;=> 5
+
+  ;; A tool can also be written as a map: its :fn gets the arguments as a map.
+  (def shout-tool
+    (h/tool {:name "shout"
+             :doc "Returns a text in capital letters."
+             :params {:text {:type "string" :doc "the text"}}
+             :fn (fn [{:keys [text]}] (str/upper-case text))}))
+  )
+
+;;;; 2. An agent and its turn
+;;
+;; An agent is an atom: a session of the model, its tools and its conversation. hc/watch!
+;; shows it above the cards, under a name: a line for the conversation, and the conversation
+;; written out as it goes. Clicking a folded entry (the model's thinking, a tool's call)
+;; opens it; clicking the conversation's line folds the whole of it away.
+
+(comment
+  (def m (ink/open model-file))
+  (def a (hc/watch! (h/agent m {:tools [add-tool shout-tool]}) "arithmetic"))
+
+  ;; ask! adds a person's message and starts the model's turn on a thread of its own: it
+  ;; returns at once, and the window follows the turn. answer waits for its end. The model
+  ;; thinks before it acts (:effort, :high when not said; :low is quicker).
+  (h/ask! a "What is 1234 plus 4321? Use the add tool, then shout the result in words.")
+  (h/answer a)
+  ;=> "1234 + 4321 = 5555.\n\nFIVE THOUSAND FIVE HUNDRED FIFTY-FIVE"
+
+  ;; The conversation, entry by entry: the message, the model's thinking, each call with
+  ;; its arguments decoded, each result as the model read it, and what it said.
+  (mapv (fn [e] (select-keys e [:role :name :args :text])) (h/entries a))
+  ;=> [{:role :user, :text "What is 1234 plus 4321? ..."}
+  ;    {:role :thinking, :text "The user wants me to compute 1234 + 4321 using the add tool, ..."}
+  ;    {:role :call, :name "add", :args {:a 1234, :b 4321}}
+  ;    {:role :result, :name "add", :text "5555"}
+  ;    {:role :thinking, :text "The add tool returned 5555. Now shout the result in words. ..."}
+  ;    {:role :call, :name "shout", :args {:text "five thousand five hundred fifty-five"}}
+  ;    {:role :result, :name "shout", :text "FIVE THOUSAND FIVE HUNDRED FIFTY-FIVE"}
+  ;    {:role :thinking, :text "..."}
+  ;    {:role :model, :text "1234 + 4321 = 5555.\n\nFIVE THOUSAND FIVE HUNDRED FIFTY-FIVE"}]
+  (h/status a)
+  ;=> {:state :done, :position 624, :context 16384, :generated 371, :seconds 11.1,
+  ;    :tokens-per-second 33.4}
+  (h/close! a)
+  )
+
+;;;; 3. The default tools
+;;
+;; eval runs code in this process's own nREPL, as an evaluation from an editor would be: it
+;; sees the engine, this harness and the conversation it is asked from. functions and
+;; describe list and document what a namespace defines. The others are for files and
+;; commands. tools/situation is a text that tells the model where it is.
+
+(comment
+  (mapv :name (tools/defaults))
+  ;=> ["eval" "functions" "describe" "read_file" "write_file" "edit_file" "list_dir" "shell"]
+  (str tools/situation)
+
+  (def b (hc/watch! (h/agent m {:tools (tools/defaults) :system tools/situation})
+                    "the default tools"))
+
+  ;; A tool's argument is the text itself: the model writes it as a JSON string, the harness
+  ;; decodes it, and the function gets the characters. Here a file with quotes, backslashes
+  ;; and the spelling of one of the model's own special tokens.
+  (h/ask! b (str "Write the file target/tutorial/note.jank with exactly this text, "
+                 "then read it back and tell me how many lines it has:\n\n"
+                 "(defn greet [name]\n"
+                 "  (str \"Hello, \\\"\" name \"\\\"!\\n\" \"C:\\\\temp\\\\x\"))\n\n"
+                 ";; a comment with <|end_message|> in it\n"
+                 "(greet \"Ana\")\n"))
+  (h/answer b)
+  ;=> "The file `target/tutorial/note.jank` is written and reads back exactly as requested.
+  ;    It has **5 lines**: ..."
+  (println (slurp "target/tutorial/note.jank"))
+  ;; prints:
+  ;;   (defn greet [name]
+  ;;     (str "Hello, \"" name "\"!\n" "C:\\temp\\x"))
+  ;;
+  ;;   ;; a comment with <|end_message|> in it
+  ;;   (greet "Ana")
+
+  ;; Without a limit on its thinking, the model once spent a whole step (4,096 tokens, two
+  ;; minutes) on this request, turning over the special token's spelling, and never wrote
+  ;; the file. :max-thinking (1,536 tokens when not said) closes a stretch of thinking that
+  ;; goes on that long, and the model goes on from what it has thought. Such an entry has
+  ;; :cut, and the window says so.
+  )
+
+;;;; 4. The model looking at itself
+;;
+;; The engine is loaded in this same process, so the model can be asked about itself and
+;; look instead of guessing. (harness.core/me) is how code it evaluates finds the
+;; conversation it is part of.
+
+(comment
+  (h/ask! b (str "Which layers of the model you run on are visited more than once in "
+                 "a forward pass, and how many visits are there in all? "
+                 "Find out; do not guess."))
+  (h/answer b)
+  ;=> "From the model's own plan (`inkling.core/plan`), a forward pass is 48 visits:
+  ;
+  ;    - **Layers 6–17 (12 layers) are visited more than once** — each exactly 3 times
+  ;      (passes 0, 1, 2), per the config's loop `{:start 6 :end 18 :passes 3}`. ...
+  ;    - **Total: 48 visits** (visits 0–47). ..."
+
+  ;; What it called to find out.
+  (defn calls [agent]
+    (mapv (fn [e] [(:name e) (:args e)])
+          (filter (fn [e] (= (:role e) :call)) (h/entries agent))))
+  (calls b)
+  ;=> [... ["functions" {:namespace "inkling.core"}]
+  ;        ["describe" {:name "inkling.core/plan"}]
+  ;        ["describe" {:name "inkling.core/config"}]
+  ;        ["eval" {:code "(harness.core/me)"}]
+  ;        ["eval" {:code "(inkling.core/config (:model (harness.core/me)))"}]
+  ;        ["eval" {:code "(inkling.core/plan (:model (harness.core/me)))"}]
+  ;        ["eval" {:code "(let [p (inkling.core/plan (:model (harness.core/me)))] ...)"}]]
+
+  ;; It reaches further than reading: the same functions change the model it runs on.
+  ;; Here it switches a part of itself off, and its own next tokens are computed without
+  ;; that part (on the CPU, so slowly) until it switches it on again. An ablation it
+  ;; forgets to undo stays, and freeing its own session ends the conversation.
+  (h/ask! b (str "Switch off the feed-forward of visit 47 of the model you run on with "
+                 "inkling.core/ablate!, check with inkling.core/ablations that it is "
+                 "off, then switch it on again and tell me what you did."))
+  (h/answer b)
+  ;=> "Done. Here's exactly what I did:
+  ;    1. **Checked the initial state** — `ablations` showed all 48 visits with `#{}` ...
+  ;    2. **Switched off visit 47's feed-forward** — `ablate!` with `#{:feed-forward}` ...
+  ;    3. **Verified** — `ablations` showed visit 47 (the last entry) as `#{:feed-forward}` ...
+  ;    4. **Switched it back on** — `ablate!` with `#{}` on visit 47.
+  ;    5. **Verified again** ..."
+  (nth (ink/ablations m) 47)
+  ;=> #{}
+  )
+
+;;;; 5. Turns cut short
+;;
+;; A step may generate :max-tokens tokens and a turn may take :max-steps steps (a step is
+;; the model speaking, then its calls). stop! ends a turn after the token being made. In
+;; each case what was made is kept, and the conversation can go on.
+
+(comment
+  (h/ask! b "Count from 1 to 400, one number per line.")
+  (h/stop! b)
+  (select-keys (last (h/entries b)) [:role :why])
+  ;=> {:role :stopped, :why :stopped}
+
+  (h/ask! b "Never mind the counting. What is 6 times 7? Answer with the number only.")
+  (h/answer b)
+  ;=> "42"
+  )
+
+;;;; 6. What the model is given
+;;
+;; The conversation is the session's tokens: frames opened and closed by special tokens,
+;; the way the model was trained on. A frame's content is tokenized as ordinary text and
+;; the model's output is split by token id, so a special token's spelling inside a message
+;; or a file is only text.
+
+(comment
+  ;; The end of the conversation as the model has it.
+  (ink/tail (:session @b) 60)
+  ;=> "... This is a simple arithmetic question; no tools needed. Answer with the number
+  ;    only.<|end_message|><|message_model|><|content_text|>42<|end_message|>
+  ;    <|content_model_end_sampling|>"
+
+  ;; The session is the engine's own: everything in the engine's tutorial applies to it.
+  (ink/info (:session @b))
+  ;=> {:position 11526, :context 16384, :logits true, :gpu true}
+  (ink/top (:session @b) 3)
+  ;=> [{:id 200001, :piece "<|message_model|>", :prob 0.99999 ...} ...]
+  )
+
+;;;; 7. Ending
+
+(comment
+  (h/close! b)
+  (ink/close! m)
+  )
