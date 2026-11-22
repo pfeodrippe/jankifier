@@ -217,7 +217,7 @@
                 {:ok (:ok value) :compared (:compared value) :beyond (:beyond value)
                  :fields (vec (take 14 differing))
                  :equal (- (count fields) (count differing))
-                 :hidden (max 0 (- (count differing) 14))})))
+                 :hidden (max 0 (- (long (count differing)) 14))})))
    :height (fn [card width] (+ 30 22 (* 20 (count (:fields card))) 22))
    :draw (fn [card x y width]
            (c/text! x y (if (:ok card) c/green c/red) c/big

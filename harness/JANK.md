@@ -25,6 +25,9 @@ the syntax, the data structures and most of `clojure.core` and
 - **A text bound by `let` and used inside an inner function** must be made
   with `str`: `(let [s (str "text")] (fn [] s))`. With the bare literal the
   code does not compile ("cannot be captured").
+- **`count` is unsigned.** `(max 0 (- (count [1 2]) 5))` is `-3`, and `min`
+  of a count and a negative number is the count. Write `(long (count xs))`
+  before subtracting from it or comparing it with what may be negative.
 - **Strings are bytes** for `count`, `subs` and `clojure.string/index-of`:
   `(count "é")` is 2.
 - **Regular expressions**: `[...]` classes and `\s` also match the bytes of

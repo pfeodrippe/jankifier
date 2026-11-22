@@ -372,7 +372,7 @@
   "Results as text: a line a check or a task, then how many passed."
   [results]
   (let [width (apply max 10 (map (fn [r] (count (:name r))) results))
-        pad (fn [text n] (str text (apply str (repeat (max 0 (- n (count (str text)))) " "))))
+        pad (fn [text n] (str text (apply str (repeat (max 0 (- (long n) (long (count (str text))))) " "))))
         line (fn [r]
                (str (if (:pass r) "pass  " "FAIL  ") (pad (:name r) (+ width 2))
                     (when (:seconds r)
