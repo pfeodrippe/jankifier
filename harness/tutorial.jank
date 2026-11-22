@@ -59,7 +59,8 @@
 ;;
 ;; An agent is an atom: a session of the model, its tools and its conversation. hc/watch!
 ;; shows it above the cards, under a name: a line for the conversation, and the conversation
-;; written out as it goes, as a terminal shows it: nothing folded, the newest at the bottom.
+;; written out as it goes, as a terminal shows it, the newest at the bottom. A long part shows
+;; its first lines; a click on "... more lines" shows it whole.
 
 (comment
   (def m (ink/open model-file))

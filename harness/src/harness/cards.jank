@@ -1,8 +1,10 @@
 ;; SPDX-License-Identifier: MIT
 ;; Agents in the window (cards.core): above the cards, a line for each conversation watched,
 ;; and the one chosen written out as a terminal is: the person's messages, the model's
-;; thinking, each tool's call with all it gave, and what the model said (headings, lists,
-;; tables, code and bold drawn), nothing folded, the newest at the bottom. Under it, what is
+;; thinking, each tool's call with what it gave, and what the model said (headings, lists,
+;; tables, code and bold drawn), the newest at the bottom. A long part (thinking, a call's
+;; arguments, what a tool gave) shows its first lines and how many more there are: a click
+;; there shows it whole. Under it, what is
 ;; going on now, and the timeline.
 ;;
 ;; The whole is small and always as tall, whatever it holds. "expand", at the timeline's
@@ -32,6 +34,7 @@
 (defonce ^:private watched (atom []))       ; [{:name :agent}], in the order they were watched
 (defonce ^:private chosen (atom nil))       ; the name of the conversation written out
 (defonce ^:private pending (atom {}))       ; name -> entry: shown from its top at the next frame
+(defonce ^:private unfolded (atom {}))      ; [name index] -> the parts of that entry shown whole
 (defonce ^:private scrolls (atom {}))       ; name -> points looked down from the top; none: the end followed
 (defonce ^:private expanded (atom false))   ; whether the conversation is open as a modal
 (defonce ^:private rows-from (atom 0.0))    ; the first conversation's line in view, of many
@@ -57,6 +60,7 @@
 (def ^:private above 62)                    ; where cards.core draws a header
 (def ^:private below 20)
 (def ^:private longest 4000)                ; lines of an entry's text, at most
+(def ^:private first-lines 3)               ; of a long part, shown until it is opened
 (def ^:private bar 38)
 (def ^:private status 26)                   ; the line of what is going on, over the timeline
 ;; A wait (a tool running, a result being read) is shown at most this long in a replay.
@@ -268,34 +272,64 @@
         (c/text! x (+ y (* line-small i)) color c/small (nth lines i))
         (recur (inc i))))))
 
+(defn- part
+  "A long text's lines as shown: its first `first-lines` and a line saying how many more
+  (a click there opens it), or all of it and a line that closes it again. Being written, its
+  last lines. Returns {:lines :toggle :h}: :toggle is the line clicked, [its text, whether it
+  opens]."
+  [lines open writing]
+  (let [n (long (count lines))
+        long-one (> n (inc first-lines))]
+    (cond
+      (not long-one) {:lines lines :toggle nil :h (* line-small n)}
+      writing {:lines (subvec lines (- n first-lines)) :toggle nil :h (* line-small first-lines)}
+      open {:lines lines :toggle [(str "show less") false] :h (* line-small (inc n))}
+      :else {:lines (subvec lines 0 first-lines)
+             :toggle [(str "... " (- n first-lines) " more lines") true]
+             :h (* line-small (inc first-lines))})))
+
+(defn- draw-part
+  "A part drawn from (x, y), its toggle's line under its lines. Returns the toggle's place
+  {:part :y :open}, y from the item's top `top`, or nil."
+  [shown x y color name top]
+  (draw-lines (:lines shown) x y color)
+  (when-let [[label opens] (:toggle shown)]
+    (let [ty (+ y (* line-small (long (count (:lines shown)))))]
+      (c/text! x ty c/blue c/small label)
+      {:part name :y (- ty top) :open (not opens) :label label})))
+
 (defn- user-item
-  "A person's message, on a band, after a prompt."
+  "A person's message, on a band, after a prompt: its lines as they were typed."
   [text width]
-  (let [inner (prose-item text (- width 40) c/ink)]
-    {:h (+ (:h inner) 24)
+  (let [lines (vec (c/wrap c/mono (- width 40) (str text) 400))
+        h (* line-mono (max 1 (long (count lines))))]
+    {:h (+ h 24)
      :draw (fn [x y w]
-             (c/rect! x y (+ x w) (+ y (:h inner) 14) c/rule 0.3 5.0)
+             (c/rect! x y (+ x w) (+ y h 14) c/rule 0.3 5.0)
              (c/text! (+ x 10) (+ y 7) c/muted c/mono (str ">"))
-             ((:draw inner) (+ x 28) (+ y 7) (- w 40)))}))
+             (doseq [[i line] (map-indexed vector lines)]
+               (c/text! (+ x 28) (+ y 7 (* line-mono i)) c/ink c/mono line))
+             [])}))
 
 (defn- thinking-item
-  "The model thinking: all of it, quiet."
-  [text cut width]
-  (let [lines (mono-lines text (- width 16) longest)
+  "The model thinking, quiet: its first lines, all of them when opened."
+  [text cut width opened writing]
+  (let [shown (part (mono-lines text (- width 16) longest) (contains? opened :text) writing)
         label (if cut (str "thinking (cut short by the harness)") (str "thinking"))]
-    {:h (+ 20 (* line-small (long (count lines))) 10)
+    {:h (+ 20 (:h shown) 10)
      :draw (fn [x y w]
              (c/text! x y c/muted c/small label)
-             (draw-lines lines (+ x 14) (+ y 18) c/muted))}))
+             (keep identity [(draw-part shown (+ x 14) (+ y 18) c/muted :text y)]))}))
 
 (defn- model-item
-  "What the model said, after a dot."
+  "What the model said, after a dot: all of it."
   [text width]
   (let [inner (prose-item text (- width 18) c/ink)]
     {:h (+ (:h inner) 10)
      :draw (fn [x y w]
              (c/circle! (+ x 5) (+ y 10) 3.5 c/ink 1.0)
-             ((:draw inner) (+ x 18) (+ y 2) (- w 18)))}))
+             ((:draw inner) (+ x 18) (+ y 2) (- w 18))
+             [])}))
 
 (defn- main-key
   "The argument of a call that says most: its code, its command, its path."
@@ -303,9 +337,9 @@
   (some (fn [k] (when (contains? args k) k)) (concat [:code :command :path :name :namespace] (keys args))))
 
 (defn- call-item
-  "A tool's call: its name, its arguments, and under them all it gave (`result`, nil while
-  it runs). `writing`: the call is still being written."
-  [entry result width writing]
+  "A tool's call: its name, its arguments, and under them what it gave (`result`, nil while
+  it runs), each its first lines until opened. `writing`: the call is still being written."
+  [entry result width opened writing]
   (let [args (:args entry)
         mk (main-key args)
         main (when mk (get args mk))
@@ -313,53 +347,56 @@
         rest-lines (vec (mapcat (fn [[k v]]
                                   (mono-lines (str (subs (str k) 1) ": " (if (string? v) v (pr-str v))) (- width 40) 200))
                                 (dissoc args mk)))
+        said (part (vec (concat main-lines rest-lines)) (contains? opened :args) writing)
         failed (boolean (and result (or (:error result) (str/starts-with? (str (:text result)) "error:"))))
-        out (if result (mono-lines (:text result) (- width 40) longest) [])
-        args-h (* line-small (+ (long (count main-lines)) (long (count rest-lines))))
-        out-h (cond writing 0 result (* line-small (max 1 (long (count out)))) :else line-small)
+        out (when result (part (mono-lines (:text result) (- width 40) longest) (contains? opened :out) false))
+        out-h (cond writing 0 out (max line-small (:h out)) :else line-small)
         note (if result (str (if failed "error  " "") (seconds-said (:seconds result))) (str ""))
         color (if failed c/red c/orange)]
-    {:h (+ 20 args-h (if writing 4 (+ 8 out-h)) 10)
+    {:h (+ 20 (:h said) (if writing 4 (+ 8 out-h)) 10)
      :draw (fn [x y w]
              (c/circle! (+ x 5) (+ y 9) 3.5 color 1.0)
              (c/text! (+ x 18) (+ y 1) color c/mono (:name entry))
              (c/text! (- (+ x w) (c/text-width c/small note) 4) (+ y 3) c/muted c/small note)
-             (let [ay (+ y 20)]
-               (draw-lines main-lines (+ x 18) ay c/blue)
-               (draw-lines rest-lines (+ x 18) (+ ay (* line-small (long (count main-lines)))) c/muted)
-               (when-not writing
-                 (let [oy (+ ay args-h 8)]
-                   ;; What it gave, under a corner.
-                   (c/line! (+ x 22) (- oy 3) (+ x 22) (+ oy 7) c/rule 1.0)
-                   (c/line! (+ x 22) (+ oy 7) (+ x 30) (+ oy 7) c/rule 1.0)
-                   (if result
-                     (draw-lines out (+ x 36) oy (if failed c/red c/ink))
-                     (c/text! (+ x 36) oy c/muted c/small (str "running...")))))))}))
+             (let [ay (+ y 20)
+                   t1 (draw-part said (+ x 18) ay c/blue :args y)
+                   t2 (when-not writing
+                        (let [oy (+ ay (:h said) 8)]
+                          ;; What it gave, under a corner.
+                          (c/line! (+ x 22) (- oy 3) (+ x 22) (+ oy 7) c/rule 1.0)
+                          (c/line! (+ x 22) (+ oy 7) (+ x 30) (+ oy 7) c/rule 1.0)
+                          (if out
+                            (draw-part out (+ x 36) oy (if failed c/red c/ink) :out y)
+                            (do (c/text! (+ x 36) oy c/muted c/small (str "running..."))
+                                nil))))]
+               (keep identity [t1 t2])))}))
 
 (defn- entry-item
-  "An entry's item. `result` is the entry after a call's (what the tool gave), or nil."
-  [entry result width]
+  "An entry's item. `result` is the entry after a call's (what the tool gave), or nil;
+  `opened` the parts of it shown whole. Its :draw returns where its toggles are."
+  [entry result width opened]
   (case (:role entry)
     :user (user-item (:text entry) width)
-    :thinking (thinking-item (:text entry) (:cut entry) width)
-    :call (call-item entry result width false)
+    :thinking (thinking-item (:text entry) (:cut entry) width opened false)
+    :call (call-item entry result width opened false)
     :model (model-item (:text entry) width)
     :stopped {:h 24
               :draw (fn [x y w]
                       (c/text! x (+ y 3) c/red c/small
                                (str "stopped: " (subs (str (:why entry)) 1)
-                                    (when (:text entry) (str ": " (first (str/split-lines (str (:text entry)))))))))}
-    {:h 0 :draw (fn [x y w] nil)}))
+                                    (when (:text entry) (str ": " (first (str/split-lines (str (:text entry))))))))
+                      [])}
+    {:h 0 :draw (fn [x y w] [])}))
 
 (defn- live-item
   "What is being written right now, drawn as it will be once written."
   [live width]
   (case (:kind live)
-    :thinking (thinking-item (:text live) false width)
+    :thinking (thinking-item (:text live) false width #{} true)
     :text (model-item (:text live) width)
-    :call (call-item {:name (:name live) :args {:code (:text live)}} nil width true)
+    :call (call-item {:name (:name live) :args {:code (:text live)}} nil width #{} true)
     ;; A tool running (its call is kept with its result once it has run).
-    :tool (call-item {:name (:name live) :args {:code (:text live)}} nil width false)
+    :tool (call-item {:name (:name live) :args {:code (:text live)}} nil width #{} false)
     nil))
 
 (defn- items
@@ -379,12 +416,14 @@
                    (if (= (:role entry) :result)
                      (recur (inc i) out)
                      (let [key [named i]
+                           opened (get @unfolded key #{})
                            kept (get @built key)
                            item (if (and kept (identical? (:entry kept) entry) (identical? (:result kept) result)
-                                         (= (:width kept) width))
+                                         (= (:width kept) width) (= (:opened kept) opened))
                                   (:item kept)
-                                  (let [item (entry-item entry result width)]
-                                    (swap! built assoc key {:entry entry :result result :width width :item item})
+                                  (let [item (entry-item entry result width opened)]
+                                    (swap! built assoc key {:entry entry :result result :width width
+                                                            :opened opened :item item})
                                     item))]
                        (recur (inc i) (conj out (assoc item :key key))))))))
         live (when (:live v) (live-item (:live v) width))]
@@ -879,17 +918,33 @@
             (reset! held nil))
           (c/line! (+ x 10) (- top 6) (- (+ x width) 10) (- top 6) c/rule 1.0)
           (c/clip-begin! x top (+ x width) (+ top shown))
-          (let [_ (loop [its (:items p) at start]
-                    (when (seq its)
-                      (let [item (first its)
-                            h (:h item)]
-                        (when (and (> (+ at h) top) (< at (+ top shown)))
-                          ((:draw item) (+ x 14) at (- width 28)))
-                        (recur (rest its) (+ at h)))))
+          (let [toggles
+                (loop [its (:items p) at start out []]
+                  (if (empty? its)
+                    out
+                    (let [item (first its)
+                          h (:h item)
+                          seen (and (> (+ at h) top) (< at (+ top shown)))
+                          drawn-ts (when seen ((:draw item) (+ x 14) at (- width 28)))
+                          here (vec (for [t drawn-ts
+                                          :let [ty (+ at (:y t))]
+                                          :when (and (:key item) (>= ty top) (<= (+ ty line-small) (+ top shown)))]
+                                      (assoc t :entry (second (:key item)) :key (:key item) :ty ty)))]
+                      (doseq [t here]
+                        (let [ty (:ty t)]
+                          (when (and over (not on-latest) (c/inside? (+ x 14) ty (- right 16) (+ ty line-small)))
+                            (c/line! (+ x 50) (+ ty line-small -2) (+ x 50 (c/text-width c/small (:label t))) (+ ty line-small -2) c/blue 1.0))
+                          (when (and over (not on-latest) (c/clicked? (+ x 14) ty (- right 16) (+ ty line-small)))
+                            ;; What is looked at stays: opened, it grows below the line clicked.
+                            (swap! scrolls assoc named looked)
+                            (swap! unfolded update (:key t)
+                                   (fn [parts] (let [parts (or parts #{})]
+                                                 (if (contains? parts (:part t)) (disj parts (:part t)) (conj parts (:part t)))))))))
+                      (recur (rest its) (+ at h) (into out here)))))
                 _ (c/clip-end!)
                 _ (draw-status (:seen p) (:value p) (:sched p) (:play p) (+ x 14) (+ top shown 2) (- width 28))
                 timeline (draw-bar named (:value p) (:sched p) (:play p) x (+ top shown status 8) width pressed modal)
-                now-drawn {:x x :y y :modal (boolean modal) :width width :top top :shown shown :tall tall :folds []
+                now-drawn {:x x :y y :modal (boolean modal) :width width :top top :shown shown :tall tall :folds [] :toggles (mapv (fn [t] {:entry (:entry t) :part (subs (str (:part t)) 1) :y (+ (:ty t) (/ line-small 2.0)) :open (:open t)}) toggles)
                            :bar timeline :height (:height p) :looked looked :furthest furthest
                            :latest (when behind {:x (/ (+ lx1 lx2) 2.0) :y (/ (+ ly1 ly2) 2.0)})
                            :anchored (and (not (pos? furthest)) (pos? tall))
@@ -972,6 +1027,21 @@
   (reset! chosen (when named (str named)))
   nil)
 
+(defn unfold!
+  "Parts of a conversation's entries shown whole (`whole` true) or by their first lines, as
+  a click on \"... more lines\" does. `which`: :all, :none, or the entries' numbers (their
+  places in (h/entries a))."
+  ([named which] (unfold! named which true))
+  ([named which whole]
+   (let [named (str named)
+         a (:agent (some (fn [w] (when (= (:name w) named) w)) @watched))
+         n (if a (count (:entries @a)) 0)
+         chosen-entries (cond (= which :all) (range n) (= which :none) (range n) :else which)
+         whole (and whole (not= which :none))]
+     (swap! unfolded (fn [m] (reduce (fn [m i] (if whole (assoc m [named i] #{:text :args :out}) (dissoc m [named i])))
+                                     m chosen-entries)))
+     nil)))
+
 (defn expand!
   "The conversation opened over the window as a modal (or closed), as the timeline's button
   does."
@@ -1034,7 +1104,8 @@
   [{name, y}], bar: {y, play, start, next, x1, x2, pace, total, t, mode, marks}, looked,
   furthest, latest, anchored}, in the window's points. `bar` is the timeline: its buttons are
   at (play, y), (start, y), (next, y), its line from x1 to x2, a step's mark at (x, y).
-  (`folds` is always empty: nothing folds.)"
+  `toggles`: the lines in view that open or close a long part ({entry, part, y, open}: a
+  click at (x + 100, y)). (`folds` is always empty.)"
   []
   (json/write (or @drawn {})))
 

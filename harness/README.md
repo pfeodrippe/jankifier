@@ -164,8 +164,12 @@ tool says so; `curl https://example.com` gets no connection.
 `(hc/watch! a "name")` shows the agent above the cards: a line for each
 conversation watched, and the one chosen written out as a terminal shows it,
 in its type: a person's messages after a prompt, the model's thinking, each
-tool's call with all it gave under it, and what the model said with its
-headings, lists, tables, code and bold drawn. Nothing is folded, and the newest
+tool's call with what it gave under it, and what the model said with its
+headings, lists, tables, code and bold drawn. A long part (thinking, a call's
+arguments, what a tool gave) shows its first three lines and how many more
+there are: a click there shows it whole, and "show less" puts it back
+(`(hc/unfold! "name" :all)` shows them all whole). While a part is being
+written, its last lines are shown. The newest
 is at the bottom; a conversation shorter than the space sits at the bottom of
 it. Under it is a line of what is going on ("thinking (12 s)", "running
 shell"), or the person's message being typed in a replay, and the timeline.
