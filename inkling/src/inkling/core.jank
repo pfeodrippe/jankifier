@@ -88,7 +88,10 @@
 (defn set-option!
   "Options: :gpu (run evals on the Metal backend; false uses the CPU
   reference), :threads (CPU workers), :quantize-expert-inputs (quantize the
-  experts' inputs as the checkpoint's reference does; false keeps FP32)."
+  experts' inputs as the checkpoint's reference does; false keeps FP32),
+  :split-attention (one token over a long context: the global layers'
+  attention split across the keys, then merged; the same arithmetic, in
+  another order)."
   [m k v]
   (cpp/inkling.jank_layer.set_option m k v))
 

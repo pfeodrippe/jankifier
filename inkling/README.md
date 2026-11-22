@@ -35,7 +35,14 @@ Not done:
   is the routed experts, which run one route at a time (running the routes by
   expert, to decode an expert's weights once for several tokens, was tried
   and was slower);
-- single-token attention over a very long context is not tuned;
+- single-token attention over a very long context: `(ink/set-option! m
+  :split-attention true)` splits the global layers' attention across the keys
+  and merges the chunks (`att_split`, `att_merge`). It passes `check-gpu` (one
+  token at position 1,362: nothing beyond tolerance, as the plain kernel). At
+  19,812 tokens it took 480 us a global visit against 2,709 us for the plain
+  kernel (profiled while another process used the GPU); at 1,364 tokens it is
+  slower (two chunks). Off until it is measured alone at several lengths, to
+  choose where it starts;
 - only Apple Silicon.
 
 ## What was checked

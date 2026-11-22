@@ -82,6 +82,16 @@ namespace inkling
       float scale;
     };
 
+    struct split_params
+    {
+      uint32_t p0, heads, kvh, slots, extent, chunk, splits;
+      float scale;
+    };
+
+    // att_split: at most this many chunks of keys, each at least this many keys.
+    constexpr uint32_t split_most{ 64 };
+    constexpr uint32_t split_least{ 512 };
+
     struct route_params
     {
       uint32_t h, ne, topk, mode, has_bias;
@@ -116,7 +126,7 @@ namespace inkling
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> embed, mix_norm, mix_pair, controller, linear1, linear4, linear_mm, conv_fixed, conv_dyn, kv_store,
-      q_prep, att1, att8, att32, rel_bias, att_scores, att_softmax, att_pv, route, gu_nv, gu_mx, act_quant, dn_nv,
+      q_prep, att1, att8, att32, att_split, att_merge, rel_bias, att_scores, att_softmax, att_pv, route, gu_nv, gu_mx, act_quant, dn_nv,
       dn_mx;
     std::unordered_map<void const *, id<MTLBuffer>> weights;
     // Half-float copies of projection weights, for the batched kernels.
@@ -135,7 +145,7 @@ namespace inkling
     std::vector<id<MTLBuffer>> k, v;
     std::vector<std::array<id<MTLBuffer>, 4>> conv;
     id<MTLBuffer> ids, stream, q, r, gate, sink, kraw, vraw, dynk, dynv, kc, vc, attended, out, ffn_in, xq, xmax, chosen,
-      cw, act, amax, ffn, hidden, logits, pair, cmp, rlogits, qg, bias, scores, inv;
+      cw, act, amax, ffn, hidden, logits, pair, cmp, rlogits, qg, bias, scores, inv, part;
     // Bytes of `scores`: the batched attention's scratch.
     size_t scores_bytes{};
     id<MTLBuffer> normed[3];
@@ -322,6 +332,8 @@ namespace inkling
       b->att1 = pipeline(device, lib, "attention", 32);
       b->att8 = pipeline(device, lib8, "attention", 256);
       b->att32 = pipeline(device, lib32, "attention", 1024);
+      b->att_split = pipeline(device, lib8, "att_split", 256);
+      b->att_merge = pipeline(device, lib, "att_merge", 32);
       b->rel_bias = pipeline(device, lib, "rel_bias", 32);
       b->att_scores = pipeline(device, lib, "att_scores", 32);
       b->att_softmax = pipeline(device, lib, "att_softmax", 128);
@@ -446,6 +458,8 @@ namespace inkling
       size_t const full{ c.kv_heads * ((t * per + 31) / 32 * 32) * slots * f };
       g->scores_bytes = std::min(full, std::max<size_t>(512u << 20, c.kv_heads * 32 * slots * f));
       g->scores = scratch_buffer(b, g->scores_bytes);
+      // att_split's records: a head a chunk, 33 float4s.
+      g->part = scratch_buffer(b, static_cast<size_t>(split_most) * c.heads * 33 * 4 * f);
       for(auto &n : g->normed)
       {
         n = scratch_buffer(b, t * h * f);
@@ -994,6 +1008,34 @@ namespace inkling
             bind(5, g.attended);
             groups(a.head_dim / 32, p.rows / 32, p.kvh, 32);
           }
+        }
+        else if(m.split_attention && nt == 1 && a.window == 0 && p0 + 1 >= 2 * split_least
+                && a.heads % a.kv_heads == 0 && a.heads / a.kv_heads <= 4 && a.head_dim == 128)
+        {
+          // One token over a long context: the keys split in chunks (att_split),
+          // then the chunks merged (att_merge).
+          uint32_t const keys{ p0 + 1 };
+          uint32_t const splits{ std::min(split_most, keys / split_least) };
+          uint32_t const chunk{ (keys + splits - 1) / splits };
+          split_params const p{ p0, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads),
+                                static_cast<uint32_t>(vc.slots), static_cast<uint32_t>(a.rel_extent), chunk, splits,
+                                1.0f / std::sqrt(static_cast<float>(a.head_dim)) };
+          use(b.att_split, "attention (global, split)");
+          [e setBytes:&p length:sizeof(p) atIndex:0];
+          bind(1, g.q);
+          bind(2, g.r);
+          bind(3, b.rel[static_cast<size_t>(visit.layer)]);
+          bind(4, g.k[vi]);
+          bind(5, g.v[vi]);
+          bind(6, g.part);
+          groups(p.kvh, splits, 1, 32 * 8);
+          use(b.att_merge, "attention (global, merge)");
+          [e setBytes:&p length:sizeof(p) atIndex:0];
+          bind(1, g.part);
+          bind(2, g.sink);
+          bind(3, g.gate);
+          bind(4, g.attended);
+          groups(p.heads, 1, 1, 32);
         }
         else
         {

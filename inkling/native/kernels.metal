@@ -816,6 +816,149 @@ kernel void attention(constant att_params &P [[buffer(0)]],
 #endif
 }
 
+// Attention of one token over a long context, split across the keys (as
+// flash-decoding does): a threadgroup of NSG simdgroups takes a chunk of the
+// keys for the query heads that share one key-value head, so that each key and
+// value row is read once for all of them. A simdgroup takes one key at a time,
+// its lanes splitting the head's 128 values four each (the rows are read in one
+// coalesced pass), with a running softmax per head. Each chunk leaves, per head,
+// its max, its sum and its weighted values; att_merge combines the chunks with
+// the sink and the gate. The same arithmetic as `attention`, in another order.
+// Only for one token (p0 is its position) and a global layer (no window).
+
+#define SPLIT_HEADS 4
+
+struct split_params
+{
+  uint p0;
+  uint heads;
+  uint kvh;
+  uint slots;
+  uint extent;
+  uint chunk;
+  uint splits;
+  float scale;
+};
+
+kernel void att_split(constant split_params &P [[buffer(0)]],
+                      device const float4 *q [[buffer(1)]],
+                      device const float4 *r [[buffer(2)]],
+                      device const float4 *rel [[buffer(3)]],
+                      device const half4 *K [[buffer(4)]],
+                      device const half4 *V [[buffer(5)]],
+                      device float4 *part [[buffer(6)]],
+                      uint3 tg [[threadgroup_position_in_grid]],
+                      ushort lane [[thread_index_in_simdgroup]],
+                      ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup float tm[NSG][SPLIT_HEADS];
+  threadgroup float tl[NSG][SPLIT_HEADS];
+  threadgroup float4 tacc[NSG][SPLIT_HEADS][32];
+  uint g = tg.x, split = tg.y;
+  uint per = P.heads / P.kvh;
+  uint p = P.p0;
+  uint begin = split * P.chunk;
+  uint end = min(begin + P.chunk, p + 1u);
+
+  float4 qv[SPLIT_HEADS];
+  float4 rv[SPLIT_HEADS];
+  float m[SPLIT_HEADS], l[SPLIT_HEADS];
+  float4 acc[SPLIT_HEADS];
+  for(uint h = 0; h < per; ++h)
+  {
+    uint head = g * per + h;
+    qv[h] = q[head * 32u + lane];
+    rv[h] = lane < 4 ? r[head * 4u + lane] : float4(0.0f);
+    m[h] = -1e30f;
+    l[h] = 0.0f;
+    acc[h] = float4(0.0f);
+  }
+
+  for(uint j = begin + sg; j < end; j += NSG)
+  {
+    uint at = ((j % P.slots) * P.kvh + g) * 32u;
+    float4 k = float4(K[at + lane]);
+    float4 v = float4(V[at + lane]);
+    uint dist = p - j;
+    bool near = dist < P.extent;
+    float4 rl = (near && lane < 4) ? rel[dist * 4u + lane] : float4(0.0f);
+    for(uint h = 0; h < per; ++h)
+    {
+      float s = simd_sum(dot(qv[h], k)) * P.scale;
+      if(near) s += rbf(simd_sum(dot(rv[h], rl)));
+      if(s > m[h])
+      {
+        float f = exp(m[h] - s);
+        l[h] *= f;
+        acc[h] *= f;
+        m[h] = s;
+      }
+      float pr = exp(s - m[h]);
+      l[h] += pr;
+      acc[h] += pr * v;
+    }
+  }
+
+  for(uint h = 0; h < per; ++h)
+  {
+    if(lane == 0)
+    {
+      tm[sg][h] = m[h];
+      tl[sg][h] = l[h];
+    }
+    tacc[sg][h][lane] = acc[h];
+  }
+  BARRIER;
+  if(sg == 0)
+  {
+    for(uint h = 0; h < per; ++h)
+    {
+      float best = -1e30f;
+      for(uint i = 0; i < NSG; ++i) best = max(best, tm[i][h]);
+      float sum = 0.0f;
+      float4 a = float4(0.0f);
+      for(uint i = 0; i < NSG; ++i)
+      {
+        float f = exp(tm[i][h] - best);
+        sum += tl[i][h] * f;
+        a += tacc[i][h][lane] * f;
+      }
+      // A record a head a chunk: 32 values, then (max, sum).
+      uint base = (split * P.heads + g * per + h) * 33u;
+      part[base + lane] = a;
+      if(lane == 0) part[base + 32u] = float4(best, sum, 0.0f, 0.0f);
+    }
+  }
+}
+
+// The chunks of att_split combined, a simdgroup a head: the sink is one more
+// logit with a zero value, and the output is gated and rounded as `attention`'s.
+kernel void att_merge(constant split_params &P [[buffer(0)]],
+                      device const float4 *part [[buffer(1)]],
+                      device const float *sink [[buffer(2)]],
+                      device const float4 *gate [[buffer(3)]],
+                      device float4 *out [[buffer(4)]],
+                      uint3 tg [[threadgroup_position_in_grid]],
+                      ushort lane [[thread_index_in_simdgroup]])
+{
+  uint head = tg.x;
+  float sk = sink[head];
+  float best = sk;
+  for(uint s = 0; s < P.splits; ++s) best = max(best, part[(s * P.heads + head) * 33u + 32u].x);
+  float den = exp(sk - best);
+  float4 a = float4(0.0f);
+  for(uint s = 0; s < P.splits; ++s)
+  {
+    uint base = (s * P.heads + head) * 33u;
+    float4 ml = part[base + 32u];
+    float f = exp(ml.x - best);
+    den += ml.y * f;
+    a += part[base + lane] * f;
+  }
+  uint o = head * 32u + lane;
+  out[o] = rbfv(a / den / (1.0f + exp(-gate[o])));
+}
+
 // Attention for a batch, as matrix products. Per key-value group g, with
 // rows = (token, head of g):
 //   att_scores:  scores[row, slot] = q[row] . k[slot] / sqrt(128) + bias, for
