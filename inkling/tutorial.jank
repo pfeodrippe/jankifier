@@ -1,0 +1,455 @@
+(ns tutorial
+  "inkling from a REPL, a form at a time: the model, text and tokens, sessions, what an
+  evaluation computed, checking the GPU against the CPU, experiments, and the window that
+  draws all of it."
+  (:require [clojure.string :as str]
+            [inkling.core :as ink]))
+
+;;;; inkling, a form at a time
+;;
+;; This file is read and run in a REPL: evaluate the forms in order, from this file's buffer
+;; (the editor sends the file's namespace with each form). The forms are in (comment ...)
+;; blocks, with what they gave on an M3 Max as `;=>` notes. Numbers such as probabilities
+;; can differ in their last digits on another machine.
+;;
+;; Before starting, once (README.md has the details):
+;;
+;;   make                                        # in inkling/: lib/libinkling.dylib, bin/inkling
+;;   bin/inkling convert <checkpoint> models/inkling-2-mini.ink
+;;   (cd ../cards && lein install)               # the cards library, for the window
+;;
+;; Then start the REPL with its window, and connect an editor to the port in viz/.nrepl-port
+;; once the window is open (CIDER: cider-connect-clj):
+;;
+;;   cd viz && ./viz.sh
+;;
+;; Every evaluation below then also appears in the window as a card. Sections 1 to 8 work
+;; without the window too, in a plain REPL started in inkling/ (the model's path is then
+;; "models/inkling-2-mini.ink"):
+;;
+;;   jank -I include -L lib -l $PWD/lib/libinkling.dylib --module-path src repl
+
+;; The model file, from where the REPL was started (viz.sh starts it in viz/).
+(def model-file "../models/inkling-2-mini.ink")
+
+;;;; 1. The model
+;;
+;; Opening a model maps its file (20 GB) into memory; nothing is read until it is used, so
+;; this takes a fraction of a second.
+
+(comment
+  (def m (ink/open model-file))
+
+  ;; Its sizes. The decoder has 24 layers of width 2304. Attention has 24 heads over 8
+  ;; key-value heads. The feed-forward of a layer is 128 experts, of which 8 are used for a
+  ;; token. Layers 6 to 17 are run 3 times (:loop).
+  (select-keys (ink/config m)
+               [:layers :hidden :heads :kv-heads :experts :top-k :expert-width :window
+                :loop])
+  ;=> {:experts 128, :window 1024, :loop {:start 6, :end 18, :passes 3, :gate-rank 64},
+  ;    :hidden 2304, :expert-width 1152, :heads 24, :kv-heads 8, :layers 24, :top-k 8}
+
+  ;; The plan is the order the layers are run in: 48 visits. A visit is a layer and the pass
+  ;; of the loop that runs it. Local visits attend to the last 1,024 tokens only.
+  (count (ink/plan m))
+  ;=> 48
+  (nth (ink/plan m) 18)
+  ;=> {:visit 18, :layer 6, :pass 1, :local true}
+  ;; In the window, (ink/plan m) is drawn: a column a layer, a row a pass.
+  (ink/plan m)
+
+  ;; The tensors are the checkpoint's, unchanged. The experts' weights are packed 4-bit
+  ;; values (:u32 holding 8 of them); the projections are BF16.
+  (count (ink/tensors m))
+  ;=> 1298
+  (ink/tensor m "model.llm.layers.0.mlp.experts.w13_weight")
+  ;=> {:name "model.llm.layers.0.mlp.experts.w13_weight", :dtype :u32, :shape [128 2304 288], :bytes 339738624}
+  (ink/tensor-values m "model.llm.norm.weight" 4)
+  ;=> [5.53125 4.9375 4.59375 5.28125]
+
+  ;; A layer's weights, by tensor name. The last four layers' experts are 8-bit.
+  (keys (ink/layer m 6))
+  ;=> (:down :index :router :mlp-query :router-bias :attention-conv :mlp-conv :attention
+  ;    :attention-query :mlp-norm :controllers :attention-norms :local :gate-up)
+  (:format (:gate-up (ink/layer m 6)))
+  ;=> :nvfp4
+  (:format (:gate-up (ink/layer m 20)))
+  ;=> :mxfp8
+
+  (ink/options m)
+  ;=> {:threads 12, :quantize-expert-inputs true, :gpu true, :gpu-available true}
+  )
+
+;;;; 2. Text and tokens
+
+(comment
+  (ink/tokenize m "The capital of France is")
+  ;=> [371 151451 149879 151194 149884]
+
+  ;; Each id with its piece of text (in the window: a chip a token).
+  (ink/pieces m (ink/tokenize m "The capital of France is"))
+  ;=> [{:id 371, :piece "The"} {:id 151451, :piece " capital"} {:id 149879, :piece " of"}
+  ;    {:id 151194, :piece " France"} {:id 149884, :piece " is"}]
+
+  (ink/detokenize m [371 151451 149879 151194 149884])
+  ;=> "The capital of France is"
+
+  ;; The model's special tokens are written <|...|>. tokenize turns them into their ids,
+  ;; unless its third argument is false: then they are ordinary text.
+  (ink/tokenize m "<|message_user|>hi<|end_message|>")
+  ;=> [200000 1910 200010]
+  (ink/tokenize m "<|message_user|>hi<|end_message|>" false)
+  ;=> [27 91 65752 62 2986 91 29 1910 27 91 406 62 65752 91 29]
+  )
+
+;;;; 3. A session
+;;
+;; A session is one sequence of tokens: the tokens, the caches the layers keep of them, and
+;; the logits after the last one. Several sessions can share a model.
+
+(comment
+  (def s (ink/session m 4096))          ; room for 4096 tokens
+
+  (ink/info s)
+  ;=> {:position 0, :context 4096, :logits false, :gpu true}
+
+  ;; eval! adds tokens (or a text) at the end. Only the new tokens are computed: the caches
+  ;; hold the rest.
+  (ink/eval! s "The capital of France is")
+  (ink/position s)
+  ;=> 5
+
+  ;; The most likely next tokens.
+  (ink/top s 3)
+  ;=> [{:id 152717, :piece " Paris", :logit 27.25, :logprob -1.317, :prob 0.268}
+  ;    {:id 167815, :piece " ________", :logit 25.66, :logprob -2.906, :prob 0.055}
+  ;    {:id 149881, :piece " in", :logit 25.53, :logprob -3.035, :prob 0.048}]
+
+  ;; sample picks one: the most likely with no options, or drawn with a temperature.
+  (ink/sample s)
+  ;=> 152717
+  (ink/sample s {:temperature 0.8 :top-p 0.95 :seed 7})
+  ;=> 151015
+
+  ;; generate! samples and evaluates n tokens, and returns their ids.
+  (ink/detokenize m (ink/generate! s 12))
+  ;=> " Paris.\n\nA. Noun\n\nB. Pronoun"
+
+  ;; The text of the session's last tokens, and where it is now.
+  (ink/tail s 20)
+  ;=> "The capital of France is Paris.\n\nA. Noun\n\nB. Pronoun"
+  (ink/info s)
+  ;=> {:position 17, :context 4096, :logits true, :gpu true}
+  )
+
+;;;; 4. A chat turn, by hand
+;;
+;; A plain text is continued as a document, as above. The model was trained on
+;; conversations written with special tokens. There is no chat template in this engine yet,
+;; so a turn is written by hand: the user's message, then the start of the model's.
+
+(comment
+  (def chat (ink/session m 4096))
+  (ink/eval! chat (str "<|message_user|><|content_text|>"
+                       "What is the capital of Italy? Answer in one word."
+                       "<|end_message|><|message_model|><|content_text|>"))
+
+  ;; generate! stops at the token that ends the model's turn.
+  (def answer (ink/generate! chat 40))
+  (ink/pieces m answer)
+  ;=> [{:id 31974, :piece "Rome"} {:id 200010, :piece "<|end_message|>"}
+  ;    {:id 200006, :piece "<|content_model_end_sampling|>"}]
+  )
+
+;;;; 5. What an evaluation computed
+;;
+;; Two ways to look inside a forward pass.
+;;
+;; Tracing keeps named values of the last token of each eval!. Evals run on the CPU while
+;; tracing is on (about 8 tokens a second).
+
+(comment
+  (ink/reset! s)                        ; an empty sequence again
+  (ink/trace! s true)
+  (ink/eval! s "The capital of France is")
+
+  ;; 13 values per visit, named v<visit>.<what>.
+  (count (ink/traces s))
+  ;=> 626
+  (take 12 (map :name (ink/traces s)))
+  ;=> ("embed" "v0.attn.input" "v0.attn.q" "v0.attn.k" "v0.attn.v" "v0.attn.sink"
+  ;    "v0.attn.weights" "v0.attn.out" "v0.ffn.input" "v0.ffn.router" "v0.ffn.experts"
+  ;    "v0.ffn.expert_weights")
+
+  ;; Attention of visit 12: each of the 24 heads' weights over the 5 tokens. In the window
+  ;; this is a heat map; the cell under the mouse is named.
+  (ink/trace s "v12.attn.weights")
+  ;=> {:name "v12.attn.weights", :shape [24 5], :values [...], :row-name "head",
+  ;    :column-name "token"}
+
+  ;; The 8 experts visit 12 chose for the last token, and their weights.
+  (:values (ink/trace s "v12.ffn.experts"))
+  ;=> [9.0 92.0 4.0 8.0 71.0 37.0 84.0 54.0]
+  (:values (ink/trace s "v12.ffn.expert_weights"))
+  ;=> [1.682 1.289 1.108 1.052 1.187 0.746 0.591 0.345]
+
+  (ink/trace! s false)
+  )
+
+;; Capturing keeps every stage of every visit, for every token of the eval's last chunk
+;; (up to 64 tokens). It works on the GPU too, where it runs stage by stage and is slower.
+
+(comment
+  (ink/reset! s)
+  (ink/capture! s true)
+  (ink/eval! s "The capital of France is")
+
+  (ink/capture-info s)
+  ;=> {:tokens 5, :pos 0, :visits 48}
+
+  ;; A field of a visit, of all tokens or of one: here the experts of visit 12, then those
+  ;; of token 4 (the last). The doc of ink/captured lists the fields.
+  (ink/captured s 12 :experts)
+  ;=> [92.0 9.0 59.0 114.0 50.0 40.0 44.0 41.0 9.0 92.0 8.0 4.0 54.0 31.0 42.0 5.0 ...]
+  (ink/captured s 12 :experts 4)
+  ;=> [9.0 92.0 8.0 4.0 71.0 37.0 84.0 54.0]
+  (count (ink/captured s 12 :attended 4))    ; attention's output, 24 heads of 128
+  ;=> 3072
+
+  ;; The output is after the last visit: visit 48 has :hidden and :logits.
+  (take 4 (ink/captured s 48 :logits))
+  ;=> (18.465137481689453 16.4348087310791 15.792407035827637 18.16773223876953)
+
+  ;; All the visits' routing for one token as a matrix: a row a visit, a column an expert,
+  ;; the weight where the expert was chosen. In the window: 48 rows of 8 marks.
+  (ink/routing s)
+  ;=> {:name "expert weights, token 4", :shape [48 128], :values [...], :row-labels [...],
+  ;    :column-name "expert"}
+
+  (ink/capture! s false)
+  )
+
+;; The caches are what a session keeps of its tokens: per visit, each token's keys and
+;; values. A local visit keeps a ring of the last 1,024 (and a chunk's worth more); a global
+;; one keeps them all.
+
+(comment
+  (select-keys (ink/cache s 12 :keys) [:slots :shape])     ; visit 12 is local
+  ;=> {:slots 1088, :shape [5 8 128]}
+  (select-keys (ink/cache s 5 :keys) [:slots :shape])      ; visit 5 is global
+  ;=> {:slots 4096, :shape [5 8 128]}
+  )
+
+;;;; 6. Sessions as values
+;;
+;; copy! makes a session continue from another's state, so one prefix can be continued in
+;; several ways without evaluating it again.
+
+(comment
+  (def fork (ink/session m 4096))
+  (ink/copy! fork s)
+  (ink/eval! fork " Paris")
+  [(ink/position s) (ink/position fork)]
+  ;=> [5 6]
+  (ink/free! fork)                      ; its caches' memory back
+  )
+
+;;;; 7. Checking the GPU against the CPU
+;;
+;; The engine computes a forward pass in two ways: the CPU path (native/cpu.cpp, written to
+;; be read) and the GPU's kernels. check-gpu evaluates tokens on the CPU, then on the GPU
+;; from the same state, putting the CPU's values into the GPU after every stage of every
+;; visit, so each stage is compared on equal inputs. This is the test to run after changing
+;; a kernel. It takes a few seconds for a few tokens.
+
+(comment
+  (let [r (ink/check-gpu s " Paris, of course.")]
+    (select-keys r [:ok :compared :beyond]))
+  ;=> {:ok true, :compared 17468266, :beyond 0}
+
+  ;; The session went on as after an eval! on the CPU.
+  (ink/position s)
+  ;=> 10
+
+  ;; In the window, the whole result is a card: the verdict, and the fields where the two
+  ;; paths differ at all (each difference a single rounding).
+  (ink/check-gpu s " It is")
+  )
+
+;;;; 8. Experiments
+;;
+;; A helper for this section: the three most likely tokens after a prompt, with their
+;; probabilities.
+
+(defn next-tokens [s prompt]
+  (ink/reset! s)
+  (ink/eval! s prompt)
+  (mapv (fn [t] [(:piece t) (:prob t)]) (ink/top s 3)))
+
+(comment
+  (next-tokens s "The capital of France is")
+  ;=> [[" Paris" 0.2678295777096048] [" ________" 0.05468839519966491] [" in" 0.04809252468480551]]
+
+  ;; The same on the CPU path. The two differ by rounding, which this model amplifies: its
+  ;; experts are chosen and their inputs quantized, so a last bit can change a choice.
+  (ink/set-option! m :gpu false)
+  (next-tokens s "The capital of France is")
+  ;=> [[" Paris" 0.2814467459458511] [" ________" 0.05734166917493482] [" in" 0.05013989424908238]]
+  (ink/set-option! m :gpu true)
+
+  ;; Parts of a visit can be switched off: :attention, :feed-forward, :messages (what a later
+  ;; pass of the loop takes from the pass before). While anything is off, evals run on the
+  ;; CPU, which implements this.
+  ;; Without the last visit's feed-forward:
+  (ink/ablate! m 47 #{:feed-forward})
+  (next-tokens s "The capital of France is")
+  ;=> [[" Paris" 0.21819151326008615] [" the" 0.06062832178689853] [" a" 0.0594262998514496]]
+  (nth (ink/ablations m) 47)
+  ;=> #{:feed-forward}
+  (ink/ablate! m 47 #{})
+
+  ;; With the loop's passes not talking to each other (visits 18 to 41 are passes 1 and 2):
+  (doseq [v (range 18 42)] (ink/ablate! m v #{:messages}))
+  (next-tokens s "The capital of France is")
+  ;=> [[" Paris" 0.3458529750383885] [" the" 0.11122436785534942] [" " 0.06403252372534125]]
+  (doseq [v (range 18 42)] (ink/ablate! m v #{}))
+
+  ;; Experts the router may not choose: layer 12's two favourites for this prompt.
+  (ink/ban-experts! m 12 [9 92])
+  (next-tokens s "The capital of France is")
+  ;=> [[" Paris" 0.24401151999990295] [" ________" 0.07292564214919978] [":" 0.04426201972774819]]
+  (ink/ban-experts! m 12 [])
+
+  ;; The checkpoint asks for the experts' inputs to be quantized like their weights. Without:
+  (ink/set-option! m :quantize-expert-inputs false)
+  (next-tokens s "The capital of France is")
+  ;=> [[" Paris" 0.25733885726900435] [" ________" 0.06119122544160018] [" in" 0.053475463381294074]]
+  (ink/set-option! m :quantize-expert-inputs true)
+  )
+
+;;;; 9. The window
+;;
+;; In the REPL viz.sh starts, each evaluation is a card, drawn by what its value is: a map
+;; as keys and values, rows as a table, numbers as bars, a matrix as a heat map, and
+;; inkling's own values (top, plan, pieces, check-gpu) in their own way. The newest card is
+;; at the bottom; the mouse wheel looks back. The session last made or worked on is shown
+;; above the cards: where it is, the end of its text, its next tokens. The library's own
+;; tutorial (../cards/tutorial.jank) has the rest of what a card can be, ImGui's widgets
+;; included.
+
+(comment
+  (require '[cards.core :as c] '[inkling.cards :as ic])
+
+  (ink/eval! s " Paris, and the capital of Italy is")
+  (ink/top s 6)                          ; a bar a token
+  ;; All 200,058 logits as a series. c/show puts a value on a card and returns nil, so the
+  ;; editor doesn't print them.
+  (c/show "the logits" (ink/logits s))
+
+  ;; Generating with the session above the cards following each token.
+  (ic/generate! s 30)
+
+  ;; Another session above the cards, and back.
+  (ic/watch! chat)
+  (ic/watch! s)
+
+  ;; The cards removed.
+  (c/clear!)
+
+  ;; A value can choose its kind of card and its title.
+  ;; This is the value's own metadata: c/as is (with-meta value {:cards/view :table ...}).
+  (defn of-layer-0? [t]
+    (str/includes? (:name t) "model.llm.layers.0."))
+  (c/as :table "tensors of layer 0" (vec (take 8 (filter of-layer-0? (ink/tensors m)))))
+
+  ;; A layout is data: [:row ...] and [:col ...] around text and any values. A function in
+  ;; it is called when the card is made, and what it returns is drawn in its place.
+  [:row {:widths [1 2]}
+   [:col
+    [:text {:size :big :color :blue} "After the prompt"]
+    [:text (ink/tail s 12)]
+    (fn [] (ink/info s))]
+   [:col
+    [:text {:size :small :color :muted} "next tokens"]
+    (fn [] (ink/top s 4))]]
+
+  ;; A function can also draw by itself, with the library's primitives: here the 8 most
+  ;; likely next tokens, a bar each as dark as its probability.
+  (def likely (ink/top s 8))
+  [:col
+   [:text "the 8 most likely next tokens"]
+   [:draw 44 (fn [x y width]
+               (doseq [[i t] (map-indexed vector likely)]
+                 (let [left (+ x (* 106 i))]
+                   (c/rect! left y (+ left 98) (+ y 20) c/blue (+ 0.1 (:prob t)) 4.0)
+                   (c/text! left (+ y 26) c/ink c/small (pr-str (:piece t))))))]]
+
+  ;; A handler is a map saying how the values it matches are drawn. :attr matches a key of
+  ;; a map, or a key of any value's metadata; :render returns what is drawn in the value's
+  ;; place: a value or a layout. From here on a tensor's map (it has :dtype) is drawn like
+  ;; this.
+  (c/handle! {:attr :dtype
+              :render (fn [t]
+                        [:row {:widths [2 1]}
+                         [:col
+                          [:text {:size :big} (:name t)]
+                          [:text {:color :muted}
+                           (str (name (:dtype t)) ", " (:bytes t) " bytes")]]
+                         [:text {:size :big :color :blue} (str (:shape t))]])})
+  (ink/tensor m "model.llm.norm.weight")
+
+  ;; :filter is a function of the value, so any data can be matched: here the packed tensors
+  ;; only. With :attr as well, both must hold. A handler without :attr needs an :id.
+  (c/handle! {:id :packed-tensor
+              :attr :dtype
+              :filter (fn [t] (contains? #{:u32 :u8} (:dtype t)))
+              :render (fn [t]
+                        [:text {:color :orange :size :big}
+                         (str (:name t) " is packed: " (:shape t))])})
+  (ink/tensor m "model.llm.layers.0.mlp.experts.w13_weight")
+  (ink/tensor m "model.llm.norm.weight")          ; still drawn by the first handler
+
+  ;; A mark in metadata, on a value of any shape.
+  (c/handle! {:attr :tutorial/note
+              :render (fn [v]
+                        [:text {:color :green :size :big}
+                         (apply str (interpose " / " v))])})
+  (with-meta ["marked" "by" "metadata"] {:tutorial/note true})
+
+  (c/unhandle! :dtype)
+  (c/unhandle! :packed-tensor)
+  (c/unhandle! :tutorial/note)
+
+  ;; A pinned card stays first while the others scroll under it. A pinned function is called
+  ;; again after every evaluation, so the card follows the session.
+  (c/pin! "next tokens" (fn [] (ink/top s 4)))
+  (ink/eval! s " Rome")
+  (c/unpin! "next tokens")
+
+  ;; A pinned atom needs nothing called: its card is made again whenever the atom holds
+  ;; another value, whoever changed it. Here a future generates on a session of its own and
+  ;; puts the text so far in an atom.
+  (def story (atom {:text "" :tokens 0}))
+  (c/pin! "a story being written" story
+          (fn [v] [:col [:text {:size :small :color :muted} (str (:tokens v) " tokens")]
+                        [:text (:text v)]]))
+  (def writer
+    (future
+      (let [w (ink/session m 4096)]
+        (ink/eval! w "Once upon a time, in a village by the sea,")
+        (dotimes [i 120]
+          (ink/eval! w [(ink/sample w {:temperature 0.7 :top-p 0.95 :seed (+ 11 i)})])
+          (reset! story {:text (ink/tail w 4096) :tokens (inc i)}))
+        (ink/free! w))))
+  ;; The REPL waits for the future to end; the card goes on following the atom meanwhile.
+  (deref writer)
+  (c/unpin!)
+  )
+
+;;;; 10. Ending
+
+(comment
+  (ink/free! s)
+  (ink/free! chat)
+  (ink/close! m)
+  )

@@ -1,0 +1,240 @@
+;; inkling's values as cards (cards.core): what `inkling.core` returns, drawn.
+;;
+;;   (ink/top s n)                 the most likely next tokens, a bar each
+;;   (ink/plan m)                  the visits: a column a layer, a row a pass of the loop
+;;   (ink/pieces m ids)            tokens, a chip each
+;;   (ink/check-gpu s ids)         what differed, field by field
+;;   (ink/routing s)               the experts each visit chose (a matrix: cards.core's own)
+;;   (ink/trace s "v12.attn.weights")  attention, heads by keys (a matrix too)
+;;
+;; Above the cards, the session last evaluated or made (`watch!` chooses one): where it is,
+;; the end of its text, and its next tokens.
+(ns inkling.cards
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [inkling.core :as ink]))
+
+(defn- visible
+  "A piece of text with its spaces and line ends shown."
+  [piece]
+  (-> (str piece)
+      (str/replace " " "·")
+      (str/replace "\n" "⏎")
+      (str/replace "\t" "⇥")))
+
+(defn- percent [p]
+  (str (c/fixed (* 100.0 p) 1) "%"))
+
+;; The session shown above the cards, and what was read from it after the last evaluation
+;; (on the REPL's thread: the drawing never touches a session).
+(defonce ^:private watched (atom {:session nil :seen nil}))
+
+(defn- look! []
+  (let [s (:session @watched)]
+    (when s
+      (if (ink/session? s)
+        (swap! watched assoc :seen (assoc (ink/info s)
+                                          :tail (ink/tail s 60)
+                                          :top (vec (ink/top s 5))))
+        (reset! watched {:session nil :seen nil})))))
+
+(defn watch!
+  "The session shown above the cards (nil for none), until an evaluation returns or works
+  on another: (def s (ink/session m)) and (ink/eval! s ...) are followed by themselves."
+  [s]
+  (ink/used-session!)
+  (swap! watched assoc :session s :seen nil)
+  (look!)
+  nil)
+
+(defn generate!
+  "As ink/generate!, a token at a time with the session above the cards following each one:
+  its text grows as it is made."
+  ([s n] (generate! s n {}))
+  ([s n opts]
+   (swap! watched assoc :session s)
+   (let [eos (:eos-token opts 200006)]
+     (loop [out [] i 0 seed (:seed opts 1)]
+       (if (= i n)
+         out
+         (let [id (ink/sample s (assoc opts :seed seed))]
+           (if (= id eos)
+             (conj out id)
+             (do (ink/eval! s [id])
+                 (look!)
+                 (recur (conj out id) (inc i) (inc seed))))))))))
+
+;; After each evaluation: the session it returned, else the one it worked on (an eval!, a
+;; reset!, a copy! on the REPL's thread; a future's work on a session of its own is not it).
+(c/on-evaluation!
+  (fn [code value error]
+    (let [worked (ink/used-session!)
+          s (if (ink/session? value) value worked)]
+      (when (and s (ink/session? s))
+        (swap! watched assoc :session s)))
+    (look!)))
+
+(c/header!
+  {:height (fn [width] (if (:seen @watched) 132 0))
+   :draw (fn [x y width]
+           (let [seen (:seen @watched)
+                 left (* 0.58 width)
+                 top (:top seen)]
+             (c/rect! x y (+ x width) (+ y 132) c/card 1.0 6.0)
+             (c/frame! x y (+ x width) (+ y 132) c/rule 1.0)
+             (c/text! (+ x 14) (+ y 10) c/ink c/serif
+                      (str "Session: token " (:position seen) " of " (:context seen)
+                           (if (:gpu seen) ", on the GPU" ", on the CPU")))
+             (c/line! (+ x 14) (+ y 34) (- (+ x width) 14) (+ y 34) c/rule 1.0)
+             ;; The end of its text.
+             (let [lines (c/wrap c/mono (- left 40) (visible (:tail seen)) 40)]
+               (doseq [[i line] (map-indexed vector (take-last 4 lines))]
+                 (c/text! (+ x 14) (+ y 44 (* 20 i)) c/ink c/mono line)))
+             ;; Its next tokens.
+             (if (empty? top)
+               (c/text! (+ x left) (+ y 44) c/muted c/small "no logits yet")
+               (doseq [[i row] (map-indexed vector top)]
+                 (let [ry (+ y 42 (* 17 i))
+                       bar (* (- width left 170) (:prob row))]
+                   (c/text! (+ x left) ry c/ink c/small (c/clip c/small 96 (visible (:piece row))))
+                   (c/rect! (+ x left 100) (+ ry 3) (+ x left 100 (max 1.0 bar)) (+ ry 13) c/blue 0.7 2.0)
+                   (c/text! (+ x left 106 (max 1.0 bar)) ry c/muted c/small (percent (:prob row))))))))})
+
+;; A model and a session: what they are, as a map's card.
+(c/defview! :inkling/model
+  {:shape (fn [value]
+            (when (ink/model? value)
+              (let [config (ink/config value)]
+                (c/shaped (merge {:model (ink/path value) :visits (count (ink/plan value))}
+                                 (select-keys config [:layers :hidden :heads :kv-heads :experts :top-k :window :context])
+                                 (ink/options value))))))})
+
+(c/defview! :inkling/session
+  {:shape (fn [value]
+            (when (ink/session? value)
+              (c/shaped (assoc (ink/info value) :session "watched: shown above the cards"))))})
+
+;; The most likely next tokens.
+(c/defview! :inkling/top
+  {:shape (fn [value]
+            (when (and (sequential? value) (seq value)
+                       (every? (fn [row] (and (map? row) (contains? row :piece) (contains? row :prob))) value))
+              {:rows (vec (take 20 value)) :count (count value)}))
+   :height (fn [card width] (* 22 (count (:rows card))))
+   :draw (fn [card x y width]
+           (doseq [[i row] (map-indexed vector (:rows card))]
+             (let [ry (+ y (* 22 i))
+                   room (- width 430)
+                   bar (max 1.0 (* room (:prob row)))]
+               (c/text! x ry c/ink c/mono (c/clip c/mono 170 (visible (:piece row))))
+               (c/rect! (+ x 180) (+ ry 3) (+ x 180 bar) (+ ry 16) c/blue 0.7 2.0)
+               (c/text! (+ x 188 bar) (+ ry 1) c/ink c/small (percent (:prob row)))
+               (c/text! (- (+ x width) 190) (+ ry 1) c/muted c/small
+                        (str "id " (:id row) "  logprob " (c/fixed (:logprob row) 3))))))})
+
+;; The plan: a column a layer, a row a pass of the loop; each cell its visit's number.
+(c/defview! :inkling/plan
+  {:shape (fn [value]
+            (when (and (sequential? value) (seq value)
+                       (every? (fn [v] (and (map? v) (contains? v :visit) (contains? v :layer) (contains? v :pass))) value))
+              {:visits (vec value)
+               :layers (inc (apply max (map :layer value)))
+               :passes (inc (apply max (map :pass value)))}))
+   :height (fn [card width] (+ 24 (* 30 (:passes card)) 26))
+   :draw (fn [card x y width]
+           (let [layers (:layers card)
+                 cell (min 36.0 (/ (- width 70) layers))]
+             (doseq [layer (range layers)]
+               (c/text! (+ x 70 (* cell layer) 4) y c/muted c/small (str layer)))
+             (c/text! x y c/muted c/small "layer")
+             (doseq [pass (range (:passes card))]
+               (c/text! x (+ y 28 (* 30 pass)) c/muted c/small (str "pass " pass)))
+             (doseq [v (:visits card)]
+               (let [cx (+ x 70 (* cell (:layer v)))
+                     cy (+ y 22 (* 30 (:pass v)))]
+                 (c/rect! cx cy (+ cx cell -2) (+ cy 26) (if (:local v) c/blue c/orange) (if (:local v) 0.22 0.55) 3.0)
+                 (c/text! (+ cx 4) (+ cy 6) c/ink c/small (str (:visit v)))))
+             (let [ly (+ y 28 (* 30 (:passes card)))]
+               (c/rect! x ly (+ x 14) (+ ly 12) c/blue 0.22 2.0)
+               (c/text! (+ x 20) (- ly 1) c/muted c/small "local attention (the last 1,024 tokens)")
+               (c/rect! (+ x 300) ly (+ x 314) (+ ly 12) c/orange 0.55 2.0)
+               (c/text! (+ x 320) (- ly 1) c/muted c/small "global attention; the number is the visit's place in the order"))))})
+
+;; Tokens: a chip each, its id under its piece.
+(defn- chips
+  "Where each of the card's tokens is drawn, rows of them filling `width`: [x y wide piece id]
+  from the card's top left."
+  [card width]
+  (loop [out [] rows (:tokens card) cx 0.0 cy 0.0]
+    (if (empty? rows)
+      out
+      (let [row (first rows)
+            piece (visible (:piece row))
+            wide (+ 14 (max (c/text-width c/mono piece) (c/text-width c/small (str (:id row)))))]
+        (if (and (pos? cx) (> (+ cx wide) width))
+          (recur out rows 0.0 (+ cy 44))
+          (recur (conj out [cx cy wide piece (:id row)]) (rest rows) (+ cx wide 6) cy))))))
+
+(c/defview! :inkling/pieces
+  {:shape (fn [value]
+            (when (and (sequential? value) (seq value)
+                       (every? (fn [row] (and (map? row) (= 2 (count row)) (contains? row :piece) (contains? row :id))) value))
+              {:tokens (vec (take 300 value)) :count (count value)}))
+   :height (fn [card width]
+             (let [placed (chips card width)]
+               (+ 44 (nth (peek placed) 1) (if (> (:count card) (count (:tokens card))) 20 0))))
+   :draw (fn [card x y width]
+           (let [placed (chips card width)]
+             (doseq [[cx cy wide piece id] placed]
+               (c/rect! (+ x cx) (+ y cy) (+ x cx wide) (+ y cy 38) c/blue 0.12 4.0)
+               (c/text! (+ x cx 7) (+ y cy 3) c/ink c/mono piece)
+               (c/text! (+ x cx 7) (+ y cy 22) c/muted c/small (str id)))
+             (when (> (:count card) (count (:tokens card)))
+               (c/text! x (+ y 46 (nth (peek placed) 1)) c/muted c/small
+                        (str "… " (- (:count card) (count (:tokens card))) " more")))))})
+
+;; check-gpu: what it compared, and the fields where the two paths differ, the worst first.
+(defn- by-field
+  "The check's rows summed by field: [{:field :values :differ :beyond :worst}]."
+  [rows]
+  (let [sums (reduce (fn [m row]
+                       (let [was (get m (:field row) {:field (name (:field row)) :values 0 :differ 0 :beyond 0 :worst 0.0})]
+                         (assoc m (:field row)
+                                (assoc was
+                                       :values (+ (:values was) (:count row))
+                                       :differ (+ (:differ was) (:different row))
+                                       :beyond (+ (:beyond was) (:beyond row))
+                                       :worst (max (:worst was) (:worst row))))))
+                     {}
+                     rows)]
+    (vec (sort-by (fn [f] (- 0.0 (:worst f))) (vals sums)))))
+
+(c/defview! :inkling/check
+  {:shape (fn [value]
+            (when (and (map? value) (contains? value :compared) (contains? value :beyond) (vector? (:rows value)))
+              (let [fields (by-field (:rows value))
+                    differing (vec (filter (fn [f] (pos? (:differ f))) fields))]
+                {:ok (:ok value) :compared (:compared value) :beyond (:beyond value)
+                 :fields (vec (take 14 differing))
+                 :equal (- (count fields) (count differing))
+                 :hidden (max 0 (- (count differing) 14))})))
+   :height (fn [card width] (+ 30 22 (* 20 (count (:fields card))) 22))
+   :draw (fn [card x y width]
+           (c/text! x y (if (:ok card) c/green c/red) c/big
+                    (str (if (:ok card) "The GPU agrees with the CPU: " "The GPU differs from the CPU: ")
+                         (:compared card) " values, " (:beyond card) " beyond tolerance"))
+           (let [top (+ y 32)
+                 columns [0 200 340 460 580]]
+             (doseq [[i what] (map-indexed vector ["field" "values" "not equal" "beyond" "worst / tolerance"])]
+               (c/text! (+ x (nth columns i)) top c/muted c/small what))
+             (doseq [[r f] (map-indexed vector (:fields card))]
+               (let [ry (+ top 20 (* 20 r))
+                     color (if (pos? (:beyond f)) c/red c/ink)]
+                 (c/text! x ry color c/mono (:field f))
+                 (c/text! (+ x 200) ry c/ink c/mono (str (:values f)))
+                 (c/text! (+ x 340) ry c/ink c/mono (str (:differ f)))
+                 (c/text! (+ x 460) ry color c/mono (str (:beyond f)))
+                 (c/text! (+ x 580) ry color c/mono (c/fixed (:worst f) 3))))
+             (c/text! x (+ top 24 (* 20 (count (:fields card)))) c/muted c/small
+                      (str (:equal card) " other fields are equal value for value"
+                           (if (pos? (:hidden card)) (str "; " (:hidden card) " more differ") "")))))})

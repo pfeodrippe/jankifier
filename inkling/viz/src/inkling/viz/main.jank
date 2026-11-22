@@ -1,0 +1,9 @@
+;; inkling's REPL with its window: jank's nREPL server and the cards (cards.main), with
+;; inkling.core loaded and its cards defined (inkling.cards).
+(ns inkling.viz.main
+  (:require [cards.main :as main]
+            [inkling.core]
+            [inkling.cards]))
+
+(defn -main [& args]
+  (main/run! (assoc (main/options args) :title "inkling")))
