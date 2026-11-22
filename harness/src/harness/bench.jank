@@ -1,0 +1,401 @@
+;; SPDX-License-Identifier: MIT
+;; A bench for the harness: checks of its mechanics that need no generation, and tasks for
+;; the model, each with a check of its own. To run after a change to the harness, the tools
+;; or the engine:
+;;
+;;   ./harness.sh --bench                    all of it, no window; the exit code says
+;;   (bench/mechanics m)                     in the REPL: the checks without generation
+;;   (bench/run! m)                          the tasks (minutes: the model thinks)
+;;   (bench/run! m {:only ["write-exact"]})  some of them
+;;
+;; A task runs in an agent of its own (a fresh session), with the default tools unless it
+;; brings its own. Its files are under target/bench, made again for every run.
+(ns harness.bench
+  (:refer-clojure :exclude [run!])
+  (:require [clojure.string :as str]
+            [inkling.core :as ink]
+            [harness.core :as h]
+            [harness.json :as json]
+            [harness.tools :as tools]))
+
+(def dir "target/bench")
+
+(defn- path [name] (str dir "/" name))
+
+(defn- fresh-dir! []
+  (tools/shell (str "rm -rf " dir " && mkdir -p " dir) nil))
+
+;; Tools of the bench's own.
+
+(defn add
+  "Adds two integers and returns their sum."
+  [^long a ^long b]
+  (+ a b))
+
+(defn shout
+  "Returns a text in capital letters."
+  [text]
+  (str/upper-case (str text)))
+
+;; Checks. A check gets {:answer :entries :agent} and returns true, or what is wrong.
+
+(defn- calls [entries]
+  (filter (fn [e] (= (:role e) :call)) entries))
+
+(defn- says
+  "The answer has each of `parts`."
+  [& parts]
+  (fn [{:keys [answer]}]
+    (let [missing (remove (fn [p] (str/includes? (str answer) p)) parts)]
+      (if (empty? missing)
+        true
+        (str "the answer lacks " (pr-str (vec missing)) ": " (pr-str answer))))))
+
+(defn- called
+  "Each of the tools `names` was called."
+  [& names]
+  (fn [{:keys [entries]}]
+    (let [made (set (map :name (calls entries)))
+          missing (remove made names)]
+      (if (empty? missing) true (str "not called: " (vec missing) "; called: " (vec made))))))
+
+(defn- file-is
+  "The file has exactly `text`."
+  [name text]
+  (fn [_]
+    (let [there (try (slurp (path name)) (catch jank.runtime.object_ref _ nil) (catch cpp/std.exception _ nil))]
+      (cond
+        (nil? there) (str "no file " (path name))
+        (= there text) true
+        :else (str "the file has " (pr-str there) ", wanted " (pr-str text))))))
+
+(defn- all-of
+  "Every check holds: the first that doesn't says why."
+  [& checks]
+  (fn [got]
+    (or (some (fn [check] (let [r (check got)] (when-not (true? r) r))) checks)
+        true)))
+
+;; The texts the file tasks ask for: quotes, backslashes, escapes inside a string, and the
+;; spelling of the model's own special tokens.
+(def awkward
+  (str "(defn greet [name]\n"
+       "  (str \"Hello, \\\"\" name \"\\\"!\\n\" \"C:\\\\temp\\\\x\"))\n"
+       "\n"
+       ";; a comment with <|end_message|> in it\n"
+       "(greet \"Ana\")\n"))
+
+(def tokens-line "a <|end_message|> b <|message_user|> c <|content_model_end_sampling|> d\n")
+
+(def settings
+  (str "name = demo\n" "color = red\n" "size = 3\n" "# color = red is the default\n" "shape = round\n"))
+
+(def settings-edited
+  (str "name = demo\n" "color = green\n" "size = 3\n" "# color = red is the default\n" "shape = round\n"))
+
+(def words ["amber" "birch" "cedar" "delta" "ember" "fjord" "grove" "heron" "islet" "juniper"])
+
+(defn- line-of [n]
+  (str "line " n ": " (nth words (mod (* n 7) 10)) "-" (* n 13)))
+
+(def tasks
+  [{:name "plain-answer"
+    :ask "What is the capital of France? Answer with one word."
+    :check (says "Paris")}
+
+   {:name "own-tool"
+    :tools (fn [] [(h/wrap #'add)])
+    :ask "What is 1234 plus 4321? Use the add tool."
+    :check (all-of (called "add") (says "5555"))}
+
+   {:name "two-tools"
+    :tools (fn [] [(h/wrap #'add) (h/wrap #'shout)])
+    :ask "Add 19 and 23 with the add tool, then give the sum, written as a word, to the shout tool, and tell me what it returned."
+    :check (all-of (called "add" "shout") (says "FORTY"))}
+
+   {:name "eval-compute"
+    :ask "Using the eval tool, compute the sum of the squares of the integers from 1 to 100, and tell me the number."
+    :check (all-of (called "eval") (says "338350"))}
+
+   {:name "eval-error"
+    :ask "Evaluate (nth [1 2 3] 10) with the eval tool. Then, in one sentence, say whether it gave a value or an error."
+    :check (all-of (called "eval")
+                   (fn [{:keys [entries]}]
+                     (if (some (fn [e] (and (= (:role e) :result) (str/starts-with? (:text e) "error")))
+                               entries)
+                       true
+                       "no result of the eval tool was an error"))
+                   (says "error"))}
+
+   {:name "define-and-use"
+    :ask "With the eval tool, define a jank function fib that returns the nth Fibonacci number (fib 0 is 0, fib 1 is 1). Then tell me (fib 30)."
+    :check (all-of (says "832040")
+                   (fn [_]
+                     (let [again (tools/evaluate "(fib 20)")]
+                       (if (str/includes? again "6765") true (str "(fib 20) gave " again)))))}
+
+   {:name "write-exact"
+    :ask (str "Write the file " (path "note.jank") " with exactly this text, and nothing else in it:\n\n" awkward)
+    :check (all-of (called "write_file") (file-is "note.jank" awkward))}
+
+   ;; The tutorial's wording of the same request. At high effort, without a limit on its
+   ;; thinking, the model spent a whole step on the token's spelling and never wrote the file.
+   {:name "write-then-read"
+    :ask (str "Write the file " (path "note2.jank") " with exactly this text, then read it back and "
+              "tell me how many lines it has:\n\n" awkward)
+    :check (all-of (called "write_file") (file-is "note2.jank" awkward) (says "5"))}
+
+   {:name "write-token-spellings"
+    :ask (str "Write the file " (path "tokens.txt") " with exactly this one line (ending in a line break):\n\n" tokens-line)
+    :check (file-is "tokens.txt" tokens-line)}
+
+   {:name "edit-one-line"
+    :setup (fn [] (spit (path "settings.ini") settings))
+    :ask (str "In the file " (path "settings.ini") ", change the setting color from red to green. Change nothing else in the file.")
+    :check (file-is "settings.ini" settings-edited)}
+
+   {:name "read-a-line"
+    :setup (fn [] (spit (path "lines.txt") (str (str/join "\n" (map line-of (range 1 301))) "\n")))
+    :ask (str "What does line 217 of the file " (path "lines.txt") " say? Quote the line.")
+    :check (says (line-of 217))}
+
+   {:name "list-a-directory"
+    :setup (fn []
+             (tools/shell (str "mkdir -p " (path "things")) nil)
+             (spit (path "things/small.txt") "x")
+             (spit (path "things/big.txt") (apply str (repeat 500 "y")))
+             (spit (path "things/middle.txt") (apply str (repeat 50 "z"))))
+    :ask (str "How many files are in the directory " (path "things") ", and which one is the largest?")
+    :check (all-of (says "big.txt") (fn [{:keys [answer]}]
+                                      (if (or (str/includes? (str answer) "3") (str/includes? (str/lower-case (str answer)) "three"))
+                                        true
+                                        (str "the answer does not say 3: " (pr-str answer)))))}
+
+   {:name "shell-command"
+    :setup (fn [] (spit (path "count.txt") (str (str/join "\n" (map line-of (range 1 124))) "\n")))
+    :ask (str "Use the shell tool to count the lines of " (path "count.txt") " with wc -l, and tell me the count.")
+    :check (all-of (called "shell") (says "123"))}
+
+   {:name "itself-config"
+    :ask "How many layers and how many experts does the model you are running on have? Look it up; do not guess."
+    :check (says "24" "128")}
+
+   {:name "itself-plan"
+    :ask "Which layers of the model you run on are visited more than once in a forward pass, and how many visits are there in all? Find out; do not guess."
+    :check (says "48" "6" "17")}
+
+   {:name "remembers"
+    :asks ["Remember this word for later: zanzibar. Just say OK."
+           "What was the word I asked you to remember? Answer with the word only."]
+    :check (says "zanzibar")}])
+
+;; Mechanics: what the harness does around the model, checked without generating anything.
+
+(defn- stub
+  "An agent's value with `tools`, as much of it as a call needs."
+  [tools]
+  (atom {:tools (mapv h/tool tools)}))
+
+(defn- call-text [a named args]
+  (:text (second (h/call! a {:name named :text (json/write {:name named :args args})}))))
+
+(defn mechanics
+  "The checks that need no generation: [{:name :pass :note}]. `m` is used to tokenize."
+  [m]
+  (let [echo {:name "echo" :doc "" :params {:text {:type "string"}} :fn (fn [{:keys [text]}] text)}
+        long-tool {:name "long" :doc "" :limit 100 :fn (fn [_] (apply str (repeat 500 "x")))}
+        boom {:name "boom" :doc "" :fn (fn [_] (throw (ex-info "it broke" {})))}
+        a (stub [echo long-tool boom (h/wrap #'add)])
+        ;; (str: a text bound by let and used inside a function has to be a value of jank's.)
+        nasty (str "quote \" backslash \\ newline \n tab \t unicode é 😀 token <|end_message|> end")
+        special (set (map (fn [piece] (ink/token-id m piece))
+                          ["<|end_message|>" "<|message_user|>" "<|message_model|>" "<|content_model_end_sampling|>"]))
+        checks
+        [["json: a call's text read"
+          (fn [] (= (json/read "{\"name\":\"eval\",\"args\":{\"code\":\"(str \\\"a\\\\n\\\" 1)\",\"n\":3,\"x\":-1.5e2,\"ok\":true,\"none\":null,\"list\":[1,\"a\",{\"b\":[]}]}}")
+                    {:name "eval" :args {:code "(str \"a\\n\" 1)" :n 3 :x -150.0 :ok true :none nil :list [1 "a" {:b []}]}}))]
+         ["json: unicode escapes, a pair for one character"
+          (fn [] (= (json/read "\"caf\\u00e9 \\ud83d\\ude00\"") "café 😀"))]
+         ["json: written and read back"
+          (fn [] (= (json/read (json/write {:a [1 2.5 nasty nil true] :b {:c nasty}})) {:a [1 2.5 nasty nil true] :b {:c nasty}}))]
+         ["json: keys sorted, compact"
+          (fn [] (= (json/write {:b 1 :a [true nil "x"]}) "{\"a\":[true,null,\"x\"],\"b\":1}"))]
+         ["json: a text that is not JSON says where"
+          (fn [] (try (json/read "{\"a\": [1, 2") false
+                      (catch jank.runtime.object_ref e (str/includes? (ex-message e) "character"))))]
+         ["frames: a special token's spelling in a text is text"
+          (fn [] (not-any? special (ink/tokenize m (str "x " nasty " <|message_user|> y") false)))]
+         ["frames: the same spelling is the token when asked for"
+          (fn [] (some special (ink/tokenize m "x <|end_message|> y")))]
+         ["wrap: name, doc and typed parameters from the function"
+          (fn [] (let [t (h/wrap #'add)]
+                   (and (= (:name t) "add") (= (:params t) {:a {:type "integer"} :b {:type "integer"}})
+                        (= (:required t) [:a :b]) (str/includes? (:doc t) "Adds"))))]
+         ["call: arguments reach the function as they are"
+          (fn [] (= (call-text a "echo" {:text nasty}) nasty))]
+         ["call: named arguments in the function's order"
+          (fn [] (= (call-text a "add" {:b 40 :a 2}) "42"))]
+         ["call: an unknown tool is an error the model is told"
+          (fn [] (str/includes? (call-text a "nope" {}) "there is no tool named"))]
+         ["call: a missing argument is an error the model is told"
+          (fn [] (str/includes? (call-text a "add" {:a 1}) "the call lacks b"))]
+         ["call: JSON that can't be read is an error the model is told"
+          (fn [] (str/includes? (:text (second (h/call! a {:name "echo" :text "{\"name\":\"echo\",\"args\":{"})))
+                                "not valid JSON"))]
+         ["call: a tool that throws is an error the model is told"
+          (fn [] (= (call-text a "boom" {}) "error: it broke"))]
+         ["call: a long result is cut at the tool's limit"
+          (fn [] (let [text (call-text a "long" {})]
+                   (and (str/starts-with? text (apply str (repeat 100 "x")))
+                        (str/includes? text "[cut here: 400 more characters]"))))]
+         ["eval: a value, with what was printed"
+          (fn [] (= (tools/evaluate "(println \"hi\") (+ 1 2)") "hi\n=> 3"))]
+         ["eval: an error, without its trace"
+          (fn [] (let [said (tools/evaluate "(no-such-function 1)")]
+                   (and (str/starts-with? said "error: ") (not (str/includes? said ":trace")))))]
+         ["eval: a function calling itself 3000 deep (a large stack)"
+          (fn [] (= (tools/evaluate "(defn bench-down [n] (if (zero? n) 0 (inc (bench-down (dec n))))) (bench-down 3000)")
+                    "=> 3000"))]
+         ["call: a tool calling itself 3000 deep (a large stack)"
+          (fn [] (let [deep (fn deep [n] (if (zero? n) 0 (inc (deep (dec n)))))
+                       b (stub [{:name "deep" :doc "" :fn (fn [_] (deep 3000))}])]
+                   (= (call-text b "deep" {}) "3000")))]
+         ["eval: two at once, one ending inside the other, both answered"
+          (fn [] (let [slow (future (tools/evaluate "(do (cpp/usleep 400000) (println \"slow\") :slow)"))
+                       _ (cpp/usleep 100000)
+                       quick (tools/evaluate "(do (println \"quick\") :quick)")]
+                   (and (str/includes? quick "=> :quick") (str/includes? (deref slow) "=> :slow")
+                        (= (tools/evaluate "(+ 2 2)") "=> 4"))))]
+         ["files: written, read by lines, edited once"
+          (fn [] (let [file (path "mechanics.txt")]
+                   (fresh-dir!)
+                   (tools/write-file file "one\ntwo\nthree\n")
+                   (and (= (tools/read-file file nil nil) "one\ntwo\nthree\n")
+                        (str/starts-with? (tools/read-file file 2 1) "2\ttwo")
+                        (= (tools/edit-file file "two" "2") (str "edited " file))
+                        (= (slurp file) "one\n2\nthree\n"))))]
+         ["files: an edit of a text that is there twice is refused"
+          (fn [] (let [file (path "twice.txt")]
+                   (spit file "a a")
+                   (try (tools/edit-file file "a" "b") false
+                        (catch jank.runtime.object_ref e (str/includes? (ex-message e) "2 times")))))]
+         ["files: a file that can't be written is an error, not a success"
+          (fn [] (try (tools/write-file "/dev/null/nowhere/x.txt" "x") false
+                      (catch jank.runtime.object_ref e (str/includes? (ex-message e) "could not be written"))))]
+         ["recording: kept in a file and read back the same"
+          (fn [] (let [made (atom {:tools [] :effort "0.9" :state :done :generated 3 :seconds 0.5
+                                   :entries [{:role :user :text nasty :began 0.0 :ended 0.0}
+                                             {:role :call :name "eval" :args {:code "(+ 1 2)"} :began 0.5 :ended 0.75}
+                                             {:role :result :name "eval" :text "=> 3" :error false :seconds 0.01
+                                              :began 0.75 :ended 0.76}
+                                             {:role :model :text "3" :began 1.0 :ended 1.25}]})
+                       file (path "recording.edn")]
+                   (h/save! made file)
+                   (= (h/load-recording file) (h/recording made))))]
+         ["shell: output, error output and exit code"
+          (fn [] (= (tools/shell "echo out; echo err 1>&2; exit 3" nil) "out\nerr\n\n[exit 3]"))]
+         ["shell: a command that does not end is killed at its time"
+          (fn [] (let [began (cpp/harness.seconds)
+                       said (tools/shell "echo started; sleep 30" 1)]
+                   (and (str/includes? said "started") (str/includes? said "[killed")
+                        (< (- (cpp/harness.seconds) began) 5))))]
+         ["shell: what is left running in the background is not waited for"
+          (fn [] (let [began (cpp/harness.seconds)
+                       said (tools/shell "(sleep 20 > /dev/null 2>&1 &) ; echo left" 10)]
+                   (and (= said "left\n") (< (- (cpp/harness.seconds) began) 3))))]
+         ["eval: what the C++ compiler says about an error is given"
+          (fn [] (str/includes? (tools/evaluate "(cpp/raw \"namespace bench_bad { inline int f() { return no_such_thing; } }\")")
+                                "no_such_thing"))]]]
+    (mapv (fn [[named check]]
+            (let [r (try (check)
+                         (catch jank.runtime.object_ref e (str "threw: " (or (ex-message e) (str e))))
+                         (catch cpp/std.exception e (str "threw: " (cpp/.what e))))]
+              ;; (A check passes with anything true that is not a text: a text says why not.)
+              {:name named :pass (and (not (string? r)) (boolean r)) :note (if (string? r) r "")}))
+          checks)))
+
+;; The tasks, run.
+
+(defn- run-task [m task opts]
+  (when-let [setup (:setup task)]
+    (setup))
+  (let [a (h/agent m {:tools (if (:tools task) ((:tools task)) (tools/defaults))
+                      :system (when-not (:tools task) tools/situation)
+                      :effort (get opts :effort :high)
+                      :max-tokens (get opts :max-tokens 4096)
+                      :max-steps (get opts :max-steps 16)})
+        began (cpp/harness.seconds)
+        answer (last (mapv (fn [ask] (h/ask! a ask) (h/answer a)) (or (:asks task) [(:ask task)])))
+        entries (h/entries a)
+        status (h/status a)
+        ;; Every entry has its times: what a replay is made from. (They are not in order
+        ;; of :began: the calls of one step are all written before the first is run.)
+        timed (every? (fn [e] (and (number? (:began e)) (number? (:ended e)) (<= (:began e) (:ended e))))
+                      entries)
+        verdict (cond
+                  (not= (:state status) :done) (str "the turn ended as " (:state status))
+                  (not timed) "an entry lacks its times"
+                  :else
+                  (try ((:check task) {:answer answer :entries entries :agent a})
+                       (catch jank.runtime.object_ref e (str "the check threw: " (or (ex-message e) (str e))))
+                       (catch cpp/std.exception e (str "the check threw: " (cpp/.what e)))))]
+    (h/close! a)
+    {:name (:name task)
+     :pass (true? verdict)
+     :seconds (- (cpp/harness.seconds) began)
+     :tokens (:generated status)
+     :calls (count (calls entries))
+     :note (if (true? verdict) "" (str verdict))
+     :entries entries}))
+
+(defonce ^{:doc "The last run's results, their conversations included: (:entries (first @last-run))."}
+  last-run (atom []))
+
+(defn run!
+  "The tasks run, each in an agent of its own on model `m`: [{:name :pass :seconds :tokens
+  :calls :note}]. `opts`: :only [names], :effort (:high), :max-tokens, :max-steps,
+  :said (fn [result]) called after each task. The conversations are kept in `last-run`."
+  ([m] (run! m {}))
+  ([m opts]
+   (fresh-dir!)
+   (let [wanted (if (:only opts) (set (:only opts)) nil)
+         chosen (filter (fn [t] (or (nil? wanted) (contains? wanted (:name t)))) tasks)
+         results (mapv (fn [task]
+                         (let [r (run-task m task opts)]
+                           (when-let [said (:said opts)] (said r))
+                           r))
+                       chosen)]
+     (reset! last-run results)
+     (mapv (fn [r] (dissoc r :entries)) results))))
+
+(defn report
+  "Results as text: a line a check or a task, then how many passed."
+  [results]
+  (let [width (apply max 10 (map (fn [r] (count (:name r))) results))
+        pad (fn [text n] (str text (apply str (repeat (max 0 (- n (count (str text)))) " "))))
+        line (fn [r]
+               (str (if (:pass r) "pass  " "FAIL  ") (pad (:name r) (+ width 2))
+                    (when (:seconds r)
+                      (str (pad (str (long (:seconds r)) " s") 8) (pad (str (:tokens r) " tokens") 14)
+                           (pad (str (:calls r) " calls") 10)))
+                    (:note r)))]
+    (str (str/join "\n" (map line results)) "\n"
+         (count (filter :pass results)) " of " (count results) " passed")))
+
+(defn main
+  "The whole bench from the command line (./harness.sh --bench [--model <file>] [--only
+  a,b] [--effort low]): the mechanics, then the tasks, each said as it ends. Returns
+  whether everything passed."
+  [args]
+  (let [after (fn [flag] (second (drop-while (fn [arg] (not= arg flag)) args)))
+        m (ink/open (or (after "--model") "../inkling/models/inkling-2-mini.ink"))
+        say (fn [text] (cpp/harness.say (str text)))
+        checked (mechanics m)
+        _ (say (str "mechanics\n" (report checked) "\n\ntasks"))
+        ran (run! m {:only (when-let [only (after "--only")] (str/split only #","))
+                     :effort (if-let [effort (after "--effort")] (keyword effort) :high)
+                     :said (fn [r] (say (first (str/split-lines (report [r])))))})]
+    (say (str "\nmechanics: " (count (filter :pass checked)) " of " (count checked)
+              "; tasks: " (count (filter :pass ran)) " of " (count ran)))
+    (ink/close! m)
+    (and (every? :pass checked) (every? :pass ran))))

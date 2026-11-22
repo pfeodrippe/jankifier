@@ -1,0 +1,16 @@
+;; The harness's REPL with its window: jank's nREPL server and the cards (cards.main), with
+;; the engine, its cards and the harness loaded. With --bench: the bench instead, no window
+;; (harness.bench/main), and the process's exit code says whether it all passed.
+(ns harness.main
+  (:require [cards.main :as main]
+            [inkling.core]
+            [inkling.cards]
+            [harness.core]
+            [harness.tools]
+            [harness.cards]
+            [harness.bench :as bench]))
+
+(defn -main [& args]
+  (if (some (fn [arg] (= arg "--bench")) args)
+    (cpp/harness.leave (if (bench/main args) 0 1))
+    (main/run! (assoc (main/options args) :title "harness"))))
