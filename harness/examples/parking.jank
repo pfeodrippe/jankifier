@@ -1,0 +1,63 @@
+;; SPDX-License-Identifier: MIT
+;; A worked example of a file harness.verify checks (VERIFY.md): a parking lot whose spots
+;; are taken and left, its Veil model, and the map that ties them.
+(ns parking
+  (:require [veil.core :as veil]
+            [harness.observe :refer [always! sometimes! reachable!]]))
+
+;; The code: a lot is an atom of the spots taken, out of `spots` (0 to spots - 1).
+
+(defn new-lot [spots]
+  (atom {:spots spots :taken #{}}))
+
+(defn park!
+  "Spot `s` taken. Throws when it already is."
+  [lot s]
+  (when (contains? (:taken @lot) s)
+    (throw (ex-info "the spot is taken" {:spot s})))
+  (swap! lot update :taken conj s)
+  (sometimes! "the lot is full" (= (count (:taken @lot)) (:spots @lot)))
+  (always! "never more cars than spots" (<= (count (:taken @lot)) (:spots @lot)) @lot))
+
+(defn leave!
+  "Spot `s` left. Throws when it is free."
+  [lot s]
+  (when-not (contains? (:taken @lot) s)
+    (throw (ex-info "the spot is free" {:spot s})))
+  (swap! lot update :taken disj s)
+  (when (empty? (:taken @lot))
+    (reachable! "the lot is empty again")))
+
+;; The model: spots, which are taken, and how many cars are parked.
+
+(veil/defmodel model ParkingLot
+  (type spot)
+  (relation taken [spot])
+  (individual parked Nat)
+  (after-init
+    (set! (taken S) false)
+    (set! parked 0))
+  (action park [s spot]
+    (require (not (taken s)))
+    (set! (taken s) true)
+    (set! parked (+ parked 1)))
+  (action leave [s spot]
+    (require (taken s))
+    (set! (taken s) false)
+    (set! parked (- parked 1)))
+  (safety a_car_a_spot (<= parked 2)))
+
+;; How the model and the code are tied.
+
+(def verification
+  {:model model
+   :instance {:spot 2}
+   ;; A state the code must be able to reach: every spot taken.
+   :sometimes {:full '(forall [s spot] (taken s))}
+   :start (fn [] (new-lot 2))
+   ;; Each action of the model, on the real lot, with the model's arguments.
+   :step {:park (fn [lot {:keys [s]}] (park! lot s))
+          :leave (fn [lot {:keys [s]}] (leave! lot s))}
+   ;; The real lot as the model's state: a relation is the set of what it holds.
+   :view (fn [lot] {:taken (:taken @lot) :parked (count (:taken @lot))})
+   :max-depth 8})

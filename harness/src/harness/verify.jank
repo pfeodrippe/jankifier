@@ -1,0 +1,477 @@
+;; SPDX-License-Identifier: MIT
+;; Code checked against a Veil model of it, by the harness rather than by what a model says
+;; it did. A file of jank code (a namespace) has, besides its code, a map `verification`:
+;;
+;;   (def verification
+;;     {:model     a Veil model of the code (veil/defmodel), its actions the code's operations
+;;      :instance  the model's types' sizes: {:key 3 :val 2}
+;;      :sometimes {:name term ...}: states the code must be able to reach, as Veil terms
+;;      :start     (fn [] system): a fresh real system
+;;      :step      {:action (fn [system args] ...) ...}: each of the model's actions done on the
+;;                 real system, with the model's arguments ({:k 0 :v 1})
+;;      :view      (fn [system] state): the real system's state as the model's state
+;;      :max-depth how many steps the model checker looks (12)})
+;;
+;; `check` then asks of it:
+;;
+;; 1. The model elaborates, keeps its safety properties as far as the checker looks, and
+;;    reaches each :sometimes state.
+;; 2. Random runs of the real code match the model step by step: each run starts where the
+;;    model starts, then takes steps the model allows (an action and its arguments, chosen
+;;    from the model's own), and after each step the real state, through :view, is one the
+;;    model reaches by that step. Real states keep the model's safety properties.
+;; 3. The model's runs to each :sometimes state, done on the real code, give the model's
+;;    states, and reach it there too.
+;; 4. The code's assertions (harness.observe) held: no `always!` false, every `sometimes!`
+;;    true once and every `reachable!` reached, no `unreachable!` reached.
+;; 5. When all of that holds: copies of the code with a deliberate bug (a comparison turned,
+;;    an `inc` made a `dec`, a `when` inverted) are checked the same way, and at least half
+;;    of them must fail. Checks that miss most deliberate bugs prove little.
+;;
+;; `tool` is a harness tool doing this on a file; `gate` makes an agent's turn end only
+;; once it passes (harness.core/agent's :obligations).
+(ns harness.verify
+  (:require [clojure.string :as str]
+            [veil.core :as veil]
+            [cards.repl :as repl]
+            [harness.observe :as observe]))
+
+;; Veil's session: its Lake project, relative to the process's directory.
+(defonce lake-project (atom "../specs"))
+(defonce ^:private session (atom nil))
+
+(defn veil-session
+  "The Veil session the checks use, made on first use (about 12 s)."
+  []
+  (or @session (reset! session (veil/session {:lake-project @lake-project}))))
+
+(def defaults {:runs 40 :steps 25 :mutants 6 :max-depth 12})
+
+;; Errors as text.
+
+(defn- said [e]
+  (str (or (ex-message e) e)))
+
+(defn attempt
+  "What `f` returns, or {:threw text} when it throws."
+  [f]
+  (try
+    (f)
+    (catch jank.runtime.object_ref e {:threw (said e)})
+    (catch cpp/jank.error_ref e {:threw (str (cpp/.-message (cpp/* e)))})
+    (catch cpp/std.exception e {:threw (str (cpp/.what e))})))
+
+(defmacro ^:private trying
+  "`body`'s value, or {:threw text} when it throws."
+  [& body]
+  `(attempt (fn [] ~@body)))
+
+(defn- threw [x]
+  (when (and (map? x) (contains? x :threw)) (:threw x)))
+
+;; The file.
+
+(defn- forms-of
+  "The forms of a file's text."
+  [text]
+  (read-string (str "[" text "\n]")))
+
+(defn- ns-of [forms]
+  (let [f (first forms)]
+    (when (and (seq? f) (= 'ns (first f)) (symbol? (second f)))
+      (second f))))
+
+(defn- load-text!
+  "Code evaluated as a file is: nil, or what it threw."
+  [text file]
+  (let [r (repl/evaluate text "user" file 1 1 false)]
+    (when-not (:ok r)
+      (str (:error r)))))
+
+(defn- spec-in
+  "The namespace's `verification` map, or nil."
+  [ns-sym]
+  (when-let [n (find-ns ns-sym)]
+    (when-let [v (ns-resolve n 'verification)]
+      (deref v))))
+
+(defn- assertion-names
+  "The assertions written in a file's text: {name kind}."
+  [text]
+  (into {}
+        (map (fn [[_ kind name]]
+               [name (keyword (str/replace kind "!" ""))]))
+        (re-seq #"\((?:[A-Za-z0-9_.\-]+/)?(always!|sometimes!|reachable!|unreachable!)\s+\"([^\"]+)\"" text)))
+
+;; Showing states and steps.
+
+(defn- step-said [{:keys [action args]}]
+  (str (name action) (when (seq args) (str " " (pr-str args)))))
+
+(defn- steps-said
+  "The steps of a run, the last `n` of them."
+  [steps n]
+  (let [steps (vec steps)
+        k (long (count steps))
+        shown (subvec steps (max 0 (- k (long n))))]
+    (str (when (> k (long n)) "... ")
+         (str/join ", then " (map step-said shown)))))
+
+(defn- diff-said
+  "How a real state and a model's differ, field by field."
+  [real model]
+  (if (not (map? real))
+    (str "  the view gave " (pr-str real) ", not a map like the model's " (pr-str model))
+    (str/join "\n"
+              (keep (fn [k]
+                      (when (not= (get real k) (get model k))
+                        (str "  " (name k) ": real " (pr-str (get real k)) ", model " (pr-str (get model k)))))
+                    (distinct (concat (keys model) (keys real)))))))
+
+;; The model.
+
+(defn- veil-name [k]
+  (str/replace (str (name k)) #"[^A-Za-z0-9_]" "_"))
+
+(defn- witness [k] (keyword (str "sometimes_" (veil-name k))))
+
+(defn- with-witnesses
+  "The model with, for each :sometimes state, a safety property it breaks there."
+  [model sometimes]
+  (assoc model
+         :name (str (:name model) "Witnessed")
+         :decls (into (vec (:decls model))
+                      (map (fn [[k t]] (list 'safety (symbol (name (witness k))) (list 'not t))))
+                      sometimes)))
+
+(defn- safety-names [model]
+  (set (keep (fn [d] (when (and (seq? d) (contains? #{'safety 'invariant} (first d))) (keyword (str (second d)))))
+             (:decls model))))
+
+(defn- model-checks
+  "The model's own checks: {:problems [...] :witness-traces {name trace} :checked n}."
+  [spec]
+  (let [vs (veil-session)
+        model (:model spec)
+        opts {:instance (:instance spec) :max-depth (or (:max-depth spec) (:max-depth defaults))}
+        loaded (trying (veil/load! vs model))]
+    (if-let [t (threw loaded)]
+      {:problems [(str "The model doesn't elaborate (Veil's messages):\n" t)]}
+      (let [mc (trying (veil/model-check vs model opts))]
+        (cond
+          (threw mc)
+          {:problems [(str "The model checker failed on the model: " (threw mc))]}
+
+          (= :foundViolation (:result mc))
+          {:problems [(str "The model breaks its own safety properties " (pr-str (:violates mc))
+                           " within " (:max-depth opts) " steps: "
+                           (steps-said (rest (:trace mc)) 12)
+                           "\n  the state then: " (pr-str (:state (peek (:trace mc)))))]}
+
+          :else
+          (reduce (fn [acc [k t]]
+                    (let [w (trying (veil/model-check vs (with-witnesses model {k t}) opts))]
+                      (cond
+                        (threw w)
+                        (update acc :problems conj (str "The :sometimes " (name k) " doesn't elaborate: " (threw w)))
+
+                        (and (= :foundViolation (:result w)) (some #{(witness k)} (:violates w)))
+                        (assoc-in acc [:witness-traces k] (:trace w))
+
+                        :else
+                        (update acc :problems conj
+                                (str "The model never reaches the :sometimes state " (name k) " "
+                                     (pr-str t) " within " (:max-depth opts)
+                                     " steps: either it can't, or the term doesn't say what you meant.")))))
+                  {:problems [] :witness-traces {} :explored (:explored-states mc)}
+                  (:sometimes spec)))))))
+
+;; The real code, against the model.
+
+(defn- real-step
+  "One step of a real run: the label done, the real state after it matched against the
+  model's states for that label. Returns {:problem text} or {:states [...] :hits #{...}}."
+  [spec sys system safety done label succ]
+  (let [f (get-in spec [:step (:action label)])]
+    (if (nil? f)
+      {:problem (str "No (:step " (:action label) "): every action of the model needs one.")}
+      (let [ran (trying (f system (:args label)) nil)
+            v (when-not (threw ran) (trying ((:view spec) system)))]
+        (cond
+          (threw ran)
+          {:problem (str "After " (steps-said (pop done) 8) ", " (step-said label)
+                         " threw on the real code: " (threw ran))}
+
+          (threw v)
+          {:problem (str "(:view) threw after " (steps-said done 8) ": " (threw v))}
+
+          :else
+          (let [options (filterv (fn [s] (= label (select-keys s [:action :args]))) succ)
+                matched (vec (keep (fn [s] (when (= (:state s) v) (:state s))) options))]
+            (if (empty? matched)
+              {:problem (str "The real code and the model part after " (steps-said done 8) ":\n"
+                             (diff-said v (:state (first options)))
+                             (when (> (count options) 1)
+                               (str "\n  (the model allows " (count options) " states there; the first is shown)")))}
+              (let [props (veil/properties sys v)
+                    broken (vec (filter (fn [[k held]] (and (contains? safety k) (not held))) props))
+                    reached (set (keep (fn [[k held]]
+                                         (when (and (not held) (str/starts-with? (name k) "sometimes_")) k))
+                                       props))]
+                (if (seq broken)
+                  {:problem (str "After " (steps-said done 8) ", the real state breaks "
+                                 (pr-str (mapv first broken)) ": " (pr-str v))}
+                  {:states matched :hits reached})))))))))
+
+(defn- real-run
+  "One random run of the real code, matched against the model step by step. Returns
+  {:problem text-or-nil :hits #{witness...} :steps n}."
+  [spec sys steps]
+  (let [system (trying ((:start spec)))
+        safety (safety-names (:model spec))]
+    (if-let [t (threw system)]
+      {:problem (str "(:start) threw: " t)}
+      (let [v0 (trying ((:view spec) system))
+            inits (veil/initial-states sys)
+            cands (if (threw v0) [] (filterv (fn [s] (= s v0)) inits))]
+        (cond
+          (threw v0) {:problem (str "(:view) of a fresh system threw: " (threw v0))}
+          (empty? cands) {:problem (str "A fresh system isn't where the model starts:\n"
+                                        (diff-said v0 (first inits)))}
+          :else
+          (loop [i 0 cands cands done [] hits #{}]
+            (let [succ (vec (distinct (mapcat (fn [s] (veil/successors sys s)) cands)))
+                  labels (vec (distinct (map (fn [s] (select-keys s [:action :args])) succ)))]
+              (if (or (>= i steps) (empty? labels))
+                {:problem nil :hits hits :steps i}
+                (let [label (rand-nth labels)
+                      done (conj done label)
+                      r (real-step spec sys system safety done label succ)]
+                  (if (:problem r)
+                    {:problem (:problem r)}
+                    (recur (inc i) (:states r) done (into hits (:hits r)))))))))))))
+
+(defn- replay
+  "A model's run done on the real code: nil, or where they part."
+  [spec trace what]
+  (let [system (trying ((:start spec)))]
+    (if-let [t (threw system)]
+      (str "(:start) threw: " t)
+      (loop [steps (rest trace) done []]
+        (if (empty? steps)
+          nil
+          (let [s (first steps)
+                label (select-keys s [:action :args])
+                f (get-in spec [:step (:action s)])
+                done (conj done label)
+                ran (if f (trying (f system (:args s)) nil) {:threw (str "no (:step " (:action s) ")")})
+                v (when-not (threw ran) (trying ((:view spec) system)))]
+            (cond
+              (threw ran) (str "The model's run to " what " (" (steps-said (rest trace) 12) ") fails on the real code: "
+                               (step-said label) " threw " (threw ran))
+              (threw v) (str "(:view) threw during the model's run to " what ": " (threw v))
+              (not= v (:state s)) (str "The model's run to " what " parts from the real code after "
+                                       (steps-said done 8) ":\n" (diff-said v (:state s)))
+              :else (recur (rest steps) done))))))))
+
+(defn- assertion-problems
+  "What the counted assertions say, against those written in the file."
+  [counted written]
+  (let [names (distinct (concat (keys written) (keys counted)))]
+    (vec (keep (fn [n]
+                 (let [a (get counted n)
+                       kind (or (:kind a) (get written n))]
+                   (case kind
+                     :always (when (and a (pos? (:failed a)))
+                               (str "always! \"" n "\" was false " (:failed a) " of " (:seen a) " times"
+                                    (when (seq (:first-failed a)) (str " (first: " (:first-failed a) ")"))))
+                     :sometimes (when (or (nil? a) (zero? (:held a)))
+                                  (str "sometimes! \"" n "\" was never true"
+                                       (if a (str " (asked " (:seen a) " times)") " (never even asked)")))
+                     :reachable (when (nil? a) (str "reachable! \"" n "\" was never reached"))
+                     :unreachable (when a (str "unreachable! \"" n "\" was reached " (:failed a) " times"
+                                               (when (seq (:first-failed a)) (str " (first: " (:first-failed a) ")"))))
+                     nil)))
+               names))))
+
+(defn- real-checks
+  "Random runs and the witness runs, the assertions counted: {:problems [...] :runs n :steps n}."
+  [spec witness-traces written opts]
+  (let [vs (veil-session)
+        sys (veil/system vs (with-witnesses (:model spec) (:sometimes spec)) {:instance (:instance spec)})
+        counted (atom {})
+        runs (:runs opts)
+        steps (:steps opts)
+        result (observe/recording
+                counted
+                (fn []
+                  (let [ran (loop [i 0 hits #{} total 0]
+                              (if (>= i runs)
+                                {:hits hits :steps total :runs i}
+                                (let [r (real-run spec sys steps)]
+                                  (if (:problem r)
+                                    {:problem (:problem r) :runs (inc i)}
+                                    (recur (inc i) (into hits (:hits r)) (+ total (:steps r)))))))
+                        replayed (vec (keep (fn [[k trace]] (replay spec trace (str ":sometimes " (name k))))
+                                            witness-traces))]
+                    (assoc ran :replayed replayed))))
+        missed (when-not (:problem result)
+                 (vec (keep (fn [k] (when-not (contains? (:hits result) (witness k))
+                                      (str "The real runs never reached the :sometimes state " (name k)
+                                           " (the model's own run to it was done on the real code, but random runs didn't get there: fine if it's rare)")))
+                            (keys (:sometimes spec)))))]
+    {:problems (vec (concat (when (:problem result) [(:problem result)])
+                            (:replayed result)
+                            (when-not (:problem result) (assertion-problems @counted written))))
+     :notes missed
+     :runs (:runs result) :steps (:steps result)}))
+
+;; Deliberate bugs.
+
+(def ^:private swaps
+  {'< '<= '<= '< '> '>= '>= '> 'inc 'dec 'dec 'inc '= 'not= 'not= '=
+   'when 'when-not 'when-not 'when 'if 'if-not 'if-not 'if 'and 'or 'or 'and
+   'first 'last 'last 'first 'max 'min 'min 'max 'conj 'disj 'assoc 'dissoc})
+
+(defn- sites
+  "Where a form can get a deliberate bug: [{:path [...] :to replacement :said text}]."
+  [form path]
+  (cond
+    (and (symbol? form) (contains? swaps form))
+    [{:path path :to (get swaps form) :said (str "`" form "` became `" (get swaps form) "`")}]
+
+    (and (integer? form) (<= 0 form 64))
+    [{:path path :to (inc form) :said (str form " became " (inc form))}]
+
+    (or (seq? form) (vector? form))
+    (vec (mapcat (fn [[i f]] (sites f (conj path i))) (map-indexed vector form)))
+
+    :else []))
+
+(defn- put-at [form path x]
+  (if (empty? path)
+    x
+    (let [i (first path)
+          v (assoc (vec form) i (put-at (nth form i) (rest path) x))]
+      (if (vector? form) v (apply list v)))))
+
+(defn- mutants
+  "Up to `n` copies of the file's forms, each with one deliberate bug in one of its
+  functions: [{:forms [...] :said text}]."
+  [forms n]
+  (let [all (vec (mapcat (fn [[i f]]
+                           (when (and (seq? f) (contains? #{'defn 'defn-} (first f)))
+                             (map (fn [s] (assoc s :form i :fn (second f)))
+                                  (sites (vec (drop 2 f)) []))))
+                         (map-indexed vector forms)))]
+    (mapv (fn [s]
+            (let [f (nth forms (:form s))
+                  head (vec (take 2 f))
+                  body (put-at (vec (drop 2 f)) (:path s) (:to s))]
+              {:forms (assoc forms (:form s) (apply list (concat head body)))
+               :said (str "in " (:fn s) ", " (:said s))}))
+          (take n (shuffle all)))))
+
+(defn- mutant-caught?
+  "Whether the checks fail on a mutant: true, false, or nil when it couldn't be loaded."
+  [spec-ns forms said i written opts]
+  (let [n (symbol (str spec-ns "-mutant-" i))
+        forms (assoc forms 0 (apply list (concat ['ns n] (drop 2 (first forms)))))
+        text (str/join "\n" (map pr-str forms))
+        failed (load-text! text (str "mutant-" i ".jank"))
+        spec (when-not failed (spec-in n))]
+    (when (and spec (not failed))
+      (let [r (trying (real-checks spec {} written opts))]
+        (or (some? (threw r)) (boolean (seq (:problems r))))))))
+
+;; The whole check.
+
+(defn check
+  "A file checked (see the namespace's documentation): {:ok :problems :notes :report :file}.
+  `opts`: :runs :steps (random runs of the real code), :mutants (deliberate bugs tried)."
+  ([path] (check path {}))
+  ([path opts]
+   (let [opts (merge defaults opts)
+         text (trying (slurp (str path)))]
+     (if (threw text)
+       {:ok false :problems [(str "There is no file " path " to check: " (threw text))]}
+       (let [forms (trying (forms-of text))
+             spec-ns (when-not (threw forms) (ns-of forms))
+             failed (cond
+                      (threw forms) (str "The file can't be read: " (threw forms))
+                      (nil? spec-ns) "The file must start with an (ns ...) form."
+                      :else (load-text! text (str path)))
+             spec (when-not failed (spec-in spec-ns))
+             missing (when (and spec (not failed))
+                       (seq (remove (fn [k] (contains? spec k)) [:model :instance :start :step :view])))]
+         (cond
+           failed {:ok false :problems [(str "Loading " path " failed: " failed)]}
+           (nil? spec) {:ok false :problems [(str "The namespace " spec-ns " has no `verification` map.")]}
+           missing {:ok false :problems [(str "`verification` lacks " (str/join ", " missing) ".")]}
+           :else
+           (let [written (assertion-names text)
+                 m (model-checks spec)
+                 r (when (empty? (:problems m)) (real-checks spec (:witness-traces m) written opts))
+                 problems (vec (concat (:problems m) (:problems r)))
+                 tried (when (and (empty? problems) (pos? (:mutants opts)))
+                         (vec (keep-indexed
+                               (fn [i mu]
+                                 (let [c (mutant-caught? spec-ns (:forms mu) (:said mu) i written
+                                                         (assoc opts :runs (max 8 (quot (:runs opts) 3))))]
+                                   (when (some? c) (assoc mu :caught c))))
+                               (mutants (vec forms) (:mutants opts)))))
+                 survivors (filterv (fn [mu] (not (:caught mu))) tried)
+                 weak (and (seq tried) (> (* 2 (count survivors)) (count tried)))
+                 problems (if weak
+                            (conj problems (str (count survivors) " of " (count tried)
+                                                " copies of the code with a deliberate bug passed every check: "
+                                                (str/join "; " (map :said survivors))
+                                                ". The model, the :view or the assertions don't look closely enough at what changed."))
+                            problems)]
+             {:ok (empty? problems)
+              :file (str path)
+              :problems problems
+              :notes (:notes r)
+              :stats {:explored (:explored m) :runs (:runs r) :steps (:steps r)
+                      :witnesses (count (:witness-traces m))
+                      :mutants (count tried) :caught (- (count tried) (count survivors))
+                      :assertions (count written)}})))))))
+
+(defn report
+  "A check's result as text, for a model or a person."
+  [r]
+  (if (:ok r)
+    (let [s (:stats r)]
+      (str "Verification of " (:file r) " passed: the model keeps its safety properties"
+           (when (:explored s) (str " (" (:explored s) " states explored)"))
+           " and reaches its " (:witnesses s) " :sometimes states; " (:runs s) " random runs of the real code ("
+           (:steps s) " steps) matched it step by step; the model's runs to its :sometimes states did the same on the real code; "
+           (:assertions s) " assertions held; " (:caught s) " of " (:mutants s) " copies with a deliberate bug were caught."
+           (when (seq (:notes r)) (str "\nNotes: " (str/join " " (:notes r))))))
+    (str "Verification of " (or (:file r) "the file") " failed (" (count (:problems r)) " problem"
+         (when (> (count (:problems r)) 1) "s") "):\n"
+         (str/join "\n" (map-indexed (fn [i p] (str (inc i) ". " p)) (:problems r))))))
+
+(defn tool
+  "The `verify` tool: a file checked, its report given to the model."
+  ([] (tool {}))
+  ([opts]
+   {:name "verify"
+    :doc (str "Checks a jank file against the Veil model in its `verification` map (VERIFY.md says what "
+              "it must hold): the model, random runs of the real code matched to it step by step, the "
+              "model's runs replayed on the code, the code's assertions, and copies of the code with "
+              "deliberate bugs. Says what failed, or that everything passed.")
+    :params {:path {:type "string" :doc "the file, e.g. work/lru.jank"}}
+    :fn (fn [{:keys [path]}] (report (check path opts)))}))
+
+(defn gate
+  "Obligations for harness.core/agent: the turn ends only once `path` passes the check.
+  Returns (fn [agent]) giving nil when it passes, else what to fix."
+  ([path] (gate path {}))
+  ([path opts]
+   (fn [_]
+     (let [r (check path opts)]
+       (when-not (:ok r)
+         (str "The harness checked your work before accepting your answer, and it isn't done yet.\n"
+              (report r)
+              "\nFix it, run the verify tool on " path " to see, and answer once it passes."))))))

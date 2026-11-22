@@ -1,0 +1,63 @@
+;; SPDX-License-Identifier: MIT
+;; Assertions a program makes about itself, in the style of Antithesis' and determinismo's:
+;; `always!` (this holds every time it is asked), `sometimes!` (this holds at least once),
+;; `reachable!` (this place is reached at least once) and `unreachable!` (this place is never
+;; reached). Each has a name. Outside a check they cost a lookup and do nothing; while
+;; harness.verify runs the program (`recording`), each is counted, and the check fails on an
+;; `always!` that didn't hold, a `sometimes!` that never held, a `reachable!` never reached,
+;; an `unreachable!` reached.
+;;
+;;   (require '[harness.observe :refer [always! sometimes! reachable! unreachable!]])
+;;   (defn store! [cache k v]
+;;     ...
+;;     (when (> (count @cache) capacity)
+;;       (reachable! "an entry is evicted")
+;;       ...)
+;;     (always! "never above capacity" (<= (count @cache) capacity) {:size (count @cache)}))
+(ns harness.observe)
+
+;; The run being recorded: an atom of {name {:kind :seen :held :failed :first-failed}}, or nil.
+(defonce ^:private current (atom nil))
+
+(defn- note!
+  "One evaluation of the assertion `name` of `kind`: whether it held, and what was said."
+  [kind name held detail]
+  (when-let [run @current]
+    (swap! run update (str name)
+           (fn [a]
+             (let [a (or a {:kind kind :seen 0 :held 0 :failed 0})
+                   a (-> a (update :seen inc) (update (if held :held :failed) inc))]
+               (if (and (not held) (nil? (:first-failed a)))
+                 (assoc a :first-failed (if (some? detail) (pr-str detail) (str "")))
+                 a)))))
+  held)
+
+(defn always!
+  "`held` must be true every time this is evaluated. Returns `held`."
+  ([name held] (always! name held nil))
+  ([name held detail] (note! :always name (boolean held) detail)))
+
+(defn sometimes!
+  "`held` must be true at least once over the runs checked. Returns `held`."
+  ([name held] (sometimes! name held nil))
+  ([name held detail] (note! :sometimes name (boolean held) detail)))
+
+(defn reachable!
+  "This place must be reached at least once over the runs checked."
+  ([name] (reachable! name nil))
+  ([name detail] (note! :reachable name true detail) nil))
+
+(defn unreachable!
+  "This place must never be reached."
+  ([name] (unreachable! name nil))
+  ([name detail] (note! :unreachable name false detail) nil))
+
+(defn recording
+  "`f` called with the assertions counted into `run` (an atom, which keeps what was counted
+  before). Returns what `f` returns. Not reentrant: one recording at a time."
+  [run f]
+  (reset! current run)
+  (try
+    (f)
+    (finally
+      (reset! current nil))))
