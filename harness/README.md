@@ -333,14 +333,21 @@ conversation, in green or red. `VERIFY.md` is what the model is told, and
 `harness.trials` measures whether this makes code right more often: each task
 is asked several times, sampled, with and without the gate, and the code is
 graded by a reference the model never sees (random operations against a
-reference implementation). The tasks: an LRU cache, and a key-value store kept
-in a log file that recovers from a crash tearing its last record.
+reference implementation). The tasks: an LRU cache, a key-value store kept
+in a log file that recovers from a crash tearing its last record, and a
+bounded queue used by several threads at once (its grader runs producers and
+consumers together and checks nothing is lost, given twice or out of order).
 
 ```clojure
 (require '[harness.trials :as trials])
 (trials/run! m {:tasks [:lru :kv] :modes [:plain :verified] :seeds [1 2 3]})
 (trials/summary)                            ; right runs per task and mode
 ```
+
+A run in progress is kept in `../trials-out/live.edn` as it goes; another
+window follows it: `(hc/follow-file! "../trials-out/live.edn" "live")` reads
+it again whenever it changes and follows the end (an entry shows once it is
+whole).
 
 Each run starts with `work/` empty, and its conversation is kept in
 `../trials-out/` for `hc/replay!`. The model must not see what it is graded

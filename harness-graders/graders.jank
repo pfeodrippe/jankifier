@@ -184,9 +184,133 @@
                   (str "round " round ": " said)
                   (recur (inc round))))))))))
 
+;; The bounded queue: its non-blocking operations one at a time against a reference, then
+;; producers and consumers on threads at once.
+
+(defn- queue-sequential
+  "try-put!, try-take! and size against a vector: nil, or what went wrong."
+  [fs]
+  (let [{:keys [new try-put! try-take! size]} fs]
+    (loop [cases (for [capacity [1 2 3] round (range 3)] capacity)]
+      (if (empty? cases)
+        nil
+        (let [capacity (first cases)
+              q (verify/attempt (fn [] (new capacity)))
+              said (if (and (map? q) (:threw q))
+                     (str "(new-queue " capacity ") threw: " (:threw q))
+                     (loop [i 0 items [] next-item 0 done []]
+                       (if (>= i 80)
+                         nil
+                         (let [pick (rand-int 10)
+                               last-done (fn [done] (str/join " " (take-last 6 done)))]
+                           (cond
+                             (< pick 5)
+                             (let [said (str "(try-put! q " next-item ")")
+                                   got (verify/attempt (fn [] (try-put! q next-item)))
+                                   want (< (count items) capacity)
+                                   done (conj done said)]
+                               (cond
+                                 (and (map? got) (:threw got)) (str said " threw: " (:threw got))
+                                 (not= (boolean got) want) (str "after " (last-done done) ": gave " (pr-str got) ", expected " want)
+                                 :else (recur (inc i) (if want (conj items next-item) items) (inc next-item) done)))
+
+                             (< pick 9)
+                             (let [got (verify/attempt (fn [] (try-take! q)))
+                                   want (first items)
+                                   done (conj done "(try-take! q)")]
+                               (cond
+                                 (and (map? got) (:threw got)) (str "(try-take! q) threw: " (:threw got))
+                                 (not= got want) (str "after " (last-done done) ": gave " (pr-str got) ", expected " (pr-str want))
+                                 :else (recur (inc i) (vec (rest items)) next-item done)))
+
+                             :else
+                             (let [got (verify/attempt (fn [] (size q)))
+                                   done (conj done "(size q)")]
+                               (if (not= got (count items))
+                                 (str "after " (last-done done) ": gave " (pr-str got) ", expected " (count items))
+                                 (recur (inc i) items next-item done))))))))]
+          (if said
+            (str "capacity " capacity ", one thread: " said)
+            (recur (rest cases))))))))
+
+(defn- caught
+  "f's value, or {:threw text} (in jank, what escapes a future ends the process)."
+  [f]
+  (try
+    (f)
+    (catch jank.runtime.object_ref e {:threw (str (or (ex-message e) e))})
+    (catch cpp/jank.error_ref e {:threw (str (cpp/.-message (cpp/* e)))})
+    (catch cpp/std.exception e {:threw (str (cpp/.what e))})
+    (catch :default _ {:threw "something jank does not say"})))
+
+(defn- queue-threads
+  "Producers and consumers at once on the blocking operations: nil, or what went wrong."
+  [fs]
+  (let [{:keys [new put! take! size]} fs
+        capacity 2
+        producers 3
+        each 30
+        q (new capacity)
+        biggest (atom 0)
+        made (mapv (fn [p] (future (caught (fn [] (dotimes [i each] (put! q [p i])) :done)))) (range producers))
+        taken (mapv (fn [_] (future (caught (fn [] (vec (repeatedly each (fn [] (take! q))))))))
+                    (range producers))
+        all (concat made taken)
+        finished (loop [waited 0]
+                   (swap! biggest max (let [n (verify/attempt (fn [] (size q)))] (if (number? n) n 0)))
+                   (cond
+                     (every? realized? all) true
+                     (> waited 1500) false
+                     :else (do (cpp/usleep 20000) (recur (inc waited)))))]
+    (if-not finished
+      (str capacity "-item queue, " producers " producers and " producers " consumers of " each " items each: "
+           "not done after 30 s (" (count (filter realized? made)) " producers and "
+           (count (filter realized? taken)) " consumers finished): a deadlock, or items lost")
+      (let [results (mapv deref all)
+            thrown (some (fn [r] (when (and (map? r) (:threw r)) (:threw r))) results)
+            got (mapcat deref taken)
+            wanted (for [p (range producers) i (range each)] [p i])]
+        (cond
+          thrown (str "a thread's call threw: " thrown)
+          (> @biggest capacity) (str "the queue held " @biggest " items, above its capacity of " capacity)
+          (not= (frequencies got) (frequencies wanted))
+          (let [missing (remove (set got) wanted)
+                twice (keep (fn [[x n]] (when (> n 1) x)) (frequencies got))]
+            (str "items lost or given twice: " (count missing) " never taken"
+                 (when (seq missing) (str " (e.g. " (pr-str (first missing)) ")"))
+                 ", " (count twice) " taken more than once"
+                 (when (seq twice) (str " (e.g. " (pr-str (first twice)) ")"))))
+          :else
+          ;; In order: what one consumer took from one producer comes in the order it was put.
+          (some (fn [c]
+                  (some (fn [p]
+                          (let [is (keep (fn [[pp i]] (when (= pp p) i)) (deref c))]
+                            (when (not= is (sort is))
+                              (str "out of order: a consumer took producer " p "'s items as " (pr-str (vec (take 8 is)))))))
+                        (range producers)))
+                taken))))))
+
+(defn- grade-queue
+  "The queue in work/queue.jank against the reference: nil, or what went wrong."
+  [path]
+  (or (load-file! path)
+      (let [names {:new "new-queue" :put! "put!" :take! "take!" :try-put! "try-put!" :try-take! "try-take!" :size "size"}
+            fs (into {} (map (fn [[k n]] [k (fn-in 'queue n)]) names))
+            missing (keep (fn [[k f]] (when-not (fn? f) (get names k))) fs)]
+        (if (seq missing)
+          (str "missing functions: " (str/join ", " missing))
+          (or (queue-sequential fs)
+              (loop [round 0]
+                (if (>= round 3)
+                  nil
+                  (or (some-> (queue-threads fs) (str " (round " round ")"))
+                      (recur (inc round))))))))))
+
 (defn grade
-  "The grade of `task`'s file (:lru or :kv): nil when it is right, else what went wrong."
+  "The grade of `task`'s file (:lru, :kv or :queue): nil when it is right, else what went
+  wrong."
   [task path]
   (case task
     :lru (grade-lru path)
-    :kv (grade-kv path)))
+    :kv (grade-kv path)
+    :queue (grade-queue path)))

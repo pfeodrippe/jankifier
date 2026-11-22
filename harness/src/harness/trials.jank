@@ -59,7 +59,22 @@
                   "Keys are integers; values are integers or strings without newlines. A write that returned "
                   "is never lost, unless a crash tore its record (it was the last one, and keep was less than "
                   "its length). A torn record is ignored when recovering, never misread. Strings are bytes in "
-                  "jank: (subs s 0 n) and (count s) count bytes; (spit f text :append true) appends.")}})
+                  "jank: (subs s 0 n) and (count s) count bytes; (spit f text :append true) appends.")}
+   :queue {:file "work/queue.jank"
+           :ask (str "Write the file work/queue.jank, a jank namespace `queue` with a bounded queue that "
+                     "several threads use at once:\n"
+                     "- (new-queue capacity): an empty queue holding at most `capacity` items (capacity >= 1).\n"
+                     "- (try-put! q x): adds x at the end and returns true when the queue has room; returns "
+                     "false, changing nothing, when it is full.\n"
+                     "- (try-take! q): removes and returns the first item, or returns nil when the queue is "
+                     "empty. Items are never nil.\n"
+                     "- (put! q x): adds x at the end, waiting while the queue is full. (take! q): removes and "
+                     "returns the first item, waiting while the queue is empty.\n"
+                     "- (size q): how many items it holds.\n"
+                     "Several threads (futures) call these at once: no item may be lost or given twice, items "
+                     "come out in the order they went in, and the queue never holds more than `capacity` items. "
+                     "jank has atoms (swap!, compare-and-set!) and (cpp/usleep microseconds) for waiting; it has "
+                     "no locks of its own.")}})
 
 (def ^:private plain-tail
   "\n\nTest it with the eval tool until you are sure it is right, then say what you did.")
@@ -73,6 +88,9 @@
 ;; A trial.
 
 (defonce results (atom []))
+
+;; The agent of the run in progress.
+(defonce ^:private current (atom nil))
 
 ;; (fn [agent name]) called with each trial's agent as it starts: harness.cards/watch! shows
 ;; it in the window as it goes (unwatch the earlier ones first: their conversations stay
@@ -100,7 +118,11 @@
                       :context 65536
                       :max-steps 80
                       :sampling {:temperature 0.7 :top-p 0.95 :seed seed}
-                      :obligations (when verified (verify/gate file))})
+                      :obligations (when verified (verify/gate file))
+                      ;; The run in progress kept where a person can follow it
+                      ;; (harness.cards/follow-file!), and the model can't read it.
+                      :on-entry (fn [_] (when-let [a @current] (h/save! a (path "live.edn"))))})
+        _ (reset! current a)
         _ (when-let [w @watcher] (w a (str (name task) " " (name mode) " " seed)))
         began (cpp/harness.seconds)
         _ (h/ask! a (str (:ask t) (if verified (verified-tail file) plain-tail)))
