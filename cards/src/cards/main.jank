@@ -14,7 +14,7 @@
             [jank.nrepl.server.core :as nrepl]
             [jank.nrepl.server.handler :as handler]
             ;; The eval operation on a large stack, its output captured safely.
-            [cards.repl]
+            [cards.repl :as repl]
             [cards.core :as cards]))
 
 (defn- after [flag args]
@@ -56,17 +56,18 @@
       (= code "1")))
 
 (defn- tell-evaluations!
-  "nREPL's eval as it was, its value (*1) or its error then told to the window."
+  "nREPL's eval as it was, its value or its error then told to the window."
   []
   (let [evaluate (get-method handler/handle-message :eval)]
     (defmethod handler/handle-message :eval [message]
-      (let [answer (evaluate message)
+      (let [got (atom nil)
+            answer (binding [repl/*result* got] (evaluate message))
             parts (if (map? answer) [answer] (remove nil? answer))
             error (some :ex parts)
             code (str/trim (get message "code" ""))]
         (when-not (tooling? code)
           (try
-            (cards/evaluated! code (when-not error *1) error)
+            (cards/evaluated! code (when-not error @got) error)
             (catch :default e
               (println "cards:" e))))
         answer))))

@@ -13,6 +13,7 @@
 ;;   file that is gone.
 ;;
 ;; Everything else of the operation is jank's: the namespace, *1, *e, the messages answered.
+;; (They are set again on the thread that asked: what the large stack's thread sets is its own.)
 ;; No window is needed for it.
 (ns cards.repl
   (:require [clojure.string :as str]
@@ -33,10 +34,16 @@
   [f]
   (cpp/cards.repl.on_big_stack f @stack-megabytes))
 
+(def ^:dynamic *result*
+  "An atom, bound by who wants an evaluation's value itself (the window, for its card): the
+  value is put in it, whichever thread asked."
+  nil)
+
 (defn evaluate
   "Code evaluated in namespace `ns` (\"user\" when there is none by that name), as the
-  nREPL does, on a large stack. Returns {:ok :value :inspected :ns :out :err :error}:
-  :value is the value printed, and :error what was thrown, as text."
+  nREPL does, on a large stack. Returns {:ok :value :result :inspected :ns :out :err :error
+  :raised}: :value is the value printed and :result itself, :error what was thrown as text
+  and :raised itself. *1 and *e are the calling thread's too."
   [code ns file line column inspect?]
   (let [target (or (some-> ns symbol find-ns) (find-ns 'user))
         id (cpp/cards.repl.capture_start)
@@ -46,16 +53,21 @@
                  (binding [*ns* target
                            *file* file]
                    ;; The evaluation may change the namespace. *1 and *e are read on the
-                   ;; thread that set them.
+                   ;; thread that set them, and then set on the one that asked.
                    (let [ok (nrepl-eval/safe-eval code line column)]
                      {:ok ok
                       :ns (str *ns*)
                       :value (when ok (pr-str *1))
+                      :result (when ok *1)
+                      :raised (when-not ok *e)
                       :inspected (when (and ok inspect?) (inspect/inspect-str *1))
                       :error (when-not ok (str *e))}))))
               (catch jank.runtime.object_ref e {:ok false :error (str e)})
               (catch cpp/std.exception e {:ok false :error (str (cpp/.what e))}))
         wrote (cpp/cards.repl.capture_end id)]
+    (cpp/cards.repl.remember (boolean (:ok ran)) (if (:ok ran) (:result ran) (or (:raised ran) (:error ran))))
+    (when (and *result* (:ok ran))
+      (reset! *result* (:result ran)))
     (assoc ran :out (:out wrote) :err (:err wrote))))
 
 (defn- answer

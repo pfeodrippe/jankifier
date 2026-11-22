@@ -245,6 +245,28 @@ namespace cards::repl
     return nullptr;
   }
 
+  /* An evaluation's result kept on the thread that asked for it, as jank's safe_eval keeps
+   * it on the one that ran it: *1, *2 and *3, or *e. A thread that didn't bind them can't set
+   * them: there they are left. */
+  inline object_ref remember(object_ref const ok, object_ref const what)
+  {
+    static auto const one{ rt::__rt_ctx->find_var("clojure.core", "*1") };
+    static auto const two{ rt::__rt_ctx->find_var("clojure.core", "*2") };
+    static auto const three{ rt::__rt_ctx->find_var("clojure.core", "*3") };
+    static auto const error{ rt::__rt_ctx->find_var("clojure.core", "*e") };
+    if(rt::truthy(ok))
+    {
+      (void)three->set(two->deref());
+      (void)two->set(one->deref());
+      (void)one->set(what);
+    }
+    else
+    {
+      (void)error->set(what);
+    }
+    return object_ref{ rt::jank_nil };
+  }
+
   inline object_ref on_big_stack(object_ref const fn, object_ref const megabytes)
   {
     /* The job is on this thread's stack, which the collector reads while this thread waits:
