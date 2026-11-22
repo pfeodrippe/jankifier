@@ -1,0 +1,31 @@
+;; The harness's sandbox (macOS sandbox-exec, used by sandbox.sh). The process, and
+;; everything it starts, may:
+;;   write   only in the work directory, the build's own places, and the system's
+;;           temporary directories;
+;;   reach   over the network only this machine.
+;; Reading is not restricted: the process can read whatever the person who started it can.
+(version 1)
+(allow default)
+
+;; Writing. The later rule wins.
+(deny file-write*
+      (subpath (param "HOME"))
+      (subpath "/opt/homebrew")
+      (subpath "/usr/local")
+      (subpath "/Applications")
+      (subpath "/Library"))
+(allow file-write*
+       (subpath (param "WORK"))
+       ;; What starting the process writes: jank's build of this project, its compiled
+       ;; headers, and the port its REPL listens on.
+       (subpath (param "TARGET"))
+       (subpath (param "JANK_CACHE"))
+       (literal (param "PORT_FILE")))
+
+;; The network: this machine only.
+(deny network*)
+(allow network*
+       (local ip "localhost:*")
+       (remote ip "localhost:*")
+       (local unix-socket)
+       (remote unix-socket))
