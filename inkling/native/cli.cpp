@@ -1,0 +1,283 @@
+// The inkling command: convert a checkpoint, inspect a model file, tokenize,
+// and generate text.
+#include "internal.hpp"
+
+#include <cmath>
+#include <map>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+
+namespace
+{
+  void usage()
+  {
+    std::fprintf(stderr,
+                 "usage:\n"
+                 "  inkling convert SOURCE OUT.ink     checkpoint directory or manifest -> model file\n"
+                 "  inkling info MODEL.ink             configuration, plan, tensors\n"
+                 "  inkling tokenize MODEL.ink TEXT    token ids and pieces (special tokens allowed)\n"
+                 "  inkling run MODEL.ink [options]    generate\n"
+                 "  inkling score MODEL.ink PROMPT IDS [--cpu]\n"
+                 "                                     log-probability of each of the ids (comma separated)\n"
+                 "                                     after the prompt: id, logprob, our argmax\n"
+                 "  inkling gpucheck MODEL.ink PROMPT [--all]\n"
+                 "                                     checks every GPU stage of every visit against the CPU\n"
+                 "                                     on the CPU's inputs; --all prints every row\n"
+                 "    -p TEXT      prompt, used as is (special tokens allowed)\n"
+                 "    -n N         tokens to generate (default 64)\n"
+                 "    -t TEMP      temperature (default 0: greedy)\n"
+                 "    --threads N  CPU threads\n"
+                 "    --cpu        run on the CPU (the reference path)\n"
+                 "    --ctx N      context (default 8192)\n"
+                 "    --top N      print the top N logits after the prompt\n");
+  }
+
+  double now()
+  {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+}
+
+int main(int argc, char **argv)
+{
+  try
+  {
+    if(argc < 2)
+    {
+      usage();
+      return 2;
+    }
+    std::string const cmd{ argv[1] };
+    if(cmd == "convert" && argc == 4)
+    {
+      inkling::convert(argv[2], argv[3]);
+      return 0;
+    }
+    if(argc < 3)
+    {
+      usage();
+      return 2;
+    }
+    double const t0{ now() };
+    std::unique_ptr<inkling::model, void (*)(inkling::model *)> m{ inkling::open(argv[2]), inkling::close };
+    double const t1{ now() };
+    auto const &c{ m->cfg };
+    if(cmd == "info")
+    {
+      std::printf("loaded in %.2f s\nlayers %d, hidden %d, vocab %d (%d used), heads %d/%d (local %d/%d), experts %d top %d "
+                  "width %d\nloop layers [%d, %d) x %d, residual blocks of %d, window %d\nplan: %zu visits\n",
+                  t1 - t0,
+                  c.layers,
+                  c.hidden,
+                  c.vocab,
+                  c.unpadded_vocab,
+                  c.heads,
+                  c.kv_heads,
+                  c.local_heads,
+                  c.local_kv_heads,
+                  c.experts,
+                  c.top_k,
+                  c.expert_width,
+                  c.loop_start,
+                  c.loop_end,
+                  c.loop_passes,
+                  c.residual_block,
+                  c.window,
+                  m->plan.size());
+      for(size_t i{}; i < m->plan.size(); ++i)
+      {
+        auto const &v{ m->plan[i] };
+        std::printf("  v%zu: layer %d pass %d %s\n", i, v.layer, v.pass, v.local ? "local" : "global");
+      }
+      std::printf("tensors: %zu, threads %d\n", m->tensors.size(), m->threads);
+      return 0;
+    }
+    if(cmd == "tokenize" && argc == 4)
+    {
+      auto const ids{ inkling::tokenize(*m, argv[3], true) };
+      for(auto const id : ids)
+      {
+        auto const piece{ inkling::detokenize(*m, &id, 1) };
+        std::printf("%d\t%s\n", id, piece.c_str());
+      }
+      return 0;
+    }
+    if(cmd == "gpucheck" && (argc == 4 || argc == 5))
+    {
+      if(!m->gpu)
+      {
+        std::fprintf(stderr, "no Metal backend for this model\n");
+        return 1;
+      }
+      bool const all{ argc == 5 && std::string{ argv[4] } == "--all" };
+      std::unique_ptr<inkling::session, void (*)(inkling::session *)> s{ inkling::new_session(*m, 8192),
+                                                                          inkling::free_session };
+      auto const report{ inkling::check_gpu(*s, inkling::tokenize(*m, argv[3], true)) };
+      std::map<std::string, inkling::check_row> by_field;
+      std::vector<std::string> order;
+      for(auto const &r : report.rows)
+      {
+        if(all || r.beyond > 0)
+        {
+          std::printf("v%-2d %-18s %9lld values, %7lld differ, %6lld beyond tolerance, worst %.3g\n", r.visit,
+                      r.field.c_str(), static_cast<long long>(r.count), static_cast<long long>(r.different),
+                      static_cast<long long>(r.beyond), r.worst);
+        }
+        if(!by_field.count(r.field))
+        {
+          order.push_back(r.field);
+          by_field[r.field].field = r.field;
+        }
+        auto &t{ by_field[r.field] };
+        t.count += r.count;
+        t.different += r.different;
+        t.beyond += r.beyond;
+        t.worst = std::max(t.worst, r.worst);
+      }
+      std::printf("%-18s %12s %10s %8s %8s\n", "field", "values", "differ", "beyond", "worst");
+      for(auto const &name : order)
+      {
+        auto const &t{ by_field[name] };
+        std::printf("%-18s %12lld %10lld %8lld %8.3g\n", name.c_str(), static_cast<long long>(t.count),
+                    static_cast<long long>(t.different), static_cast<long long>(t.beyond), t.worst);
+      }
+      std::printf("%s: %lld values compared, %lld beyond tolerance\n", report.ok() ? "OK" : "FAILED",
+                  static_cast<long long>(report.compared), static_cast<long long>(report.beyond));
+      return report.ok() ? 0 : 1;
+    }
+    if(cmd == "score" && (argc == 5 || argc == 6))
+    {
+      if(argc == 6 && std::string{ argv[5] } == "--cpu")
+      {
+        m->use_gpu = false;
+      }
+      std::unique_ptr<inkling::session, void (*)(inkling::session *)> s{ inkling::new_session(*m, 8192),
+                                                                          inkling::free_session };
+      inkling::eval(*s, inkling::tokenize(*m, argv[3], true));
+      std::string const list{ argv[4] };
+      size_t at{};
+      while(at < list.size())
+      {
+        auto const comma{ list.find(',', at) };
+        auto const id{ static_cast<int32_t>(std::stol(list.substr(at, comma - at))) };
+        at = comma == std::string::npos ? list.size() : comma + 1;
+        auto const &lg{ s->logits };
+        float const best{ *std::max_element(lg.begin(), lg.end()) };
+        double sum{};
+        for(auto const l : lg)
+        {
+          sum += std::exp(static_cast<double>(l - best));
+        }
+        double const lse{ best + std::log(sum) };
+        auto const arg{ static_cast<int32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin()) };
+        std::printf("%d\t%.5f\t%d\n", id, lg[static_cast<size_t>(id)] - lse, arg);
+        std::fflush(stdout);
+        inkling::eval(*s, &id, 1);
+      }
+      return 0;
+    }
+    if(cmd == "run")
+    {
+      std::string prompt{ "Hello" };
+      int32_t n{ 64 };
+      float temp{ 0 };
+      int32_t ctx{ 8192 };
+      int32_t top{ 0 };
+      for(int i{ 3 }; i < argc; ++i)
+      {
+        std::string const a{ argv[i] };
+        auto const next{ [&] {
+          if(i + 1 >= argc)
+          {
+            usage();
+            std::exit(2);
+          }
+          return std::string{ argv[++i] };
+        } };
+        if(a == "-p")
+        {
+          prompt = next();
+        }
+        else if(a == "-n")
+        {
+          n = std::stoi(next());
+        }
+        else if(a == "-t")
+        {
+          temp = std::stof(next());
+        }
+        else if(a == "--threads")
+        {
+          inkling::set_threads(*m, std::stoi(next()));
+        }
+        else if(a == "--cpu")
+        {
+          m->use_gpu = false;
+        }
+        else if(a == "--ctx")
+        {
+          ctx = std::stoi(next());
+        }
+        else if(a == "--top")
+        {
+          top = std::stoi(next());
+        }
+        else
+        {
+          usage();
+          return 2;
+        }
+      }
+      std::unique_ptr<inkling::session, void (*)(inkling::session *)> s{ inkling::new_session(*m, ctx),
+                                                                          inkling::free_session };
+      auto const ids{ inkling::tokenize(*m, prompt, true) };
+      double const p0{ now() };
+      inkling::eval(*s, ids);
+      double const p1{ now() };
+      std::fprintf(stderr, "prompt: %zu tokens in %.2f s (%.1f tok/s)\n", ids.size(), p1 - p0, ids.size() / (p1 - p0));
+      if(top > 0)
+      {
+        std::vector<int32_t> idx(s->logits.size());
+        for(size_t i{}; i < idx.size(); ++i)
+        {
+          idx[i] = static_cast<int32_t>(i);
+        }
+        std::partial_sort(idx.begin(), idx.begin() + top, idx.end(), [&](int32_t a, int32_t b) {
+          return s->logits[static_cast<size_t>(a)] > s->logits[static_cast<size_t>(b)];
+        });
+        for(int32_t i{}; i < top; ++i)
+        {
+          auto const id{ idx[static_cast<size_t>(i)] };
+          std::printf("%d\t%.4f\t%s\n", id, s->logits[static_cast<size_t>(id)], inkling::detokenize(*m, &id, 1).c_str());
+        }
+      }
+      uint64_t rng{ 0x9e3779b97f4a7c15ull };
+      double const g0{ now() };
+      int32_t produced{};
+      for(; produced < n; ++produced)
+      {
+        auto const id{ inkling::sample(s->logits.data(), static_cast<int32_t>(s->logits.size()), temp, 0.95f, 0, rng) };
+        std::fputs(inkling::detokenize(*m, &id, 1).c_str(), stdout);
+        std::fflush(stdout);
+        if(id == c.eos_token)
+        {
+          break;
+        }
+        inkling::eval(*s, &id, 1);
+      }
+      double const g1{ now() };
+      std::fprintf(stderr, "\ngenerated %d tokens in %.2f s (%.2f tok/s)\n", produced, g1 - g0, produced / (g1 - g0));
+      return 0;
+    }
+    usage();
+    return 2;
+  }
+  catch(std::exception const &e)
+  {
+    std::fprintf(stderr, "%s\n", e.what());
+    return 1;
+  }
+}
