@@ -44,11 +44,12 @@
 (def orange 0xb86b00)
 (def purple 0x6a1b9a)
 
-;; Text sizes: mono small, normal, large; serif normal, large.
+;; Text sizes: mono small, normal, large; serif normal, large; mono bold (Menlo's own bold).
 (def small 0)
 (def mono 1)
 (def big 2)
 (def serif 3)
+(def mono-bold 5)
 (def title 4)
 
 ;; Native primitives, by name.
@@ -198,6 +199,13 @@
       what
       (let [at (fit size what (- width (text-width size "…")))]
         (if at (str (subs what 0 at) "…") what)))))
+
+(defn wrap-words
+  "`what` as lines of at most `width` points at size `size`, broken between words where it
+  can be (a word wider than a line between its characters); at most `limit` lines. A line's
+  indentation is kept."
+  [size width what limit]
+  (vec (str/split-lines (cpp/cards.wrap_words size (str what) width limit))))
 
 (defn wrap
   "`what` as lines of at most `width` points at size `size`, cut between characters; at

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,9 +52,10 @@ namespace cards
   struct state
   {
     GLFWwindow *window{};
-    /* Text sizes: 0 small, 1 normal, 2 large (mono); 3 normal, 4 large (serif). */
-    ImFont *fonts[5]{};
-    float sizes[5]{ 12.0f, 14.0f, 18.0f, 15.0f, 26.0f };
+    /* Text sizes: 0 small, 1 normal, 2 large (mono); 3 normal, 4 large (serif); 5 normal mono,
+     * bold. */
+    ImFont *fonts[6]{};
+    float sizes[6]{ 12.0f, 14.0f, 18.0f, 15.0f, 26.0f, 14.0f };
     FILE *recording{};
     std::vector<unsigned char> pixels;
     /* A recording's frames: drawn into a framebuffer of its own, the size asked, whatever the
@@ -132,9 +134,15 @@ namespace cards
     auto const scale(offscreen || window_width <= 0 ? 1.0f : static_cast<float>(frame_width) / static_cast<float>(window_width));
     char const *mono("/System/Library/Fonts/Menlo.ttc");
     char const *serif("/System/Library/Fonts/Supplemental/Georgia.ttf");
-    for(int i{}; i < 5; ++i)
+    for(int i{}; i < 6; ++i)
     {
-      s.fonts[i] = io.Fonts->AddFontFromFileTTF(i < 3 ? mono : serif, s.sizes[i] * scale);
+      ImFontConfig config;
+      bool const is_mono(i < 3 || i == 5);
+      /* Menlo's second face is its bold. stb_truetype draws thin, light strokes: the mono
+       * ones a little darker. */
+      config.FontNo = i == 5 ? 1 : 0;
+      config.RasterizerMultiply = is_mono ? 1.25f : 1.0f;
+      s.fonts[i] = io.Fonts->AddFontFromFileTTF(is_mono ? mono : serif, s.sizes[i] * scale, &config);
       if(!s.fonts[i])
       {
         s.fonts[i] = io.Fonts->AddFontDefault();
@@ -575,7 +583,7 @@ namespace cards
   inline int font_of(obj const size)
   {
     auto const index(static_cast<int>(num(size)));
-    return index < 0 ? 0 : (index > 4 ? 4 : index);
+    return index < 0 ? 0 : (index > 5 ? 5 : index);
   }
 
   inline void text(obj const x, obj const y, obj const rgb, obj const size, obj const what)
@@ -620,6 +628,68 @@ namespace cards
       }
     }
     return static_cast<double>(rest - begin);
+  }
+
+  /* `what` broken into lines of at most `width` points at a size, between words where it
+   * can be (ImGui's own word wrap; a word wider than a line between its characters), at
+   * most `limit` lines: the lines joined by newlines. A line's indentation is kept; the
+   * spaces where a line is broken are not. */
+  inline std::string wrap_words(obj const size, obj const what, obj const width, obj const limit)
+  {
+    auto &s(get());
+    auto const index(font_of(size));
+    auto *const font(s.fonts[index]);
+    auto const px(s.sizes[index]);
+    auto const wide(static_cast<float>(num(width)));
+    auto const most(static_cast<long>(num(limit)));
+    auto const text(str(what));
+    char const *at(text.c_str());
+    char const *const end(at + text.size());
+    std::string out;
+    long lines{};
+    auto const emit([&](char const *from, char const *to) {
+      if(lines > 0)
+      {
+        out.push_back('\n');
+      }
+      out.append(from, static_cast<size_t>(to - from));
+      ++lines;
+    });
+    while(lines < most)
+    {
+      auto const newline(static_cast<char const *>(std::memchr(at, '\n', static_cast<size_t>(end - at))));
+      char const *const line_end(newline ? newline : end);
+      if(at == line_end)
+      {
+        emit(at, at);
+      }
+      char const *q(at);
+      while(q < line_end && lines < most)
+      {
+        char const *cut(font->CalcWordWrapPosition(px, q, line_end, wide));
+        if(cut <= q)
+        {
+          /* Not even a character fits: one, whole. */
+          cut = q + 1;
+          while(cut < line_end && (static_cast<unsigned char>(*cut) & 0xC0) == 0x80)
+          {
+            ++cut;
+          }
+        }
+        emit(q, cut);
+        q = cut;
+        while(q < line_end && *q == ' ')
+        {
+          ++q;
+        }
+      }
+      if(!newline)
+      {
+        break;
+      }
+      at = newline + 1;
+    }
+    return out;
   }
 
   inline void line(obj const x1, obj const y1, obj const x2, obj const y2, obj const rgb, obj const thickness)
