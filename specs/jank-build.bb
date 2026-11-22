@@ -1,6 +1,9 @@
 (require '[babashka.fs :as fs]
          '[jank.build.util :as util])
 
+;; The conformance harnesses' C++ (include/jank_specs/harness.hpp).
+(util/include-dir (str (fs/path (fs/parent *file*) "include")))
+
 ;; The model libraries, built here by `lake build +JankSpecs.Native.TinyAtom:dynlib` (the
 ;; build sandbox can't run Lake). Veil's packages first, dependencies before what uses them: a
 ;; Lean library resolves its imports' symbols among the libraries already loaded. lean-sys loads

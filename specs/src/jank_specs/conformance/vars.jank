@@ -1,0 +1,145 @@
+(ns jank-specs.conformance.vars
+  "Conformance of jank's vars and `require` with JankSpecs/Blind/Vars.lean and
+  JankSpecs/Blind/Require.lean, by outcome sets: each program runs many times in one `jank run`, and every outcome it
+  shows must be one the models allow (JankSpecs/Conformance/VarsOutcomes.lean).
+  Clojure runs the same programs, for comparison.
+
+  Programs (futures start together, on a promise):
+  - three futures `(alter-var-root #'x inc)` from 0: the root (V1);
+  - two futures `(with-redefs [y 50] ...)` of a var whose root is 3: the root
+    afterwards (V5);
+  - two futures `(defonce dN (do (swap! evals inc) 7))`, on a new var each
+    run: how many times the expression ran (V4);
+  - two futures `(require 'rN)`, on a new lib each run, whose body counts its
+    runs (V7);
+  - once, in a future, `(alter-var-root #'z (fn [v] (alter-var-root #'z inc)
+    (inc v)))`: whether it has returned after 3 seconds (A5).
+
+  With `:fixes` (e.g. `[:a5]`), the outcomes are the fixed model's."
+  (:require [clojure.string :as string]
+            [jank-specs.harness :as h]))
+
+(def common
+  "
+(def x 0)
+
+(defn alters []
+  (alter-var-root #'x (constantly 0))
+  (let [go (promise)
+        fs (doall (for [_ (range 3)] (future @go (alter-var-root #'x inc))))]
+    (deliver go true)
+    (doseq [f fs] @f)
+    (str \"root=\" x)))
+
+(def y 3)
+
+(defn redefs []
+  (alter-var-root #'y (constantly 3))
+  (let [go (promise)
+        fs (doall (for [_ (range 2)] (future @go (with-redefs [y 50] (SLEEP)))))]
+    (deliver go true)
+    (doseq [f fs] @f)
+    (str \"root=\" y)))
+
+(def evals (atom 0))
+(def loads (atom 0))
+
+(doseq [[o n] (frequencies (repeatedly RUNS alters))] (println \"ALTERS\" o n))
+(doseq [[o n] (frequencies (repeatedly RUNS redefs))] (println \"REDEFS\" o n))
+")
+
+(def defonce-block
+  "(let [go (promise) before @evals
+      fs (doall (for [_ (range 2)] (future @go (defonce dN (do (swap! evals inc) 7)))))]
+  (deliver go true)
+  (doseq [f fs] @f)
+  (println \"DEFONCE\" (str \"evals=\" (- @evals before) \" root=\" dN)))
+")
+
+(def require-block
+  "(let [go (promise) before @loads
+      fs (doall (for [_ (range 2)] (future @go (require 'rN))))]
+  (deliver go true)
+  (doseq [f fs] @f)
+  (println \"REQUIRE\" (str \"runs=\" (- @loads before))))
+")
+
+;; jank's (deref f ms timeout-val) is a stub returning nil at once (RESULTS S3), so this waits 3
+;; seconds and asks realized?.
+(def nested
+  "
+(def z 0)
+(let [f (future (alter-var-root #'z (fn [v] (alter-var-root #'z inc) (inc v))))]
+  (WAIT)
+  (println \"NESTED\" (if (realized? f) (str \"returned root=\" z) \"stuck\")))
+")
+
+(defn program
+  [lang runs blocks]
+  (let [jank? (= lang :jank)]
+    (str (if jank?
+           "(ns vars-scenario)\n(cpp/raw \"#include <unistd.h>\")\n(cpp/raw \"#include <cstdio>\")\n"
+           "(ns vars-scenario)\n")
+         (-> common
+             (string/replace "RUNS" (str runs))
+             (string/replace "(SLEEP)" (if jank? "(cpp/usleep 50)" "(Thread/sleep 0 50000)")))
+         (apply str (for [i (range blocks)] (string/replace defonce-block "dN" (str "d" i))))
+         (apply str (for [i (range blocks)] (string/replace require-block "rN" (str "r" i))))
+         (string/replace nested "(WAIT)" (if jank? "(cpp/usleep 3000000)" "(Thread/sleep 3000)"))
+         ;; The nested alter-var-root's thread never ends in jank: leave without waiting for it.
+         (if jank?
+           "(cpp/fflush cpp/stdout)\n(cpp/_exit 0)\n"
+           "(shutdown-agents)\n(System/exit 0)\n"))))
+
+(defn outcomes
+  "The outcomes of `tag` in `out`, with how often each happened."
+  [out tag]
+  (let [re (re-pattern (str "^" tag " (.*?)(?: (\\d+))?$"))]
+    (reduce (fn [acc line]
+              (if-let [[_ o n] (re-find re line)]
+                ;; jank's re-find gives "" for a group that didn't match (Clojure: nil, RESULTS S6).
+                (assoc acc o (+ (get acc o 0) (if (seq n) (parse-long n) 1)))
+                acc))
+            {}
+            (string/split-lines out))))
+
+(def checks
+  "Each program's tag, the Lean function of its model's outcomes, its name, and
+  whether the function takes proposed fixes (the vars model has them, the
+  `require` one doesn't)."
+  [["ALTERS" "Vars.Outcomes.alterOutcomes" "three futures alter-var-root" true]
+   ["REDEFS" "Vars.Outcomes.redefsOutcomes" "two futures with-redefs" true]
+   ["DEFONCE" "Vars.Outcomes.defonceOutcomes" "two futures defonce" true]
+   ["REQUIRE" "Require.Outcomes.requireOutcomes" "two futures require" false]
+   ["NESTED" "Vars.Outcomes.nestedOutcomes" "nested alter-var-root" true]])
+
+(defn check
+  ([]
+   (check {}))
+  ([{:keys [runs blocks fixes] :or {runs 2000 blocks 200}}]
+   (h/load-lean! "JankSpecs/Conformance/Outcomes.lean" "JankSpecs/Blind/Vars.lean"
+                 "JankSpecs/Blind/Require.lean" "JankSpecs/Conformance/VarsOutcomes.lean")
+   (let [work (h/scratch-dir "vars-")]
+     (doseq [i (range blocks)
+             ext ["jank" "clj"]]
+       (h/write-file! (str work "/r" i "." ext)
+                      (str "(ns r" i ")\n(swap! vars-scenario/loads inc)\n(def a 1)\n(def b 2)\n")))
+     (h/write-file! (str work "/vars_scenario.jank") (program :jank runs blocks))
+     (h/write-file! (str work "/vars_scenario.clj") (program :clj runs blocks))
+     (let [jank (h/run-jank (into ["run" "vars_scenario.jank"] (h/jank-args {:module-path [work]}))
+                            work 3600)
+           clojure (h/run-clojure ["-Sdeps" "{:paths [\".\"]}" "-M" "vars_scenario.clj"] work)]
+       (when-not (some #(string/starts-with? % "NESTED") (string/split-lines (:out jank)))
+         (throw (ex-info "the jank program didn't finish" {:out (:out jank)})))
+       (let [results (vec (for [[tag f label fixable?] checks]
+                            (let [allowed (set (if fixable? (h/call f (vec fixes)) (h/call f)))
+                                  observed (outcomes (:out jank) tag)]
+                              {:scenario label
+                               :model-outcomes (count allowed)
+                               :observed observed
+                               :clojure (outcomes (:out clojure) tag)
+                               :unexpected (vec (remove allowed (keys observed)))})))]
+         {:harness "vars"
+          :work work
+          :ok? (every? #(empty? (:unexpected %)) results)
+          :results results})))))

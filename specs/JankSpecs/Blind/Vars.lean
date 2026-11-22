@@ -30,6 +30,15 @@ thread's steps interleaved. One var, whose root is a number.
   under one write lock: one step here (`intern`).
 
 Each thread runs one program, from the theory.
+
+`fixed` turns on a proposed fix of jank, to check it before it's written:
+
+- `a5`: `write_mutex` is recursive (as Clojure's `synchronized alterRoot`
+  is), so an `alter-var-root` inside `f` re-enters it; the outer one then
+  stores `(f v)` over the nested one's value, as on Clojure. (Not calling `f`
+  under the lock, with a compare-and-set loop as `swap!` does, would loop
+  forever on this `f`: each retry alters the var again, so the outer
+  compare-and-set fails again.)
 -/
 
 -- The SMT solver's answers are turned into proofs which Lean's kernel checks.
@@ -44,11 +53,14 @@ type thread
 `(intern ns 'y)` (or `create-ns`, `keyword`). -/
 enum prog_t = { alter, alterNested, define, redefs, defonce, intern }
 enum pc_t = { start, waiting, locked, stuck, checked, evaluated, inBody, done }
+/- The proposed fixes (see above). -/
+enum fix_t = { a5 }
 
 immutable function prog : thread → prog_t
 immutable individual initRoot : Nat
 immutable individual initBound : Bool
 immutable individual focus : Nat
+immutable relation fixed : fix_t → Bool
 
 /- The var's root (when it has one), and who holds `write_mutex`. -/
 individual root : Nat
@@ -103,10 +115,12 @@ action alterAcquire (t : thread) {
 
 /- With the lock, `f` is called on the root. A nested `alter-var-root` of the
 same var locks `write_mutex` again, which this thread holds: it waits
-forever. Otherwise the result is stored and the lock released. -/
+forever (with the fix `a5`, it re-enters the lock and stores `v + 1`, then
+the outer one stores `v + 1` too). Otherwise the result is stored and the
+lock released. -/
 action alterApply (t : thread) {
   require pc t = locked
-  if prog t = alterNested then
+  if prog t = alterNested ∧ ¬ fixed a5 then
     pc t := stuck
   else
     root := root + 1
@@ -210,6 +224,8 @@ safety [v5_redefs_restored]
 also when `f` alters the same var (Clojure's `alterRoot` is `synchronized`,
 which is reentrant). -/
 safety [v1_alter_returns] focus = 1 → pc T ≠ stuck
+/- With the fix `a5`, it does. -/
+safety [v1_fixed_alter_returns] fixed a5 → pc T ≠ stuck
 
 /- Auxiliary invariants, which make V1 and V2 inductive: a thread holds the
 lock exactly while it's in `alter_root`, and only one does; interned objects
@@ -241,6 +257,7 @@ info: Initialization must establish the invariant:
   v4_defonce_once ... ✅
   v5_redefs_restored ... ✅
   v1_alter_returns ... ✅
+  v1_fixed_alter_returns ... ✅
   lock_held ... ✅
   lock_single ... ✅
   alter_only_alters ... ✅
@@ -255,6 +272,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -268,6 +286,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ❌
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -281,6 +300,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -294,6 +314,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -307,6 +328,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -320,6 +342,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ❌
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -333,6 +356,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ❌
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -346,6 +370,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -359,6 +384,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -372,6 +398,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -385,6 +412,7 @@ The following set of actions must preserve the invariant and successfully termin
     v4_defonce_once ... ✅
     v5_redefs_restored ... ✅
     v1_alter_returns ... ✅
+    v1_fixed_alter_returns ... ✅
     lock_held ... ✅
     lock_single ... ✅
     alter_only_alters ... ✅
@@ -401,46 +429,65 @@ set_option veil.violationIsError false in
 
 -- Three threads `alter-var-root` at once; three intern at once.
 #model_check { thread := Fin 3 }
-  { prog := fun _ => prog_t_IndT.alter, initRoot := 0, initBound := true, focus := 0 }
+  { prog := fun _ => prog_t_IndT.alter, initRoot := 0, initBound := true, focus := 0,
+    fixed := fun _ => false }
 #model_check { thread := Fin 3 }
-  { prog := fun _ => prog_t_IndT.intern, initRoot := 0, initBound := true, focus := 0 }
+  { prog := fun _ => prog_t_IndT.intern, initRoot := 0, initBound := true, focus := 0,
+    fixed := fun _ => false }
 
 -- V4 and V5 hold for one thread at a time (the body throwing or not makes no
 -- difference: the restore is in `finally`).
 #model_check { thread := Fin 1 }
-  { prog := fun _ => prog_t_IndT.defonce, initRoot := 0, initBound := false, focus := 4 }
+  { prog := fun _ => prog_t_IndT.defonce, initRoot := 0, initBound := false, focus := 4,
+    fixed := fun _ => false }
 #model_check { thread := Fin 1 }
-  { prog := fun _ => prog_t_IndT.redefs, initRoot := 3, initBound := true, focus := 5 }
+  { prog := fun _ => prog_t_IndT.redefs, initRoot := 3, initBound := true, focus := 5,
+    fixed := fun _ => false }
 
 -- V4: two threads `defonce` at once.
 #guard_msgs (drop error) in
 #model_check { thread := Fin 2 }
-  { prog := fun _ => prog_t_IndT.defonce, initRoot := 0, initBound := false, focus := 4 }
+  { prog := fun _ => prog_t_IndT.defonce, initRoot := 0, initBound := false, focus := 4,
+    fixed := fun _ => false }
   (sequential := true)
 set_option veil.violationIsError false in
 #model_check { thread := Fin 2 }
-  { prog := fun _ => prog_t_IndT.defonce, initRoot := 0, initBound := false, focus := 4 }
+  { prog := fun _ => prog_t_IndT.defonce, initRoot := 0, initBound := false, focus := 4,
+    fixed := fun _ => false }
   (sequential := true)
 
 -- V5: two threads `with-redefs` the same var at once.
 #guard_msgs (drop error) in
 #model_check { thread := Fin 2 }
-  { prog := fun _ => prog_t_IndT.redefs, initRoot := 3, initBound := true, focus := 5 }
+  { prog := fun _ => prog_t_IndT.redefs, initRoot := 3, initBound := true, focus := 5,
+    fixed := fun _ => false }
   (sequential := true)
 set_option veil.violationIsError false in
 #model_check { thread := Fin 2 }
-  { prog := fun _ => prog_t_IndT.redefs, initRoot := 3, initBound := true, focus := 5 }
+  { prog := fun _ => prog_t_IndT.redefs, initRoot := 3, initBound := true, focus := 5,
+    fixed := fun _ => false }
   (sequential := true)
 
 -- `v1_alter_returns`: `f` alters the same var.
 #guard_msgs (drop error) in
 #model_check { thread := Fin 1 }
-  { prog := fun _ => prog_t_IndT.alterNested, initRoot := 0, initBound := true, focus := 1 }
+  { prog := fun _ => prog_t_IndT.alterNested, initRoot := 0, initBound := true, focus := 1,
+    fixed := fun _ => false }
   (sequential := true)
 set_option veil.violationIsError false in
 #model_check { thread := Fin 1 }
-  { prog := fun _ => prog_t_IndT.alterNested, initRoot := 0, initBound := true, focus := 1 }
+  { prog := fun _ => prog_t_IndT.alterNested, initRoot := 0, initBound := true, focus := 1,
+    fixed := fun _ => false }
   (sequential := true)
+
+-- `v1_alter_returns` with the fix `a5`: no violation, for one thread and for
+-- two (each with a nested `alter-var-root`).
+#model_check { thread := Fin 1 }
+  { prog := fun _ => prog_t_IndT.alterNested, initRoot := 0, initBound := true, focus := 1,
+    fixed := fun _ => true }
+#model_check { thread := Fin 2 }
+  { prog := fun _ => prog_t_IndT.alterNested, initRoot := 0, initBound := true, focus := 1,
+    fixed := fun _ => true }
 
 #gen_executable
 

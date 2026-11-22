@@ -20,12 +20,15 @@ showed up.
   runs; its comment has the two `clang++` commands.
 
 - `.py` scripts need several processes (`jank compile-module`, a running
-  REPL) or an nREPL client. They use the conformance harness's runner and
-  client, start jank in scratch directories under `conformance/out/`, and
-  print the same way: `python3 <file>.py`.
+  REPL) or an nREPL client. They share a jank runner and client
+  (`jank_harness.py`), start jank in scratch directories under
+  `conformance/out/`, and print the same way: `python3 <file>.py`.
 
 Checked on 2026-11-21 with jank 0.1 (Homebrew, `f3d82d654`) on macOS 15.1,
-Apple Silicon, and Clojure 1.11.1. "Clojure" is what the same file prints on
+Apple Silicon, and Clojure 1.11.1; and on the build of jank's main published
+on 2026-11-20 (`774d02f62`), where each prints the same, except N1 and S5
+(fixed) and S8 (it compiles, but `(case k :a 1 true)` is `1`). The `.py`
+scripts take another jank from `$JANK`. "Clojure" is what the same file prints on
 Clojure. "determinismo" is its jank analysis
 (`determinismo/ai-analysis/jank-0.1.md`), where a finding is also there.
 
@@ -44,6 +47,12 @@ Clojure. "determinismo" is its jank analysis
 | S1 | `print-exception-crashes-at-exit.cljc` | exit code 139 | 0 | |
 | S2 | `let-string-literal-does-not-compile.cljc` | the second `defn` doesn't compile | `ok` | (§3.13 has another `let` that codegen types wrong) |
 | S3 | `timed-deref-is-a-stub.cljc` | `nil` three times | `1`, `:timeout`, `:timeout` | |
+| S5 | `sort-empty-crashes.cljc` | exit code 139 at `(first (sort []))` | `nil` | |
+| S6 | `regex-unmatched-group-empty-string.cljc` | `["a" ""]` | `["a" nil]` | |
+| S7 | `if-number-and-boolean-literals.cljc` | `1` and `0` | `true` and `false` | |
+| S8 | `case-literal-default-does-not-compile.cljc` | the second `defn` doesn't compile when called | `true` | |
+| S9 | `count-arithmetic-unsigned.cljc` | `-2997`, `false`, `-2997` | `-2997`, `true`, `0` | |
+| S10 | `small-integer-arithmetic-wraps.cljc` | `-2147483648` (twice), `-1486618624`, `-1294967296`, `2147483647`; `inc` is right | the right values | |
 | M1 | `module-object-ignores-changed-dependency.py` | 1, also after `compile-module` again | | |
 | M2 | `module-path-last-directory-wins.py` | `b` | | |
 | M3 | `module-repl-never-sees-new-object.py` | `false` | | |

@@ -24,6 +24,13 @@ the same time (`compiler+runtime/src/cpp/jank/runtime/obj/` at `f3d82d654`):
 The delay's body is one of: return a value, throw, or deref the delay itself.
 The lazy seq's body throws on its first call or not, then returns.
 
+`fixed` turns on a proposed fix of jank, to check it before it's written:
+
+- `c5`: a deref of the delay by the thread running its body throws at once
+  (instead of waiting for the mutex it holds), so a body which derefs its own
+  delay throws, and the delay caches that error. Clojure's recursive lock
+  runs the body again instead, until the stack overflows.
+
 The state uses only relations, functions, enums and numbers (no `Option`), so
 that `#check_invariants` can prove the properties which hold for any number of
 threads and values.
@@ -40,10 +47,13 @@ enum body_t = { returns, throws, derefsSelf }
 enum dpc_t = { idle, waiting, running, finished, stuck }
 /- A result: none yet, a value, or an error. -/
 enum res_t = { nothing, ok, err }
+/- The proposed fixes (see above). -/
+enum fix_t = { c5 }
 
 immutable individual delayBody : body_t
 immutable relation lazyThrowsFirst : thread → Bool
 immutable individual focus : Nat
+immutable relation fixed : fix_t → Bool
 
 /-! Delay: who holds its mutex, what's cached, how many times the body ran,
 and what each thread's deref gave. -/
@@ -121,9 +131,17 @@ action delayRun (t : thread) {
         owns t := false
         dpc t := finished
       else
-        -- The body derefs the delay: the same thread asks for the mutex it
-        -- holds, and waits for it forever.
-        dpc t := stuck
+        if fixed c5 then
+          -- The fix: the body's deref of its own delay throws at once, so the
+          -- body throws, and its error is cached.
+          cached := err
+          got t := err
+          owns t := false
+          dpc t := finished
+        else
+          -- The body derefs the delay: the same thread asks for the mutex it
+          -- holds, and waits for it forever.
+          dpc t := stuck
 }
 
 /-! ## promise -/
@@ -164,6 +182,8 @@ safety [c5_delay_runs_once] runs ≤ 1
 safety [c5_delay_derefs_agree] got T ≠ nothing ∧ got U ≠ nothing → got T = got U
 /- C5: a deref of the delay returns (or throws). -/
 safety [c5_delay_deref_returns] focus = 5 → dpc T ≠ stuck
+/- C5 with the fix: every deref of the delay returns (or throws). -/
+safety [c5_fixed_deref_returns] fixed c5 → dpc T ≠ stuck
 /- C6: every deref of a promise returns the first value delivered. -/
 safety [c6_promise_first_wins] promiseGot T V → promised V
 /- C9: once a lazy seq is realized its body isn't called again; it's called
@@ -211,6 +231,7 @@ info: Initialization must establish the invariant:
   c5_delay_runs_once ... ✅
   c5_delay_derefs_agree ... ✅
   c5_delay_deref_returns ... ✅
+  c5_fixed_deref_returns ... ✅
   c6_promise_first_wins ... ✅
   c9_lazy_body_once ... ✅
   c9_lazy_realized_once ... ✅
@@ -227,6 +248,7 @@ The following set of actions must preserve the invariant and successfully termin
     c5_delay_runs_once ... ✅
     c5_delay_derefs_agree ... ✅
     c5_delay_deref_returns ... ✅
+    c5_fixed_deref_returns ... ✅
     c6_promise_first_wins ... ✅
     c9_lazy_body_once ... ✅
     c9_lazy_realized_once ... ✅
@@ -242,6 +264,7 @@ The following set of actions must preserve the invariant and successfully termin
     c5_delay_runs_once ... ✅
     c5_delay_derefs_agree ... ✅
     c5_delay_deref_returns ... ✅
+    c5_fixed_deref_returns ... ✅
     c6_promise_first_wins ... ✅
     c9_lazy_body_once ... ✅
     c9_lazy_realized_once ... ✅
@@ -257,6 +280,7 @@ The following set of actions must preserve the invariant and successfully termin
     c5_delay_runs_once ... ✅
     c5_delay_derefs_agree ... ✅
     c5_delay_deref_returns ... ✅
+    c5_fixed_deref_returns ... ✅
     c6_promise_first_wins ... ✅
     c9_lazy_body_once ... ✅
     c9_lazy_realized_once ... ✅
@@ -272,6 +296,7 @@ The following set of actions must preserve the invariant and successfully termin
     c5_delay_runs_once ... ✅
     c5_delay_derefs_agree ... ✅
     c5_delay_deref_returns ... ✅
+    c5_fixed_deref_returns ... ✅
     c6_promise_first_wins ... ✅
     c9_lazy_body_once ... ✅
     c9_lazy_realized_once ... ✅
@@ -287,6 +312,7 @@ The following set of actions must preserve the invariant and successfully termin
     c5_delay_runs_once ... ✅
     c5_delay_derefs_agree ... ✅
     c5_delay_deref_returns ... ✅
+    c5_fixed_deref_returns ... ✅
     c6_promise_first_wins ... ✅
     c9_lazy_body_once ... ✅
     c9_lazy_realized_once ... ✅
@@ -302,6 +328,7 @@ The following set of actions must preserve the invariant and successfully termin
     c5_delay_runs_once ... ✅
     c5_delay_derefs_agree ... ✅
     c5_delay_deref_returns ... ❌
+    c5_fixed_deref_returns ... ✅
     c6_promise_first_wins ... ✅
     c9_lazy_body_once ... ✅
     c9_lazy_realized_once ... ✅
@@ -322,20 +349,29 @@ set_option veil.violationIsError false in
 
 -- Three threads, a delay which returns, and one which throws.
 #model_check { thread := Fin 3, value := Fin 2 }
-  { delayBody := body_t_IndT.returns, lazyThrowsFirst := fun t => t = 0, focus := 0 }
+  { delayBody := body_t_IndT.returns, lazyThrowsFirst := fun t => t = 0, focus := 0,
+    fixed := fun _ => false }
 #model_check { thread := Fin 3, value := Fin 2 }
-  { delayBody := body_t_IndT.throws, lazyThrowsFirst := fun _ => false, focus := 0 }
+  { delayBody := body_t_IndT.throws, lazyThrowsFirst := fun _ => false, focus := 0,
+    fixed := fun _ => false }
 
 -- C5, with a body which derefs its own delay.
 #guard_msgs (drop error) in
 #model_check interpreted { thread := Fin 1, value := Fin 2 }
-  { delayBody := body_t_IndT.derefsSelf, lazyThrowsFirst := fun _ => false, focus := 5 }
+  { delayBody := body_t_IndT.derefsSelf, lazyThrowsFirst := fun _ => false, focus := 5,
+    fixed := fun _ => false }
   (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check interpreted { thread := Fin 1, value := Fin 2 }
-  { delayBody := body_t_IndT.derefsSelf, lazyThrowsFirst := fun _ => false, focus := 5 }
+  { delayBody := body_t_IndT.derefsSelf, lazyThrowsFirst := fun _ => false, focus := 5,
+    fixed := fun _ => false }
   (sequential := true)
+
+-- C5 with the fix: no violation, for two threads.
+#model_check interpreted { thread := Fin 2, value := Fin 2 }
+  { delayBody := body_t_IndT.derefsSelf, lazyThrowsFirst := fun _ => false, focus := 5,
+    fixed := fun _ => true }
 
 #gen_executable
 

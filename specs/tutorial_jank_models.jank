@@ -1,0 +1,640 @@
+(ns tutorial-jank-models
+  "TUTORIAL.md's models, written in jank as data: Veil checks them in this
+  process (through the veil and lean-sys libraries), and jank replays what it
+  finds."
+  (:require [clojure.string :as string]
+            [jank-specs.tutorial :refer [random-run replay-array-map sh vs]]
+            [veil.core :as veil]))
+
+;;;; Modelling jank in Veil, with the models in jank
+;;
+;; The three models of TUTORIAL.md, written in jank. veil/defmodel takes Veil's declarations as
+;; s-expressions, and a model is jank data: a map of its name and its declarations, which jank
+;; functions can build and change. TUTORIAL.md explains the reasoning behind the models, and
+;; tutorial.jank goes through it with the .lean files; here each part defines its model, prints
+;; the Veil text it gives (veil/source), and checks it.
+;;
+;; The REPL is the one of tutorial.jank (its header says how to set it up): CIDER's jack-in from
+;; this file starts it in specs/. Evaluate the forms from this file's buffer, top to bottom; they
+;; are in (comment ...) blocks, with their output as `;=>` notes.
+;;
+;; - `vs` is a Veil session: Lean, with Veil imported, in this process. The first form that uses
+;;   it creates it, in a few seconds.
+;; - veil/model-check, veil/prove and veil/system elaborate a model into the session, the first
+;;   time, and return Veil's results as jank data. After changing a model, evaluate its
+;;   defmodel again.
+;; - (sh "command") runs a shell command in specs/: the reproduction scripts.
+;;
+;; The notation, for a few of Veil's constructs (veil/defmodel's docstring has all of them):
+;;
+;;   Veil                                     jank
+;;   individual value : Nat                   (individual value Nat)
+;;   function pc : thread → pc_t              (function pc [thread] pc_t)
+;;   relation points : obj → arr → Bool       (relation points [obj arr])
+;;   action load (t : thread) { ... }         (action load [t thread] ...)
+;;   require pc t = idle                      (require (= (pc t) :idle))
+;;   pc t := loaded                           (set! (pc t) :loaded)
+;;   if c then ... else ...                   (if c (do ...) (do ...))
+;;   ∃ A, points t A ∧ slot A k V             (exists [A arr] (and (points t A) (slot A k V)))
+;;   safety [no_lost_update] value = swaps    (safety no_lost_update (= value swaps))
+
+;;;; 1. Array map transients
+;;
+;; A small map (up to 8 entries) is an array map: a pointer to an array of key/value slots.
+;; (transient m) copies that pointer, not the array, and assoc! of a key that's already there
+;; overwrites its slot in place. Maps point to arrays and arrays hold the entries, as in the C++;
+;; `should` is ghost state, what each map should hold according to the docs.
+
+(veil/defmodel tiny-array-map TinyArrayMap
+  (type obj)
+  (type arr)
+  (type key)
+  (type val)
+  ;; The fix: transient copies the array. jank 0.1 doesn't.
+  (immutable (relation copyOnTransient []))
+  (relation used [obj])
+  (relation persistentMap [obj])
+  (relation finished [obj])
+  (relation points [obj arr])              ; map o points to array a
+  (relation arrUsed [arr])
+  (relation slot [arr key val])            ; array a holds k v
+  (relation should [obj key val])          ; ghost: what o should hold
+  (after-init
+    (set! (used O) false)
+    (set! (persistentMap O) false)
+    (set! (finished O) false)
+    (set! (points O A) false)
+    (set! (arrUsed A) false)
+    (set! (slot A K V) false)
+    (set! (should O K V) false))
+  ;; {k v}: a new persistent map, in a new array.
+  (action literal [o obj a arr k key v val]
+    (require (and (not (used o)) (not (arrUsed a))))
+    (set! (used o) true)
+    (set! (persistentMap o) true)
+    (set! (arrUsed a) true)
+    (set! (points o A) (decide (= A a)))
+    (set! (slot a K V) (decide (and (= K k) (= V v))))
+    (set! (should o K V) (decide (and (= K k) (= V v)))))
+  ;; (transient p): jank shares p's array; the fix copies it into a.
+  (action transient [p obj t obj a arr]
+    (require (and (used p) (persistentMap p) (not (used t)) (not (arrUsed a))))
+    (set! (used t) true)
+    (if copyOnTransient
+      (do (set! (arrUsed a) true)
+          (set! (slot a K V) (decide (exists [B arr] (and (points p B) (slot B K V)))))
+          (set! (points t A) (decide (= A a))))
+      (set! (points t A) (points p A)))
+    (set! (should t K V) (should p K V)))
+  ;; (assoc! t k v) when k is there: the value is overwritten in place.
+  (action assocBang [t obj k key v val]
+    (require (and (used t) (not (persistentMap t)) (not (finished t))))
+    (require (exists [A arr V val] (and (points t A) (slot A k V))))
+    (set! (slot A K V) (decide (or (and (points t A) (= K k) (= V v))
+                                   (and (not (points t A)) (slot A K V)))))
+    (set! (should t K V) (decide (and (= K k) (= V v)))))
+  ;; (persistent! t): the result points to t's array.
+  (action persistentBang [t obj q obj]
+    (require (and (used t) (not (persistentMap t)) (not (finished t)) (not (used q))))
+    (set! (finished t) true)
+    (set! (used q) true)
+    (set! (persistentMap q) true)
+    (set! (points q A) (points t A))
+    (set! (should q K V) (should t K V)))
+  ;; From transient's docstring: a persistent map always holds what it should.
+  (safety maps_hold_what_they_should
+          (=> (persistentMap O) (<=> (exists [A arr] (and (points O A) (slot A K V))) (should O K V)))))
+
+(comment
+  ;; The Veil text of the model:
+  (println (veil/source tiny-array-map))
+
+  ;; Model checking, without the fix: three maps, three arrays, one key, two values.
+  (def r (veil/model-check @vs tiny-array-map {:instance {:obj 3 :arr 3 :key 1 :val 2}
+                                               :theory {:copyOnTransient false}}))
+  (:violates r)
+  ;=> [:maps_hold_what_they_should]
+  (mapv (juxt :action :args) (:trace r))
+  ;=> [[:after_init nil] [:literal {:o 0, :a 0, :k 0, :v 0}] [:transient {:p 0, :t 1, :a 1}]
+  ;    [:assocBang {:t 1, :k 0, :v 1}]]
+  (select-keys (:state (last (:trace r))) [:points :slot :should])
+  ;=> {:points #{[0 0] [1 0]}, :slot #{[0 [0 1]]}, :should #{[1 [0 1]] [0 [0 0]]}}
+  ;   maps 0 and 1 point to array 0, which now holds k = 1, while map 0 should hold k = 0
+
+  ;; With the fix:
+  (veil/model-check @vs tiny-array-map {:instance {:obj 3 :arr 3 :key 1 :val 2}
+                                        :theory {:copyOnTransient true}})
+  ;=> {:result :noViolationFound, :explored-states 715, ...}
+
+  ;; The counterexample's steps, done on jank maps:
+  (replay-array-map (:trace r))
+  ;=> {0 {:jank {0 1}, :should {0 0}}}: map 0 changed. Clojure gives {0 0}.
+
+  ;; clojure.core uses transients, so ordinary code is affected:
+  [(def m2 {:a 1 :b 2})
+   (into m2 {:a 9})
+   m2]
+  ;=> [#'tutorial-jank-models/m2 {:a 9, :b 2} {:a 9, :b 2}]: m2 changed
+
+  ;; The reproduction file, run on jank and then on Clojure:
+  (println (sh "jank run repro/transient-array-map-mutates-source.cljc; clojure -M repro/transient-array-map-mutates-source.cljc")))
+
+;;;; 2. swap! on atoms
+;;
+;; jank's swap! reads the value, computes the new one, then does a compare-and-set: if the atom
+;; changed in the meantime, it starts again. TinyAtom models it; NaiveAtom stores what it read
+;; plus one, without the compare.
+
+(veil/defmodel tiny-atom TinyAtom
+  ;; Proofs checked by Lean's kernel, not only by the SMT solver.
+  (set-option veil.smt.trust false)
+  (type thread)
+  (enum pc_t idle loaded done)
+  (individual value Nat)
+  (function pc [thread] pc_t)
+  (function seen [thread] Nat)                    ; what the thread read
+  ;; Ghost state, for the properties (not in jank): how many swap!s took effect, the largest
+  ;; value one returned, and whether one returned a value no larger than an earlier one did.
+  (individual swaps Nat)
+  (individual maxReturned Nat)
+  (individual stale Bool)
+  (after-init
+    (set! value 0)
+    (set! (pc T) :idle)
+    (set! (seen T) 0)
+    (set! swaps 0)
+    (set! maxReturned 0)
+    (set! stale false))
+  (action load [t thread]
+    (require (= (pc t) :idle))
+    (set! (seen t) value)
+    (set! (pc t) :loaded))
+  (action cas [t thread]
+    (require (= (pc t) :loaded))
+    (if (= value (seen t))                        ; unchanged since the read
+      (do (set! value (+ (seen t) 1))
+          (set! swaps (+ swaps 1))
+          (set! stale (decide (or stale (<= (+ (seen t) 1) maxReturned))))
+          (when (< maxReturned (+ (seen t) 1))
+            (set! maxReturned (+ (seen t) 1)))
+          (set! (pc t) :done))
+      (set! (pc t) :idle)))                       ; read again
+  (safety no_lost_update (= value swaps))
+  (safety results_increase (not stale))
+  (invariant max_is_swaps (= maxReturned swaps)))
+
+(veil/defmodel naive-atom NaiveAtom
+  (type thread)
+  (enum pc_t idle loaded done)
+  (individual value Nat)
+  (function pc [thread] pc_t)
+  (function seen [thread] Nat)
+  (individual swaps Nat)
+  (after-init
+    (set! value 0)
+    (set! (pc T) :idle)
+    (set! (seen T) 0)
+    (set! swaps 0))
+  (action load [t thread]
+    (require (= (pc t) :idle))
+    (set! (seen t) value)
+    (set! (pc t) :loaded))
+  (action store [t thread]
+    (require (= (pc t) :loaded))
+    (set! value (+ (seen t) 1))
+    (set! swaps (+ swaps 1))
+    (set! (pc t) :done))
+  (safety no_lost_update (= value swaps)))
+
+(comment
+  (println (veil/source naive-atom))
+
+  ;; Model checking NaiveAtom with two threads:
+  (def naive (veil/model-check @vs naive-atom {:instance {:thread 2}}))
+  (:violates naive)
+  ;=> [:no_lost_update]
+  (mapv (juxt :action :args) (:trace naive))
+  ;=> [[:after_init nil] [:load {:t 0}] [:load {:t 1}] [:store {:t 0}] [:store {:t 1}]]
+  (:state (last (:trace naive)))
+  ;=> {:value 1, :pc {0 :done, 1 :done}, :seen {0 0, 1 0}, :swaps 2}: two increments, one lost
+
+  ;; The trace replayed in one thread, with deref and reset!, then with compare-and-set! as in
+  ;; jank's swap!:
+  (let [a (atom 0)
+        seen-0 @a                  ; load(t=0)
+        seen-1 @a                  ; load(t=1)
+        _ (reset! a (inc seen-0))  ; store(t=0)
+        _ (reset! a (inc seen-1))] ; store(t=1)
+    @a)
+  ;=> 1: two increments, one lost
+  (let [a (atom 0)
+        seen-0 @a
+        seen-1 @a
+        ok-0 (compare-and-set! a seen-0 (inc seen-0))
+        ok-1 (compare-and-set! a seen-1 (inc seen-1))]
+    [ok-0 ok-1 @a])
+  ;=> [true false 1]: thread 1's compare fails, so it reads again and its update isn't lost
+
+  ;; TinyAtom, with three threads:
+  (veil/model-check @vs tiny-atom {:instance {:thread 3}})
+  ;=> {:result :noViolationFound, :explored-states 71, :termination :exploredAllReachableStates}
+
+  ;; Its executable transition system: initial states, the steps a state allows, and the
+  ;; properties in a state, for states from the model or written in jank.
+  (def sys (veil/system @vs tiny-atom {:instance {:thread 2}}))
+  (veil/initial-states sys)
+  ;=> [{:value 0, :pc {0 :idle, 1 :idle}, :seen {0 0, 1 0}, :swaps 0, :maxReturned 0, :stale false}]
+  (veil/successors sys {:value 1 :pc {0 :loaded 1 :done} :seen {0 0 1 0}
+                        :swaps 1 :maxReturned 1 :stale false})
+  ;=> [{:action :cas, :args {:t 0}, :state {:value 1, :pc {0 :idle, 1 :done}, ...}}]
+  (veil/properties sys {:value 1 :pc {0 :done 1 :done} :seen {0 0 1 0}
+                        :swaps 2 :maxReturned 1 :stale false})
+  ;=> {:no_lost_update false, :results_increase true, :max_is_swaps false}
+
+  ;; The model as a test oracle for jank's atoms: random runs of its steps, each done on an atom
+  ;; too, compared after every step.
+  (count (remove #(nil? (:disagreement %)) (repeatedly 200 #(random-run sys))))
+  ;=> 0
+  )
+
+;; Model checking covers every interleaving of three threads, and no more. A proof covers any
+;; number of threads, by induction over steps: the properties hold in the initial state, and in
+;; any state where they all hold, any step keeps them holding. veil/prove (Veil's
+;; #check_invariants) asks an SMT solver both questions for every action, and Lean's kernel
+;; checks the answers.
+
+(comment
+  ;; The first attempt didn't have the invariant max_is_swaps. A model is data, so it is
+  ;; tiny-atom without its invariant:
+  (def first-try
+    (update tiny-atom :decls (fn [decls]
+                               (vec (remove #(= 'invariant (first %)) decls)))))
+  (def failed (remove #(= :proven (:status %)) (remove :alternative-for (veil/prove @vs first-try))))
+  (mapv :vc failed)
+  ;=> [:cas_results_increase]
+
+  ;; The solver's counterexample to induction: a state where the properties hold, and a cas that
+  ;; breaks results_increase. No run reaches that state (maxReturned = 1 while no swap! is done);
+  ;; the induction considers every state where the properties hold, reachable or not.
+  (:counterexample (first failed))
+  ;=> {:theory {},
+  ;    :pre-state {:value 0, :pc {0 :loaded}, :seen {0 0}, :swaps 0, :maxReturned 1, :stale false},
+  ;    :action :cas, :args {:t 0},
+  ;    :post-state {:value 1, :pc {0 :done}, :seen {0 0}, :swaps 1, :maxReturned 1, :stale true}}
+
+  ;; The invariant that rules it out: the largest value returned is the number of swap!s.
+  (veil/proved? (veil/prove @vs tiny-atom))
+  ;=> true
+  )
+
+;;;; 3. The nREPL server model
+;;
+;; Each connection of jank's nREPL server gets a thread that takes its requests one at a time. To
+;; capture an eval's output, the server saves file descriptor 1 (dup), flushes C's stdout buffer,
+;; points descriptor 1 at a temp file (dup2), evaluates, flushes, points descriptor 1 back, and
+;; reads and deletes the temp file. Descriptor 1 and C's buffer belong to the process, so each
+;; operation on them is a step of its own (TUTORIAL.md, part 3, describes how the model was built).
+;;
+;;   queued -take-> taken -redirect-> capturing -evaluate-> evaluated -endFlush-> flushed -release-> released -respond-> answered
+;;
+;; The requests (which connection, what kind, which session) are the theory: immutable functions,
+;; given per model check. `focus` selects which expected-to-fail property a check is about.
+
+(veil/defmodel nrepl Nrepl
+  (set-option veil.smt.trust false)
+  (type conn)
+  (type req)
+  (type session)
+  (instantiate tot (TotalOrder req))
+  (lean "open TotalOrder")
+  (enum kind_t evalOk evalPrint evalThrow evalStar1 evalBad unknownOp otherOp)
+  (enum phase_t queued taken capturing evaluated flushed released answered lost)
+  (immutable (function reqConn [req] conn))
+  (immutable (function reqKind [req] kind_t))
+  (immutable (function reqSession [req] session))
+  (immutable (individual focus Nat))
+  (relation alive [conn])
+  (relation busy [conn])
+  (function phase [req] phase_t)
+  ;; Where descriptor 1 points (stdoutTo q: q's temp file; none: the process's stdout), each
+  ;; eval's backup of it, and the deleted temp files.
+  (relation stdoutTo [req])
+  (relation backupTo [req req])
+  (relation deleted [req])
+  ;; What's in C's buffer, and, as ghost state, where each print ended up.
+  (relation buffered [req])
+  (relation printedIn [req req])
+  (relation printedLost [req])
+  (relation printedTerminal [req])
+  ;; What each eval returned, *1 per connection and per session, and what the responses carried.
+  (relation valueIs [req req])
+  (relation errDoneTogether [req])
+  (relation star1Is [conn req])
+  (relation star1SessionIs [session req])
+  (relation expectedIs [req req])
+  (relation tagged [req])
+  (relation unknownReported [req])
+  (after-init
+    (set! (alive C) true)
+    (set! (busy C) false)
+    (set! (phase R) :queued)
+    (set! (stdoutTo R) false)
+    (set! (backupTo R Q) false)
+    (set! (deleted R) false)
+    (set! (buffered R) false)
+    (set! (printedIn R Q) false)
+    (set! (printedLost R) false)
+    (set! (printedTerminal R) false)
+    (set! (valueIs R Q) false)
+    (set! (errDoneTogether R) false)
+    (set! (star1Is C R) false)
+    (set! (star1SessionIs S R) false)
+    (set! (expectedIs R Q) false)
+    (set! (tagged R) false)
+    (set! (unknownReported R) false))
+  (ghost-relation isEval [r req]
+    (or (= (reqKind r) :evalOk) (= (reqKind r) :evalPrint) (= (reqKind r) :evalThrow)
+        (= (reqKind r) :evalStar1) (= (reqKind r) :evalBad)))
+  ;; fflush(stdout): the buffer goes to wherever descriptor 1 points.
+  (procedure flush []
+    (set! (printedTerminal X) (decide (or (printedTerminal X)
+                                          (and (buffered X) (forall [Q req] (not (stdoutTo Q)))))))
+    (set! (printedLost X) (decide (or (printedLost X)
+                                      (and (buffered X) (exists [Q req] (and (stdoutTo Q) (deleted Q)))))))
+    (set! (printedIn X Q) (decide (or (printedIn X Q)
+                                      (and (buffered X) (stdoutTo Q) (not (deleted Q))))))
+    (set! (buffered X) false))
+  ;; The connection's loop takes its next request; an eval starts its capture with the backup.
+  (action take [c conn r req]
+    (require (and (alive c) (not (busy c))))
+    (require (and (= (reqConn r) c) (= (phase r) :queued)))
+    (require (forall [Q req] (=> (and (= (reqConn Q) c) (= (phase Q) :queued)) (le r Q))))
+    (if (isEval r)
+      (do (set! (busy c) true)
+          (set! (backupTo r Q) (stdoutTo Q))
+          (set! (phase r) :taken))
+      (do (when (= (reqKind r) :unknownOp)
+            (set! (unknownReported r) true))
+          (set! (tagged r) true)
+          (set! (phase r) :answered))))
+  ;; fflush, then the temp file over descriptor 1.
+  (action redirect [r req]
+    (require (= (phase r) :taken))
+    (flush)
+    (set! (stdoutTo Q) (decide (= Q r)))
+    (set! (phase r) :capturing))
+  ;; The eval runs; what it prints goes to the buffer.
+  (action evaluate [r req]
+    (require (= (phase r) :capturing))
+    (let [c (reqConn r)]
+      (when (= (reqKind r) :evalPrint)
+        (set! (buffered r) true))
+      (when (or (= (reqKind r) :evalOk) (= (reqKind r) :evalPrint))
+        (set! (valueIs r Q) (decide (= Q r)))
+        (set! (star1Is c Q) (decide (= Q r)))
+        (set! (star1SessionIs (reqSession r) Q) (decide (= Q r))))
+      (when (= (reqKind r) :evalStar1)
+        (set! (valueIs r Q) (star1Is c Q))
+        (set! (expectedIs r Q) (star1SessionIs (reqSession r) Q)))
+      (set! (phase r) :evaluated)))
+  (action endFlush [r req]
+    (require (= (phase r) :evaluated))
+    (flush)
+    (set! (phase r) :flushed))
+  ;; Descriptor 1 goes back to the backup; the temp file is read and deleted.
+  (action release [r req]
+    (require (= (phase r) :flushed))
+    (set! (stdoutTo Q) (backupTo r Q))
+    (set! (deleted r) true)
+    (if (= (reqKind r) :evalBad)
+      (do (set! (alive (reqConn r)) false)          ; the bad argument ends the connection's loop
+          (set! (busy (reqConn r)) false)
+          (set! (phase r) :lost))
+      (set! (phase r) :released)))
+  (action respond [r req]
+    (require (= (phase r) :released))
+    (when (= (reqKind r) :evalThrow)
+      (set! (errDoneTogether r) true))
+    (set! (tagged r) true)
+    (set! (busy (reqConn r)) false)
+    (set! (phase r) :answered))
+  ;; N1 every request is answered; N3 `done` comes in its own message; N4 an eval's output goes
+  ;; to its own response, and only there; N5 once no eval runs, stdout is the process's again;
+  ;; N6 *1 is the session's last value; N2 responses carry their request's id and session; N7 an
+  ;; unknown op is reported as one.
+  (safety n1_connection_survives (=> (= focus 1) (alive C)))
+  (safety n3_done_separate (=> (= focus 3) (not (errDoneTogether R))))
+  (safety n4_output_isolation
+    (=> (= focus 4) (and (=> (printedIn X R) (= X R)) (not (printedLost X)) (not (printedTerminal X)))))
+  (safety n5_stdout_restored (=> (= focus 5) (=> (forall [C conn] (not (busy C))) (not (stdoutTo Q)))))
+  (safety n6_sessions_isolated
+    (=> (= focus 6) (=> (and (= (phase R) :answered) (= (reqKind R) :evalStar1))
+                        (<=> (valueIs R Q) (expectedIs R Q)))))
+  (safety n2_responses_tagged (=> (= (phase R) :answered) (tagged R)))
+  (safety n7_unknown_op_reported
+    (=> (and (= (phase R) :answered) (= (reqKind R) :unknownOp)) (unknownReported R)))
+  ;; These hold: a connection handles one eval at a time, in order.
+  (ghost-relation inEval [r req]
+    (or (= (phase r) :taken) (= (phase r) :capturing) (= (phase r) :evaluated)
+        (= (phase r) :flushed) (= (phase r) :released)))
+  (safety one_eval_per_connection (=> (and (inEval R) (inEval Q) (= (reqConn R) (reqConn Q))) (= R Q)))
+  (safety in_order
+    (=> (and (not= (phase R) :queued) (= (reqConn Q) (reqConn R)) (le Q R)) (not= (phase Q) :queued)))
+  (safety answered_only_when_alive_or_before (=> (= (phase R) :lost) (not (alive (reqConn R)))))
+  ;; What makes them inductive: an eval in progress keeps its connection busy; only evals are
+  ;; captured; descriptor 1 and each backup point to at most one temp file.
+  (invariant eval_busy (=> (inEval R) (busy (reqConn R))))
+  (invariant only_evals_capture (=> (or (inEval R) (= (phase R) :lost)) (isEval R)))
+  (invariant stdout_single (=> (and (stdoutTo Q) (stdoutTo R)) (= Q R)))
+  (invariant backup_single (=> (and (backupTo R Q) (backupTo R X)) (= Q X))))
+
+;; Two connections, four requests, two sessions. The theories: which connection sends each
+;; request, what kind it is, its session, and focus.
+
+(def nrepl-instance {:conn 2 :req 4 :session 2})
+
+(def every-kind
+  "Connection 0 sends requests 0 and 1, connection 1 sends 2 and 3, with every
+  kind of eval; nothing is expected to fail (focus 0)."
+  {:reqConn '(fun [r] (if (< r.val 2) 0 1))
+   :reqKind '(fun [r] (if (= r.val 0) kind_t_IndT.evalPrint
+                          (if (= r.val 1) kind_t_IndT.evalStar1
+                              (if (= r.val 2) kind_t_IndT.evalPrint kind_t_IndT.evalThrow))))
+   :reqSession '(fun [r] (if (= (mod r.val 2) 0) 0 1))
+   :focus 0})
+
+(def by-property
+  "A theory per property expected to fail, with its focus."
+  {:n1 {:reqConn '(fun [_] 0)
+        :reqKind '(fun [r] (if (= r.val 0) kind_t_IndT.evalBad kind_t_IndT.evalOk))
+        :reqSession '(fun [_] 0)
+        :focus 1}
+   :n3 {:reqConn '(fun [_] 0) :reqKind '(fun [_] kind_t_IndT.evalThrow) :reqSession '(fun [_] 0) :focus 3}
+   :n4 {:reqConn '(fun [r] (if (< r.val 2) 0 1)) :reqKind '(fun [_] kind_t_IndT.evalPrint)
+        :reqSession '(fun [_] 0) :focus 4}
+   :n5 {:reqConn '(fun [r] (if (< r.val 2) 0 1)) :reqKind '(fun [_] kind_t_IndT.evalPrint)
+        :reqSession '(fun [_] 0) :focus 5}
+   :n6 {:reqConn '(fun [_] 0)
+        :reqKind '(fun [r] (if (= r.val 0) kind_t_IndT.evalOk kind_t_IndT.evalStar1))
+        :reqSession '(fun [r] (if (= r.val 0) 0 1))
+        :focus 6}})
+
+(comment
+  (println (veil/source nrepl))
+
+  ;; Everything that should hold holds, with every kind of request:
+  (veil/model-check @vs nrepl {:instance nrepl-instance :theory every-kind})
+  ;=> {:result :noViolationFound, :explored-states 8970, ...}
+
+  ;; Each property expected to fail, with its theory:
+  (into (sorted-map)
+        (for [[k theory] by-property]
+          [k (:violates (veil/model-check @vs nrepl {:instance nrepl-instance :theory theory}))]))
+  ;=> {:n1 [:n1_connection_survives], :n3 [:n3_done_separate], :n4 [:n4_output_isolation],
+  ;    :n5 [:n5_stdout_restored], :n6 [:n6_sessions_isolated]}
+
+  ;; N4: two connections, each printing. The flush at the end of r0's capture writes r0's print
+  ;; into r2's temp file:
+  (def n4 (veil/model-check @vs nrepl {:instance nrepl-instance :theory (:n4 by-property)}))
+  (mapv (juxt :action :args) (rest (:trace n4)))
+  ;=> [[:take {:c 0, :r 0}] [:take {:c 1, :r 2}] [:redirect {:r 0}] [:redirect {:r 2}]
+  ;    [:evaluate {:r 0}] [:endFlush {:r 0}]]
+  (:printedIn (:state (last (:trace n4))))
+  ;=> #{[0 2]}: r0's print is in r2's temp file
+
+  ;; N5: r2's backup is r0's temp file, saved while r0 captured; after both release, descriptor 1
+  ;; points to that deleted file, and stdout is lost:
+  (def n5 (veil/model-check @vs nrepl {:instance nrepl-instance :theory (:n5 by-property)}))
+  (mapv (juxt :action :args) (rest (:trace n5)))
+  ;=> [[:take {:c 0, :r 0}] [:redirect {:r 0}] [:take {:c 1, :r 2}] [:redirect {:r 2}]
+  ;    [:evaluate {:r 0}] [:evaluate {:r 2}] [:endFlush {:r 0}] [:endFlush {:r 2}]
+  ;    [:release {:r 0}] [:release {:r 2}] [:respond {:r 0}] [:respond {:r 2}]]
+  (select-keys (:state (last (:trace n5))) [:stdoutTo :deleted :busy])
+  ;=> {:stdoutTo #{0}, :deleted #{0 2}, :busy #{}}: no eval runs, and descriptor 1 points to r0's
+  ;   deleted temp file
+
+  ;; The reproductions on jank, which need fresh servers:
+  (println (sh "python3 repro/nrepl-concurrent-output-swap.py"))         ; N4, N5
+  (println (sh "python3 repro/nrepl-bad-argument-ends-connection.py"))   ; N1
+  (println (sh "python3 repro/nrepl-done-with-eval-error.py"))           ; N3
+  (println (sh "python3 repro/nrepl-sessions-share-star1.py"))           ; N6
+
+  ;; The proof, for any number of connections and requests: 98 obligations proven; the 7
+  ;; disproven are those of the properties expected to fail, which hold only for the focus that
+  ;; selects them.
+  (def nrepl-proof (remove :alternative-for (veil/prove @vs nrepl)))
+  (frequencies (map :status nrepl-proof))
+  ;=> {:proven 98, :disproven 7}
+  (sort (distinct (map :property (filter #(= :disproven (:status %)) nrepl-proof))))
+  ;=> (:n1_connection_survives :n3_done_separate :n4_output_isolation :n5_stdout_restored
+  ;    :n6_sessions_isolated)
+
+  ;; Without eval_busy, the reason a connection can't run two evals at once, the proof of
+  ;; one_eval_per_connection fails:
+  (def without-eval-busy
+    (update nrepl :decls (fn [decls]
+                           (vec (remove #(= ['invariant 'eval_busy] (take 2 %)) decls)))))
+  (->> (veil/prove @vs without-eval-busy)
+       (remove :alternative-for)
+       (filter #(and (= :disproven (:status %)) (= :one_eval_per_connection (:property %))))
+       (mapv :vc))
+  ;=> [:take_one_eval_per_connection]: a take could start a second eval on a busy connection,
+  ;   in a state no run reaches
+  )
+
+;;;; 4. Compiled checking, simulation and temporal properties
+;;
+;; Veil's model checker runs in Lean's interpreter by default. `:compiled` compiles it to native
+;; code first: Lean's compiler emits C for the checker and the model, leanc compiles it, and the
+;; library is loaded into this process (it's reused for the same model and options).
+;; `:parallel` splits the search into sub-tasks. veil/simulate takes random runs instead of all of
+;; them.
+;;
+;; Temporal properties are about whole runs, in linear temporal logic: `(always f)` holds in
+;; every state from now on, `(eventually f)` in some state from now on, `(state t)` is a term on
+;; one state, and `(wf a)` is weak fairness of action `a` (if it stays enabled, it's eventually
+;; taken). veil/check-temporal model checks one on an instance: it holds, or a run violates it,
+;; given as a stem of states and a loop the run repeats forever. veil/prove-temporal proves one
+;; for every run, by Lean tactics. Veil's Consensus example (Examples/Liveness/TLA/Consensus.lean):
+
+(veil/defmodel consensus Consensus
+  (set-option veil.smt.trust false)
+  (lean "open Lentil")
+  (type value)
+  (relation chosen [value])
+  (after-init (set! (chosen V) false))
+  (ghost-relation noneChosen [] (forall [v value] (not (chosen v))))
+  (ghost-relation someChosen [] (exists [v value] (chosen v)))
+  (action choose []
+    (require noneChosen)
+    (pick v value)
+    (set! (chosen v) true))
+  (action stutter [] (lean "pure ()"))
+  (safety agreement (=> (and (chosen V1) (chosen V2)) (= V1 V2)))
+  ;; If choosing is weakly fair, a value is eventually chosen.
+  (temporal success (=> (wf choose) (eventually (state someChosen))))
+  ;; Without fairness, it isn't: a run can stutter forever.
+  (temporal eventuallyChosen (eventually (state someChosen))))
+
+(def consensus-proof
+  "The proof of `success` in Veil's example: by WF1, noneChosen leads to
+  someChosen."
+  "tclear hInv
+tintro hwf
+tsuffices hleadsto :
+ ⌜fun st => (veil_term% noneChosen) st⌝ ↝ ⌜fun st => (veil_term% someChosen) st⌝ by
+  tunfold leads_to at hleadsto
+  thave himp := always_weaken hleadsto
+  tapply himp
+  tclear *- hInit
+  veil_solve_temporal
+tclear hInit
+trevert hNext hwf ; trewrite [← Lentil.and_imp]
+tapply wf1_original
+tsplit_ands
+all_goals tmonotone ; veil_solve_temporal")
+
+(comment
+  ;; The nREPL model's instance where everything holds, interpreted, then compiled (the first
+  ;; compiled call compiles, the second only runs), then in parallel:
+  (time (:explored-states (veil/model-check @vs nrepl {:instance nrepl-instance :theory every-kind})))
+  ;=> 8970, in about 1.5 s
+  (time (:explored-states (veil/model-check @vs nrepl {:instance nrepl-instance :theory every-kind
+                                                       :compiled true})))
+  ;=> 8970, in about 3.4 s, compiling included
+  (time (:explored-states (veil/model-check @vs nrepl {:instance nrepl-instance :theory every-kind
+                                                       :compiled true})))
+  ;=> 8970, in about 0.04 s
+  (time (:explored-states (veil/model-check @vs nrepl {:instance nrepl-instance :theory every-kind
+                                                       :parallel true})))
+  ;=> 8970, in about 1.3 s (interpreted; parallel sub-tasks help more on bigger instances)
+
+  ;; Random runs of NaiveAtom find the lost update too:
+  (select-keys (veil/simulate @vs naive-atom {:instance {:thread 2} :traces 100})
+               [:result :violates :traces-run])
+  ;=> {:result :foundViolation, :violates [:no_lost_update], :traces-run 3}: in a few runs
+
+  ;; Consensus with three values: success holds; eventuallyChosen doesn't.
+  (veil/check-temporal @vs consensus 'success {:instance {:value 3}})
+  ;=> {:result :holds, :explored-states 4}
+  (veil/check-temporal @vs consensus 'eventuallyChosen {:instance {:value 3}})
+  ;=> {:result :fails, :stem [{:chosen #{}}], :loop [{:chosen #{}} {:chosen #{}}]}: a run that
+  ;   stutters forever, choosing nothing
+
+  ;; success for every run and any number of values, checked by Lean's kernel:
+  (select-keys (veil/prove-temporal @vs consensus 'success consensus-proof) [:proved? :axioms])
+  ;=> {:proved? true, :axioms [propext Classical.choice Quot.sound]}: only Lean's own axioms
+  )
+
+;;;; Summary of the method
+;;
+;; 1. Write the properties from the docs, before reading the code for bugs.
+;; 2. Model each step of the code that touches shared state as an action, and model the data
+;;    layout where bugs can be.
+;; 3. Add ghost state for what the properties need (swaps, should).
+;; 4. Model check small instances. Reproduce each counterexample on jank; if it doesn't reproduce,
+;;    fix the model.
+;; 5. Prove the properties that model checking didn't violate. For each failed obligation, read
+;;    the counterexample to induction, find why its state is unreachable, and add that as an
+;;    invariant.
+;; 6. Test the model against real runs of jank.

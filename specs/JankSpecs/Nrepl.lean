@@ -41,6 +41,18 @@ stdout is modelled; stderr is captured the same way.
 The state uses only relations and enums (no `Option`), so that
 `#check_invariants` can prove what holds for any number of connections,
 requests and sessions.
+
+`fixed` turns on proposed fixes of jank, to check them before they're written:
+
+- `n1`: converting an eval's arguments is inside the handler's `try`, so a
+  bad argument gets an error response, and the connection's loop goes on.
+- `n3`: a failed eval sends `:ex` and `:status [:eval-error]`, then
+  `{:status [:done]}` in its own message, as nREPL does.
+- `n4n5`: an eval's output goes to a writer of its own (`*out*` bound for the
+  request, as Clojure's nREPL does, with `println` writing to `*out*`),
+  instead of moving file descriptor 1: the capture doesn't `dup2` or flush
+  anything, and the process's stdout is never redirected. Fixes N4 and N5.
+- `n6`: sessions are tracked, each with its own `*1`.
 -/
 
 -- The SMT solver's answers are turned into proofs which Lean's kernel checks.
@@ -56,11 +68,14 @@ open TotalOrder
 
 enum kind_t = { evalOk, evalPrint, evalThrow, evalStar1, evalBad, unknownOp, otherOp }
 enum phase_t = { queued, taken, capturing, evaluated, flushed, released, answered, lost }
+/- The proposed fixes (see above). -/
+enum fix_t = { n1, n3, n4n5, n6 }
 
 immutable function reqConn : req → conn
 immutable function reqKind : req → kind_t
 immutable function reqSession : req → session
 immutable individual focus : Nat
+immutable relation fixed : fix_t → Bool
 
 relation alive : conn → Bool
 relation busy : conn → Bool
@@ -137,7 +152,8 @@ action take (c : conn) (r : req) {
   require ∀ Q, reqConn Q = c ∧ phase Q = queued → le r Q
   if isEval r then
     busy c := true
-    backupTo r Q := stdoutTo Q
+    if ¬ fixed n4n5 then
+      backupTo r Q := stdoutTo Q
     phase r := taken
   else
     if reqKind r = unknownOp then
@@ -146,44 +162,57 @@ action take (c : conn) (r : req) {
     phase r := answered
 }
 
-/- The capture goes on: `fflush`, then the temp file over descriptor 1. -/
+/- The capture goes on: `fflush`, then the temp file over descriptor 1 (with
+the fix `n4n5`, the request's own writer is bound, and descriptor 1 is left
+alone). -/
 action redirect (r : req) {
   require phase r = taken
-  flush
-  stdoutTo Q := decide (Q = r)
+  if ¬ fixed n4n5 then
+    flush
+    stdoutTo Q := decide (Q = r)
   phase r := capturing
 }
 
-/- The eval runs, inside the capture; what it prints goes to the buffer. -/
+/- The eval runs, inside the capture; what it prints goes to the buffer (with
+the fix `n4n5`, to the request's own writer). -/
 action evaluate (r : req) {
   require phase r = capturing
   let c := reqConn r
   if reqKind r = evalPrint then
-    buffered r := true
+    if fixed n4n5 then
+      printedIn r Q := decide (Q = r)
+    else
+      buffered r := true
   if reqKind r = evalOk ∨ reqKind r = evalPrint then
     valueIs r Q := decide (Q = r)
     star1Is c Q := decide (Q = r)
     star1SessionIs (reqSession r) Q := decide (Q = r)
   if reqKind r = evalStar1 then
-    valueIs r Q := star1Is c Q
+    if fixed n6 then
+      valueIs r Q := star1SessionIs (reqSession r) Q
+    else
+      valueIs r Q := star1Is c Q
     expectedIs r Q := star1SessionIs (reqSession r) Q
   phase r := evaluated
 }
 
-/- The capture ends: `fflush`, ... -/
+/- The capture ends: `fflush`, ... (not with the fix `n4n5`) -/
 action endFlush (r : req) {
   require phase r = evaluated
-  flush
+  if ¬ fixed n4n5 then
+    flush
   phase r := flushed
 }
 
 /- ... then descriptor 1 goes back to the backup, and the temp file is read
-and deleted. -/
+and deleted (with the fix `n4n5`, the writer is read). A bad argument ends the
+connection's loop (with the fix `n1`, it's an error response). -/
 action release (r : req) {
   require phase r = flushed
-  stdoutTo Q := backupTo r Q
-  deleted r := true
-  if reqKind r = evalBad then
+  if ¬ fixed n4n5 then
+    stdoutTo Q := backupTo r Q
+    deleted r := true
+  if reqKind r = evalBad ∧ ¬ fixed n1 then
     -- The bad argument threw: the connection's loop ends.
     alive (reqConn r) := false
     busy (reqConn r) := false
@@ -192,10 +221,11 @@ action release (r : req) {
     phase r := released
 }
 
-/- The responses are written. -/
+/- The responses are written; an error comes with `done` (with the fix `n3`,
+before it). -/
 action respond (r : req) {
   require phase r = released
-  if reqKind r = evalThrow then
+  if (reqKind r = evalThrow ∨ reqKind r = evalBad) ∧ ¬ fixed n3 then
     errDoneTogether r := true
   tagged r := true
   busy (reqConn r) := false
@@ -206,16 +236,23 @@ action respond (r : req) {
 
 /- N1: every request is answered: a connection's loop doesn't end. -/
 safety [n1_connection_survives] focus = 1 → alive C
+safety [n1_fixed_connection_survives] fixed n1 → alive C
 /- N3: `done` comes in its own message, not with `eval-error`. -/
 safety [n3_done_separate] focus = 3 → ¬ errDoneTogether R
+safety [n3_fixed_done_separate] fixed n3 → ¬ errDoneTogether R
 /- N4: an eval's output goes to its own response, and only there. -/
 safety [n4_output_isolation]
   focus = 4 → ((printedIn X R → X = R) ∧ ¬ printedLost X ∧ ¬ printedTerminal X)
+safety [n4_fixed_output_isolation]
+  fixed n4n5 → ((printedIn X R → X = R) ∧ ¬ printedLost X ∧ ¬ printedTerminal X)
 /- N5: once no eval is running, stdout is the process's again. -/
 safety [n5_stdout_restored] focus = 5 → ((∀ C, ¬ busy C) → ¬ stdoutTo Q)
+safety [n5_fixed_stdout_restored] fixed n4n5 → ((∀ C, ¬ busy C) → ¬ stdoutTo Q)
 /- N6: `*1` is the session's last value. -/
 safety [n6_sessions_isolated]
   focus = 6 → (phase R = answered ∧ reqKind R = evalStar1 → (valueIs R Q ↔ expectedIs R Q))
+safety [n6_fixed_sessions_isolated]
+  fixed n6 → (phase R = answered ∧ reqKind R = evalStar1 → (valueIs R Q ↔ expectedIs R Q))
 /- N2: every response carries its request's `id` and `session`. N7: an
 unknown op is reported as one. (They hold by `response-for` and the
 `:default` handler, which the model copies; the conformance check is what
@@ -242,6 +279,12 @@ invariant [eval_busy] inEval R → busy (reqConn R)
 invariant [only_evals_capture] inEval R ∨ phase R = lost → isEval R
 invariant [stdout_single] stdoutTo Q ∧ stdoutTo R → Q = R
 invariant [backup_single] backupTo R Q ∧ backupTo R X → Q = X
+/- With the fix `n4n5`, nothing is buffered or redirected; with `n6`, an eval
+of `*1` returns what it should from the start. -/
+invariant [n4n5_fixed_unbuffered] fixed n4n5 → ¬ buffered X ∧ ¬ printedLost X ∧ ¬ printedTerminal X
+invariant [n4n5_fixed_not_redirected] fixed n4n5 → ¬ stdoutTo Q ∧ ¬ backupTo R Q
+invariant [n4n5_fixed_own_output] fixed n4n5 ∧ printedIn X R → X = R
+invariant [n6_fixed_star1] fixed n6 ∧ reqKind R = evalStar1 → (valueIs R Q ↔ expectedIs R Q)
 
 #gen_spec
 
@@ -259,10 +302,15 @@ pins the table of results, so the build fails if any of them changes. -/
 info: Initialization must establish the invariant:
   doesNotThrow ... ✅
   n1_connection_survives ... ✅
+  n1_fixed_connection_survives ... ✅
   n3_done_separate ... ✅
+  n3_fixed_done_separate ... ✅
   n4_output_isolation ... ✅
+  n4_fixed_output_isolation ... ✅
   n5_stdout_restored ... ✅
+  n5_fixed_stdout_restored ... ✅
   n6_sessions_isolated ... ✅
+  n6_fixed_sessions_isolated ... ✅
   n2_responses_tagged ... ✅
   n7_unknown_op_reported ... ✅
   one_eval_per_connection ... ✅
@@ -272,14 +320,23 @@ info: Initialization must establish the invariant:
   only_evals_capture ... ✅
   stdout_single ... ✅
   backup_single ... ✅
+  n4n5_fixed_unbuffered ... ✅
+  n4n5_fixed_not_redirected ... ✅
+  n4n5_fixed_own_output ... ✅
+  n6_fixed_star1 ... ✅
 The following set of actions must preserve the invariant and successfully terminate:
   release
     doesNotThrow ... ✅
     n1_connection_survives ... ❌
+    n1_fixed_connection_survives ... ✅
     n3_done_separate ... ✅
+    n3_fixed_done_separate ... ✅
     n4_output_isolation ... ✅
+    n4_fixed_output_isolation ... ✅
     n5_stdout_restored ... ❌
+    n5_fixed_stdout_restored ... ✅
     n6_sessions_isolated ... ✅
+    n6_fixed_sessions_isolated ... ✅
     n2_responses_tagged ... ✅
     n7_unknown_op_reported ... ✅
     one_eval_per_connection ... ✅
@@ -289,13 +346,22 @@ The following set of actions must preserve the invariant and successfully termin
     only_evals_capture ... ✅
     stdout_single ... ✅
     backup_single ... ✅
+    n4n5_fixed_unbuffered ... ✅
+    n4n5_fixed_not_redirected ... ✅
+    n4n5_fixed_own_output ... ✅
+    n6_fixed_star1 ... ✅
   redirect
     doesNotThrow ... ✅
     n1_connection_survives ... ✅
+    n1_fixed_connection_survives ... ✅
     n3_done_separate ... ✅
+    n3_fixed_done_separate ... ✅
     n4_output_isolation ... ❌
+    n4_fixed_output_isolation ... ✅
     n5_stdout_restored ... ✅
+    n5_fixed_stdout_restored ... ✅
     n6_sessions_isolated ... ✅
+    n6_fixed_sessions_isolated ... ✅
     n2_responses_tagged ... ✅
     n7_unknown_op_reported ... ✅
     one_eval_per_connection ... ✅
@@ -305,13 +371,22 @@ The following set of actions must preserve the invariant and successfully termin
     only_evals_capture ... ✅
     stdout_single ... ✅
     backup_single ... ✅
+    n4n5_fixed_unbuffered ... ✅
+    n4n5_fixed_not_redirected ... ✅
+    n4n5_fixed_own_output ... ✅
+    n6_fixed_star1 ... ✅
   endFlush
     doesNotThrow ... ✅
     n1_connection_survives ... ✅
+    n1_fixed_connection_survives ... ✅
     n3_done_separate ... ✅
+    n3_fixed_done_separate ... ✅
     n4_output_isolation ... ❌
+    n4_fixed_output_isolation ... ✅
     n5_stdout_restored ... ✅
+    n5_fixed_stdout_restored ... ✅
     n6_sessions_isolated ... ✅
+    n6_fixed_sessions_isolated ... ✅
     n2_responses_tagged ... ✅
     n7_unknown_op_reported ... ✅
     one_eval_per_connection ... ✅
@@ -321,13 +396,22 @@ The following set of actions must preserve the invariant and successfully termin
     only_evals_capture ... ✅
     stdout_single ... ✅
     backup_single ... ✅
+    n4n5_fixed_unbuffered ... ✅
+    n4n5_fixed_not_redirected ... ✅
+    n4n5_fixed_own_output ... ✅
+    n6_fixed_star1 ... ✅
   respond
     doesNotThrow ... ✅
     n1_connection_survives ... ✅
+    n1_fixed_connection_survives ... ✅
     n3_done_separate ... ❌
+    n3_fixed_done_separate ... ✅
     n4_output_isolation ... ✅
+    n4_fixed_output_isolation ... ✅
     n5_stdout_restored ... ❌
+    n5_fixed_stdout_restored ... ✅
     n6_sessions_isolated ... ❌
+    n6_fixed_sessions_isolated ... ✅
     n2_responses_tagged ... ✅
     n7_unknown_op_reported ... ✅
     one_eval_per_connection ... ✅
@@ -337,13 +421,22 @@ The following set of actions must preserve the invariant and successfully termin
     only_evals_capture ... ✅
     stdout_single ... ✅
     backup_single ... ✅
+    n4n5_fixed_unbuffered ... ✅
+    n4n5_fixed_not_redirected ... ✅
+    n4n5_fixed_own_output ... ✅
+    n6_fixed_star1 ... ✅
   evaluate
     doesNotThrow ... ✅
     n1_connection_survives ... ✅
+    n1_fixed_connection_survives ... ✅
     n3_done_separate ... ✅
+    n3_fixed_done_separate ... ✅
     n4_output_isolation ... ✅
+    n4_fixed_output_isolation ... ✅
     n5_stdout_restored ... ✅
+    n5_fixed_stdout_restored ... ✅
     n6_sessions_isolated ... ✅
+    n6_fixed_sessions_isolated ... ✅
     n2_responses_tagged ... ✅
     n7_unknown_op_reported ... ✅
     one_eval_per_connection ... ✅
@@ -353,13 +446,22 @@ The following set of actions must preserve the invariant and successfully termin
     only_evals_capture ... ✅
     stdout_single ... ✅
     backup_single ... ✅
+    n4n5_fixed_unbuffered ... ✅
+    n4n5_fixed_not_redirected ... ✅
+    n4n5_fixed_own_output ... ✅
+    n6_fixed_star1 ... ✅
   take
     doesNotThrow ... ✅
     n1_connection_survives ... ✅
+    n1_fixed_connection_survives ... ✅
     n3_done_separate ... ✅
+    n3_fixed_done_separate ... ✅
     n4_output_isolation ... ✅
+    n4_fixed_output_isolation ... ✅
     n5_stdout_restored ... ✅
+    n5_fixed_stdout_restored ... ✅
     n6_sessions_isolated ... ✅
+    n6_fixed_sessions_isolated ... ✅
     n2_responses_tagged ... ✅
     n7_unknown_op_reported ... ✅
     one_eval_per_connection ... ✅
@@ -369,6 +471,10 @@ The following set of actions must preserve the invariant and successfully termin
     only_evals_capture ... ✅
     stdout_single ... ✅
     backup_single ... ✅
+    n4n5_fixed_unbuffered ... ✅
+    n4n5_fixed_not_redirected ... ✅
+    n4n5_fixed_own_output ... ✅
+    n6_fixed_star1 ... ✅
 -/
 #guard_msgs in
 set_option veil.printCounterexamples false in
@@ -386,65 +492,113 @@ Two connections, four requests, two sessions. -/
     reqKind := fun r => match r.val with
       | 0 => kind_t_IndT.evalPrint | 1 => kind_t_IndT.evalStar1
       | 2 => kind_t_IndT.evalPrint | _ => kind_t_IndT.evalThrow,
-    reqSession := fun r => if r.val % 2 = 0 then 0 else 1, focus := 0 }
+    reqSession := fun r => if r.val % 2 = 0 then 0 else 1, focus := 0,
+    fixed := fun _ => false }
 
 -- N1: a bad eval argument ends the connection.
 #guard_msgs (drop error) in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun _ => 0,
     reqKind := fun r => if r.val = 0 then kind_t_IndT.evalBad else kind_t_IndT.evalOk,
-    reqSession := fun _ => 0, focus := 1 } (sequential := true)
+    reqSession := fun _ => 0, focus := 1,
+    fixed := fun _ => false } (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun _ => 0,
     reqKind := fun r => if r.val = 0 then kind_t_IndT.evalBad else kind_t_IndT.evalOk,
-    reqSession := fun _ => 0, focus := 1 } (sequential := true)
+    reqSession := fun _ => 0, focus := 1,
+    fixed := fun _ => false } (sequential := true)
 
 -- N3: an eval which throws.
 #guard_msgs (drop error) in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun _ => 0, reqKind := fun _ => kind_t_IndT.evalThrow,
-    reqSession := fun _ => 0, focus := 3 } (sequential := true)
+    reqSession := fun _ => 0, focus := 3,
+    fixed := fun _ => false } (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun _ => 0, reqKind := fun _ => kind_t_IndT.evalThrow,
-    reqSession := fun _ => 0, focus := 3 } (sequential := true)
+    reqSession := fun _ => 0, focus := 3,
+    fixed := fun _ => false } (sequential := true)
 
 -- N4 and N5: two connections printing at the same time.
 #guard_msgs (drop error) in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun r => if r.val < 2 then 0 else 1, reqKind := fun _ => kind_t_IndT.evalPrint,
-    reqSession := fun _ => 0, focus := 4 } (sequential := true)
+    reqSession := fun _ => 0, focus := 4,
+    fixed := fun _ => false } (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun r => if r.val < 2 then 0 else 1, reqKind := fun _ => kind_t_IndT.evalPrint,
-    reqSession := fun _ => 0, focus := 4 } (sequential := true)
+    reqSession := fun _ => 0, focus := 4,
+    fixed := fun _ => false } (sequential := true)
 
 #guard_msgs (drop error) in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun r => if r.val < 2 then 0 else 1, reqKind := fun _ => kind_t_IndT.evalPrint,
-    reqSession := fun _ => 0, focus := 5 } (sequential := true)
+    reqSession := fun _ => 0, focus := 5,
+    fixed := fun _ => false } (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun r => if r.val < 2 then 0 else 1, reqKind := fun _ => kind_t_IndT.evalPrint,
-    reqSession := fun _ => 0, focus := 5 } (sequential := true)
+    reqSession := fun _ => 0, focus := 5,
+    fixed := fun _ => false } (sequential := true)
 
 -- N6: two sessions on one connection.
 #guard_msgs (drop error) in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun _ => 0,
     reqKind := fun r => if r.val = 0 then kind_t_IndT.evalOk else kind_t_IndT.evalStar1,
-    reqSession := fun r => if r.val = 0 then 0 else 1, focus := 6 } (sequential := true)
+    reqSession := fun r => if r.val = 0 then 0 else 1, focus := 6,
+    fixed := fun _ => false } (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
   { reqConn := fun _ => 0,
     reqKind := fun r => if r.val = 0 then kind_t_IndT.evalOk else kind_t_IndT.evalStar1,
-    reqSession := fun r => if r.val = 0 then 0 else 1, focus := 6 } (sequential := true)
+    reqSession := fun r => if r.val = 0 then 0 else 1, focus := 6,
+    fixed := fun _ => false } (sequential := true)
+
+/- Each finding with its fix: no violation. -/
+
+-- N1 with `n1`.
+#model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
+  { reqConn := fun _ => 0,
+    reqKind := fun r => if r.val = 0 then kind_t_IndT.evalBad else kind_t_IndT.evalOk,
+    reqSession := fun _ => 0, focus := 1, fixed := fun f => f = fix_t_IndT.n1 }
+
+-- N3 with `n3`.
+#model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
+  { reqConn := fun _ => 0, reqKind := fun _ => kind_t_IndT.evalThrow,
+    reqSession := fun _ => 0, focus := 3, fixed := fun f => f = fix_t_IndT.n3 }
+
+-- N4 and N5 with `n4n5`.
+#model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
+  { reqConn := fun r => if r.val < 2 then 0 else 1, reqKind := fun _ => kind_t_IndT.evalPrint,
+    reqSession := fun _ => 0, focus := 4, fixed := fun f => f = fix_t_IndT.n4n5 }
+#model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
+  { reqConn := fun r => if r.val < 2 then 0 else 1, reqKind := fun _ => kind_t_IndT.evalPrint,
+    reqSession := fun _ => 0, focus := 5, fixed := fun f => f = fix_t_IndT.n4n5 }
+
+-- N6 with `n6`.
+#model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
+  { reqConn := fun _ => 0,
+    reqKind := fun r => if r.val = 0 then kind_t_IndT.evalOk else kind_t_IndT.evalStar1,
+    reqSession := fun r => if r.val = 0 then 0 else 1, focus := 6,
+    fixed := fun f => f = fix_t_IndT.n6 }
+
+-- Every request kind, with all the fixes: what held still holds.
+#model_check { conn := Fin 2, req := Fin 4, session := Fin 2 }
+  { reqConn := fun r => if r.val < 2 then 0 else 1,
+    reqKind := fun r => match r.val with
+      | 0 => kind_t_IndT.evalPrint | 1 => kind_t_IndT.evalBad
+      | 2 => kind_t_IndT.evalStar1 | _ => kind_t_IndT.evalThrow,
+    reqSession := fun r => if r.val % 2 = 0 then 0 else 1, focus := 0,
+    fixed := fun _ => true }
 
 #gen_executable
 

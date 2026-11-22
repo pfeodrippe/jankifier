@@ -4,7 +4,8 @@ import JankSpecs.Conformance.Outcomes
 /-!
 # The run-once model's outcomes
 
-For the program `conformance/concurrency/once.py` runs on jank (three threads,
+For the program the run-once conformance check ran on jank (now
+`jank-specs.conformance/check-once`, which explores the model in process; three threads,
 each dereffing a delay, delivering a promise and dereffing it, and realizing a
 lazy seq whose body throws on its first call), every outcome the model allows:
 how many times the delay's body ran and what the derefs got (`v` a value, `e`
@@ -17,14 +18,14 @@ namespace Once.Outcomes
 open Once JankSpecs.Outcomes
 
 abbrev Th := Fin 3
-abbrev St := State (FieldConcreteType Th (Fin 2) body_t_IndT dpc_t_IndT res_t_IndT)
+abbrev St := State (FieldConcreteType Th (Fin 2) body_t_IndT dpc_t_IndT res_t_IndT fix_t_IndT)
 
-def theory (b : body_t_IndT) : Theory Th (Fin 2) body_t_IndT dpc_t_IndT res_t_IndT :=
-  ⟨b, fun _ => true, 0⟩
+def thy (b : body_t_IndT) : Theory Th (Fin 2) body_t_IndT dpc_t_IndT res_t_IndT fix_t_IndT :=
+  ⟨b, fun _ => true, 0, fun _ => false⟩
 
 def sys (b : body_t_IndT) :=
   letI : Veil.LogSwitch := ⟨false⟩
-  enumerableTransitionSystem Th (Fin 2) body_t_IndT dpc_t_IndT res_t_IndT (theory b)
+  enumerableTransitionSystem Th (Fin 2) body_t_IndT dpc_t_IndT res_t_IndT fix_t_IndT (thy b)
 
 def showGot : res_t_IndT → String
   | .ok => "v"
@@ -40,7 +41,7 @@ def obs (s : St) : String :=
   s!"delay runs={s.runs} got={got.mergeSort (fun a b => decide (a ≤ b))}|promise={pv.eraseDups}|lazy calls={s.lazyCalls} errors={lazyErrs}"
 
 def onceOutcomes (b : body_t_IndT) : List String :=
-  outcomes (sys b).initStates (fun s => ((sys b).tr (theory b) s).successes.map (·.2)) reprStr obs
+  outcomes (sys b).initStates (fun s => ((sys b).tr (thy b) s).successes.map (·.2)) reprStr obs
 
 #eval onceOutcomes .returns
 #eval onceOutcomes .throws

@@ -1,0 +1,183 @@
+(ns lean-sys.session
+  "Lean in-process: import modules, elaborate commands, and call Lean functions
+  on jank values.
+
+  A session is a Lean environment, as in a file: `elab` elaborates commands
+  into it, and namespaces, options and sections stay open from one call to the
+  next. `call` calls a Lean constant, building its arguments from jank values
+  and reading its result as a jank value, by their Lean types:
+
+  | Lean                                   | jank                               |
+  |----------------------------------------|------------------------------------|
+  | `Nat`, `Int`, `UInt8`...`UInt64`, `Fin n` | integer (big integer when needed) |
+  | `Float`, `Float32`                     | double                             |
+  | `Bool`                                 | boolean                            |
+  | `String`, `Char`                       | string, character                  |
+  | `Lean.Name`                            | symbol                             |
+  | `Unit`, proofs, types                  | nil                                |
+  | `Option α`                             | nil or the value                   |
+  | `List α`, `Array α`                    | vector                             |
+  | `α × β`                                | vector of two                      |
+  | `Std.TreeMap`, `Std.ExtTreeMap`        | map                                |
+  | `Std.TreeSet`, `Std.ExtTreeSet`        | set                                |
+  | an enum (constructors without fields)  | keyword, as `:green`               |
+  | a structure                            | map of its fields, as `{:name ...}`|
+  | another inductive type                 | `{:lean/ctor :some_ctor ...fields}`, or a keyword for a constructor without fields |
+  | anything else (functions, `IO.Ref`...) | an opaque Lean value, passed back as is |
+
+  The layouts come from Lean's compiler: lean-sys elaborates a few definitions
+  into each session (`LeanSys.constShapes`) that describe how values of a type
+  are laid out at runtime, and reads and builds them from C++
+  (`lean_sys/lean_sys.hpp`).
+
+  Lean runs on a thread of its own, with a large stack; calls from any jank
+  thread wait for it. Lean values held by jank (opaque ones, sessions) are
+  released when jank's GC collects them.
+
+  `compile!` compiles a constant to native code: calls of it then run as fast
+  as Lean's compiled code, instead of in Lean's interpreter."
+  (:require [clojure.string :as string]
+            [lean-sys.core]))
+
+(cpp/raw "#include <lean_sys/jank.hpp>")
+
+(defn lake-search-path
+  "The directories of a built Lake project's modules, and of its packages'
+  modules: the search path of a session importing them."
+  [project-dir]
+  (cpp/lean_sys.jank_layer.lake_search_path (str project-dir)))
+
+(defn lake-libraries
+  "The shared libraries of a built Lake project: its packages', and its own."
+  [project-dir]
+  (cpp/lean_sys.jank_layer.lake_libraries (str project-dir)))
+
+(defn load-libraries!
+  "Loads shared libraries, each after the ones it depends on."
+  [paths]
+  (cpp/lean_sys.jank_layer.load_libraries (vec paths))
+  nil)
+
+(defn session
+  "A new session: imports `:imports` (module names, as \"Veil\"), found in
+  `:search-path` and in Lean's own library. `Lean` is always imported.
+
+  With `:lake-project` (a built Lake project's directory), the search path is
+  the project's (`lake-search-path`), and the project's libraries are loaded
+  first (`lake-libraries`), so that the modules' native code is used.
+  Otherwise Lean interprets the code of modules whose library isn't loaded,
+  which is much slower."
+  [{:keys [lake-project search-path imports]}]
+  (when lake-project
+    (load-libraries! (lake-libraries lake-project)))
+  (cpp/lean_sys.jank_layer.new_session (vec (concat search-path
+                                                    (when lake-project
+                                                      (lake-search-path lake-project))))
+                                       (vec (map str imports))))
+
+(defn errors
+  "The errors among `messages`."
+  [messages]
+  (filterv #(= :error (:severity %)) messages))
+
+(defn elab
+  "Elaborates `text` (commands, as in a file) into the session. Returns its
+  messages, as `{:severity :info :line 3 :column 0 :text \"...\"}`, with
+  `:severity` `:info`, `:warning` or `:error`."
+  ([s text]
+   (elab s text {}))
+  ([s text {:keys [file] :or {file "<jank>"}}]
+   (cpp/lean_sys.jank_layer.elab s (str text) (str file))))
+
+(defn elab!
+  "As `elab`, but throws when there are errors (the messages are in the
+  exception's data)."
+  ([s text]
+   (elab! s text {}))
+  ([s text opts]
+   (let [messages (elab s text opts)]
+     (when (seq (errors messages))
+       (throw (ex-info (str "Lean: "
+                            (string/join "\n" (map (fn [m]
+                                                     (str (:line m) ":" (:column m) ": " (:text m)))
+                                                   (errors messages))))
+                       {:messages messages})))
+     messages)))
+
+(defn call
+  "Calls Lean constant `name` (a string or symbol) on `args`: its value, when
+  it has no parameters. Arguments are given for the parameters that aren't
+  types or proofs. An `IO` action is run."
+  [s name & args]
+  (cpp/lean_sys.jank_layer.call s (str name) (vec args)))
+
+(defn arity
+  "How many arguments `call` takes for `name`."
+  [s name]
+  (cpp/lean_sys.jank_layer.arity s (str name)))
+
+(defn function
+  "A jank function calling Lean constant `name`."
+  [s name]
+  (fn [& args]
+    (apply call s name args)))
+
+(defn compile!
+  "Compiles Lean constant `name` to native code, with the definitions of the
+  session it uses: Lean's compiler emits C, the toolchain's clang builds a
+  shared library in `:cache-dir` (a library for the same code is reused), and
+  the library is loaded into this process (`:cache-dir` defaults to
+  `$TMPDIR/lean-sys`). Calls of `name` (`call`, `function`) then run the native
+  code; their arguments and results don't change. Compiling takes seconds to
+  minutes, depending on the code's size."
+  ([s name]
+   (compile! s name {}))
+  ([s name {:keys [cache-dir]}]
+   (cpp/lean_sys.jank_layer.compile s (str name) (str cache-dir))
+   nil))
+
+(defn released-count
+  "How many Lean values (and sessions) jank has released so far: those whose
+  jank box its GC collected."
+  []
+  (cpp/lean_sys.jank_layer.released_count))
+
+(defn collect!
+  "Runs jank's GC and releases the Lean values it found unreachable."
+  []
+  (cpp/lean_sys.jank_layer.collect)
+  nil)
+
+(def ^:private eval-counter (atom 0))
+
+(defn axioms
+  "The axioms Lean constant `name` depends on, as symbols: `sorryAx` when its
+  proof has a `sorry`, an axiom of its own when it trusts compiled code
+  (`native_decide` adds `<name>._native.native_decide.ax_1`); otherwise only
+  Lean's own (`propext`, `Classical.choice`, `Quot.sound`)."
+  [s name]
+  (lean-sys.session/call s "LeanSys.axiomsOf" (symbol (str name))))
+
+(defn prove-theorem
+  "Elaborates `theorem <name> : <statement> := <proof>` in the session: a proof
+  term, or `by` and tactics. Returns `{:proved? true :name name :axioms [...]
+  :messages [...]}`: proved when it elaborates without errors, Lean's kernel
+  accepts it, and it has no `sorry`. `:name` defaults to a fresh one."
+  ([s statement proof]
+   (prove-theorem s statement proof {}))
+  ([s statement proof {:keys [name]}]
+   (let [n (or (some-> name str) (str "_lean_sys_theorem_" (swap! eval-counter inc)))
+         messages (elab s (str "theorem " n " : " statement " :=\n" proof))
+         ok? (empty? (errors messages))
+         axioms (when ok? (axioms s n))]
+     {:proved? (boolean (and ok? (not (some #{'sorryAx} axioms))))
+      :name (symbol n)
+      :axioms (vec axioms)
+      :messages messages})))
+
+(defn evaluate
+  "The value of Lean term `term` (a string), elaborated in the session."
+  [s term]
+  (let [n (str "_lean_sys_eval_" (swap! eval-counter inc))]
+    (elab! s (str "def " n " :=\n" term))
+    (call s n)))

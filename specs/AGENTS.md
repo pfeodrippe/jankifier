@@ -22,6 +22,15 @@ was hit while building them, with Veil `v4.35.0` and jank 0.1.
   `#model_check` with that `focus`. The proofs stay sound because with
   `focus = 0` those properties hold trivially and no action reads `focus`; the
   comment next to `#check_invariants` says so.
+- A fix of a finding is modelled before it's written in jank: a value of the
+  model's `enum fix_t`, and `immutable relation fixed : fix_t → Bool` in its
+  theory, which the changed actions read. Each finding's property gets a
+  `#model_check` with its fix (no violation expected), and, where the model
+  has proofs, a property `fixed x → ...` in the pinned table. Every theory
+  has `fixed`: in Lean files `fixed := fun _ => false` is jank as it is; from
+  jank, `:fixed (h/fixed-term [])`. Adding an enum adds a type argument to
+  `Theory`, `State`, `Label` and `enumerableTransitionSystem` in the
+  checkers.
 - Proofs are kernel-checked (`set_option veil.smt.trust false` at the top of
   the file), and the `#check_invariants` table is pinned with `#guard_msgs`
   (unless a row can time out, see below), so the build fails when a proof
@@ -29,8 +38,8 @@ was hit while building them, with Veil `v4.35.0` and jank 0.1.
 - Every finding has a reproduction in [repro/](repro/README.md): a `.cljc`
   that runs on jank and Clojure when possible; nondeterministic ones run many
   times and print how often the bug showed up.
-- jank runs in scratch directories (`scratch_dir` in
-  `conformance/lib/jank_harness.py`, under the ignored `conformance/out/`),
+- jank runs in scratch directories (`scratch-dir` in
+  `src/jank_specs/harness.jank`, under the ignored `conformance/out/`),
   because `jank repl` writes `.nrepl-port` in its directory.
 
 ## Veil: writing models
@@ -91,6 +100,28 @@ was hit while building them, with Veil `v4.35.0` and jank 0.1.
 | A crash calling Lean from a future | Register the thread first (`lean_initialize_thread`); lean-sys's helpers do it |
 | The build script can't run Lake | The sandbox can't reach `~/.elan`: build the Lean side before `lein run` |
 | `Could not locate jank/build/util` in a dependency's build script | A lein-jank issue: it gives a dependency's build script an empty classpath (no `jank-build`) when the dependency comes from a profile's `:dependencies`. To be fixed in lein-jank, not worked around in the packages |
+| A crash right after calling a compiled Lean function from C++ | Signatures come from Lean's IR (`IR.findEnvDecl`): erased parameters (types, proofs, the `IO` world) are still passed, as `lean_box(0)`; a `BaseIO` function returns its value, an `IO` one an ok/error object; `@&` parameters are borrowed |
+| Where a Lean value's fields are, when reading it from C++ | Constructor layouts come from the compiler (`Lean.Compiler.LCNF.getCtorLayout`): objects first, then usize, then scalars by size; a structure with one relevant field is that field (`hasTrivialStructure?`), so `Fin n` is a `Nat` and `Std.ExtTreeMap` is its tree |
+| A library compiled from Lean's emitted C exports nothing | `LEAN_EXPORT` marks symbols visible only with `-DLEAN_EXPORTING`; compile with `leanc -c` (the toolchain's `clang` alone has no system headers) and link with `cc -shared -undefined dynamic_lookup`, not `leanc`, which would link a second copy of Lean's runtime |
+| A value with one constructor and one field reads as the field | Lean represents it as the field; lean-sys keeps the constructor and field of an inductive type (a Veil label type with one action) and the field's name of a structure defined in the session (a Veil state with one field), not a library structure's (`Fin`) |
+| `lein test` (or a program) ends with SIGSEGV and no output | RESULTS S1: jank crashes at exit after printing an exception, and the buffered output is lost; fix the failing test, or run the tests in a REPL to see them |
+| `native_decide` doesn't show `Lean.ofReduceBool` among a theorem's axioms | Lean 4.35 adds an axiom of its own, `<theorem>._native.native_decide.ax_1` |
+| `(catch :default e ...)` gets `nil` | jank 0.1 binds nothing there; `(catch jank.runtime.object_ref e ...)` gets the `ex-info` (lean-sys turns its C++ errors into `ex-info`s) |
+
+## Veil from jank (`veil`)
+
+| Symptom | Cause, and what to do |
+|---|---|
+| `failed to synthesize ... EnumClass` in a term built outside the module | The module's enum instances are scoped to its namespace: elaborate the term inside `open Veil M in` |
+| `unexpected token 'theory'` (or `'action'`) in Lean code elaborated after `import Veil` | Veil makes `theory` and `action` keywords (and `trace` in modules), even as structure fields: rename them |
+| A counterexample to induction without a post-state | The primary (weakest-precondition) condition's counterexample has none; its `_tr` alternative's has one (`veil/prove` takes it from there) |
+| `Unknown identifier veilInst.thread` in a quotation | The quotation's `let` binder is hygienic: use `mkIdent` for the binder too |
+| `verification interrupted: specification owner was canceled` | Veil ties a module's proof run to the info tree of the command that prepared it: a session must keep earlier info trees alive (lean-sys does) |
+| `... has already been declared` when a model or file is loaded again | Modules can't be redeclared in a session: veil loads it again under a name with a number |
+| `#model_check` in a loaded file takes minutes | Veil's default mode also builds a compiled checker with Lake; `VEIL_ONLINE_ENV` (veil sets it) keeps it interpreted |
+| A theory or instance term elaborated while another module is open doesn't type-check (`kind_t_IndT` against `veilInst.kind_t`) | Names resolve in the open module's namespace first; veil's elaborators make the checked module's namespace the current one |
+| Exploring a model's states from jank, step by step, is slow | Each step converts the state between Lean and jank; `veil/reachable-states` searches in Lean and returns the states once |
+| `#check_invariants`'s rows with no status | They are Veil's alternative formulations (`_tr`), tried only when the primary fails: count them with their primary (`veil/proved?`) |
 
 ## jank, when writing test programs
 
@@ -105,4 +136,10 @@ was hit while building them, with Veil `v4.35.0` and jank 0.1.
 | A deadlocked thread keeps the process alive | End with `(cpp/_exit 0)` |
 | The same program on jank and Clojure | A `.cljc` with `#?(:jank ... :clj ...)`: `jank run --module-path . x.cljc`, `clojure -Sdeps '{:paths ["."]}' -M x.cljc` |
 | Clojure fails compiling a big generated form jank takes | A method is too large: generate one top-level form per run |
+| A sum or product of numbers is wrong, with no error | RESULTS S10: arithmetic on two integers that fit in 32 bits wraps at 32 bits. Do it in C++ (`cpp/raw`) when it can pass 2^31 |
+| `(if c 1 true)` returns `1` | RESULTS S7: don't mix a number literal and a boolean literal in the branches of one `if` |
+| `case` with a `true`, `false` or number default doesn't compile when the function is first called | RESULTS S8: give every value a branch, or make the default a non-literal |
+| `(- (count x) n)` is huge, or compares wrongly | RESULTS S9: `count`'s arithmetic is unsigned; compare before subtracting (`h/tail`) |
+| `(first (sort []))` crashes | RESULTS S5: check `seq` before sorting what can be empty |
+| An optional regex group is `""` | RESULTS S6: jank gives `""` where Clojure gives `nil`; test with `seq` |
 | Reading jank's internals (binding frames, thread ids) | `cpp/raw` a C++ function over `jank::runtime::__rt_ctx` (`repro/binding-frames-never-freed.jank`) |

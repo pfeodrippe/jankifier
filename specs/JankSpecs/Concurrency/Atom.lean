@@ -23,6 +23,12 @@ Each thread runs a small program, from the theory: some `swap!`s, then
 optionally one `compare-and-set!` of what it last saw to that plus 10, or one
 `reset!`.
 
+`fixed` turns on a proposed fix of jank, to check it before it's written:
+
+- `c2`: `compare-and-set!` uses `compare_exchange_strong`, which fails only
+  when the value doesn't match. (`swap!` can keep the weak one: a spurious
+  failure there only costs a retry.)
+
 The state uses only relations, functions and numbers (the watch's calls are a
 numbered log, not a list), so that `#check_invariants` can prove C1 for any
 number of threads and `swap!`s.
@@ -39,6 +45,8 @@ each (the instances use `Fin n`, from 0, adding 1). -/
 type slot
 
 enum pc_t = { idle, loaded, notifying, resetting, done }
+/- The proposed fixes (see above). -/
+enum fix_t = { c2 }
 
 /- Each thread's program: how many `swap!`s, then `compare-and-set!`
 (`casAfter`) or `reset!` to `resetTo t` (`resetAfter`), or nothing. -/
@@ -49,6 +57,7 @@ immutable function resetTo : thread → Nat
 immutable individual focus : Nat
 immutable individual firstSlot : slot
 immutable function slotAfter : slot → slot
+immutable relation fixed : fix_t → Bool
 
 individual value : Nat
 function pc : thread → pc_t
@@ -146,11 +155,12 @@ action notify (t : thread) {
 }
 
 /- After its `swap!`s, `compare-and-set!` from the value it last saw (its last
-swap's result) to that plus 10: one `compare_exchange_weak`. -/
+swap's result) to that plus 10: one `compare_exchange_weak`, or with the fix
+`c2`, one `compare_exchange_strong`, which doesn't fail spuriously. -/
 action cas (t : thread) (spurious : Bool) {
   require (pc t = idle ∨ pc t = done) ∧ swapsDone t = swaps t ∧ casAfter t ∧ ¬ casDone t
   casDone t := true
-  if value = lastSwap t ∧ ¬ spurious then
+  if value = lastSwap t ∧ (¬ spurious ∨ fixed c2) then
     value := lastSwap t + 10
     casOk t := true
     record (lastSwap t) (lastSwap t + 10)
@@ -185,6 +195,8 @@ safety [c1_swap_results_increase]
   (∀ T, ¬ casAfter T ∧ ¬ resetAfter T) → ¬ returnedStale
 /- C2: `compare-and-set!` succeeds when the atom holds the expected value. -/
 safety [c2_cas_succeeds_on_match] focus = 2 → ¬ casSpurious T
+/- C2 with the fix. -/
+safety [c2_fixed_cas_succeeds_on_match] fixed c2 → ¬ casSpurious T
 /- The watch sees the updates in order: each call's old value is the previous
 call's new value. Not a requirement: `add-watch`'s docstring says the state may
 have changed again before the call, and that watch fns may be called from
@@ -217,6 +229,7 @@ info: Initialization must establish the invariant:
   c1_swaps_are_atomic ... ✅
   c1_swap_results_increase ... ✅
   c2_cas_succeeds_on_match ... ✅
+  c2_fixed_cas_succeeds_on_match ... ✅
   watch_calls_chain ... ✅
   c1_max_returned ... ✅
   resetting_resets ... ✅
@@ -226,6 +239,7 @@ The following set of actions must preserve the invariant and successfully termin
     c1_swaps_are_atomic ... ✅
     c1_swap_results_increase ... ✅
     c2_cas_succeeds_on_match ... ✅
+    c2_fixed_cas_succeeds_on_match ... ✅
     watch_calls_chain ... ✅
     c1_max_returned ... ✅
     resetting_resets ... ✅
@@ -234,6 +248,7 @@ The following set of actions must preserve the invariant and successfully termin
     c1_swaps_are_atomic ... ✅
     c1_swap_results_increase ... ✅
     c2_cas_succeeds_on_match ... ✅
+    c2_fixed_cas_succeeds_on_match ... ✅
     watch_calls_chain ... ❌
     c1_max_returned ... ✅
     resetting_resets ... ✅
@@ -242,6 +257,7 @@ The following set of actions must preserve the invariant and successfully termin
     c1_swaps_are_atomic ... ✅
     c1_swap_results_increase ... ✅
     c2_cas_succeeds_on_match ... ✅
+    c2_fixed_cas_succeeds_on_match ... ✅
     watch_calls_chain ... ❌
     c1_max_returned ... ✅
     resetting_resets ... ✅
@@ -250,6 +266,7 @@ The following set of actions must preserve the invariant and successfully termin
     c1_swaps_are_atomic ... ✅
     c1_swap_results_increase ... ✅
     c2_cas_succeeds_on_match ... ✅
+    c2_fixed_cas_succeeds_on_match ... ✅
     watch_calls_chain ... ✅
     c1_max_returned ... ✅
     resetting_resets ... ✅
@@ -258,6 +275,7 @@ The following set of actions must preserve the invariant and successfully termin
     c1_swaps_are_atomic ... ✅
     c1_swap_results_increase ... ✅
     c2_cas_succeeds_on_match ... ❌
+    c2_fixed_cas_succeeds_on_match ... ✅
     watch_calls_chain ... ❌
     c1_max_returned ... ✅
     resetting_resets ... ✅
@@ -266,6 +284,7 @@ The following set of actions must preserve the invariant and successfully termin
     c1_swaps_are_atomic ... ✅
     c1_swap_results_increase ... ✅
     c2_cas_succeeds_on_match ... ✅
+    c2_fixed_cas_succeeds_on_match ... ✅
     watch_calls_chain ... ✅
     c1_max_returned ... ✅
     resetting_resets ... ✅
@@ -280,29 +299,41 @@ set_option veil.violationIsError false in
 -- Two threads with two `swap!`s each: no lost update.
 #model_check { thread := Fin 2, slot := Fin 6 }
   { swaps := fun _ => 2, casAfter := fun _ => false, resetAfter := fun _ => false,
-    resetTo := fun _ => 0, focus := 0, firstSlot := 0, slotAfter := fun i => i + 1 }
+    resetTo := fun _ => 0, focus := 0, firstSlot := 0, slotAfter := fun i => i + 1,
+    fixed := fun _ => false }
 
 -- C2, on its own: `compare_exchange_weak` can fail with the expected value.
 #guard_msgs (drop error) in
 #model_check interpreted { thread := Fin 1, slot := Fin 6 }
   { swaps := fun _ => 1, casAfter := fun _ => true, resetAfter := fun _ => false,
-    resetTo := fun _ => 0, focus := 2, firstSlot := 0, slotAfter := fun i => i + 1 } (sequential := true)
+    resetTo := fun _ => 0, focus := 2, firstSlot := 0, slotAfter := fun i => i + 1,
+    fixed := fun _ => false } (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check interpreted { thread := Fin 1, slot := Fin 6 }
   { swaps := fun _ => 1, casAfter := fun _ => true, resetAfter := fun _ => false,
-    resetTo := fun _ => 0, focus := 2, firstSlot := 0, slotAfter := fun i => i + 1 } (sequential := true)
+    resetTo := fun _ => 0, focus := 2, firstSlot := 0, slotAfter := fun i => i + 1,
+    fixed := fun _ => false } (sequential := true)
+
+-- C2 with the fix: no violation, with two threads doing a `swap!` and then
+-- `compare-and-set!`.
+#model_check interpreted { thread := Fin 2, slot := Fin 6 }
+  { swaps := fun _ => 1, casAfter := fun _ => true, resetAfter := fun _ => false,
+    resetTo := fun _ => 0, focus := 2, firstSlot := 0, slotAfter := fun i => i + 1,
+    fixed := fun _ => true } (sequential := true)
 
 -- Watch order, on its own: two threads' `swap!`s notify out of order.
 #guard_msgs (drop error) in
 #model_check interpreted { thread := Fin 2, slot := Fin 6 }
   { swaps := fun _ => 1, casAfter := fun _ => false, resetAfter := fun _ => false,
-    resetTo := fun _ => 0, focus := 3, firstSlot := 0, slotAfter := fun i => i + 1 } (sequential := true)
+    resetTo := fun _ => 0, focus := 3, firstSlot := 0, slotAfter := fun i => i + 1,
+    fixed := fun _ => false } (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check interpreted { thread := Fin 2, slot := Fin 6 }
   { swaps := fun _ => 1, casAfter := fun _ => false, resetAfter := fun _ => false,
-    resetTo := fun _ => 0, focus := 3, firstSlot := 0, slotAfter := fun i => i + 1 } (sequential := true)
+    resetTo := fun _ => 0, focus := 3, firstSlot := 0, slotAfter := fun i => i + 1,
+    fixed := fun _ => false } (sequential := true)
 
 #gen_executable
 

@@ -1,0 +1,252 @@
+(ns jank-specs.conformance.arraymap
+  "Conformance of jank's array maps with JankSpecs/Blind/ArrayMap.lean, step by
+  step.
+
+  Random programs of `{}`, `assoc`, `dissoc`, `transient`, `assoc!`, `dissoc!`
+  and `persistent!` over the keys and values 0 and 1, run in one `jank run`;
+  at the end, every persistent map is printed entry by entry, in the order
+  jank stores them (`(vec (map vec m))`). `ArrayMap.Replay.replay`
+  (JankSpecs/Conformance/ArrayMapReplay.lean) runs each program through the
+  model, which must print exactly the same: the same entries, and the same
+  corruption where the storage is shared (RESULTS A1).
+
+  Programs are built with a copy of the model's steps (below), so that every
+  step is one the model allows; new objects and arrays take the lowest unused
+  number, as the replay expects.
+
+  With `:fixes [:a1]`, programs follow the fixed model (`transient` copies the
+  array, `toTransientCopy`), and jank's maps must be what it predicts: none
+  corrupted. That's what jank should print once the fix is written."
+  (:require [clojure.string :as string]
+            [jank-specs.harness :as h]))
+
+(def n-objs 8)
+(def n-bufs 12)
+(def n-slots 3)
+
+;; The model's steps (ArrayMap.lean). An object is {:persistent :active :buf :len :cap}; a buffer
+;; is n-slots [k v] cells; `logical` is what each object should hold.
+
+(defn- free-obj
+  [st]
+  (first (remove (:objs st) (range n-objs))))
+
+(defn- free-buf
+  [st]
+  (first (remove (:bufs st) (range n-bufs))))
+
+(defn- first-slot
+  [st o k]
+  (let [{:keys [buf len]} (get-in st [:objs o])]
+    (first (filter #(= k (get-in st [:bufs buf % 0])) (range len)))))
+
+(defn- new-empty
+  [st o b]
+  (-> st
+      (assoc-in [:bufs b] (vec (repeat n-slots [0 0])))
+      (assoc-in [:objs o] {:persistent true :active false :buf b :len 0 :cap 0})
+      (assoc-in [:logical o] {})))
+
+(defn- p-assoc
+  [st p k v q b]
+  (let [d (get-in st [:objs p])
+        src (get-in st [:bufs (:buf d)])
+        i (first-slot st p k)
+        st (assoc-in st [:logical q] (assoc (get-in st [:logical p]) k v))]
+    (if (some? i)
+      (-> st
+          (assoc-in [:bufs b] (assoc-in src [i 1] v))
+          (assoc-in [:objs q] {:persistent true :active false :buf b :len (:len d) :cap (:cap d)}))
+      (-> st
+          (assoc-in [:bufs b] (assoc src (:len d) [k v]))
+          (assoc-in [:objs q] {:persistent true :active false :buf b :len (inc (:len d))
+                               :cap (max (:cap d) (inc (:len d)))})))))
+
+(defn- shift-out
+  "Cells with the one at i removed by shifting the next ones left (the last
+  one stays)."
+  [cells i n]
+  (reduce (fn [cs j] (assoc cs j (nth cells (inc j)))) cells (range i (dec n))))
+
+(defn- p-dissoc
+  [st p k q b]
+  (let [d (get-in st [:objs p])
+        src (get-in st [:bufs (:buf d)])
+        i (first-slot st p k)
+        st (assoc-in st [:logical q] (dissoc (get-in st [:logical p]) k))]
+    (-> st
+        (assoc-in [:bufs b] (if (some? i) (shift-out src i (:len d)) src))
+        (assoc-in [:objs q] {:persistent true :active false :buf b
+                             :len (if (some? i) (dec (:len d)) (:len d)) :cap (:cap d)}))))
+
+(defn- to-transient
+  [st p t]
+  (let [d (get-in st [:objs p])]
+    (-> st
+        (assoc-in [:logical t] (get-in st [:logical p]))
+        (assoc-in [:objs t] (assoc d :persistent false :active true)))))
+
+(defn- to-transient-copy
+  "`transient` with the fix `a1`: the transient gets a copy of the array, `b`."
+  [st p t b]
+  (let [d (get-in st [:objs p])]
+    (-> st
+        (assoc-in [:bufs b] (get-in st [:bufs (:buf d)]))
+        (assoc-in [:logical t] (get-in st [:logical p]))
+        (assoc-in [:objs t] (assoc d :buf b :persistent false :active true)))))
+
+(defn- t-assoc
+  [st t k v b]
+  (let [d (get-in st [:objs t])
+        i (first-slot st t k)
+        st (assoc-in st [:logical t k] v)]
+    (cond
+      (some? i) (assoc-in st [:bufs (:buf d) i 1] v)
+      (< (:len d) (:cap d)) (-> st
+                                (assoc-in [:bufs (:buf d) (:len d)] [k v])
+                                (update-in [:objs t :len] inc))
+      :else (-> st
+                (assoc-in [:bufs b] (assoc (get-in st [:bufs (:buf d)]) (:len d) [k v]))
+                (update-in [:objs t] assoc :buf b :len (inc (:len d)) :cap (inc (:len d)))))))
+
+(defn- t-dissoc
+  [st t k]
+  (let [d (get-in st [:objs t])
+        i (first-slot st t k)
+        st (update-in st [:logical t] dissoc k)]
+    (if (some? i)
+      (-> st
+          (update-in [:bufs (:buf d)] shift-out i (:len d))
+          (update-in [:objs t :len] dec))
+      st)))
+
+(defn- persistent-t
+  [st t q]
+  (let [d (get-in st [:objs t])]
+    (-> st
+        (assoc-in [:logical q] (get-in st [:logical t]))
+        (assoc-in [:objs t :active] false)
+        (assoc-in [:objs q] (assoc d :persistent true :active false)))))
+
+(defn random-program
+  "`{:labels :forms :persistent :logical}`: the model's labels, the program's
+  let bindings, and the persistent maps with what they should hold; with
+  `copy?`, of the model with the fix `a1`."
+  [r copy?]
+  (let [o (free-obj {:objs {}})
+        b (free-buf {:bufs {}})
+        start {:st (new-empty {:objs {} :bufs {} :logical {}} o b)
+               :labels [{:lean/ctor :newEmpty :o o :b b}]
+               :forms [(str "o" o " {}")]}
+        {:keys [st labels forms]}
+        (loop [n (h/rand-between! r 3 12)
+               {:keys [st] :as acc} start]
+          (if (zero? n)
+            acc
+            (let [o (free-obj st)
+                  b (free-buf st)
+                  pers (vec (sort (keep (fn [[x d]] (when (:persistent d) x)) (:objs st))))
+                  act (vec (sort (keep (fn [[x d]] (when (:active d) x)) (:objs st))))
+                  options (cond-> []
+                            (and o b) (into [:passoc :passoc :pdissoc])
+                            o (into [:transient :transient])
+                            (seq act) (into [:tassoc :tassoc :tassoc :tdissoc])
+                            (and (seq act) o) (conj :persistent))
+                  k (h/rand-int! r 2)
+                  v (h/rand-int! r 2)]
+              (if (empty? options)
+                acc
+                (let [step (fn [st label form] {:st st
+                                                :labels (conj (:labels acc) label)
+                                                :forms (conj (:forms acc) form)})]
+                  (recur
+                   (dec n)
+                   (case (h/rand-nth! r options)
+                     :passoc (let [ps (filterv #(< (get-in st [:objs % :len]) n-slots) pers)]
+                               (if (empty? ps)
+                                 acc
+                                 (let [p (h/rand-nth! r ps)]
+                                   (step (p-assoc st p k v o b)
+                                         {:lean/ctor :pAssoc :p p :k k :v v :q o :b b}
+                                         (str "o" o " (assoc o" p " " k " " v ")")))))
+                     :pdissoc (let [p (h/rand-nth! r pers)]
+                                (step (p-dissoc st p k o b)
+                                      {:lean/ctor :pDissoc :p p :k k :q o :b b}
+                                      (str "o" o " (dissoc o" p " " k ")")))
+                     :transient (let [p (h/rand-nth! r pers)]
+                                  (cond
+                                    (not copy?) (step (to-transient st p o)
+                                                      {:lean/ctor :toTransient :p p :t o}
+                                                      (str "o" o " (transient o" p ")"))
+                                    b (step (to-transient-copy st p o b)
+                                            {:lean/ctor :toTransientCopy :p p :t o :b b}
+                                            (str "o" o " (transient o" p ")"))
+                                    :else acc))
+                     :tassoc (let [ts (filterv #(< (get-in st [:objs % :len]) n-slots) act)]
+                               (if (or (empty? ts) (nil? b))
+                                 acc
+                                 (let [t (h/rand-nth! r ts)]
+                                   (step (t-assoc st t k v b)
+                                         {:lean/ctor :tAssoc :t t :k k :v v :b b}
+                                         (str "_ (assoc! o" t " " k " " v ")")))))
+                     :tdissoc (let [t (h/rand-nth! r act)]
+                                (step (t-dissoc st t k)
+                                      {:lean/ctor :tDissoc :t t :k k}
+                                      (str "_ (dissoc! o" t " " k ")")))
+                     (let [t (h/rand-nth! r act)]
+                       (step (persistent-t st t o)
+                             {:lean/ctor :persistentT :t t :q o}
+                             (str "o" o " (persistent! o" t ")"))))))))))
+        persistent (vec (sort (keep (fn [[x d]] (when (:persistent d) x)) (:objs st))))]
+    {:labels labels
+     :forms forms
+     :persistent persistent
+     :logical (select-keys (:logical st) persistent)}))
+
+(defn check
+  ([]
+   (check {}))
+  ([{:keys [programs seed fixes] :or {programs 500 seed 1}}]
+   (h/load-lean! "JankSpecs/Blind/ArrayMap.lean" "JankSpecs/Conformance/ArrayMapReplay.lean")
+   (let [r (h/rng seed)
+         copy? (contains? (set fixes) :a1)
+         progs (vec (repeatedly programs #(random-program r copy?)))
+         work (h/scratch-dir "arraymap-")]
+     (h/write-file! (str work "/arraymap_scenario.jank")
+                    (string/join
+                     "\n"
+                     (concat ["(ns arraymap-scenario)"]
+                             (map-indexed
+                              (fn [n {:keys [forms persistent]}]
+                                (str "(let [" (string/join " " forms) "] (println \"MAPS " n "\" (pr-str ["
+                                     (string/join " " (map #(str "[" % " (vec (map vec o" % "))]") persistent))
+                                     "])))"))
+                              progs)
+                             [""])))
+     (let [{:keys [exit out]} (h/run-jank ["run" "arraymap_scenario.jank"] work 3600)
+           printed (into {}
+                         (keep (fn [line]
+                                 (when-let [[_ n maps] (re-find #"^MAPS (\d+) (.*)$" line)]
+                                   [(parse-long n) (read-string maps)]))
+                               (string/split-lines out)))]
+       (when-not (and (= 0 exit) (= programs (count printed)))
+         (throw (ex-info "the jank program failed" {:out out})))
+       (let [results (vec (map-indexed
+                           (fn [n {:keys [labels logical]}]
+                             (let [maps (get printed n)
+                                   replay (h/except (h/call "ArrayMap.Replay.replay" labels
+                                                            (mapv (fn [[o entries]] [o (pr-str entries)]) maps)
+                                                            (vec fixes)))
+                                   corrupted? (some (fn [[o entries]]
+                                                      (not= (sort entries) (sort (map vec (get logical o)))))
+                                                    maps)]
+                               {:scenario (str "program-" n)
+                                :result (if (contains? replay :ok) :conforms (:error replay))
+                                :corrupted? (boolean corrupted?)}))
+                           progs))]
+         {:harness "arraymap"
+          :work work
+          :ok? (every? #(= :conforms (:result %)) results)
+          :programs programs
+          :corrupted (count (filter :corrupted? results))
+          :failures (vec (remove #(= :conforms (:result %)) results))})))))

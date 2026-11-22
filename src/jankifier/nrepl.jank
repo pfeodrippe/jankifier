@@ -20,7 +20,8 @@
   It's a development tool which uses jank's own nREPL server namespaces, so
   only require it in a REPL, e.g. right after connecting:
 
-    (require 'jankifier.nrepl)"
+    (require 'jankifier.nrepl)
+  "
   (:require [clojure.string :as string]
             [clojure.test :as test]
             [jank.nrepl.server.capture :refer [with-capture]]

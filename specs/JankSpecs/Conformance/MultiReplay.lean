@@ -4,7 +4,7 @@ import Std.Data.HashSet
 /-!
 # Replaying multimethod programs through the model
 
-`conformance/multi/run.py` runs random programs of `derive`, `defmethod`,
+`jank-specs.conformance.multi` runs random programs of `derive`, `defmethod`,
 `prefer-method` and calls on jank (and on Clojure). `checkProgram` follows a
 program through the model: setup steps are actions; for each call it explores
 every order of the method table (`visit`) to the call's end, and jank's result
@@ -19,15 +19,21 @@ namespace Multi.Replay
 open Multi
 
 abbrev D := Fin 5
-abbrev L := Label D phase_t_IndT res_t_IndT
-abbrev St := State (FieldConcreteType D phase_t_IndT res_t_IndT)
+abbrev L := Label D phase_t_IndT res_t_IndT fix_t_IndT
+abbrev St := State (FieldConcreteType D phase_t_IndT res_t_IndT fix_t_IndT)
 
-def theory : Theory D phase_t_IndT res_t_IndT :=
-  { defaultVal := 4, maxSetups := 16, maxPrefs := 8, focus := 0 }
+/-- The theory with the proposed fixes `fixes` (none: jank as it is). -/
+def thyWith (fixes : List fix_t_IndT) : Theory D phase_t_IndT res_t_IndT fix_t_IndT :=
+  { defaultVal := 4, maxSetups := 16, maxPrefs := 8, focus := 0,
+    fixed := fun f => decide (f ∈ fixes) }
 
-def sys :=
+def thy := thyWith []
+
+def sysWith (fixes : List fix_t_IndT) :=
   letI : Veil.LogSwitch := ⟨false⟩
-  enumerableTransitionSystem D phase_t_IndT res_t_IndT theory
+  enumerableTransitionSystem D phase_t_IndT res_t_IndT fix_t_IndT (thyWith fixes)
+
+def sys := sysWith []
 
 def d (n : Nat) : D := Fin.ofNat 5 n
 
@@ -55,31 +61,34 @@ inductive Step where
   /-- A call, with what jank returned and what Clojure returned. -/
   | call (v : Nat) (jank clojure : String)
 
-def apply1 (l : L) (cur : List St) : List St :=
+def apply1 (l : L) (cur : List St) (fixes : List fix_t_IndT := []) : List St :=
   cur.flatMap fun s =>
-    ((sys.tr theory s).successes.filter fun (l', _) => reprStr l' == reprStr l).map (·.2)
+    (((sysWith fixes).tr (thyWith fixes) s).successes.filter fun (l', _) =>
+      reprStr l' == reprStr l).map (·.2)
 
 /-- Every end of the call in progress, over all orders. -/
-partial def ends (todo : List St) (seen : Std.HashSet String) (acc : List St) : List St :=
+partial def ends (todo : List St) (seen : Std.HashSet String) (acc : List St)
+    (fixes : List fix_t_IndT := []) : List St :=
   match todo with
   | [] => acc
   | s :: rest =>
     let k := reprStr s
-    if seen.contains k then ends rest seen acc
-    else if s.phase == .done then ends rest (seen.insert k) (s :: acc)
-    else ends (((sys.tr theory s).successes.map (·.2)) ++ rest) (seen.insert k) acc
+    if seen.contains k then ends rest seen acc fixes
+    else if s.phase == .done then ends rest (seen.insert k) (s :: acc) fixes
+    else ends ((((sysWith fixes).tr (thyWith fixes) s).successes.map (·.2)) ++ rest)
+      (seen.insert k) acc fixes
 
-def replay (steps : List Step) : Except String (List String) := do
-  let mut cur : List St := sys.initStates
+def replay (steps : List Step) (fixes : List fix_t_IndT := []) : Except String (List String) := do
+  let mut cur : List St := (sysWith fixes).initStates
   let mut i := 0
   let mut notes : List String := []
   for st in steps do
     match st with
-    | .derive x y => cur := apply1 (.derive (d x) (d y)) cur
-    | .defmethod k => cur := apply1 (.defmethod (d k)) cur
-    | .prefer x y => cur := apply1 (.preferMethod (d x) (d y)) cur
+    | .derive x y => cur := apply1 (.derive (d x) (d y)) cur fixes
+    | .defmethod k => cur := apply1 (.defmethod (d k)) cur fixes
+    | .prefer x y => cur := apply1 (.preferMethod (d x) (d y)) cur fixes
     | .call v jank clojure =>
-      let done := ends (apply1 (.call (d v)) cur) {} []
+      let done := ends (apply1 (.call (d v)) cur fixes) {} [] fixes
       let allowed := (done.map resOf).eraseDups
       let allowedC := (done.map resOfC).eraseDups
       let ok := done.filter fun s => resOf s == jank
@@ -89,7 +98,7 @@ def replay (steps : List Step) : Except String (List String) := do
         notes := notes ++ [s!"step {i}: call of {v}: Clojure gave {clojure}, the model's copy of Clojure's loop allows {allowedC}"]
       if jank != clojure then
         notes := notes ++ [s!"step {i}: call of {v}: jank {jank}, Clojure {clojure}"]
-      cur := apply1 .next ok
+      cur := apply1 .next ok fixes
     if cur.isEmpty then
       throw s!"step {i}: the model doesn't allow this step"
     i := i + 1

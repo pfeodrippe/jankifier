@@ -1,0 +1,130 @@
+(ns jank-specs.tutorial
+  "What tutorial.jank and tutorial_jank_models.jank share: a Veil session in
+  this process (`vs`), `check` for Veil files, `sh` for the reproduction
+  scripts, and the replays of counterexamples on jank."
+  (:require [clojure.string :as string]
+            [veil.core :as veil]))
+
+(cpp/raw "
+#include <cstdio>
+#include <string>
+#include <jank/runtime/obj/persistent_string.hpp>
+
+inline jank::runtime::object_ref tutorial_sh(jank::runtime::object_ref const cmd)
+{
+  auto const text{ cmd.to_string() };
+  std::string const command{ \"( \" + std::string{ text.data(), text.size() } + \" ) 2>&1\" };
+  FILE * const p{ popen(command.c_str(), \"r\") };
+  if(!p)
+  {
+    return jank::runtime::make_box<jank::runtime::obj::persistent_string>(\"(couldn't start it)\");
+  }
+  std::string out;
+  char buf[4096];
+  size_t n{};
+  while((n = std::fread(buf, 1, sizeof buf, p)) > 0)
+  {
+    out.append(buf, n);
+  }
+  pclose(p);
+  return jank::runtime::make_box<jank::runtime::obj::persistent_string>(
+    jtl::immutable_string{ out.data(), out.size() });
+}")
+
+(def specs-dir
+  "specs/, found from the REPL's directory (specs/ itself, or the project root,
+  where CIDER's jack-in starts the REPL)."
+  (string/trim (cpp/tutorial_sh (str "if [ -f lakefile.lean ]; then pwd; "
+                                     "elif [ -f specs/lakefile.lean ]; then cd specs && pwd; fi"))))
+
+(defn sh
+  "Runs `cmd` with the shell, in specs/, and returns its output and errors.
+  elan's and Homebrew's bin directories are added to the PATH (an editor's REPL
+  may not have them)."
+  [cmd]
+  (if (string/blank? specs-dir)
+    (str "Can't find specs/ from this REPL's directory: start the REPL in the project or in specs/.")
+    (cpp/tutorial_sh (str "cd '" specs-dir "' && "
+                          "export PATH=\"$HOME/.elan/bin:/opt/homebrew/bin:$PATH\" && "
+                          cmd))))
+
+(def vs
+  "A Veil session: Lean, with Veil imported from specs/'s Lake project, in this
+  process. Created on first use (`@vs`)."
+  (delay (veil/session {:lake-project specs-dir})))
+
+(defn- finding? [line]
+  (boolean (re-find #"Violation|No violation|\(via |Initialization must|following set|\.\.\. |Counterexample|Action:|Theory:|^[0-9]+: |^  [A-Za-z_]+$" line)))
+
+(defn check
+  "Elaborates the Veil file `file` (relative to specs/) in the session, and
+  prints what Veil found, each message after its line in the file. With
+  `all?`, every line, whole states included."
+  ([file]
+   (check file false))
+  ([file all?]
+   (let [lines (mapcat (fn [m]
+                         (string/split-lines (str (:line m) ": " (:text m))))
+                       (veil/load-file! @vs (str specs-dir "/" file)))]
+     (if all?
+       (doseq [l lines]
+         (println l))
+       ;; The fields of a state are printed only inside a counterexample to induction.
+       (loop [ls lines
+              in-state? false]
+         (when-let [l (first ls)]
+           (let [starts? (re-find #"Pre-state:|Post-state:" l)
+                 in-state? (cond
+                             starts? true
+                             (re-find #"Action:|Counterexample|^\S|^  \S" l) false
+                             :else in-state?)]
+             (when (or in-state? (finding? l))
+               (println l))
+             (recur (rest ls) in-state?))))))))
+
+(defn replay-array-map
+  "Does the steps of a TinyArrayMap trace (from veil/model-check) on jank maps,
+  keeping each of the trace's objects by its number. Returns, for each
+  persistent map, what it holds on jank and what the model says it should hold."
+  [trace]
+  (let [objs (reduce (fn [objs {:keys [action args]}]
+                       (case action
+                         :literal (assoc objs (:o args) {(:k args) (:v args)})
+                         :transient (assoc objs (:t args) (transient (get objs (:p args))))
+                         :assocBang (assoc objs (:t args) (assoc! (get objs (:t args)) (:k args) (:v args)))
+                         :persistentBang (assoc objs (:q args) (persistent! (get objs (:t args))))
+                         objs))
+                     {}
+                     trace)
+        state (:state (last trace))]
+    (into {}
+          (for [o (:persistentMap state)]
+            [o {:jank (get objs o)
+                :should (into {} (keep (fn [[o' kv]]
+                                         (when (= o o') kv))
+                                       (:should state)))}]))))
+
+(defn random-run
+  "Uses the TinyAtom system `sys` as a test oracle: takes random enabled steps
+  until none is left, does each on an atom too (deref for load,
+  compare-and-set! for cas), and compares the atom's value with the model's
+  after every step."
+  [sys]
+  (let [a (atom 0)]
+    (loop [state (first (veil/initial-states sys))
+           seen {}
+           steps []]
+      (let [enabled (veil/successors sys state)]
+        (if (empty? enabled)
+          {:steps steps :value @a :disagreement nil}
+          (let [{:keys [action args] :as step} (rand-nth enabled)
+                t (:t args)
+                seen (if (= :load action)
+                       (assoc seen t @a)
+                       (do (compare-and-set! a (get seen t) (inc (get seen t)))
+                           seen))
+                steps (conj steps [action t])
+                model (:value (:state step))]
+            (if (= model @a)
+              (recur (:state step) seen steps)
+              {:steps steps :value @a :disagreement {:model model :atom @a}})))))))

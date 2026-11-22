@@ -1,0 +1,170 @@
+(ns lean-sys.session-test
+  (:require [clojure.string :as string]
+            [clojure.test :refer [deftest is testing]]
+            [lean-sys.session :as lean]))
+
+(def definitions "
+structure Account where
+  owner : String
+  balance : Int
+
+inductive Op where
+  | deposit (n : Nat)
+  | withdraw (n : Nat)
+  | close
+
+def applyOp (a : Account) : Op → Account
+  | .deposit n => { a with balance := a.balance + n }
+  | .withdraw n => { a with balance := a.balance - n }
+  | .close => { a with balance := 0 }
+
+inductive Color where
+  | red | green | blue
+
+structure Pixel where
+  c : Color
+  alpha : UInt8
+  w : UInt64
+  f : Float
+  ok : Bool
+  ch : Char
+
+def idPixel (p : Pixel) : Pixel := p
+def idOp (o : Op) : Op := o
+def idList (xs : List (Nat × String)) : List (Nat × String) := xs
+def idOption (x : Option Int) : Option Int := x
+def idArray (xs : Array Float) : Array Float := xs
+def idMap (m : Std.TreeMap Nat String) : Std.TreeMap Nat String := m
+def idSet (s : Std.TreeSet String) : Std.TreeSet String := s
+def idName (n : Lean.Name) : Lean.Name := n
+def idInt (i : Int) : Int := i
+def idFin (i : Fin 5) : Fin 5 := i
+
+structure Wrapper where
+  inner : Nat
+
+def idWrapper (w : Wrapper) : Wrapper := w
+
+def big : Nat := 2 ^ 100
+def negBig : Int := -(2 ^ 80)
+def json : Lean.Json := Lean.Json.mkObj [(\"a\", 1), (\"b\", Lean.Json.arr #[true, \"x\", Lean.toJson (1.5 : Float)])]
+def greet (n : Nat) : IO String := pure s!\"hi {n}\"
+def fails : IO Nat := throw (IO.userError \"boom\")
+def sumTo (n : Nat) : Nat := (List.range (n + 1)).foldl (· + ·) 0
+def adder (n : Nat) : Nat → Nat := (· + n)
+def applyFn (f : Nat → Nat) (x : Nat) : Nat := f x
+")
+
+(def s
+  (delay
+    (let [s (lean/session {:imports []})]
+      (lean/elab! s definitions)
+      s)))
+
+(deftest structures-and-inductives-test
+  (testing "a structure is a map, another inductive type a map with :lean/ctor"
+    (is (= {:owner "ana" :balance -15}
+           (lean/call @s "applyOp" {:owner "ana" :balance 10} {:lean/ctor :withdraw :n 25}))))
+  (testing "a constructor without fields is a keyword"
+    (is (= {:owner "ana" :balance 0} (lean/call @s "applyOp" {:owner "ana" :balance 10} :close)))
+    (is (= :close (lean/call @s "idOp" :close))))
+  (testing "enums and scalar fields"
+    (let [p {:c :green :alpha 200 :w 18446744073709551615 :f 1.5 :ok true :ch \x}]
+      (is (= (dissoc p :w) (dissoc (lean/call @s "idPixel" p) :w)))
+      (is (= "18446744073709551615" (string/replace (str (:w (lean/call @s "idPixel" p))) "N" "")))))
+  (testing "a structure with one field, defined in the session, keeps its name"
+    (is (= {:inner 3} (lean/call @s "idWrapper" {:inner 3})))))
+
+(deftest collections-test
+  (is (= [[1 "a"] [2 "b"]] (lean/call @s "idList" [[1 "a"] [2 "b"]])))
+  (is (= [1.5 2.5] (lean/call @s "idArray" [1.5 2.5])))
+  (is (= {1 "one" 2 "two"} (lean/call @s "idMap" {2 "two" 1 "one"})))
+  (is (= #{"a" "b"} (lean/call @s "idSet" #{"b" "a"})))
+  (is (nil? (lean/call @s "idOption" nil)))
+  (is (= -4 (lean/call @s "idOption" -4))))
+
+(deftest numbers-and-names-test
+  (is (= "1267650600228229401496703205376" (string/replace (str (lean/call @s "big")) "N" "")))
+  (is (= "-1208925819614629174706176" (string/replace (str (lean/call @s "negBig")) "N" "")))
+  (is (= -7 (lean/call @s "idInt" -7)))
+  (is (= 4 (lean/call @s "idFin" 4)))
+  (is (= 'Lean.Elab.Command (lean/call @s "idName" 'Lean.Elab.Command))))
+
+(deftest json-test
+  (is (= {:a 1 :b [true "x" 1.5]} (lean/call @s "json"))))
+
+(deftest io-test
+  (is (= "hi 7" (lean/call @s "greet" 7)))
+  (is (= "boom"
+         (try
+           (lean/call @s "fails")
+           (catch jank.runtime.object_ref e
+             (last (string/split (ex-message e) #": ")))))))
+
+(deftest errors-test
+  (testing "elaboration errors are data"
+    (let [[m] (lean/elab @s "def broken : Nat := \"no\"")]
+      (is (= :error (:severity m)))
+      (is (= 1 (:line m)))
+      (is (string/includes? (:text m) "Type mismatch"))))
+  (testing "elab! throws with the messages"
+    (is (= 1 (try
+               (lean/elab! @s "def broken2 : Nat := \"no\"")
+               (catch jank.runtime.object_ref e
+                 (count (:messages (ex-data e))))))))
+  (testing "a missing field, an unknown constant"
+    (is (string/includes? (try
+                            (lean/call @s "applyOp" {:owner "ana"} :close)
+                            (catch jank.runtime.object_ref e
+                              (ex-message e)))
+                          "no :balance"))
+    (is (string/includes? (try
+                            (lean/call @s "nope")
+                            (catch jank.runtime.object_ref e
+                              (ex-message e)))
+                          "unknown constant nope"))))
+
+(deftest evaluate-and-functions-test
+  (is (= [0 2 4 6 8] (lean/evaluate @s "(List.range 5).map (· * 2)")))
+  (testing "an opaque Lean value (a function) passed back to Lean"
+    (is (= 13 (lean/call @s "applyFn" (lean/call @s "adder" 10) 3))))
+  (testing "calls from several threads"
+    (let [f (lean/function @s "sumTo")]
+      (is (= [55 210 465] (mapv deref [(future (f 10)) (future (f 20)) (future (f 30))]))))))
+
+(deftest compile-test
+  (let [interpreted (lean/call @s "sumTo" 100000)]
+    (lean/compile! @s "sumTo")
+    (is (= interpreted (lean/call @s "sumTo" 100000)))
+    (is (= 5000050000 interpreted)))
+  (testing "a compiled IO action"
+    (lean/compile! @s "greet")
+    (is (= "hi 8" (lean/call @s "greet" 8)))))
+
+(deftest release-test
+  (let [before (lean/released-count)]
+    (dotimes [_ 2000]
+      (lean/call @s "adder" 1))
+    (lean/collect!)
+    (lean/collect!)
+    (is (< before (lean/released-count)))))
+
+(deftest prove-theorem-test
+  (testing "proved, with Lean's own axioms only"
+    (let [r (lean/prove-theorem @s "∀ n : Nat, n + 0 = n" "by simp")]
+      (is (:proved? r))
+      (is (every? #{'propext 'Classical.choice 'Quot.sound} (:axioms r)))))
+  (testing "a sorry isn't a proof"
+    (is (not (:proved? (lean/prove-theorem @s "1 = 2" "by sorry")))))
+  (testing "a false statement"
+    (is (not (:proved? (lean/prove-theorem @s "1 = 2" "by simp")))))
+  (testing "native_decide trusts compiled code: an axiom of its own"
+    (is (some #(string/includes? (str %) "native_decide")
+              (:axioms (lean/prove-theorem @s "10 < 20" "by native_decide"))))))
+
+(deftest one-constructor-test
+  (lean/elab! @s "inductive Step where
+  | flip (n : Nat)
+def idStep (x : Step) : Step := x")
+  (testing "an inductive type with one constructor and one field keeps both"
+    (is (= {:lean/ctor :flip :n 3} (lean/call @s "idStep" {:lean/ctor :flip :n 3})))))

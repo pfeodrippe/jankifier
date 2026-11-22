@@ -1,0 +1,418 @@
+(ns jank-specs.conformance.module-cache
+  "Conformance of jank's module loader with JankSpecs/ModuleCache.lean, by
+  trace replay.
+
+  A scenario is a sequence of the model's actions. Each runs on the real jank,
+  and what jank shows at each step is recorded; `ModuleCache.Replay.replay`
+  (JankSpecs/Conformance/ModuleCacheReplay.lean) then follows the trace
+  through every state the model can be in. The scenarios are the model
+  checker's counterexamples (M1..M5) and random ones; with `:prove? true`,
+  the harness also proves `deps_loaded` and `loaded_has_code` by induction.
+  With `:fixes` (the model's proposed fixes, e.g. `[:m1 :m5]`), the traces are
+  replayed on the fixed model: what jank should do once they're written.
+
+  How each action runs:
+
+  - editSrc, deleteSrc, deleteObj, touchSrc and tieSrcToObj change files.
+    Every mtime is set from the model's clock (`base + clock` seconds), so jank
+    compares the same times as the model.
+  - startRun starts `jank repl` (its nREPL server); a load is then `(require
+    'm)`, or `(require 'm :reload)` when `m` is already loaded.
+  - A compile (startCompile, its loads, stop) is one `jank compile-module`,
+    for the last module it loads; the object files it writes get the clock's
+    next times, in load order, as in the model.
+  - Each module prints `LOAD <module> dir=<d> v= <version> aot= <bool>` (and,
+    for `app`, `lib-macro= <version>`) when it loads; errors are classified by
+    their message."
+  (:require [clojure.string :as string]
+            [jank-specs.harness :as h]
+            [jank-specs.tutorial :refer [specs-dir vs]]
+            [veil.core :as veil]))
+
+(def mods ["lib" "app"])
+(def deps {"app" "lib"})
+(def dirs ["a" "b" "build"])
+(def build 2)
+(def base-s 1000000000)
+
+(def instance {:modname 2 :dir 3 :proc 2})
+
+(defn theory
+  [focus]
+  {:dep "fun m d => decide (m = 1 ∧ d = 0)" :build build :focus focus :fixed (h/fixed-term [])})
+
+(def load-re #"LOAD (\w+) dir=(\w+) v= (\d+) aot= (true|false)(?: lib-macro= (\d+))?")
+
+(defn- nonconformance
+  [msg]
+  (ex-info msg {:kind :nonconformance}))
+
+(defn- index-of
+  [v x]
+  (first (keep-indexed (fn [i y] (when (= x y) i)) v)))
+
+(defn- failing-module
+  "The module a load error is about."
+  [text]
+  (let [m (some #(second (re-find (re-pattern %) text))
+                ["The module `([\\w-]+)` could not be found"
+                 "The registered module `([\\w-]+)` has no source files"
+                 "/(\\w+)\\.jank` does not exist"
+                 "/(\\w+)\\.jank\"\\]"])]
+    (when (some #{m} mods) m)))
+
+(defn- classify-error
+  [text]
+  (cond
+    (string/includes? text "last_write_time") :fsError
+    (or (string/includes? text "unable-to-open-file") (string/includes? text "does not exist")) :missingFile
+    (or (string/includes? text "binary-without-source") (string/includes? text "has no source files")) :noSource
+    (or (string/includes? text "module-not-found") (string/includes? text "could not be found")) :notFound
+    :else nil))
+
+(defn- loaded-obs
+  "A `LOAD` line's groups as an observation."
+  [[_ _ d v aot lib-ver]]
+  [:loaded (index-of dirs d) (parse-long v) (= "true" aot)
+   ;; An optional group that didn't match is "" in jank (RESULTS S6).
+   (if (seq lib-ver) (parse-long lib-ver) 0)])
+
+;;;; A run: the scenario's files, processes and recorded steps
+
+(defn- new-run
+  [nm]
+  (let [w (h/scratch-dir (str "mc-" nm "-"))
+        b (str w "/build")]
+    (doseq [d (take 2 dirs)]
+      (h/make-dirs! (str w "/" d)))
+    {:name nm
+     :w w
+     :build b
+     :args (h/jank-args {:module-path (mapv #(str w "/" %) (take 2 dirs)) :build-dir b :binary-version "v"})
+     :clock 0
+     :next-ver 1
+     :procs {}
+     :steps []
+     :log []}))
+
+(defn- src
+  [run d m]
+  (str (:w run) "/" (nth dirs d) "/" (nth mods m) ".jank"))
+
+(defn- obj
+  [run d m]
+  (when (not= d build)
+    (throw (ex-info "object files are only in the build directory" {:d d})))
+  (str (:build run) "/v/" (nth mods m) ".o"))
+
+(defn- set-time!
+  [path t]
+  (h/set-mtime-s! path (+ base-s t)))
+
+(defn- write-src!
+  [run d m v]
+  (let [mod (nth mods m)
+        dep (get deps mod)]
+    (h/write-file! (src run d m)
+                   (str "(ns " mod (when dep (str " (:require [" dep "])")) ")\n"
+                        "(defmacro ver [] " v ")\n"
+                        "(defmacro aot? [] (boolean clojure.core/*compile-files*))\n"
+                        "(println \"LOAD " mod " dir=" (nth dirs d) " v=\" (ver) \"aot=\" (aot?)"
+                        (when dep (str " \"" dep "-macro=\" (" dep "/ver)"))
+                        ")\n"))))
+
+(defn- record
+  ([run label]
+   (record run label [:none]))
+  ([run label obs]
+   (update run :steps conj [label obs])))
+
+(defn- obj-stamp
+  [run m]
+  (h/stamp (obj run build m)))
+
+(defn- load-obs
+  [run m out err]
+  (let [lines (re-seq load-re out)
+        run (update run :log conj {:module (nth mods m) :out out
+                                   :err (h/tail err 2000)})]
+    (if (seq lines)
+      (let [loaded (mapv second lines)]
+        (when (not= loaded [(nth mods m)])
+          (throw (nonconformance (str "loading " (nth mods m) " loaded " loaded))))
+        [run (loaded-obs (first lines))])
+      (if-let [kind (classify-error err)]
+        [run [:failed kind]]
+        (throw (nonconformance (str "loading " (nth mods m) ": no LOAD line and an unknown error:\n"
+                                    (h/tail err 1500))))))))
+
+(defn- run-compile
+  "One `jank compile-module` for the compile's last module. Its steps are what
+  jank did: the modules it loaded (their `LOAD` lines, in order), then the
+  module its error names, if it failed; they replace the planned load steps."
+  [run proc]
+  (let [loads (:loads proc)]
+    (if (empty? loads)
+      run
+      (let [target (nth mods (first (last loads)))
+            {:keys [exit out]} (h/run-jank (into (:args run) ["compile-module" target]) (:w run))
+            out (or out "")
+            run (update run :log conj {:compile target :exit exit
+                                       :out (h/tail out 3000)})
+            p (get-in run [:steps (second (first loads)) 0 :p])
+            loaded (mapv (fn [groups]
+                           [{:lean/ctor :load :p p :m (index-of mods (second groups))}
+                            (loaded-obs groups)])
+                         (re-seq load-re out))
+            observed (if (= 0 exit)
+                       loaded
+                       (let [kind (classify-error out)
+                             failed (failing-module out)]
+                         (when (or (nil? kind) (nil? failed))
+                           (throw (nonconformance (str "compile of " target " failed with an unknown error:\n"
+                                                       (h/tail out 1500)))))
+                         (conj loaded [{:lean/ctor :load :p p :m (index-of mods failed)} [:failed kind]])))
+            first-i (second (first loads))
+            planned (set (map second loads))
+            steps (:steps run)
+            keep-unplanned (fn [from to]
+                             (keep (fn [i] (when-not (contains? planned i) (nth steps i))) (range from to)))
+            run (assoc run :steps (vec (concat (keep-unplanned 0 first-i)
+                                               observed
+                                               (keep-unplanned first-i (count steps)))))]
+        ;; The object files it wrote get the clock's next times, in load order.
+        (reduce (fn [run [label [k]]]
+                  (let [m (:m label)]
+                    (if (and (= :loaded k) (not= (obj-stamp run m) (get-in proc [:objs m])))
+                      (let [run (update run :clock inc)]
+                        (set-time! (obj run build m) (:clock run))
+                        run)
+                      run)))
+                run
+                observed)))))
+
+(defn- stop-server!
+  [proc]
+  (when (= :run (:kind proc))
+    (h/stop! (:server proc))))
+
+(defn- step!
+  "Runs action `a` (`[action & args]`) on `run`."
+  [run [action & args]]
+  (case action
+    :editSrc (let [[d m] args
+                   _ (when (= d build) (throw (ex-info "no sources in the build directory" {})))
+                   run (update run :clock inc)]
+               (write-src! run d m (:next-ver run))
+               (set-time! (src run d m) (:clock run))
+               (-> run
+                   (update :next-ver inc)
+                   (record {:lean/ctor :editSrc :d d :m m})))
+    :deleteSrc (let [[d m] args]
+                 (h/delete! (src run d m))
+                 (record run {:lean/ctor :deleteSrc :d d :m m}))
+    :deleteObj (let [[d m] args]
+                 (h/delete! (obj run d m))
+                 (record run {:lean/ctor :deleteObj :d d :m m}))
+    :touchSrc (let [[d m] args
+                    run (update run :clock inc)]
+                (set-time! (src run d m) (:clock run))
+                (record run {:lean/ctor :touchSrc :d d :m m}))
+    :tieSrcToObj (let [[ds dob m] args]
+                   (h/set-mtime-ns! (src run ds m) (first (h/stamp (obj run dob m))))
+                   (record run {:lean/ctor :tieSrcToObj :ds ds :dob dob :m m}))
+    :startRun (let [[p] args
+                    srv (h/server (:w run) (:args run))]
+                (-> run
+                    (assoc-in [:procs p] {:kind :run :server srv :conn (h/connect srv) :loaded #{}})
+                    (record {:lean/ctor :startRun :p p})))
+    :startCompile (let [[p] args]
+                    (-> run
+                        (assoc-in [:procs p] {:kind :compile :loads []
+                                              :objs (into {} (for [m (range (count mods))]
+                                                               [m (obj-stamp run m)]))})
+                        (record {:lean/ctor :startCompile :p p})))
+    :load (let [[p m] args
+                proc (get-in run [:procs p])
+                label {:lean/ctor :load :p p :m m}]
+            (if (= :run (:kind proc))
+              (let [mod (nth mods m)
+                    code (if (contains? (:loaded proc) m)
+                           (str "(require '" mod " :reload)")
+                           (str "(require '" mod ")"))
+                    r (h/nrepl-eval (:conn proc) code 300000)
+                    [run obs] (load-obs run m (:out r) (str (:err r) (apply str (:ex r))))]
+                (cond-> (record run label obs)
+                  (= :loaded (first obs)) (update-in [:procs p :loaded] conj m)))
+              (-> run
+                  (update-in [:procs p :loads] conj [m (count (:steps run))])
+                  (record label nil))))
+    :stop (let [[p] args
+                proc (get-in run [:procs p])
+                run (update run :procs dissoc p)
+                run (if (= :run (:kind proc))
+                      (do (stop-server! proc) run)
+                      (run-compile run proc))]
+            (record run {:lean/ctor :stop :p p}))))
+
+(defn- enabled?
+  "The model's `require`s which the files and processes show."
+  [run [action & args]]
+  ;; Every action has its branch: a `case` whose default is `true` doesn't compile (RESULTS S8).
+  (case action
+    :editSrc (not= build (first args))
+    (:deleteSrc :touchSrc) (h/exists? (apply src run args))
+    :deleteObj (h/exists? (apply obj run args))
+    :tieSrcToObj (let [[ds dob m] args]
+                   (and (h/exists? (src run ds m)) (h/exists? (obj run dob m))))
+    (:startRun :startCompile) (not (contains? (:procs run) (first args)))
+    :stop (contains? (:procs run) (first args))
+    :load (let [[p m] args
+                proc (get-in run [:procs p])]
+            (and (some? proc)
+                 (let [loaded (if (= :run (:kind proc)) (:loaded proc) (set (map first (:loads proc))))]
+                   (and (not (and (= :compile (:kind proc)) (contains? loaded m)))
+                        (every? (fn [[k d]] (or (not= k (nth mods m)) (contains? loaded (index-of mods d))))
+                                deps)))))))
+
+(defn run-scenario
+  "Runs `actions` in a new scratch directory: `{:steps :status :work :log}`,
+  `:status` `:ran`, or why it couldn't be replayed."
+  [nm actions skip-disabled?]
+  (let [state (atom (new-run nm))]
+    (try
+      (doseq [a actions]
+        (if (enabled? @state a)
+          (reset! state (step! @state a))
+          (when-not skip-disabled?
+            (throw (ex-info (str a " isn't enabled") {:kind :error})))))
+      ;; Ends the compiles still open (a counterexample can end inside one): that's when they run.
+      (doseq [[p proc] (:procs @state)
+              :when (= :compile (:kind proc))]
+        (reset! state (step! @state [:stop p])))
+      (assoc (select-keys @state [:steps :log]) :status :ran :work (:w @state))
+      (catch jank.runtime.object_ref e
+        (assoc (select-keys @state [:steps :log]) :status (ex-message e) :work (:w @state)))
+      (finally
+        (doseq [proc (vals (:procs @state))]
+          (stop-server! proc))))))
+
+;;;; Scenarios
+
+(def params
+  "Each action's parameters, in order."
+  {:editSrc [:d :m] :deleteSrc [:d :m] :deleteObj [:d :m] :touchSrc [:d :m]
+   :tieSrcToObj [:ds :dob :m] :startRun [:p] :startCompile [:p] :stop [:p] :load [:p :m]})
+
+(def show
+  "Steps that show a counterexample's violation, added when it doesn't end with
+  them: M2's index picks `b`, which a load shows; M3's REPL misses the object
+  file the compile wrote, which shows once the compile ends and the REPL loads
+  the module."
+  {:m2_first_match_wins [[:load 0 0]]
+   :m3_index_sees_new_objects [[:stop 1] [:load 0 0]]})
+
+(defn counterexamples
+  "The model checker's counterexamples for M1..M5, as actions."
+  []
+  (vec (for [focus (range 1 6)
+             ;; Compiled: interpreted, the search takes minutes per property.
+             :let [cex (h/counterexample "ModuleCache" {:instance instance :theory (theory focus)
+                                                        :compiled true})]
+             :when cex]
+         (let [prop (first (:violates cex))]
+           (let [acts (mapv (fn [[action args]] (into [action] (map args (get params action)))) (:actions cex))
+                 extra (get show prop)]
+             [(str "cex-" (name prop))
+              (if (= extra (vec (take-last (count extra) acts))) acts (into acts extra))])))))
+
+(defn random-scenario
+  "A random sequence of actions which the model allows (its `require`s), with
+  compiles run as one block."
+  [r length]
+  (loop [acts []
+         srcs #{}
+         objs #{}
+         procs {}]
+    (if (>= (count acts) length)
+      acts
+      (let [choice (h/weighted! r [:edit :touch :delete :tie :compile :start :load :stop] [5 1 1 1 3 2 5 1])
+            d (h/rand-int! r 2)
+            m (h/rand-int! r 2)
+            free (vec (remove #(contains? procs %) (range 2)))]
+        (case choice
+          :edit (recur (conj acts [:editSrc d m]) (conj srcs [d m]) objs procs)
+          :touch (if (contains? srcs [d m])
+                   (recur (conj acts [:touchSrc d m]) srcs objs procs)
+                   (recur acts srcs objs procs))
+          :delete (cond
+                    (and (< (h/rand-float! r) 0.5) (contains? srcs [d m]))
+                    (recur (conj acts [:deleteSrc d m]) (disj srcs [d m]) objs procs)
+                    (contains? objs m) (recur (conj acts [:deleteObj build m]) srcs (disj objs m) procs)
+                    :else (recur acts srcs objs procs))
+          :tie (if (and (contains? srcs [d m]) (contains? objs m))
+                 (recur (conj acts [:tieSrcToObj d build m]) srcs objs procs)
+                 (recur acts srcs objs procs))
+          :compile (if (seq free)
+                     (let [p (h/rand-nth! r free)]
+                       (recur (-> acts
+                                  (conj [:startCompile p] [:load p 0])
+                                  (into (when (< (h/rand-float! r) 0.6) [[:load p 1]]))
+                                  (conj [:stop p]))
+                              ;; Possibly written; only used to enable actions.
+                              srcs (into objs [0 1]) procs))
+                     (recur acts srcs objs procs))
+          :start (if (seq free)
+                   (let [p (h/rand-nth! r free)]
+                     (recur (conj acts [:startRun p]) srcs objs (assoc procs p #{})))
+                   (recur acts srcs objs procs))
+          :load (if (seq procs)
+                  (let [p (h/rand-nth! r (keys procs))
+                        m (if (and (= m 1) (not (contains? (get procs p) 0))) 0 m)]
+                    ;; It may fail; the replay checks what happened.
+                    (recur (conj acts [:load p m]) srcs objs (update procs p conj m)))
+                  (recur acts srcs objs procs))
+          (if (seq procs)
+            (let [p (h/rand-nth! r (keys procs))]
+              (recur (conj acts [:stop p]) srcs objs (dissoc procs p)))
+            (recur acts srcs objs procs)))))))
+
+(defn- obs-term
+  [[k & args]]
+  (case k
+    :none :none
+    :loaded (let [[d v aot lv] args]
+              {:lean/ctor :loaded :dir d :ver v :aot aot :libVer lv})
+    {:lean/ctor :failed :o (first args)}))
+
+(defn check
+  ([]
+   (check {}))
+  ([{:keys [random length seed prove? fixes] :or {random 20 length 14 seed 1 prove? false}}]
+   (h/load-lean! "JankSpecs/ModuleCache.lean" "JankSpecs/Conformance/ModuleCacheReplay.lean")
+   (let [cexs (counterexamples)
+         r (h/rng seed)
+         scenarios (into cexs (for [i (range random)]
+                                [(str "random-" seed "-" i) (random-scenario r length)]))
+         results (vec (for [[nm actions] scenarios]
+                        (let [{:keys [steps status work]} (run-scenario nm actions (string/starts-with? nm "random"))
+                              res (if (= :ran status)
+                                    (let [replay (h/except (h/call "ModuleCache.Replay.replay"
+                                                                   (mapv (fn [[l o]] [l (obs-term o)]) steps)
+                                                                   (vec fixes)))]
+                                      (if (contains? replay :ok) :conforms (:error replay)))
+                                    status)]
+                          {:scenario nm :steps (count steps) :result res :work work})))
+         proofs (when prove?
+                  ;; `prove` works on the open module, which loading the checker closed: the model
+                  ;; is loaded again (under a new name, which "ModuleCache" then refers to).
+                  (veil/load-file! @vs (str specs-dir "/JankSpecs/ModuleCache.lean") {:checks? false})
+                  (vec (filter #(contains? #{:deps_loaded :loaded_has_code} (:property %))
+                               (veil/prove @vs "ModuleCache"))))
+         proved? (or (not prove?)
+                     (and (seq proofs) (every? #(= :proven (:status %)) proofs)))]
+     {:harness "module-cache"
+      :ok? (and (= 5 (count cexs)) proved? (every? #(= :conforms (:result %)) results))
+      :counterexamples (count cexs)
+      :proved? (when prove? proved?)
+      :results results})))

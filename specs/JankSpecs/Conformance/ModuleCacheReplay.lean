@@ -3,11 +3,11 @@ import JankSpecs.ModuleCache
 /-!
 # Replaying jank's behaviour through the module cache model
 
-`conformance/module_cache/run.py` runs scenarios on the real jank and writes
-what it observed as traces of `ModuleCache`'s actions, each step with what jank
-showed. `checkTrace` follows a trace through every state the model can be in,
-keeping the successors whose action and observation match; the trace conforms
-if that never runs out.
+`jank-specs.conformance.module-cache` (src/jank_specs/conformance/) runs
+scenarios on the real jank and passes what it observed to `replay`, as traces
+of `ModuleCache`'s actions, each step with what jank showed. `replay` follows a
+trace through every state the model can be in, keeping the successors whose
+action and observation match; the trace conforms if that never runs out.
 
 The instance is the model checking one: `lib` (0) and `app` (1, requires
 `lib`), directories `a` (0), `b` (1) and the build directory (2), two
@@ -21,15 +21,20 @@ open ModuleCache
 abbrev Mod := Fin 2
 abbrev Dir := Fin 3
 abbrev Proc := Fin 2
-abbrev L := Label Mod Dir Proc mode_t_IndT outcome_IndT
-abbrev St := State (FieldConcreteType Mod Dir Proc mode_t_IndT outcome_IndT)
+abbrev L := Label Mod Dir Proc mode_t_IndT outcome_IndT fix_t_IndT
+abbrev St := State (FieldConcreteType Mod Dir Proc mode_t_IndT outcome_IndT fix_t_IndT)
 
-def theory : Theory Mod Dir Proc mode_t_IndT outcome_IndT :=
-  ⟨fun m d => decide (m = 1 ∧ d = 0), 2, 0⟩
+/-- The theory with the proposed fixes `fixes` (none: jank as it is). -/
+def thyWith (fixes : List fix_t_IndT) : Theory Mod Dir Proc mode_t_IndT outcome_IndT fix_t_IndT :=
+  ⟨fun m d => decide (m = 1 ∧ d = 0), 2, 0, fun f => decide (f ∈ fixes)⟩
 
-def sys :=
+def thy := thyWith []
+
+def sysWith (fixes : List fix_t_IndT) :=
   letI : Veil.LogSwitch := ⟨false⟩
-  enumerableTransitionSystem Mod Dir Proc mode_t_IndT outcome_IndT theory
+  enumerableTransitionSystem Mod Dir Proc mode_t_IndT outcome_IndT fix_t_IndT (thyWith fixes)
+
+def sys := sysWith []
 
 /-- What a step shows: nothing (file and process actions), a module's `LOAD`
 line (the directory and version of its source, whether it was compiled ahead
@@ -53,12 +58,12 @@ def obsOk : Obs → St → Bool
   | .none, _ => true
   | o, s => reprStr (obsOf s) == reprStr o
 
-def replay (steps : List (L × Obs)) : Except String Unit := do
-  let mut current : List St := sys.initStates
+def replay (steps : List (L × Obs)) (fixes : List fix_t_IndT := []) : Except String Unit := do
+  let mut current : List St := (sysWith fixes).initStates
   let mut i := 0
   for (l, o) in steps do
     let moves := current.flatMap fun s =>
-      (sys.tr theory s).successes.filter fun (l', _) => reprStr l' == reprStr l
+      ((sysWith fixes).tr (thyWith fixes) s).successes.filter fun (l', _) => reprStr l' == reprStr l
     if moves.isEmpty then
       throw s!"step {i}: the model doesn't allow {reprStr l} here"
     let next := moves.filterMap fun (_, s') => if obsOk o s' then some s' else none

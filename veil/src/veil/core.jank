@@ -1,0 +1,796 @@
+(ns veil.core
+  "Veil models from jank, in-process.
+
+  A model is jank data: Veil's declarations written as s-expressions (see
+  `defmodel`). A session (`session`) runs Lean and Veil in this process, through
+  lean-sys; models are elaborated into it, and:
+
+  - `model-check` runs Veil's model checker, and returns its result: the
+    violation, and the trace leading to it, made of the model's own states;
+  - `prove` checks the invariants by induction, as `#check_invariants` does, and
+    returns the status of each verification condition;
+  - `system` gives the model's executable transition system: its initial
+    states, the steps enabled in a state, and whether the properties hold in a
+    state, for states read from Veil or built in jank.
+
+  States, labels and results are jank data, read from Veil's Lean values by
+  their types (see `lean-sys.session`): a state is a map of its fields, a
+  function field a map, a relation a set, an enum value a keyword."
+  (:require [clojure.string :as string]
+            [lean-sys.session :as lean]))
+
+(cpp/raw "
+#include <cstdlib>
+#include <thread>
+#include <veil_jank/source.hpp>
+#include <lean_sys/jank.hpp>
+
+namespace veil_jank
+{
+  inline jank::runtime::object_ref source_string()
+  {
+    return lean_sys::jank_layer::str(lean_source);
+  }
+
+  /* `#model_check` in Veil's default mode also builds a compiled checker in the background, by
+   * running Lake; with VEIL_ONLINE_ENV set, it only runs interpreted, in this process. */
+  inline void interpreted_model_checking()
+  {
+    setenv(\"VEIL_ONLINE_ENV\", \"1\", 1);
+  }
+
+  inline int64_t cores()
+  {
+    return static_cast<int64_t>(std::thread::hardware_concurrency());
+  }
+}
+")
+
+;;;; Models as data
+
+(defn model
+  "A Veil module named `module-name`, from its declarations (see `defmodel`)."
+  [module-name & decls]
+  {:name (str module-name)
+   :decls (vec decls)})
+
+(defmacro defmodel
+  "Defines `sym` as the model of a Veil module named `module-name`, from
+  declarations written as Veil's, in s-expressions:
+
+  | jank                                   | Veil                                  |
+  |----------------------------------------|---------------------------------------|
+  | `(type thread)`                        | `type thread`                         |
+  | `(enum pc_t idle loaded done)`         | `enum pc_t = { idle, loaded, done }`  |
+  | `(individual value Nat)`               | `individual value : Nat`              |
+  | `(function pc [thread] pc_t)`          | `function pc : thread → pc_t`         |
+  | `(relation r [node node])`             | `relation r : node → node → Bool`     |
+  | `(immutable decl)`, `(ghost decl)`     | `immutable ...`, `ghost ...`          |
+  | `(instantiate tot (TotalOrder req))`   | `instantiate tot : TotalOrder req`    |
+  | `(ghost-relation isEval [r req] term)` | `ghost relation isEval (r : req) := term` |
+  | `(after-init stmt...)`                 | `after_init { ... }`                  |
+  | `(action load [t thread] stmt...)`     | `action load (t : thread) { ... }`    |
+  | `(procedure p [x T] stmt...)`          | `procedure p (x : T) { ... }`         |
+  | `(safety name term)`                   | `safety [name] term`                  |
+  | `(invariant name term)`                | `invariant [name] term`               |
+  | `(assumption name term)`               | `assumption [name] term`              |
+  | `(temporal name formula)`              | `temporal [name] formula`             |
+  | `(set-option veil.smt.trust false)`    | `set_option ...`, before the module   |
+  | `(lean \"text\")`                        | `text`, as is                         |
+
+  Statements: `(require t)`, `(assert t)`, `(set! place t)` (`place` is a
+  name, or a function and its arguments: `(pc t)`), `(let [x t ...] stmt...)`,
+  `(pick x T)` (`let x ← pick T`, any value of type `T`),
+  `(if t stmt stmt)` (a branch of several statements is `(do stmt...)`),
+  `(when t stmt...)`, `(lean \"text\")`, or a procedure call.
+
+  Terms: names, numbers, strings, `true`, `false`, keywords for constructors
+  (`:idle`), `(= a b)`, `(not= a b)`, `(< a b)`, `(<= a b)`, `(> a b)`,
+  `(>= a b)`, `(+ a b ...)`, `(- a b)`, `(* a b)`, `(/ a b)`, `(mod a b)`,
+  `(and ...)`, `(or ...)`, `(not a)`, `(=> a b)`, `(<=> a b)`,
+  `(if c a b)`, `(forall [x T ...] t)`, `(exists [x T ...] t)`, `(fun [x] t)`,
+  `[a b]` for a tuple, `(lean \"text\")`, and any other list as an
+  application: `(pc t)`.
+
+  Temporal formulas: `(always f)` (`□`), `(eventually f)` (`◇`), `(next f)`
+  (`◯`), `(state t)` (`⌜ t ⌝`, a term in a state), `(happens a x)` (`⟨ a x ⟩`, a
+  step of action `a`), `(enabled a x)`, `(wf a x)` and `(sf a x)` (weak and
+  strong fairness), where `_` is some value of an argument (`·`), `(and ...)`,
+  `(or ...)`, `(not f)`, `(=> f g)`, `(<=> f g)`, `(until f g)` (`𝑈`),
+  `(leads-to f g)` (`↝`), `(forall [x] f)`, `(forall [x T] f)`, `(exists ...)`,
+  `true` and `false`.
+
+  The state declarations come first (`lean` lines among them stay there, as
+  `open TotalOrder`); Veil's `#gen_state`, `#gen_spec` and `#gen_executable`
+  are added."
+  [sym module-name & decls]
+  `(def ~sym (model '~module-name ~@(map (fn [d] (list 'quote d)) decls))))
+
+(def ^:private infix
+  {'= "="
+   'not= "≠"
+   '< "<"
+   '<= "≤"
+   '> ">"
+   '>= "≥"
+   '+ "+"
+   '- "-"
+   '* "*"
+   '/ "/"
+   'mod "%"
+   'and "∧"
+   'or "∨"
+   '=> "→"
+   '<=> "↔"})
+
+(declare term)
+
+(defn- binders
+  [bs]
+  (string/join " " (map (fn [[x t]]
+                          (str "(" x " : " (term t) ")"))
+                        (partition 2 bs))))
+
+(defn- term
+  [x]
+  (cond
+    (symbol? x) (str x)
+    (keyword? x) (name x)
+    (string? x) (pr-str x)
+    (true? x) (str "true")
+    (false? x) (str "false")
+    (number? x) (str x)
+    (vector? x) (str "(" (string/join ", " (map term x)) ")")
+    (seq? x) (let [[op & args] x]
+               (cond
+                 (and (= op '-) (= 1 (count args))) (str "(-" (term (first args)) ")")
+                 (contains? infix op) (str "("
+                                           (string/join (str " " (get infix op) " ") (map term args))
+                                           ")")
+                 (= op 'not) (str "(¬ " (term (first args)) ")")
+                 (= op 'if) (let [[c a b] args]
+                              (str "(if " (term c) " then " (term a) " else " (term b) ")"))
+                 (= op 'forall) (str "(∀ " (binders (first args)) ", " (term (second args)) ")")
+                 (= op 'exists) (str "(∃ " (binders (first args)) ", " (term (second args)) ")")
+                 (= op 'fun) (str "(fun " (string/join " " (map str (first args))) " => "
+                                  (term (second args)) ")")
+                 (= op 'lean) (str (first args))
+                 :else (str "(" (string/join " " (map term x)) ")")))
+    :else (throw (ex-info (str "veil: not a term: " (pr-str x)) {:term x}))))
+
+(defn- action-term
+  "An action and some of its arguments, as temporal formulas name them: `_` is
+  some value (Veil's `·`)."
+  [a args]
+  (string/join " " (cons (str a) (map #(if (= '_ %) "·" (term %)) args))))
+
+(defn- tl-binder
+  [[x t]]
+  (if t
+    (str x " : " (term t))
+    (str x)))
+
+(declare tl)
+
+(defn- tl
+  "A temporal (LTL) formula, in Lentil's syntax."
+  [f]
+  (cond
+    (true? f) (str "⊤")
+    (false? f) (str "⊥")
+    (symbol? f) (str f)
+    (seq? f) (let [[op & args] f
+                   join (fn [s] (str "(" (string/join (str " " s " ") (map tl args)) ")"))]
+               (case op
+                 always (str "(□ " (tl (first args)) ")")
+                 eventually (str "(◇ " (tl (first args)) ")")
+                 next (str "(◯ " (tl (first args)) ")")
+                 not (str "(¬ " (tl (first args)) ")")
+                 state (str "⌜ " (term (first args)) " ⌝")
+                 happens (str "⟨ " (action-term (first args) (rest args)) " ⟩")
+                 enabled (str "(Enabled (" (action-term (first args) (rest args)) "))")
+                 wf (str "(𝒲ℱ (" (action-term (first args) (rest args)) "))")
+                 sf (str "(𝒮ℱ (" (action-term (first args) (rest args)) "))")
+                 and (join "∧")
+                 or (join "∨")
+                 => (join "→")
+                 <=> (join "↔")
+                 until (join "𝑈")
+                 leads-to (join "↝")
+                 forall (str "(∀ " (tl-binder (first args)) ", " (tl (second args)) ")")
+                 exists (str "(∃ " (tl-binder (first args)) ", " (tl (second args)) ")")
+                 (throw (ex-info (str "veil: not a temporal formula: " (pr-str f)) {:formula f}))))
+    :else (throw (ex-info (str "veil: not a temporal formula: " (pr-str f)) {:formula f}))))
+
+(declare stmt stmts)
+
+(defn- place
+  [p]
+  (if (seq? p)
+    (string/join " " (map term p))
+    (term p)))
+
+(defn- block
+  [indent s]
+  (if (and (seq? s) (= 'do (first s)))
+    (stmts indent (rest s))
+    (stmt indent s)))
+
+(defn- stmt
+  [indent x]
+  (let [[op & args] x]
+    (case op
+      require (str indent "require " (term (first args)))
+      assert (str indent "assert " (term (first args)))
+      set! (str indent (place (first args)) " := " (term (second args)))
+      let (let [[bs & body] args]
+            (str (string/join "\n" (map (fn [[n v]]
+                                          (str indent "let " n " := " (term v)))
+                                        (partition 2 bs)))
+                 (when (seq body)
+                   (str "\n" (stmts indent body)))))
+      if (let [[c then else] args]
+           (str indent "if " (term c) " then\n" (block (str indent "  ") then)
+                (when (some? else)
+                  (str "\n" indent "else\n" (block (str indent "  ") else)))))
+      when (str indent "if " (term (first args)) " then\n" (stmts (str indent "  ") (rest args)))
+      do (stmts indent args)
+      pick (str indent "let " (first args) " ← pick " (term (second args)))
+      lean (str indent (first args))
+      (str indent (place x)))))
+
+(defn- stmts
+  [indent xs]
+  (string/join "\n" (map #(stmt indent %) xs)))
+
+(def ^:private state-decls
+  "The declarations before Veil's `#gen_state`; `lean` lines among them stay there."
+  '#{type enum individual function relation immutable ghost instantiate lean})
+
+(defn- callable
+  [kind [n params & body]]
+  (str kind " " n
+       (when (seq params)
+         (str " " (binders params)))
+       " {\n" (stmts "  " body) "\n}"))
+
+(defn- decl
+  [x]
+  (let [[op & args] x]
+    (case op
+      type (str "type " (first args))
+      enum (str "enum " (first args) " = { " (string/join ", " (map str (rest args))) " }")
+      individual (str "individual " (first args) " : " (term (second args)))
+      function (let [[n params t] args]
+                 (str "function " n " : " (string/join " → " (map term (conj (vec params) t)))))
+      relation (let [[n params] args]
+                 (str "relation " n " : " (string/join " → " (map term (conj (vec params) 'Bool)))))
+      instantiate (str "instantiate " (first args) " : " (string/join " " (map term (second args))))
+      ghost-relation (let [[n params t] args]
+                       (str "ghost relation " n
+                            (when (seq params)
+                              (str " " (binders params)))
+                            " :=\n  " (term t)))
+      immutable (str "immutable " (decl (first args)))
+      ghost (str "ghost " (decl (first args)))
+      after-init (str "after_init {\n" (stmts "  " args) "\n}")
+      action (callable "action" args)
+      procedure (callable "procedure" args)
+      safety (str "safety [" (first args) "] " (term (second args)))
+      invariant (str "invariant [" (first args) "] " (term (second args)))
+      assumption (str "assumption [" (first args) "] " (term (second args)))
+      termination (str "termination [" (first args) "] " (term (second args)))
+      temporal (str "temporal [" (first args) "] " (tl (second args)))
+      lean (str (first args))
+      (throw (ex-info (str "veil: unknown declaration " op) {:declaration x})))))
+
+(defn source
+  "The Veil text of `model`, as module `module-name` (the model's name by
+  default)."
+  ([model]
+   (source model (:name model)))
+  ([model module-name]
+   (let [decls (:decls model)
+         options (filter #(= 'set-option (first %)) decls)
+         body (remove #(= 'set-option (first %)) decls)
+         [state others] (split-with #(contains? state-decls (first %)) body)]
+     (str (string/join (map (fn [[_ k v]]
+                              (str "set_option " k " " (term v) "\n"))
+                            options))
+          "veil module " module-name "\n\n"
+          (string/join "\n" (map decl state))
+          "\n\n#gen_state\n\n"
+          (string/join "\n\n" (map decl others))
+          "\n\n#gen_spec\n#gen_executable\n"))))
+
+;;;; Sessions
+
+(defn session
+  "A session with Veil: a Lean session (lean-sys) importing Veil from the
+  built Lake project at `:lake-project` (one that depends on Veil), whose
+  libraries are loaded so that Veil's native code runs.
+
+  `#model_check` commands elaborated in the session (from files, see
+  `load-file!`) run interpreted, in this process: veil sets `VEIL_ONLINE_ENV`
+  for it, which only keeps Veil from also building a compiled checker with
+  Lake."
+  [{:keys [lake-project imports] :or {imports ["Veil"]}}]
+  (cpp/veil_jank.interpreted_model_checking)
+  (let [s (lean/session {:lake-project lake-project :imports imports})]
+    (lean/elab! s (cpp/veil_jank.source_string) {:file "<veil-jank>"})
+    {:lean s
+     :state (atom {:open nil :loaded {} :modules #{} :aliases {} :helpers {} :counter 0})}))
+
+(defn- close-open-module!
+  [vs]
+  (when-let [o (:open @(:state vs))]
+    (lean/elab! (:lean vs) (str "end " o))
+    (swap! (:state vs) assoc :open nil)))
+
+(defn load!
+  "Elaborates `model` into the session, as a Veil module left open (proofs need
+  it open), and returns the module's name: the model's name, or, if a module
+  of that name is already in the session, the name with a number. A model
+  already loaded and open isn't loaded again."
+  [vs model]
+  (let [{:keys [lean state]} vs
+        st @state
+        loaded (get-in st [:loaded model])]
+    (if (and loaded (= loaded (:open st)))
+      loaded
+      (let [base (:name model)
+            module-name (if (contains? (:modules st) base)
+                          (str base "_" (inc (:counter st)))
+                          base)]
+        (close-open-module! vs)
+        (swap! state (fn [st]
+                       (-> st
+                           (assoc :open module-name)
+                           (update :modules conj module-name)
+                           (update :counter inc))))
+        (lean/elab! lean (source model module-name) {:file (str module-name ".lean")})
+        (swap! state assoc-in [:loaded model] module-name)
+        module-name))))
+
+(def ^:private check-command
+  #"^(#model_check|#check_invariants|#temporal_check|#simulate|#check_action|sat trace|unsat trace)\b")
+
+(def ^:private command-prefix
+  #"^(set_option \S+ \S+ in|#guard_msgs(\s*\([^)]*\))? in)\s*(.*)$")
+
+(defn- top-level?
+  "Whether `line` starts a command: something in its first column, other than
+  the `}` which closes a block (a `sat trace`'s)."
+  [line]
+  (and (seq line)
+       (not (string/starts-with? line " "))
+       (not (string/starts-with? line "\t"))
+       (not (string/starts-with? line "}"))))
+
+(defn- without-checks
+  "`lines` with Veil's checking commands blanked (`#model_check`,
+  `#check_invariants`...): with the `set_option ... in` and `#guard_msgs ...
+  in` before them, and the doc comment holding their pinned output."
+  [lines]
+  (let [n (count lines)
+        ;; Where the command starting at line i ends: before the next line in the first column.
+        command-end (fn [i]
+                      (loop [j (inc i)]
+                        (if (and (< j n) (not (top-level? (nth lines j))))
+                          (recur (inc j))
+                          j)))
+        ;; From line i, through prefixes, whether the command is a check, and where it ends.
+        check-from (fn [i]
+                     (loop [i i]
+                       (when (< i n)
+                         (let [line (nth lines i)]
+                           (if-let [[_ _ _ rest] (re-find command-prefix line)]
+                             (if (seq rest)
+                               (when (re-find check-command rest) (command-end i))
+                               (recur (inc i)))
+                             (when (re-find check-command line) (command-end i)))))))]
+    (loop [i 0
+           out (vec lines)]
+      (if (>= i n)
+        out
+        (let [line (nth lines i)
+              doc-end (when (string/starts-with? line "/--")
+                        (loop [j i]
+                          (cond
+                            (>= j n) nil
+                            (string/includes? (nth lines j) "-/") j
+                            :else (recur (inc j)))))
+              end (cond
+                    doc-end (when-let [e (check-from (inc doc-end))] e)
+                    (top-level? line) (check-from i)
+                    :else nil)]
+          (if end
+            (recur end (reduce #(assoc %1 %2 "") out (range i end)))
+            (recur (inc (or doc-end i)) out)))))))
+
+(defn load-file!
+  "Elaborates a Veil file into the session, without its `module` and `import`
+  lines (blanked, so that the messages' lines are the file's), and returns its
+  messages, as `lean-sys.session/elab` does. Its last module is left open, so
+  that `prove` works on it: functions taking a model also take the name of a
+  module loaded this way. A module already in the session (the file loaded
+  again, after an edit) is elaborated under its name with a number, and its
+  name then refers to the latest one.
+
+  With `{:checks? false}`, the file's checking commands (`#model_check`,
+  `#check_invariants`, `sat trace`, and those of the other checks) are left
+  out: the module and its executable definitions only, for `model-check`,
+  `system` and the others to use."
+  ([vs path]
+   (load-file! vs path {}))
+  ([vs path {:keys [checks?] :or {checks? true}}]
+   (let [st @(:state vs)
+         renames (atom {})
+         raw (string/split-lines (slurp path))
+         lines (mapv (fn [l]
+                       (cond
+                         (re-find #"^(module|(public )?import )" l) ""
+                         :else (if-let [[_ m] (re-find #"^veil module (\S+)\s*$" l)]
+                                 (let [actual (if (contains? (:modules st) m)
+                                                (str m "_" (+ (inc (:counter st)) (count @renames)))
+                                                m)]
+                                   (swap! renames assoc m actual)
+                                   (str "veil module " actual))
+                                 (if-let [[_ m] (re-find #"^end (\S+)\s*$" l)]
+                                   (str "end " (get @renames m m))
+                                   l))))
+                     (if checks? raw (without-checks raw)))
+         module-name (last (keep #(second (re-find #"^veil module (\S+)" %)) lines))
+         end-line (str "end " module-name)
+         end-index (last (keep-indexed (fn [i l]
+                                         (when (= (string/trim l) end-line) i))
+                                       lines))
+         text (string/join "\n" (cond-> lines end-index (assoc end-index "")))]
+     (close-open-module! vs)
+     (swap! (:state vs) (fn [st]
+                          (cond-> (-> st
+                                      (update :counter + (count @renames))
+                                      (update :modules into (vals @renames))
+                                      (update :aliases merge @renames))
+                            module-name (assoc :open module-name))))
+     (lean/elab (:lean vs) text {:file (str path)}))))
+
+(defn- module-name
+  "The module of `model` (or `model` itself, a module's name) in the session,
+  loading the model if needed."
+  [vs model]
+  (if (string? model)
+    (get-in @(:state vs) [:aliases model] model)
+    (or (get-in @(:state vs) [:loaded model])
+        (load! vs model))))
+
+(defn- helper!
+  "The name of definitions made by `f` (given a fresh name), once per `k`."
+  [vs k f]
+  (or (get-in @(:state vs) [:helpers k])
+      (let [n (str "_jank_veil_" (:counter (swap! (:state vs) update :counter inc)))]
+        (lean/elab! (:lean vs) (f n))
+        (swap! (:state vs) assoc-in [:helpers k] n)
+        n)))
+
+(defn- fields-term
+  "A Lean structure instance from a map: `{ thread := Fin 2 }`. In an
+  instantiation, an integer `n` is `Fin n`."
+  [m instance?]
+  (str "{ "
+       (string/join ", " (map (fn [[k v]]
+                                (str (name k) " := "
+                                     (cond
+                                       (and instance? (integer? v)) (str "Fin " v)
+                                       (string? v) v
+                                       :else (term v))))
+                              m))
+       " }"))
+
+;;;; Results
+
+(defn- lean-name
+  [n]
+  (keyword (str n)))
+
+(defn- step
+  "A label as `{:action :load :args {:t 0}}`."
+  [label]
+  (if (keyword? label)
+    {:action label :args {}}
+    {:action (:lean/ctor label) :args (dissoc label :lean/ctor)}))
+
+(defn- display->data
+  "A value in Veil's display form (`Lean.Json`, see Veil/Util/ValueDisplay.lean)
+  as the data `model-check` gives: a record or a map is a map, a set a set, a
+  constructor with arguments `{:lean/ctor :name ...}`, and a string (an enum
+  constructor's name, as Veil shows it) a keyword."
+  [j]
+  (let [tag (when (map? j) (get j (keyword "$veil")))]
+    (cond
+      (= tag "record") (into {} (map (fn [f]
+                                       [(keyword (:name f)) (display->data (:value f))]))
+                             (:fields j))
+      (= tag "map") (into {} (map (fn [e]
+                                    [(display->data (:key e)) (display->data (:value e))]))
+                          (:entries j))
+      (= tag "set") (into #{} (map display->data) (:elements j))
+      (= tag "multiset") (into {} (map (fn [e]
+                                         [(display->data (:element e)) (:count e)]))
+                               (:entries j))
+      (= tag "ctor") (if (seq (:args j))
+                       (into {:lean/ctor (keyword (:name j))}
+                             (map (fn [a]
+                                    [(keyword (:name a)) (display->data (:value a))]))
+                             (:args j))
+                       (keyword (:name j)))
+      (map? j) (into {} (map (fn [[k v]]
+                               [k (display->data v)]))
+                     j)
+      (vector? j) (mapv display->data j)
+      (string? j) (keyword j)
+      :else j)))
+
+(defn- counterexample
+  "A counterexample to induction, from Veil's display form: a state where the
+  properties hold, a step, and the state after it."
+  [cti]
+  (let [s (step (display->data (:label cti)))]
+    {:theory (display->data (:theory cti))
+     :pre-state (display->data (:preState cti))
+     :action (:action s)
+     :args (:args s)
+     :post-state (display->data (:postState cti))}))
+
+(defn- trace-steps
+  [trace]
+  (when trace
+    (-> [{:action :after_init :state (:initialState trace)}]
+        (into (map (fn [s]
+                     (assoc (step (:transitionLabel s)) :state (:nextState s))))
+              (:steps trace))
+        (into (when-let [f (:failingStep trace)]
+                [(assoc (step (:transitionLabel f)) :state (:nextState f) :failing true)])))))
+
+(defn- model-check-result
+  [r]
+  (case (:lean/ctor r)
+    :foundViolation
+    (let [v (:violation r)
+          trace (:viaTrace r)]
+      (cond-> {:result :foundViolation
+               :violation (if (keyword? v) v (:lean/ctor v))
+               :trace (trace-steps trace)}
+        (seq (:violates v)) (assoc :violates (mapv lean-name (:violates v)))
+        (and (map? v) (contains? v :exceptionId)) (assoc :exception-id (:exceptionId v))
+        (some? (:theory trace)) (assoc :theory (:theory trace))))
+    :noViolationFound
+    (let [t (:terminationReason r)]
+      {:result :noViolationFound
+       :explored-states (:exploredStates r)
+       :termination (if (keyword? t) t (:lean/ctor t))})
+    r))
+
+;;;; Model checking, proofs and systems
+
+(defn- tasks
+  "The parallel sub-tasks for `:parallel`: a number, or `true` for one per core."
+  [parallel]
+  (cond
+    (true? parallel) (cpp/veil_jank.cores)
+    (integer? parallel) parallel
+    :else 0))
+
+(defn- maybe-compile!
+  [vs n compiled]
+  (when compiled
+    (lean/compile! (:lean vs) n (if (map? compiled) compiled {}))))
+
+(defn model-check
+  "Veil's model checker on `model`, for the instantiation `:instance` (a map
+  from the model's types to Lean types: `{:thread 2}` is `Fin 2`), the theory
+  `:theory` (a map of the immutable fields' values) and, when not 0, the depth
+  bound `:max-depth`. Returns
+  `{:result :foundViolation :violation :safetyFailure :violates [...] :trace [...]}`,
+  where the trace is `{:action :load :args {:t 0} :state {...}}` steps, or
+  `{:result :noViolationFound :explored-states n ...}`.
+
+  `:parallel` searches with that many sub-tasks (`true`: one per core).
+  `:compiled` compiles the checker to native code first (`lean-sys.session/compile!`;
+  a map is its options): the compiling takes seconds, the checking runs many
+  times faster, and the library is reused for the same model and options."
+  ([vs model]
+   (model-check vs model {}))
+  ([vs model {:keys [instance theory max-depth parallel compiled] :or {max-depth 0}}]
+   (let [m (module-name vs model)
+         n (helper! vs [:model-check m instance theory max-depth (tasks parallel)]
+                    (fn [n]
+                      (str "def _root_." n " := veil_find_reachable% " m
+                           " " (fields-term instance true)
+                           " " (fields-term theory false)
+                           " " max-depth " " (tasks parallel))))]
+     (maybe-compile! vs n compiled)
+     (model-check-result (lean/call (:lean vs) n)))))
+
+(defn simulate
+  "Veil's simulator on `model`: `:traces` random runs (1000 by default) of up to
+  `:max-steps` steps (100), checking the invariants and safety properties in
+  each state, with `:seed` (0: a random one). For `:instance`, `:theory` and
+  `:compiled`, see `model-check`. Returns
+  `{:result :foundViolation :violation ... :violates [...] :trace [...] :traces-run n :seed s}`
+  or `{:result :noViolationFound :traces-run n :seed s}`."
+  ([vs model]
+   (simulate vs model {}))
+  ([vs model {:keys [instance theory traces max-steps seed compiled]
+              :or {traces 1000 max-steps 100 seed 0}}]
+   (let [m (module-name vs model)
+         n (helper! vs [:simulate m instance theory traces max-steps seed]
+                    (fn [n]
+                      (str "def _root_." n " := veil_simulate% " m
+                           " " (fields-term instance true)
+                           " " (fields-term theory false)
+                           " " traces " " max-steps " " seed)))]
+     (maybe-compile! vs n compiled)
+     (let [r (lean/call (:lean vs) n)
+           res (:result r)
+           base {:traces-run (:tracesRun r) :seed (:seed r) :elapsed-ms (:elapsedMs r)}]
+       (cond
+         (nil? res) (assoc base :result :noViolationFound)
+         (keyword? res) (assoc base :result res)
+         (= :assumptionFailure (:lean/ctor res)) (assoc base
+                                                       :result :foundViolation
+                                                       :violation :assumptionFailure
+                                                       :violates (mapv lean-name (:violates res)))
+         :else (let [v (:violation res)]
+                 (cond-> (assoc base
+                                :result :foundViolation
+                                :violation (if (keyword? v) v (:lean/ctor v))
+                                :trace (trace-steps (:viaTrace res)))
+                   (seq (:violates v)) (assoc :violates (mapv lean-name (:violates v))))))))))
+
+(defn check-temporal
+  "Veil's liveness model checker on `model`'s temporal property `property` (a
+  `(temporal name formula)` declaration), by `:route` (`:fair` by default; also
+  `:crossing`, `:patOnly`, `:prune`, `:dijkstra`). For `:instance`, `:theory`
+  and `:compiled`, see `model-check`. Returns `{:result :holds :explored-states n}`,
+  or `{:result :fails :stem [...] :loop [...]}`: a run that violates it, as the
+  states leading to a cycle and the cycle's states."
+  ([vs model property]
+   (check-temporal vs model property {}))
+  ([vs model property {:keys [instance theory route compiled] :or {route :fair}}]
+   (let [m (module-name vs model)
+         n (helper! vs [:temporal m instance theory property route]
+                    (fn [n]
+                      (str "def _root_." n " := veil_check_temporal% " m
+                           " " (fields-term instance true)
+                           " " (fields-term theory false)
+                           " " (name property) " " (name route))))]
+     (maybe-compile! vs n compiled)
+     (let [r (lean/call (:lean vs) n)]
+       (if (= :empty (:lean/ctor r))
+         {:result :holds :explored-states (:exploredStates r)}
+         {:result :fails :stem (:stem r) :loop (:loop r)})))))
+
+(defn prove
+  "Checks `model`'s invariants and safety properties by induction, as
+  `#check_invariants` does, and returns each verification condition's status:
+  `[{:vc :load_no_lost_update :action :load :property :no_lost_update
+  :status :proven} ...]`, with `:status` `:proven`, `:disproven`, `:unknown`,
+  `:error` or `:timeout`. Kernel-checked when the model sets
+  `(set-option veil.smt.trust false)`."
+  [vs model]
+  (if (string? model)
+    (when (not= (module-name vs model) (:open @(:state vs)))
+      (throw (ex-info (str "veil: module " model " isn't open: load its file again") {:module model})))
+    (load! vs model))
+  (let [vcs (lean/call (:lean vs) "JankVeil.checkInvariants")
+        names (into {} (map (juxt :id #(lean-name (:name %)))) vcs)
+        results (mapv (fn [vc]
+                        (cond-> {:vc (lean-name (:name vc))
+                                 :status (:status vc)}
+                          (some? (:actionName vc)) (assoc :action (lean-name (:actionName vc)))
+                          (some? (:propertyName vc)) (assoc :property (lean-name (:propertyName vc)))
+                          (some? (:alternativeFor vc)) (assoc :alternative-for (names (:alternativeFor vc)))
+                          (some? (:counterexample vc)) (assoc :counterexample
+                                                              (counterexample (:counterexample vc)))))
+                      vcs)
+        ;; The counterexamples of the alternatives (transition-relation style) have a post-state.
+        alternative-counterexamples (into {}
+                                          (keep (fn [r]
+                                                  (when (and (:alternative-for r)
+                                                             (:post-state (:counterexample r)))
+                                                    [(:alternative-for r) (:counterexample r)])))
+                                          results)]
+    (mapv (fn [r]
+            (let [c (get alternative-counterexamples (:vc r))]
+              (if (and c (nil? (:post-state (:counterexample r))))
+                (assoc r :counterexample c)
+                r)))
+          results)))
+
+(defn prove-temporal
+  "Proves `model`'s temporal property `property` for every run, by Lean's
+  `proof` (tactics, as text), with Veil's `prove_temporal_by`. Returns
+  `{:proved? true :axioms [...] :messages [...]}`: proved when it elaborates
+  without errors and has no `sorry`; `:axioms` are those the proof depends on
+  (see `lean-sys.session/axioms`)."
+  [vs model property proof]
+  (let [m (if (string? model)
+            (let [n (module-name vs model)]
+              (when (not= n (:open @(:state vs)))
+                (throw (ex-info (str "veil: module " model " isn't open: load its file again")
+                                {:module model})))
+              n)
+            (load! vs model))
+        messages (lean/elab (:lean vs)
+                            (str "prove_temporal_by [" (name property) "]\n"
+                                 (string/join "\n" (map #(str "  " %) (string/split-lines proof))))
+                            {:file "<prove-temporal>"})
+        ok? (empty? (lean/errors messages))
+        axioms (when ok? (lean/axioms (:lean vs) (str m "." (name property) "._proof")))]
+    {:proved? (boolean (and ok? (not (some #{'sorryAx} axioms))))
+     :axioms (vec axioms)
+     :messages messages}))
+
+(defn proved?
+  "Whether `prove`'s results prove everything: each verification condition is
+  proven, or one of its alternatives is."
+  [results]
+  (let [alternatives (group-by :alternative-for (filter :alternative-for results))]
+    (every? (fn [vc]
+              (or (= :proven (:status vc))
+                  (some #(= :proven (:status %)) (get alternatives (:vc vc)))))
+            (remove :alternative-for results))))
+
+(defn system
+  "`model`'s executable transition system, for `:instance` and `:theory` (as in
+  `model-check`), to use with `initial-states`, `successors`, `properties`
+  and `reachable-states`. `:compiled` compiles them to native code."
+  ([vs model]
+   (system vs model {}))
+  ([vs model {:keys [instance theory compiled]}]
+   (let [m (module-name vs model)
+         th (fields-term theory false)
+         n (helper! vs [:system m instance theory]
+                    (fn [n]
+                      (str "def _root_." n "_sys := veil_system% " m " " (fields-term instance true) " " th "\n"
+                           "def _root_." n "_init := " n "_sys.initStates\n"
+                           "def _root_." n "_next := fun s => (" n "_sys.tr " th " s).successes\n"
+                           "def _root_." n "_props := veil_properties% " m
+                           " " (fields-term instance true) " " th "\n"
+                           "def _root_." n "_reachable := JankVeil.reachableStates " n "_sys " th "\n")))]
+     (when compiled
+       (doseq [suffix ["_init" "_next" "_props" "_reachable"]]
+         (maybe-compile! vs (str n suffix) compiled)))
+     {:session vs :name n})))
+
+(defn initial-states
+  "The system's initial states."
+  [sys]
+  (lean/call (:lean (:session sys)) (str (:name sys) "_init")))
+
+(defn successors
+  "The steps enabled in `state`, as `{:action :load :args {:t 0} :state {...}}`."
+  [sys state]
+  (mapv (fn [[label s]]
+          (assoc (step label) :state s))
+        (lean/call (:lean (:session sys)) (str (:name sys) "_next") state)))
+
+(defn reachable-states
+  "The states the system can reach from its initial states: all of them, or,
+  with `:terminal true`, those with no successor (where a run ends). The search
+  runs in Lean (natively when the system is compiled); the states come back
+  once, as data."
+  ([sys]
+   (reachable-states sys {}))
+  ([sys {:keys [terminal]}]
+   (lean/call (:lean (:session sys)) (str (:name sys) "_reachable") (boolean terminal))))
+
+(defn properties
+  "Whether each of the model's invariants and safety properties holds in
+  `state`: `{:no_lost_update true ...}`."
+  [sys state]
+  (into {}
+        (map (fn [[n holds]]
+               [(keyword n) holds]))
+        (lean/call (:lean (:session sys)) (str (:name sys) "_props") state)))

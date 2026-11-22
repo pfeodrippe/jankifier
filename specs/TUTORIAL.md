@@ -11,10 +11,13 @@ This document goes through three models, with their real output:
    required.
 
 [tutorial.jank](tutorial.jank) has the same text as a jank file, with forms to
-evaluate in a REPL: `(veil "JankSpecs.Tutorial.TinyArrayMap")` builds a model
-and prints what Veil found, other forms replay each counterexample on jank, and
-part 2 calls the `swap!` model from jank through lean-sys. Its header says how
-to start that REPL.
+evaluate in a REPL, where Veil runs in the REPL's process (through the
+[veil](../veil) library): `(check "JankSpecs/Tutorial/TinyArrayMap.lean")`
+elaborates a model and prints what Veil found, `veil/model-check` and
+`veil/prove` return Veil's results as jank data, and other forms replay each
+counterexample on jank. Its header says how to start that REPL.
+[tutorial_jank_models.jank](tutorial_jank_models.jank) goes through the same
+three models written in jank, as data (`veil/defmodel`).
 
 The Veil files of parts 1 and 2 are in `JankSpecs/Tutorial/`. To build them:
 

@@ -6,7 +6,7 @@ import JankSpecs.Conformance.Outcomes
 
 For a script of four requests (which connection sends each, what it is, in
 which session), every outcome the model allows, as
-`conformance/nrepl/run.py` observes jank: per request, its response (for an
+`jank-specs.conformance.nrepl` observes jank: per request, its response (for an
 eval: the requests whose prints are in its `:out`, its value, whether `done`
 came with `eval-error`; for an unknown op, whether it was reported as one) or
 `none` if it got none; the prints which went to the server's own stdout;
@@ -21,18 +21,22 @@ open Nrepl JankSpecs.Outcomes
 abbrev Conn := Fin 2
 abbrev Req := Fin 4
 abbrev Sess := Fin 2
-abbrev St := State (FieldConcreteType Conn Req Sess kind_t_IndT phase_t_IndT)
+abbrev St := State (FieldConcreteType Conn Req Sess kind_t_IndT phase_t_IndT fix_t_IndT)
 
-def theory (conns : List Nat) (kinds : List kind_t_IndT) (sessions : List Nat) :
-    Theory Conn Req Sess kind_t_IndT phase_t_IndT :=
+/-- The theory of a script, with the proposed fixes `fixes` (none: jank as it
+is). -/
+def thy (conns : List Nat) (kinds : List kind_t_IndT) (sessions : List Nat)
+    (fixes : List fix_t_IndT := []) :
+    Theory Conn Req Sess kind_t_IndT phase_t_IndT fix_t_IndT :=
   ⟨fun r => Fin.ofNat 2 (conns.getD r.val 0),
    fun r => kinds.getD r.val .otherOp,
    fun r => Fin.ofNat 2 (sessions.getD r.val 0),
-   0⟩
+   0,
+   fun f => decide (f ∈ fixes)⟩
 
-def sys (th : Theory Conn Req Sess kind_t_IndT phase_t_IndT) :=
+def sys (th : Theory Conn Req Sess kind_t_IndT phase_t_IndT fix_t_IndT) :=
   letI : Veil.LogSwitch := ⟨false⟩
-  enumerableTransitionSystem Conn Req Sess kind_t_IndT phase_t_IndT th
+  enumerableTransitionSystem Conn Req Sess kind_t_IndT phase_t_IndT fix_t_IndT th
 
 def isEvalKind : kind_t_IndT → Bool
   | .evalOk | .evalPrint | .evalThrow | .evalStar1 | .evalBad => true
@@ -44,7 +48,7 @@ def showVal : Option Req → String
 
 def reqs4 : List Req := List.finRange 4
 
-def obs (th : Theory Conn Req Sess kind_t_IndT phase_t_IndT) (s : St) : String :=
+def obs (th : Theory Conn Req Sess kind_t_IndT phase_t_IndT fix_t_IndT) (s : St) : String :=
   let rels (f : _) (x : Req) (y : Req) : Bool := (f : Std.ExtTreeSet (Req × Req)).contains (x, y)
   let set1 (f : _) (x : Req) : Bool := (f : Std.ExtTreeSet Req).contains x
   let restored := reqs4.all fun q => !set1 s.stdoutTo q
@@ -65,9 +69,9 @@ def obs (th : Theory Conn Req Sess kind_t_IndT phase_t_IndT) (s : St) : String :
   let tagged := reqs4.all fun r => !answered r || set1 s.tagged r
   s!"{" ".intercalate reqs} term={term} late={late} tagged={tagged}"
 
-def nreplOutcomes (conns : List Nat) (kinds : List kind_t_IndT) (sessions : List Nat) :
-    List String :=
-  let th := theory conns kinds sessions
+def nreplOutcomes (conns : List Nat) (kinds : List kind_t_IndT) (sessions : List Nat)
+    (fixes : List fix_t_IndT := []) : List String :=
+  let th := thy conns kinds sessions fixes
   outcomes (sys th).initStates (fun s => ((sys th).tr th s).successes.map (·.2)) reprStr (obs th)
 
 #eval nreplOutcomes [0, 0, 1, 1] [.evalPrint, .evalStar1, .evalPrint, .evalThrow] [0, 1, 0, 1]

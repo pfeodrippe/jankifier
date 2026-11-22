@@ -1,5 +1,6 @@
-"""Drive the real jank for the conformance tests: run jank commands, and start
-an nREPL server and talk to it over bencode.
+"""Drive the real jank for the reproduction scripts: run jank commands, and
+start an nREPL server and talk to it over bencode. (The conformance harnesses,
+which used it too, are jank code now: src/jank_specs/harness.jank.)
 
 Only the standard library is used. jank is `/opt/homebrew/bin/jank` unless
 `JANK` is set.
@@ -210,7 +211,7 @@ class Connection:
 
 
 def scratch_dir(prefix):
-    root = os.path.join(os.path.dirname(__file__), "..", "out")
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "conformance", "out")
     os.makedirs(root, exist_ok=True)
     return tempfile.mkdtemp(prefix=prefix, dir=root)
 

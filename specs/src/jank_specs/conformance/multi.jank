@@ -1,0 +1,175 @@
+(ns jank-specs.conformance.multi
+  "Conformance of jank's multimethods with JankSpecs/Blind/Multi.lean, by
+  program replay.
+
+  Random programs of `derive`, `defmethod`, `prefer-method` and calls, over the
+  dispatch values `:pN/v0` .. `:pN/v3` and `:default` (4), each on its own
+  multimethod, run in one `jank run` and in one Clojure process. Every method
+  returns its dispatch value, so a call shows which method it used, or which
+  error it threw. `Multi.Replay.replay` (JankSpecs/Conformance/MultiReplay.lean)
+  checks that every jank result is one the model allows (over all orders of the
+  method table), and notes where jank and Clojure differ.
+
+  Programs only take steps the model allows (no cyclic `derive`, no
+  conflicting `prefer-method`). The model checker's counterexamples come
+  first. With `:fixes` (e.g. `[:a3 :a4]`), jank's results are checked against
+  the fixed model."
+  (:require [clojure.string :as string]
+            [jank-specs.harness :as h]))
+
+(def n-values 5)
+(def default-value 4)
+
+(def targeted
+  [["mm1-preference" [[:derive 3 2] [:defmethod 0] [:derive 2 1] [:defmethod 2]
+                      [:derive 3 0] [:prefer 0 1] [:call 3]]]
+   ["mm1-order" [[:derive 1 0] [:derive 0 3] [:defmethod 3] [:defmethod 0]
+                 [:derive 0 2] [:defmethod 2] [:call 1]]]
+   ["like-clojure" [[:derive 3 2] [:defmethod 0] [:derive 2 0] [:defmethod 2]
+                    [:derive 2 1] [:prefer 0 1] [:call 3]]]])
+
+;; The program's state, to keep to steps the model allows.
+
+(defn- empty-state
+  []
+  {:isa (set (for [a (range n-values)] [a a])) :methods #{} :prefs #{}})
+
+(defn- prefers?
+  [st x y]
+  (boolean (some (fn [[x2 y2]]
+                   (and (contains? (:isa st) [x x2]) (contains? (:isa st) [y y2])))
+                 (:prefs st))))
+
+(defn- can-derive?
+  [st x y]
+  (and (not= x y)
+       (not (contains? #{x y} default-value))
+       (not (contains? (:isa st) [x y]))
+       (not (contains? (:isa st) [y x]))))
+
+(defn- derive-in
+  [st x y]
+  (update st :isa into (for [a (range n-values)
+                             b (range n-values)
+                             :when (and (contains? (:isa st) [a x]) (contains? (:isa st) [y b]))]
+                         [a b])))
+
+(defn- can-prefer?
+  [st x y]
+  (and (not= x y) (not (contains? (:prefs st) [x y])) (not (prefers? st y x))))
+
+(defn random-program
+  [r]
+  (let [[_ steps]
+        (reduce
+         (fn [[st steps] _]
+           (case (h/rand-nth! r [:derive :derive :defmethod :defmethod :prefer :call])
+             :derive (let [pairs (for [x (range n-values) y (range n-values) :when (can-derive? st x y)] [x y])]
+                       (if (seq pairs)
+                         (let [[x y] (h/rand-nth! r pairs)]
+                           [(derive-in st x y) (conj steps [:derive x y])])
+                         [st steps]))
+             :defmethod (let [free (remove (:methods st) (range n-values))]
+                          (if (seq free)
+                            (let [k (h/rand-nth! r free)]
+                              [(update st :methods conj k) (conj steps [:defmethod k])])
+                            [st steps]))
+             :prefer (let [pairs (for [x (range n-values) y (range n-values) :when (can-prefer? st x y)] [x y])]
+                       (if (and (seq pairs) (< (count (:prefs st)) 2))
+                         (let [[x y] (h/rand-nth! r pairs)]
+                           [(update st :prefs conj [x y]) (conj steps [:prefer x y])])
+                         [st steps]))
+             [st (conj steps [:call (h/rand-int! r n-values)])]))
+         [(empty-state) []]
+         (range (h/rand-between! r 3 9)))]
+    (into steps [[:call (h/rand-int! r n-values)] [:call (h/rand-int! r n-values)]])))
+
+(defn- kw
+  [n v]
+  (if (= v default-value) ":default" (str ":p" n "/v" v)))
+
+(defn program-text
+  [n steps catch]
+  (string/join
+   "\n"
+   (cons (str "(defmulti f" n " identity)")
+         (map-indexed
+          (fn [i [k a b]]
+            (case k
+              :derive (str "(derive " (kw n a) " " (kw n b) ")")
+              :defmethod (str "(defmethod f" n " " (kw n a) " [_] " a ")")
+              :prefer (str "(prefer-method f" n " " (kw n a) " " (kw n b) ")")
+              (str "(println \"CALL " n " " i "\" (try (pr-str (f" n " " (kw n a) ")) " catch "))")))
+          steps))))
+
+(defn- classify
+  [text]
+  (cond
+    (re-matches #"\d" text) (if (= default-value (parse-long text)) "default" (str "method " text))
+    (string/includes? text "Multiple methods") "ambiguous"
+    (or (string/includes? text "No method") (string/includes? text "does not define a method")) "none"
+    :else (str "other: " (subs text 0 (min 80 (count text))))))
+
+(defn results
+  "The calls' results in `out`, by `[program step]`."
+  [out]
+  (into {}
+        (keep (fn [line]
+                (when-let [[_ n i text] (re-find #"^CALL (\d+) (\d+) (.*)$" line)]
+                  [[(parse-long n) (parse-long i)]
+                   (classify (string/replace (string/trim text) "\"" ""))]))
+              (string/split-lines out))))
+
+(defn- step
+  "A program step as a `Multi.Replay.Step`, with each language's result for a call."
+  [jank clojure n i [k a b]]
+  (case k
+    :derive {:lean/ctor :derive :x a :y b}
+    :defmethod {:lean/ctor :defmethod :k a}
+    :prefer {:lean/ctor :prefer :x a :y b}
+    {:lean/ctor :call :v a :jank (get jank [n i] "missing") :clojure (get clojure [n i] "missing")}))
+
+(defn check
+  ([]
+   (check {}))
+  ([{:keys [programs seed fixes] :or {programs 200 seed 1}}]
+   (h/load-lean! "JankSpecs/Blind/Multi.lean" "JankSpecs/Conformance/MultiReplay.lean")
+   (let [r (h/rng seed)
+         progs (into targeted (for [i (range programs)]
+                                [(str "random-" seed "-" i) (random-program r)]))
+         work (h/scratch-dir "multi-")]
+     (h/write-file! (str work "/multi_scenario.jank")
+                    (str (string/join "\n" (cons "(ns multi-scenario)"
+                                                 (map-indexed (fn [n [_ steps]]
+                                                                (program-text n steps "(catch std.exception e (str (.what e))) (catch :default e \"other\")"))
+                                                              progs)))
+                         "\n"))
+     (h/write-file! (str work "/multi_scenario.clj")
+                    (str (string/join "\n" (cons "(ns multi-scenario)"
+                                                 (map-indexed (fn [n [_ steps]]
+                                                                (program-text n steps "(catch Exception e (.getMessage e))"))
+                                                              progs)))
+                         "\n"))
+     (let [jank (h/run-jank ["run" "multi_scenario.jank"] work 3600)
+           clojure (h/run-clojure ["-M" "multi_scenario.clj"] work)]
+       (when-not (= 0 (:exit jank))
+         (throw (ex-info "the jank program failed" {:out (:out jank)})))
+       (let [rj (results (:out jank))
+             rc (results (:out clojure))
+             res (vec (map-indexed
+                       (fn [n [nm steps]]
+                         (let [replay (h/except (h/call "Multi.Replay.replay"
+                                                        (vec (map-indexed (fn [i st] (step rj rc n i st)) steps))
+                                                        (vec fixes)))]
+                           (if (contains? replay :ok)
+                             {:scenario nm :result :conforms :notes (:ok replay)}
+                             {:scenario nm :result (:error replay)})))
+                       progs))]
+         {:harness "multi"
+          :work work
+          :ok? (every? #(= :conforms (:result %)) res)
+          :calls (count (filter #(= :call (first %)) (mapcat second progs)))
+          :differ-from-clojure (count (filter #(some (fn [note] (string/includes? note "Clojure"))
+                                                     (:notes %))
+                                              res))
+          :results res})))))

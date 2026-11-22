@@ -1,0 +1,186 @@
+(ns jank-specs.conformance.transients
+  "Conformance of jank's transients with JankSpecs/Blind/Transients.lean, and a
+  differential test against Clojure.
+
+  1. After `persistent!`: for each kind of transient and each operation it
+     has, jank runs the operation on a finished transient; whether it threw
+     must be what the model predicts (`Transients.Check.predict`, in
+     JankSpecs/Conformance/TransientsCheck.lean; T3 says it should always
+     throw). Clojure's result is kept next to it.
+  2. Random programs (T1, T2, T4, T5), on vectors, maps (small, so array maps,
+     and growing past 8 keys, so hash maps) and sets: two transients made from
+     one source, a third from the first result, each with random operations.
+     Each program prints whether the source is unchanged, each result equals
+     the same operations done persistently, and the first result is unchanged
+     by the third transient; and what it holds. jank must print what Clojure
+     prints. The array map bug (RESULTS A1) shows here, on maps only.
+
+  With `:fixes` (e.g. `[:a2]`), the table is checked against the fixed model;
+  the differential part has no model."
+  (:require [clojure.string :as string]
+            [jank-specs.harness :as h]))
+
+(def kinds
+  "The kinds of the model's instance, in order, with a one-element source."
+  [[:vector "[0]"] [:arrayMap "{0 0}"] [:hashMap "(zipmap (range 20) (range 20))"]
+   [:hashSet "#{0}"] [:sortedMap "(sorted-map 0 0)"] [:sortedSet "(sorted-set 0)"]])
+
+(def map-ops
+  [[:conjOp "(conj! t [9 9])"] [:assocOp "(assoc! t 9 9)"] [:dissocOp "(dissoc! t 0)"]
+   [:persistentOp "(persistent! t)"] [:countOp "(count t)"] [:getOp "(get t 0)"]
+   [:getFallbackOp "(get t 0 :nf)"] [:containsOp "(contains? t 0)"] [:findOp "(find t 0)"]
+   [:callOp "(t 0)"] [:callFallbackOp "(t 0 :nf)"]])
+
+(def set-ops
+  [[:conjOp "(conj! t 9)"] [:disjOp "(disj! t 0)"] [:persistentOp "(persistent! t)"]
+   [:countOp "(count t)"] [:getOp "(get t 0)"] [:getFallbackOp "(get t 0 :nf)"]
+   [:containsOp "(contains? t 0)"] [:callOp "(t 0)"] [:callFallbackOp "(t 0 :nf)"]])
+
+(def vector-ops
+  [[:conjOp "(conj! t 9)"] [:assocOp "(assoc! t 0 9)"] [:dissocOp "(dissoc! t 0)"]
+   [:popOp "(pop! t)"] [:persistentOp "(persistent! t)"] [:countOp "(count t)"]
+   [:getOp "(get t 0)"] [:getFallbackOp "(get t 0 :nf)"] [:nthOp "(nth t 0)"]
+   [:nthFallbackOp "(nth t 0 :nf)"] [:containsOp "(contains? t 0)"] [:findOp "(find t 0)"]
+   [:callOp "(t 0)"]])
+
+(def ops
+  {:vector vector-ops :arrayMap map-ops :hashMap map-ops :hashSet set-ops
+   :sortedMap map-ops :sortedSet set-ops})
+
+(defn table-forms
+  [catch]
+  (for [[k [kind src]] (map-indexed vector kinds)
+        [op form] (get ops kind)]
+    (str "(println \"AFTER " k " " (name op) "\" (try (let [t (transient " src ")] (persistent! t) "
+         form " :returned) " catch "))")))
+
+(defn- random-ops
+  "Random operations, as `[transient-form persistent-form]` pairs, and for a
+  vector its contents after them."
+  [r kind coll]
+  (loop [n (h/rand-between! r 1 12)
+         ops []
+         coll coll]
+    (if (zero? n)
+      [ops coll]
+      (case kind
+        :vector (let [choice (h/rand-nth! r (if (seq coll) [:conj :assoc :pop] [:conj :assoc]))]
+                  (case choice
+                    :conj (let [x (h/rand-int! r 100)]
+                            (recur (dec n) (conj ops [(str "(conj! " x ")") (str "(conj " x ")")]) (conj coll x)))
+                    :assoc (let [i (h/rand-int! r (inc (count coll)))
+                                 x (h/rand-int! r 100)]
+                             (recur (dec n) (conj ops [(str "(assoc! " i " " x ")") (str "(assoc " i " " x ")")])
+                                    (assoc coll i x)))
+                    (recur (dec n) (conj ops ["(pop!)" "(pop)"]) (pop coll))))
+        :map (let [choice (h/rand-nth! r [:assoc :assoc :dissoc :conj])
+                   k (h/rand-int! r 12)
+                   v (h/rand-int! r 100)]
+               (recur (dec n)
+                      (conj ops (case choice
+                                  :assoc [(str "(assoc! " k " " v ")") (str "(assoc " k " " v ")")]
+                                  :dissoc [(str "(dissoc! " k ")") (str "(dissoc " k ")")]
+                                  [(str "(conj! [" k " " v "])") (str "(conj [" k " " v "])")]))
+                      coll))
+        (let [x (h/rand-int! r 12)]
+          (recur (dec n)
+                 (conj ops (if (< (h/rand-float! r) 0.7)
+                             [(str "(conj! " x ")") (str "(conj " x ")")]
+                             [(str "(disj! " x ")") (str "(disj " x ")")]))
+                 coll))))))
+
+(defn program
+  "Program `n`: its kind and its text."
+  [n r]
+  (let [kind (h/rand-nth! r [:vector :map :set])
+        [src coll] (case kind
+                     :vector (let [items (vec (repeatedly (h/rand-int! r 5) #(h/rand-int! r 100)))]
+                               [(str "[" (string/join " " items) "]") items])
+                     :map [(str "{" (string/join ", " (for [k (h/sample! r (range 12) (h/rand-int! r 10))]
+                                                        (str k " " (h/rand-int! r 100))))
+                                "}")
+                           nil]
+                     [(str "#{" (string/join " " (h/sample! r (range 12) (h/rand-int! r 6))) "}") nil])
+        [o1 c1] (random-ops r kind coll)
+        [o2 _] (random-ops r kind coll)
+        ;; The third transient starts from the first result: for vectors, its contents keep
+        ;; assoc! indexes valid.
+        [o3 _] (random-ops r kind c1)
+        t (fn [ops] (string/join " " (map first ops)))
+        p (fn [ops] (string/join " " (map second ops)))]
+    [kind
+     (str "(let [src " src " r1 (persistent! (-> (transient src) " (t o1) ")) r1s (pr-str (norm r1))"
+          " p1 (-> src " (p o1) ")"
+          " r2 (persistent! (-> (transient src) " (t o2) ")) p2 (-> src " (p o2) ")"
+          " r3 (persistent! (-> (transient r1) " (t o3) ")) p3 (-> r1 " (p o3) ")]"
+          " (println \"PROG " n "\" (and (= src " src ") (= r1 p1) (= r2 p2) (= r3 p3) (= r1s (pr-str (norm r1))))"
+          " (pr-str (mapv norm [src r1 r2 r3]))))")]))
+
+(def norm
+  "(defn norm [c] (cond (map? c) (into (sorted-map) c) (set? c) (into (sorted-set) c) :else c))")
+
+(defn- tagged
+  "The lines `TAG rest` of `out`, by their first word after the tag."
+  [out tag]
+  (into {}
+        (keep (fn [line]
+                (when (string/starts-with? line (str tag " "))
+                  (let [[_ k v] (re-find #"^\S+ (\S+) (.*)$" line)]
+                    [k v])))
+              (string/split-lines out))))
+
+(defn check
+  ([]
+   (check {}))
+  ([{:keys [programs seed fixes] :or {programs 500 seed 1}}]
+   (h/load-lean! "JankSpecs/Blind/Transients.lean" "JankSpecs/Conformance/TransientsCheck.lean")
+   (let [r (h/rng seed)
+         progs (mapv #(program % r) (range programs))
+         work (h/scratch-dir "transients-")]
+     (h/write-file! (str work "/transients_scenario.jank")
+                    (string/join "\n" (concat ["(ns transients-scenario)" norm]
+                                              (table-forms "(catch :default _ :threw)")
+                                              (map second progs) [""])))
+     (h/write-file! (str work "/transients_scenario.clj")
+                    (string/join "\n" (concat ["(ns transients-scenario)" norm]
+                                              (table-forms "(catch Throwable _ :threw)")
+                                              (map second progs) [""])))
+     (let [jank (h/run-jank ["run" "transients_scenario.jank"] work 3600)
+           clojure (h/run-clojure ["-M" "transients_scenario.clj"] work)]
+       (when-not (= 0 (:exit jank))
+         (throw (ex-info "the jank program failed" {:out (:out jank)})))
+       (let [after (fn [out]
+                     (into {}
+                           (keep (fn [line]
+                                   (when-let [[_ k op res] (re-find #"^AFTER (\d) (\w+) :(\w+)$" line)]
+                                     [[(parse-long k) (keyword op)] res]))
+                                 (string/split-lines out))))
+             after-j (after (:out jank))
+             after-c (after (:out clojure))
+             table (vec (for [[[k op] res] (sort after-j)]
+                          {:kind (first (nth kinds k))
+                           :op op
+                           :jank res
+                           :clojure (get after-c [k op])
+                           :model (h/call "Transients.Check.predict" k op (vec fixes))}))
+             table-ok? (every? #(= (:jank %) (:model %)) table)
+             pj (tagged (:out jank) "PROG")
+             pc (tagged (:out clojure) "PROG")
+             kind-of (fn [n] (first (nth progs n)))
+             inner-bad (fn [printed]
+                         (vec (remove #(string/starts-with? (get printed (str %) "") "true ")
+                                      (range programs))))
+             cross-bad (vec (remove #(= (get pj (str %)) (get pc (str %))) (range programs)))
+             jank-bad (inner-bad pj)
+             clojure-bad (inner-bad pc)
+             only-maps? (every? #(= :map (kind-of %)) (concat jank-bad cross-bad))]
+         {:harness "transients"
+          :work work
+          :ok? (and table-ok? only-maps? (empty? clojure-bad))
+          :table-conforms? table-ok?
+          :returned-after-persistent (filterv #(= "returned" (:jank %)) table)
+          :programs programs
+          :jank-failing (frequencies (map kind-of jank-bad))
+          :clojure-failing (frequencies (map kind-of clojure-bad))
+          :differ-from-clojure (count cross-bad)
+          :differences-only-on-maps? only-maps?})))))

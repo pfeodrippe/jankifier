@@ -3,9 +3,9 @@ import JankSpecs.Concurrency.Bindings
 /-!
 # Replaying jank's behaviour through the bindings model
 
-`conformance/concurrency/bindings.py` runs generated jank programs and writes
-what they did as traces of `Bindings`' actions; `checkTrace` follows each trace
-through every state the model can be in.
+`jank-specs.conformance.bindings` (src/jank_specs/conformance/) runs generated
+jank programs and passes what they did to `replay`, as traces of `Bindings`'
+actions; `replay` follows each trace through every state the model can be in.
 
 The instance: thread 0 is the main thread, 1..7 are futures; OS thread ids
 0..5, with 0 the main thread's (real ids are numbered in the order the program
@@ -19,31 +19,40 @@ open Bindings
 abbrev Th := Fin 8
 abbrev Tid := Fin 6
 abbrev Val := Fin 3
-abbrev L := Label Th Tid Val
-abbrev St := State (FieldConcreteType Th Tid Val)
+abbrev L := Label Th Tid Val fix_t_IndT
+abbrev St := State (FieldConcreteType Th Tid Val fix_t_IndT)
 
-def theory : Theory Th Tid Val := ⟨0, 0, 0, 0⟩
+/-- The theory with the proposed fixes `fixes` (none: jank as it is). -/
+def thyWith (fixes : List fix_t_IndT) : Theory Th Tid Val fix_t_IndT :=
+  ⟨0, 0, 0, 0, fun f => decide (f ∈ fixes)⟩
 
-def sys :=
+def thy := thyWith []
+
+def sysWith (fixes : List fix_t_IndT) :=
   letI : Veil.LogSwitch := ⟨false⟩
-  enumerableTransitionSystem Th Tid Val theory
+  enumerableTransitionSystem Th Tid Val fix_t_IndT (thyWith fixes)
 
-/-- What a step shows: nothing, or what a deref returned (`none`: `nil`). -/
+def sys := sysWith []
+
+/-- What a step shows: nothing, what a deref returned (`none`: `nil`), or that
+it threw (with the fix `c8`). -/
 inductive Obs where
   | none
   | deref (v : Option Val)
+  | threw
   deriving Repr
 
 def obsOk : Obs → St → Bool
   | .none, _ => true
-  | .deref v, s => s.lastDeref == v
+  | .deref v, s => s.lastDeref == v && !s.lastDerefThrew
+  | .threw, s => s.lastDerefThrew
 
-def replay (steps : List (L × Obs)) : Except String Unit := do
-  let mut current : List St := sys.initStates
+def replay (steps : List (L × Obs)) (fixes : List fix_t_IndT := []) : Except String Unit := do
+  let mut current : List St := (sysWith fixes).initStates
   let mut i := 0
   for (l, o) in steps do
     let moves := current.flatMap fun s =>
-      (sys.tr theory s).successes.filter fun (l', _) => reprStr l' == reprStr l
+      ((sysWith fixes).tr (thyWith fixes) s).successes.filter fun (l', _) => reprStr l' == reprStr l
     if moves.isEmpty then
       throw s!"step {i}: the model doesn't allow {reprStr l} here"
     let next := moves.filterMap fun (_, s') => if obsOk o s' then some s' else none

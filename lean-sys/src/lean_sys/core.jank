@@ -4,7 +4,7 @@
   A Lean library built as a shared library (`lake build Lib:shared`, with
   `@[export c_name]` on the functions to call) is loaded like any native
   library: lean-sys links Lean's runtime (`libleanshared`), and the project
-  links its own library (`:linked-libraries` in project.clj). Then:
+  links its own library (from its `jank-build.bb`). Then:
 
   - `initialize-module!` runs a module's initializer, once, before its
     functions are called;
@@ -13,54 +13,23 @@
   - any other signature can be declared in `cpp/raw`, with the types of
     `lean/lean.h`, and called directly.
 
+  `lean-sys.session` runs Lean itself in-process instead: it imports modules,
+  elaborates commands and calls Lean functions on jank values.
+
   Lean objects (`lean_object*`) are reference counted: an exported function
   owns its arguments and returns an object its caller owns. The helpers here
   copy results into jank values and release the Lean objects."
   (:require [clojure.string :as string]))
 
 (cpp/raw "
-#include <atomic>
-#include <dlfcn.h>
-#include <mutex>
-#include <stdexcept>
-#include <string>
+#include <lean_sys/jank.hpp>
 
-#include <lean/lean.h>
-#include <jank/runtime/obj/persistent_string.hpp>
-
-/* Exported by libleanshared; not in lean.h (generated Lean programs declare them themselves). */
-extern \"C\" void lean_initialize_thread();
-extern \"C\" void lean_init_task_manager();
-
-namespace lean_sys
+namespace lean_sys::core
 {
-  /* Whether a module initializer has run (it sets up Lean's runtime, the first
-   * time), and whether this thread is registered with Lean's runtime. */
-  inline std::atomic<bool> runtime_ready{ false };
-  inline thread_local bool thread_ready{ false };
-  inline std::mutex init_mutex;
-
-  /* A thread that calls into Lean must be registered with its runtime first,
-   * except the one that set the runtime up. */
-  inline void ensure_thread()
-  {
-    if(!thread_ready && runtime_ready.load())
-    {
-      lean_initialize_thread();
-      thread_ready = true;
-    }
-  }
-
   inline std::string to_std(jank::runtime::object_ref const o)
   {
     auto const s{ o.to_string() };
     return std::string{ s.data(), s.size() };
-  }
-
-  inline jank::runtime::object_ref to_jank(std::string const &s)
-  {
-    return jank::runtime::make_box<jank::runtime::obj::persistent_string>(
-      jtl::immutable_string{ s.data(), s.size() });
   }
 
   inline void *find(std::string const &symbol)
@@ -68,52 +37,39 @@ namespace lean_sys
     auto const p{ dlsym(RTLD_DEFAULT, symbol.c_str()) };
     if(!p)
     {
-      throw std::runtime_error{ \"lean-sys: no symbol \" + symbol + \" in the loaded libraries\" };
+      throw error{ \"lean-sys: no symbol \" + symbol + \" in the loaded libraries\" };
     }
     return p;
   }
 
-  /* Runs `initialize_<package>_<Module_Path>(builtin)`, as a Lean program's main
-   * does. Lean's initializers are idempotent. */
-  inline void initialize_module(jank::runtime::object_ref const symbol_name)
+  inline void initialize_module(jank::runtime::object_ref const symbol)
   {
-    std::lock_guard<std::mutex> const lock{ init_mutex };
-    auto const symbol{ to_std(symbol_name) };
-    auto const init{ reinterpret_cast<lean_object *(*)(uint8_t)>(find(symbol)) };
-    ensure_thread();
-    lean_object * const res{ init(1) };
-    if(lean_io_result_is_error(res))
-    {
-      lean_io_result_show_error(res);
-      lean_dec_ref(res);
-      throw std::runtime_error{ \"lean-sys: the initializer \" + symbol + \" failed\" };
-    }
-    lean_dec_ref(res);
-    if(!runtime_ready.exchange(true))
-    {
-      thread_ready = true;
-      lean_init_task_manager();
-    }
+    jank_layer::guarded([&] { lean_sys::initialize_module(to_std(symbol)); });
   }
 
-  /* Calls an exported `String → String` function. */
-  inline jank::runtime::object_ref call_string(jank::runtime::object_ref const symbol_name,
+  /* Calls an exported `String → String` function, on the calling thread. */
+  inline jank::runtime::object_ref call_string(jank::runtime::object_ref const symbol,
                                                jank::runtime::object_ref const arg)
   {
-    auto const f{ reinterpret_cast<lean_object *(*)(lean_object *)>(find(to_std(symbol_name))) };
+    auto const f{ jank_layer::guarded([&] {
+      return reinterpret_cast<lean_object *(*)(lean_object *)>(find(to_std(symbol)));
+    }) };
     ensure_thread();
-    auto const text{ to_std(arg) };
     /* f owns its argument, and we own its result. */
-    lean_object * const res{ f(lean_mk_string_from_bytes(text.data(), text.size())) };
-    std::string const out{ lean_string_cstr(res), lean_string_size(res) - 1 };
+    lean_object * const res{ f(mk_string(to_std(arg))) };
+    auto const out{ view(res) };
+    auto const r{ jank::runtime::make_box<jank::runtime::obj::persistent_string>(
+      jtl::immutable_string{ out.data(), out.size() }) };
     lean_dec_ref(res);
-    return to_jank(out);
+    return r;
   }
 
-  /* Calls an exported `UInt64 → UInt64` function (unboxed in C). */
-  inline int64_t call_u64(jank::runtime::object_ref const symbol_name, int64_t const arg)
+  /* Calls an exported `UInt64 → UInt64` function (unboxed in C), on the calling thread. */
+  inline int64_t call_u64(jank::runtime::object_ref const symbol, int64_t const arg)
   {
-    auto const f{ reinterpret_cast<uint64_t (*)(uint64_t)>(find(to_std(symbol_name))) };
+    auto const f{ jank_layer::guarded([&] {
+      return reinterpret_cast<uint64_t (*)(uint64_t)>(find(to_std(symbol)));
+    }) };
     ensure_thread();
     return static_cast<int64_t>(f(static_cast<uint64_t>(arg)));
   }
@@ -129,18 +85,18 @@ namespace lean_sys
 (defn initialize-module!
   "Runs the initializer of `module` of Lake `package`, from a loaded shared
   library. Call it once before calling the module's functions (again is
-  harmless). The first one also starts Lean's runtime."
+  harmless). The first call also starts Lean's runtime."
   [package module]
-  (cpp/lean_sys.initialize_module (initializer-symbol package module))
+  (cpp/lean_sys.core.initialize_module (initializer-symbol package module))
   nil)
 
 (defn call-string
   "Calls the exported Lean function `symbol`, of type `String → String`, on the
   string `s`."
   [symbol s]
-  (cpp/lean_sys.call_string symbol (str s)))
+  (cpp/lean_sys.core.call_string symbol (str s)))
 
 (defn call-u64
   "Calls the exported Lean function `symbol`, of type `UInt64 → UInt64`, on `n`."
   [symbol n]
-  (cpp/lean_sys.call_u64 symbol n))
+  (cpp/lean_sys.core.call_u64 symbol n))

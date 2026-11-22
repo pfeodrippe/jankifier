@@ -23,9 +23,16 @@ that's the `checks` table, read off the code:
 
 `pop!` on an empty vector throws before changing anything (`:229`).
 
+`fixed` turns on a proposed fix of jank, to check it before it's written:
+
+- `a2`: the seven methods which don't call `assert_active` call it, so every
+  operation on a finished transient throws (the same as `checks` true for
+  every operation).
+
 T1, T2, T4 and T5 (the source, the result and other transients aren't
 changed) are about immer's structural sharing, which this model doesn't
-describe; `conformance/transients/run.py` tests them on jank against Clojure.
+describe; `jank-specs.conformance.transients` tests them on jank against
+Clojure.
 -/
 
 veil module Transients
@@ -35,12 +42,15 @@ enum kind_t = { vector, arrayMap, hashMap, hashSet, sortedMap, sortedSet }
 enum op_t = { conjOp, assocOp, dissocOp, disjOp, popOp, persistentOp, countOp, getOp,
   getFallbackOp, nthOp, nthFallbackOp, containsOp, findOp, callOp, callFallbackOp }
 enum out_t = { nothing, returned, threw }
+/- The proposed fixes (see above). -/
+enum fix_t = { a2 }
 
 immutable function kindOf : tr → kind_t
 /- The operations each kind has, and those which check `active`. -/
 immutable relation supported : kind_t → op_t → Bool
 immutable relation checks : kind_t → op_t → Bool
 immutable individual focus : Nat
+immutable relation fixed : fix_t → Bool
 
 relation active : tr → Bool
 function size : tr → Nat
@@ -71,7 +81,7 @@ action apply (t : tr) (o : op_t) {
   lastWasActive := active t
   lastSize := size t
   if ¬ active t then
-    if checks (kindOf t) o then
+    if checks (kindOf t) o ∨ fixed a2 then
       lastOut := threw
     else
       -- Reads the data the result was made from (or moved from).
@@ -137,7 +147,7 @@ holds, T3 doesn't. -/
       | .arrayMap, .getFallbackOp | .arrayMap, .findOp | .arrayMap, .containsOp
       | .arrayMap, .callFallbackOp => false
       | _, _ => true,
-    focus := 0 }
+    focus := 0, fixed := fun _ => false }
 
 #guard_msgs (drop error) in
 #model_check { tr := Fin 6 }
@@ -159,7 +169,7 @@ holds, T3 doesn't. -/
       | .arrayMap, .getFallbackOp | .arrayMap, .findOp | .arrayMap, .containsOp
       | .arrayMap, .callFallbackOp => false
       | _, _ => true,
-    focus := 3 } (sequential := true)
+    focus := 3, fixed := fun _ => false } (sequential := true)
 set_option veil.violationIsError false in
 #model_check { tr := Fin 6 }
   { kindOf := fun t => match t.val with
@@ -180,7 +190,29 @@ set_option veil.violationIsError false in
       | .arrayMap, .getFallbackOp | .arrayMap, .findOp | .arrayMap, .containsOp
       | .arrayMap, .callFallbackOp => false
       | _, _ => true,
-    focus := 3 } (sequential := true)
+    focus := 3, fixed := fun _ => false } (sequential := true)
+
+-- T3 with the fix `a2`: no violation.
+#model_check { tr := Fin 6 }
+  { kindOf := fun t => match t.val with
+      | 0 => kind_t_IndT.vector | 1 => kind_t_IndT.arrayMap | 2 => kind_t_IndT.hashMap
+      | 3 => kind_t_IndT.hashSet | 4 => kind_t_IndT.sortedMap | _ => kind_t_IndT.sortedSet,
+    supported := fun k o => match k, o with
+      | .vector, .disjOp | .vector, .callFallbackOp => false
+      | .vector, _ => true
+      | .hashSet, .assocOp | .hashSet, .dissocOp | .hashSet, .popOp | .hashSet, .nthOp
+      | .hashSet, .nthFallbackOp | .hashSet, .findOp => false
+      | .sortedSet, .assocOp | .sortedSet, .dissocOp | .sortedSet, .popOp | .sortedSet, .nthOp
+      | .sortedSet, .nthFallbackOp | .sortedSet, .findOp => false
+      | .hashSet, _ | .sortedSet, _ => true
+      | _, .disjOp | _, .popOp | _, .nthOp | _, .nthFallbackOp => false
+      | _, _ => true,
+    checks := fun k o => match k, o with
+      | .vector, .nthOp | .vector, .findOp | .vector, .containsOp => false
+      | .arrayMap, .getFallbackOp | .arrayMap, .findOp | .arrayMap, .containsOp
+      | .arrayMap, .callFallbackOp => false
+      | _, _ => true,
+    focus := 3, fixed := fun _ => true }
 
 #gen_executable
 

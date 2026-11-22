@@ -1,0 +1,160 @@
+(ns jank-specs.conformance.nrepl
+  "Conformance of jank's nREPL server with JankSpecs/Nrepl.lean, by outcome
+  sets (JankSpecs/Conformance/NreplOutcomes.lean computes the model's).
+
+  A scenario is four requests, each with its connection (0 or 1), kind and
+  session. For each run, a fresh `jank repl` is started; each connection sends
+  its requests back to back, both connections at once, and every response is
+  collected. Then a new connection evals a future which prints `LATE-MARK`
+  after its eval's capture has ended, and evals again to flush stdio's buffer:
+  whether the server's stdout shows it is whether stdout was restored. It also
+  records whether every response carried its request's `id` and `session`
+  (N2), and whether an unknown op was reported as one (N7). The outcome must
+  be one the model allows.
+
+  Kinds, as jank code: evalOk `(do R)`; evalPrint `(do (usleep) (println \"PR\")
+  (usleep) R)`; evalThrow `(throw (ex-info \"ER\" {}))`; evalStar1 `*1`; evalBad
+  `(do R)` with `\"line\": \"bad\"`; unknownOp: op `no-such-op`; otherOp: op
+  `describe`.
+
+  With `:fixes` (e.g. `[:n1 :n3 :n4n5 :n6]`), the outcomes are the fixed
+  model's: what jank should show once they're written."
+  (:require [clojure.string :as string]
+            [jank-specs.harness :as h]))
+
+(def kinds [:evalOk :evalPrint :evalThrow :evalStar1 :evalBad :unknownOp :otherOp])
+
+(defn- request
+  [r kind session rng]
+  (let [sid (str "session-" session)]
+    (case kind
+      :evalOk {:op "eval" :code (str "(do " r ")") :session sid}
+      :evalPrint (let [a (* 1000 (h/rand-nth! rng [0 50 150]))
+                       b (* 1000 (h/rand-nth! rng [0 50 150]))]
+                   {:op "eval" :session sid
+                    :code (str "(do (cpp/usleep " a ") (println \"P" r "\") (cpp/usleep " b ") " r ")")})
+      :evalThrow {:op "eval" :code (str "(throw (ex-info \"E" r "\" {}))") :session sid}
+      :evalStar1 {:op "eval" :code "*1" :session sid}
+      :evalBad {:op "eval" :code (str "(do " r ")") :line "bad" :session sid}
+      :unknownOp {:op "no-such-op" :session sid}
+      {:op "describe" :session sid})))
+
+(defn- statuses
+  [response]
+  (set (:status response)))
+
+(defn- int-list
+  "Sorted distinct integers, as a Python list prints them: `[0, 1]`."
+  [xs]
+  ;; Not `sort` on an empty collection: its `first` crashes jank (RESULTS S5).
+  (if (seq xs)
+    (str "[" (string/join ", " (sort (distinct xs))) "]")
+    "[]"))
+
+(defn outcome
+  "A run's outcome, as NreplOutcomes.lean writes them, from each request's
+  responses, how many responses lacked their request's `id` or `session`, and
+  what the server printed."
+  [scenario responses untagged server-out]
+  (let [parts (for [r (range 4)
+                    :let [rs (get responses r)
+                          kind (nth (nth scenario r) 1)]]
+                (cond
+                  (not (some h/done? rs)) (str "r" r ":none")
+                  (= kind :unknownOp) (if (some #(every? (statuses %) ["error" "unknown-op" "done"]) rs)
+                                        (str "r" r ":unknown-op")
+                                        (str "r" r ":ok"))
+                  (= kind :otherOp) (str "r" r ":ok")
+                  :else (let [out (apply str (keep :out rs))
+                              values (keep :value rs)]
+                          ;; An error with `done`: `eval-error` (a failed eval), or `error` (main's
+                          ;; answer to a request it couldn't handle, N1's fix).
+                          (str "r" r ":out=" (int-list (map #(parse-long (second %)) (re-seq #"P(\d)" out)))
+                               ",value=" (if (seq values) (last values) "nil")
+                               ",errdone=" (if (some #(and (contains? (statuses %) "done")
+                                                           (or (contains? (statuses %) "eval-error")
+                                                               (contains? (statuses %) "error")))
+                                                     rs)
+                                             "true"
+                                             "false")))))
+        term (keep #(when-let [[_ d] (re-matches #"P(\d)" %)] (parse-long d))
+                   (string/split-lines server-out))]
+    (str (string/join " " parts)
+         " term=" (int-list term)
+         " late=" (if (string/includes? server-out "LATE-MARK") "visible" "hidden")
+         " tagged=" (if (zero? untagged) "true" "false"))))
+
+(defn observe
+  "One run of `scenario` (four `[connection kind session]`) on a fresh server:
+  its outcome, as NreplOutcomes.lean writes them."
+  [scenario rng work]
+  (let [srv (h/server work)]
+    (try
+      (let [setup (h/connect srv)
+            _ (h/nrepl-eval setup "(cpp/raw \"#include <unistd.h>\")" 120000)
+            conns {0 (h/connect srv) 1 (h/connect srv)}
+            responses (atom (into {} (for [r (range 4)] [r []])))
+            untagged (atom 0)
+            drive (fn [c]
+                    (let [conn (get conns c)
+                          mine (vec (keep-indexed (fn [r [rc]] (when (= rc c) r)) scenario))]
+                      (doseq [r mine]
+                        (let [[_ kind session] (nth scenario r)]
+                          (h/send! conn (assoc (request r kind session rng) :id (str r)))))
+                      (loop [pending (set mine)]
+                        (when (seq pending)
+                          (when-let [resp (h/read! conn 8000)]
+                            (let [rid (if (re-matches #"\d+" (str (:id resp))) (parse-long (:id resp)) -1)]
+                              (when (or (not (contains? (set mine) rid))
+                                        (not= (:session resp) (str "session-" (nth (nth scenario rid) 2))))
+                                (swap! untagged inc))
+                              (when (contains? @responses rid)
+                                (swap! responses update rid conj resp))
+                              (recur (if (h/done? resp) (disj pending rid) pending))))))))]
+        (doseq [f [(future (drive 0)) (future (drive 1))]]
+          @f)
+        (let [late (h/connect srv)]
+          (h/nrepl-eval late "(do (future (cpp/usleep 300000) (println \"LATE-MARK\")) nil)" 60000)
+          (h/sleep-ms 1000)
+          ;; The print is in stdio's buffer; the next eval's capture flushes it (`fflush(stdout)`)
+          ;; to wherever file descriptor 1 points.
+          (h/nrepl-eval late "nil" 60000)
+          (h/sleep-ms 500))
+        (outcome scenario @responses @untagged (h/server-output srv)))
+      (finally
+        (h/stop! srv)))))
+
+(def targeted
+  [["bad-eval-ends-connection" [[0 :evalBad 0] [0 :evalOk 0] [1 :evalOk 0] [1 :evalOk 0]]]
+   ["throw-done-with-error" [[0 :evalThrow 0] [0 :evalOk 0] [1 :unknownOp 0] [1 :otherOp 0]]]
+   ["concurrent-prints" [[0 :evalPrint 0] [0 :evalPrint 0] [1 :evalPrint 0] [1 :evalPrint 0]]]
+   ["sessions-share-star1" [[0 :evalOk 0] [0 :evalStar1 1] [1 :evalStar1 0] [1 :evalOk 1]]]])
+
+(defn- random-scenario
+  [r]
+  (vec (repeatedly 4 (fn [] [(h/rand-int! r 2) (h/rand-nth! r kinds) (h/rand-int! r 2)]))))
+
+(defn check
+  ([]
+   (check {}))
+  ([{:keys [random repeat seed fixes] :or {random 10 repeat 3 seed 1}}]
+   (h/load-lean! "JankSpecs/Conformance/Outcomes.lean" "JankSpecs/Nrepl.lean"
+                 "JankSpecs/Conformance/NreplOutcomes.lean")
+   (let [r (h/rng seed)
+         scenarios (into targeted (for [i (range random)]
+                                    [(str "random-" seed "-" i) (random-scenario r)]))
+         work (h/scratch-dir "nrepl-")
+         results (vec (for [[nm sc] scenarios]
+                        (let [seen (vec (distinct (repeatedly repeat #(observe sc r work))))
+                              allowed (set (h/call "Nrepl.Outcomes.nreplOutcomes"
+                                                   (mapv first sc) (mapv second sc) (mapv #(nth % 2) sc)
+                                                   (vec fixes)))]
+                          {:scenario nm
+                           :requests sc
+                           :observed seen
+                           :model-outcomes (count allowed)
+                           :unexpected (vec (remove allowed seen))})))]
+     {:harness "nrepl"
+      :work work
+      :ok? (every? #(empty? (:unexpected %)) results)
+      :results results})))

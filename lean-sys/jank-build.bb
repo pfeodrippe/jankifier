@@ -10,6 +10,8 @@
       dir-name  (-> toolchain (string/replace "/" "--") (string/replace ":" "---"))
       prefix    (str (System/getProperty "user.home") "/.elan/toolchains/" dir-name)]
   (util/include-dir (str prefix "/include"))
+  ;; lean-sys's C++ layer (lean_sys/*.hpp).
+  (util/include-dir (str (fs/path (fs/parent *file*) "include")))
   (util/link-dir (str prefix "/lib/lean"))
   ;; In dependency order: these libraries have no rpath, so each finds the ones it depends on
   ;; only when they're already loaded. A library built by Lake depends on Lake_shared.

@@ -1,0 +1,216 @@
+(ns jank-specs.conformance.bindings
+  "Conformance of jank's dynamic bindings and futures with
+  JankSpecs/Concurrency/Bindings.lean, by trace replay.
+
+  A scenario is a sequence of the model's actions: the model checker's
+  counterexamples (C3, C4, C8), and random ones. Each becomes a jank program,
+  run in a fresh `jank run`, whose events become a trace of the model, which
+  `Bindings.Replay.replay` (JankSpecs/Conformance/BindingsReplay.lean) checks.
+
+  How actions map to jank, on the main thread:
+  - push v / pop: `(binding [*x* :vV] ...)`, nested in order;
+  - spawn f i: `(future (body f))`; the body records its OS thread id first,
+    then returns `*x*`. The model's `i` is the real id, numbered in the order
+    the program sees ids (the main thread's is 0);
+  - finish f: the body returning, placed right before the deref;
+  - cancel f: the body sleeps after recording its id, the program waits for
+    it, then calls `future-cancel`;
+  - deref f: `@f`, printing what it returned, or that it threw.
+
+  With `:fixes` (the model's proposed fixes, e.g. `[:c3c4 :c8]`), the traces
+  are replayed on the fixed model: what jank should do once they're written."
+  (:require [clojure.string :as string]
+            [jank-specs.harness :as h]))
+
+(def max-threads 7)
+(def max-tids 6)
+
+(def prelude
+  "(ns bindings-scenario (:include \"pthread.h\" \"unistd.h\"))
+(cpp/raw \"inline long jank_spec_tid() { return (long)(uintptr_t)pthread_self(); }\")
+(def ^:dynamic *x* :v0)
+(def tids (atom {}))
+(defn body [f slow?]
+  (swap! tids assoc f (cpp/jank_spec_tid))
+  (when slow? (cpp/usleep 4000000))
+  *x*)
+(defn wait-for-tid [f]
+  (while (nil? (get @tids f)) (cpp/usleep 1000)))
+(println \"EV main\" (cpp/jank_spec_tid))
+")
+
+(defn program
+  "The jank program for `actions` (spawns without their thread id, which is
+  observed)."
+  [actions]
+  (let [cancelled (set (keep (fn [[k f]] (when (= :cancel k) f)) actions))
+        ind (fn [depth] (apply str (repeat depth "  ")))
+        [lines depth] (reduce
+                       (fn [[lines depth] [k a]]
+                         (case k
+                           :push [(conj lines
+                                        (str (ind depth) "(binding [*x* :v" a "]")
+                                        (str (ind depth) "  (println \"EV push " a "\")"))
+                                  (inc depth)]
+                           :pop [(conj lines (str (ind (dec depth)) "  (println \"EV pop\"))")) (dec depth)]
+                           :spawn [(conj lines
+                                         (str (ind depth) "(def f" a " (future (body " a " "
+                                              (if (contains? cancelled a) "true" "false") ")))")
+                                         (str (ind depth) "(wait-for-tid " a ")")
+                                         (str (ind depth) "(println \"EV spawn " a "\" (get @tids " a "))"))
+                                   depth]
+                           :cancel [(conj lines
+                                          (str (ind depth) "(future-cancel f" a ")")
+                                          (str (ind depth) "(println \"EV cancel " a "\")"))
+                                    depth]
+                           :deref [(conj lines (str (ind depth) "(println \"EV deref " a
+                                                    "\" (try (pr-str @f" a ") (catch :default _ \"threw\")))"))
+                                   depth]
+                           [lines depth]))
+                       [[prelude] 0]
+                       actions)
+        closing (for [d (reverse (range depth))]
+                  (str (ind d) "  (println \"EV pop\"))"))]
+    (str (string/join "\n" (concat lines closing)) "\n")))
+
+(defn trace-of
+  "The program's events as steps of the model, `[label observation]`, with real
+  thread ids numbered in the order they're seen."
+  [out]
+  (let [events (keep (fn [l]
+                       (when (string/starts-with? l "EV ")
+                         (rest (string/split l #" "))))
+                     (string/split-lines out))]
+    (when-not (= "main" (first (first events)))
+      (throw (ex-info "no main thread id" {})))
+    (loop [[ev & evs] (rest events)
+           ids {(second (first events)) 0}
+           steps []
+           finished #{}
+           cancelled #{}]
+      (if (nil? ev)
+        (do
+          (when (> (count ids) max-tids)
+            (throw (ex-info (str (count ids) " thread ids, more than the replay instance has") {})))
+          steps)
+        (let [[kind a b] ev]
+          (case kind
+            "push" (recur evs ids (conj steps [{:lean/ctor :push :v (parse-long a)} :none]) finished cancelled)
+            "pop" (recur evs ids (conj steps [:pop :none]) finished cancelled)
+            "spawn" (let [ids (if (contains? ids b) ids (assoc ids b (count ids)))]
+                      (recur evs ids
+                             (conj steps [{:lean/ctor :spawn :f (parse-long a) :i (get ids b)} :none])
+                             finished cancelled))
+            "cancel" (recur evs ids (conj steps [{:lean/ctor :cancel :f (parse-long a)} :none])
+                            finished (conj cancelled (parse-long a)))
+            "deref" (let [f (parse-long a)
+                          finish? (not (or (contains? finished f) (contains? cancelled f)))
+                          obs (case b
+                                "threw" :threw
+                                "nil" {:lean/ctor :deref :v nil}
+                                {:lean/ctor :deref :v (parse-long (subs b 2))})
+                          steps (cond-> steps
+                                  finish? (conj [{:lean/ctor :finish :f f} :none]))]
+                      (recur evs ids
+                             (conj steps [{:lean/ctor :deref :f f} obs])
+                             (conj finished f) cancelled))
+            (recur evs ids steps finished cancelled)))))))
+
+(defn- action-of
+  "A step of a model counterexample as a program action."
+  [[action args]]
+  (case action
+    :push [:push (:v args)]
+    :pop [:pop]
+    :spawn [:spawn (:f args)]
+    :cancel [:cancel (:f args)]
+    :deref [:deref (:f args)]
+    nil))
+
+(defn counterexamples
+  "The model checker's counterexamples (C3, C4, C8) as program actions:
+  spawns lose their thread id (the OS picks it), finishes are implied, and
+  every future is dereffed."
+  []
+  (vec
+   (for [focus [3 4 8]
+         :let [cex (h/counterexample "Bindings" {:instance {:thread 3 :tid 3 :val 3}
+                                                 :theory {:main 0 :mainTid 0 :root 0 :focus focus
+                                                          :fixed (h/fixed-term [])}})]
+         :when cex]
+     (let [acts (vec (keep action-of (:actions cex)))
+           spawned (set (keep (fn [[k f]] (when (= :spawn k) f)) acts))
+           dereffed (set (keep (fn [[k f]] (when (= :deref k) f)) acts))]
+       [(str "cex-" (name (first (:violates cex))))
+        (into acts (map (fn [f] [:deref f]) (sort (remove dereffed spawned))))]))))
+
+(defn random-scenario
+  [r length]
+  (loop [acts []
+         depth 0
+         next-f 1
+         live []
+         done []]
+    (if (>= (count acts) length)
+      (into acts (map (fn [f] [:deref f]) live))
+      (let [c (h/weighted! r [:push :pop :spawn :deref :cancel :redo] [3 2 4 4 1 1])]
+        (cond
+          (and (= c :push) (< depth 2))
+          (recur (conj acts [:push (inc (h/rand-int! r 2))]) (inc depth) next-f live done)
+
+          (and (= c :pop) (pos? depth))
+          (recur (conj acts [:pop]) (dec depth) next-f live done)
+
+          (and (= c :spawn) (<= next-f max-threads) (< (count live) (- max-tids 2)))
+          (recur (conj acts [:spawn next-f]) depth (inc next-f) (conj live next-f) done)
+
+          (and (= c :deref) (seq live))
+          (let [i (h/rand-int! r (count live))
+                f (nth live i)]
+            (recur (conj acts [:deref f]) depth next-f
+                   (vec (concat (subvec live 0 i) (subvec live (inc i)))) (conj done f)))
+
+          (and (= c :cancel) (<= next-f max-threads) (< (count live) (- max-tids 2)))
+          (recur (into acts [[:spawn next-f] [:cancel next-f] [:deref next-f]])
+                 depth (inc next-f) live (conj done next-f))
+
+          (and (= c :redo) (seq done))
+          (recur (conj acts [:deref (h/rand-nth! r done)]) depth next-f live done)
+
+          :else (recur acts depth next-f live done))))))
+
+(defn check
+  "Runs the scenarios on jank and replays their traces on the model:
+  `{:harness \"bindings\" :ok? bool :results [{:scenario :steps :result}]}`,
+  where `:result` is `:conforms`, or why not."
+  ([]
+   (check {}))
+  ([{:keys [random length seed fixes] :or {random 30 length 12 seed 1}}]
+   (h/load-lean! "JankSpecs/Concurrency/Bindings.lean" "JankSpecs/Conformance/BindingsReplay.lean")
+   (let [r (h/rng seed)
+         scenarios (into (counterexamples)
+                         (for [i (range random)]
+                           [(str "random-" seed "-" i) (random-scenario r length)]))
+         work (h/scratch-dir "bindings-")
+         results (vec
+                  (for [[nm acts] scenarios]
+                    (let [path (str work "/" nm ".jank")
+                          _ (h/write-file! path (program acts))
+                          {:keys [exit out]} (h/run-jank ["run" path] work 300)]
+                      (try
+                        (when-not (= 0 exit)
+                          (throw (ex-info (str "jank exited with " exit ": "
+                                               (h/tail out 1500))
+                                          {})))
+                        (let [steps (trace-of out)
+                              replay (h/except (h/call "Bindings.Replay.replay" steps (vec fixes)))]
+                          {:scenario nm
+                           :steps (count steps)
+                           :result (if (contains? replay :ok) :conforms (:error replay))})
+                        (catch jank.runtime.object_ref e
+                          {:scenario nm :result (str "not run: " (ex-message e))})))))]
+     {:harness "bindings"
+      :work work
+      :ok? (and (= 3 (count (filter #(string/starts-with? (:scenario %) "cex-") results)))
+                (every? #(= :conforms (:result %)) results))
+      :results results})))

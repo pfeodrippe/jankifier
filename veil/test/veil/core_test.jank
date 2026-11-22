@@ -1,0 +1,244 @@
+(ns veil.core-test
+  (:require [clojure.string :as string]
+            [clojure.test :refer [deftest is testing]]
+            [lean-sys.session :as lean]
+            [veil.core :as veil]))
+
+;; The Lake project with Veil built (its packages' shared libraries included), relative to veil/:
+;; this repository's specs/. Without it, only the rendering tests run.
+(def lake-project "../specs")
+
+(def veil-built?
+  (boolean (seq (lean/lake-libraries lake-project))))
+
+(def vs
+  (delay (veil/session {:lake-project lake-project})))
+
+(veil/defmodel naive-atom NaiveAtom
+  (type thread)
+  (enum pc_t idle loaded done)
+  (individual value Nat)
+  (function pc [thread] pc_t)
+  (function seen [thread] Nat)
+  (individual swaps Nat)
+  (after-init
+    (set! value 0)
+    (set! (pc T) :idle)
+    (set! (seen T) 0)
+    (set! swaps 0))
+  (action load [t thread]
+    (require (= (pc t) :idle))
+    (set! (seen t) value)
+    (set! (pc t) :loaded))
+  (action store [t thread]
+    (require (= (pc t) :loaded))
+    (set! value (+ (seen t) 1))
+    (set! swaps (+ swaps 1))
+    (set! (pc t) :done))
+  (safety no_lost_update (= value swaps)))
+
+(veil/defmodel tiny-atom TinyAtom
+  (set-option veil.smt.trust false)
+  (type thread)
+  (enum pc_t idle loaded done)
+  (individual value Nat)
+  (function pc [thread] pc_t)
+  (function seen [thread] Nat)
+  (individual swaps Nat)
+  (individual maxReturned Nat)
+  (individual stale Bool)
+  (after-init
+    (set! value 0)
+    (set! (pc T) :idle)
+    (set! (seen T) 0)
+    (set! swaps 0)
+    (set! maxReturned 0)
+    (set! stale false))
+  (action load [t thread]
+    (require (= (pc t) :idle))
+    (set! (seen t) value)
+    (set! (pc t) :loaded))
+  (action cas [t thread]
+    (require (= (pc t) :loaded))
+    (if (= value (seen t))
+      (do (set! value (+ (seen t) 1))
+          (set! swaps (+ swaps 1))
+          (set! stale (decide (or stale (<= (+ (seen t) 1) maxReturned))))
+          (when (< maxReturned (+ (seen t) 1))
+            (set! maxReturned (+ (seen t) 1)))
+          (set! (pc t) :done))
+      (set! (pc t) :idle)))
+  (safety no_lost_update (= value swaps))
+  (safety results_increase (not stale))
+  (invariant max_is_swaps (= maxReturned swaps)))
+
+;; Veil's liveness example (Examples/LivenessMC/SimpleAtomicProp.lean), with a property that holds.
+(veil/defmodel live Live
+  (individual chosen Nat)
+  (after-init (set! chosen 0))
+  (action noChoose [] (set! chosen 0))
+  (action choose [] (set! chosen 1))
+  (action stutter []
+    (require (= chosen 1))
+    (set! chosen 1))
+  (safety myexample (or (= chosen 0) (= chosen 1)))
+  (temporal chosenEqOne (always (eventually (state (= chosen 1)))))
+  (temporal fairChoice (=> (wf choose) (eventually (state (= chosen 1))))))
+
+(deftest source-test
+  (let [text (veil/source naive-atom)]
+    (testing "the declarations, in Veil's syntax, with the generated commands"
+      (is (string/starts-with? text "veil module NaiveAtom\n"))
+      (is (string/includes? text "function pc : thread → pc_t"))
+      (is (string/includes? text "  require ((pc t) = idle)"))
+      (is (string/includes? text "  pc t := loaded"))
+      (is (string/includes? text "safety [no_lost_update] (value = swaps)"))
+      (is (string/includes? text "#gen_state\n"))
+      (is (string/ends-with? text "#gen_spec\n#gen_executable\n"))))
+  (testing "statements"
+    (is (string/includes? (veil/source tiny-atom)
+                          "  if (value = (seen t)) then\n    value := ((seen t) + 1)"))
+    (is (string/starts-with? (veil/source tiny-atom) "set_option veil.smt.trust false\n")))
+  (testing "temporal formulas"
+    (is (string/includes? (veil/source live) "temporal [chosenEqOne] (□ (◇ ⌜ (chosen = 1) ⌝))"))
+    (is (string/includes? (veil/source live) "temporal [fairChoice] ((𝒲ℱ (choose)) → (◇ ⌜ (chosen = 1) ⌝))")))
+  (testing "a model is data"
+    (is (= "TinyAtom" (:name tiny-atom)))
+    (is (= 3 (count (filter #(#{'safety 'invariant} (first %)) (:decls tiny-atom)))))))
+
+(deftest model-check-test
+  (when veil-built?
+    (let [r (veil/model-check @vs naive-atom {:instance {:thread 2}})]
+      (testing "a violation, with its trace of the model's states"
+        (is (= :foundViolation (:result r)))
+        (is (= [:no_lost_update] (:violates r)))
+        (is (= 5 (count (:trace r))))
+        (is (= {:value 1 :pc {0 :done 1 :done} :seen {0 0 1 0} :swaps 2}
+               (:state (last (:trace r)))))))
+    (testing "no violation"
+      (is (= {:result :noViolationFound :explored-states 71 :termination :exploredAllReachableStates}
+             (veil/model-check @vs tiny-atom {:instance {:thread 3}}))))
+    (testing "in parallel, and compiled to native code: the same results"
+      (is (= 71 (:explored-states (veil/model-check @vs tiny-atom {:instance {:thread 3} :parallel 4}))))
+      (is (= (veil/model-check @vs tiny-atom {:instance {:thread 3}})
+             (veil/model-check @vs tiny-atom {:instance {:thread 3} :compiled true})))
+      (is (= [:no_lost_update]
+             (:violates (veil/model-check @vs naive-atom {:instance {:thread 2} :compiled true})))))))
+
+(deftest simulate-test
+  (when veil-built?
+    (let [r (veil/simulate @vs naive-atom {:instance {:thread 2} :traces 200 :seed 7})]
+      (is (= :foundViolation (:result r)))
+      (is (= [:no_lost_update] (:violates r))))
+    (is (= :noViolationFound
+           (:result (veil/simulate @vs tiny-atom {:instance {:thread 2} :traces 200 :seed 7}))))))
+
+(deftest prove-test
+  (when veil-built?
+    (is (veil/proved? (veil/prove @vs tiny-atom)))
+    (let [first-try (update tiny-atom :decls (fn [ds] (vec (remove #(= 'invariant (first %)) ds))))
+          failed (remove #(= :proven (:status %)) (remove :alternative-for (veil/prove @vs first-try)))]
+      (is (= [:cas_results_increase] (mapv :vc failed)))
+      (testing "the counterexample to induction"
+        (let [c (:counterexample (first failed))]
+          (is (= :cas (:action c)))
+          (is (= 1 (:maxReturned (:pre-state c))))
+          (is (= true (:stale (:post-state c)))))))))
+
+(deftest system-test
+  (when veil-built?
+    (let [sys (veil/system @vs tiny-atom {:instance {:thread 2}})
+          [s0] (veil/initial-states sys)]
+      (is (= {:value 0 :pc {0 :idle 1 :idle} :seen {0 0 1 0} :swaps 0 :maxReturned 0 :stale false} s0))
+      (is (= [[:load {:t 0}] [:load {:t 1}]] (mapv (juxt :action :args) (veil/successors sys s0))))
+      (testing "on a state written in jank"
+        (is (= {:no_lost_update false :results_increase true :max_is_swaps false}
+               (veil/properties sys {:value 1 :pc {0 :done 1 :done} :seen {0 0 1 0}
+                                     :swaps 2 :maxReturned 1 :stale false})))))
+    (testing "compiled"
+      (let [sys (veil/system @vs tiny-atom {:instance {:thread 2} :compiled true})]
+        (is (= 2 (count (veil/successors sys (first (veil/initial-states sys))))))))))
+
+(deftest temporal-test
+  (when veil-built?
+    (let [r (veil/check-temporal @vs live 'chosenEqOne)]
+      (testing "a run that keeps choosing noChoose never sets chosen"
+        (is (= :fails (:result r)))
+        (is (every? #(= {:chosen 0} %) (:loop r)))))
+    (testing "with weak fairness of choose"
+      (is (= :holds (:result (veil/check-temporal @vs live 'fairChoice)))))))
+
+(deftest files-test
+  (when veil-built?
+    (let [messages (veil/load-file! @vs (str lake-project "/JankSpecs/Tutorial/TinyArrayMap.lean"))]
+      (is (= [95 99] (mapv :line messages))))
+    (testing "loaded again, after an edit"
+      (veil/load-file! @vs (str lake-project "/JankSpecs/Tutorial/TinyArrayMap.lean"))
+      (is (= [:maps_hold_what_they_should]
+             (:violates (veil/model-check @vs "TinyArrayMap"
+                                          {:instance {:obj 3 :arr 3 :key 1 :val 2}
+                                           :theory {:copyOnTransient false}})))))))
+
+;; Veil's Consensus example (Examples/Liveness/TLA/Consensus.lean): a value is eventually chosen,
+;; when choosing is weakly fair, proved for every run.
+(veil/defmodel consensus Consensus
+  (set-option veil.smt.trust false)
+  (lean "open Lentil")
+  (type value)
+  (relation chosen [value])
+  (after-init (set! (chosen V) false))
+  (ghost-relation noneChosen [] (forall [v value] (not (chosen v))))
+  (ghost-relation someChosen [] (exists [v value] (chosen v)))
+  (action choose []
+    (require noneChosen)
+    (pick v value)
+    (set! (chosen v) true))
+  (action stutter [] (lean "pure ()"))
+  (safety agreement (=> (and (chosen V1) (chosen V2)) (= V1 V2)))
+  (temporal success (=> (wf choose) (eventually (state someChosen)))))
+
+(def consensus-proof
+  "tclear hInv
+tintro hwf
+tsuffices hleadsto :
+ ⌜fun st => (veil_term% noneChosen) st⌝ ↝ ⌜fun st => (veil_term% someChosen) st⌝ by
+  tunfold leads_to at hleadsto
+  thave himp := always_weaken hleadsto
+  tapply himp
+  tclear *- hInit
+  veil_solve_temporal
+tclear hInit
+trevert hNext hwf ; trewrite [← Lentil.and_imp]
+tapply wf1_original
+tsplit_ands
+all_goals tmonotone ; veil_solve_temporal")
+
+(deftest temporal-proof-test
+  (when veil-built?
+    (testing "model checked for three values"
+      (is (= :holds (:result (veil/check-temporal @vs consensus 'success {:instance {:value 3}})))))
+    (testing "proved for every run and any number of values, without trusting the SMT solver"
+      (let [r (veil/prove-temporal @vs consensus 'success consensus-proof)]
+        (is (:proved? r))
+        (is (every? #{'propext 'Classical.choice 'Quot.sound} (:axioms r)))))
+    (testing "a wrong proof"
+      (is (not (:proved? (veil/prove-temporal @vs consensus 'success "tclear hInv\nveil_solve_temporal")))))))
+
+;; A theory naming the model's enum, checked while another module (a variant of it) is open.
+(veil/defmodel colors Colors
+  (type node)
+  (enum color red blue)
+  (immutable (function initial [node] color))
+  (function current [node] color)
+  (after-init (set! (current N) (initial N)))
+  (action flip [n node]
+    (set! (current n) (if (= (current n) :red) :blue :red)))
+  (safety someRed (exists [n node] (= (current n) :red))))
+
+(deftest names-in-theories-test
+  (when veil-built?
+    (veil/load! @vs colors)
+    (veil/load! @vs (update colors :decls conj '(safety alwaysTrue true)))
+    (let [r (veil/model-check @vs colors {:instance {:node 2} :theory {:initial "fun _ => color_IndT.red"}})]
+      (is (= [:someRed] (:violates r)))
+      (is (= {0 :blue 1 :blue} (:current (:state (last (:trace r)))))))))

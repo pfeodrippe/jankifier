@@ -1,0 +1,342 @@
+(ns jank-specs.harness
+  "What the conformance harnesses share (src/jank_specs/conformance/): running
+  jank and Clojure in fresh processes, jank's nREPL server and a client for it
+  (bencode over TCP), files and their times, a seeded random generator, and the
+  Lean models and checkers, loaded into the Veil session.
+
+  A harness generates programs from scenarios (the model checker's
+  counterexamples, and random ones), runs them on jank, turns what jank showed
+  into observations, and calls a Lean checker of JankSpecs/Conformance/ on them,
+  in this process."
+  (:require [clojure.string :as string]
+            [jank-specs.tutorial :refer [specs-dir vs]]
+            [lean-sys.session :as lean]
+            [veil.core :as veil]))
+
+(cpp/raw "#include <jank_specs/harness.hpp>")
+
+;;;; Processes
+
+(defn- quote-arg
+  [s]
+  (str "'" (string/replace (str s) "'" "'\\''") "'"))
+
+(defn jank-binary
+  "The jank the harnesses run: `$JANK` if it's set (a jank built from source,
+  say), else `jank` on the PATH."
+  []
+  (cpp/jank_specs.harness.jank_binary))
+
+(defn spawn
+  "Starts `args` (a command and its arguments) in directory `dir`, with elan's
+  and Homebrew's bin directories on the PATH. Its stdout and stderr are
+  captured (`output`); its stdin stays open."
+  [args dir]
+  (cpp/jank_specs.harness.spawn
+   (str "env PATH=\"$HOME/.elan/bin:/opt/homebrew/bin:$PATH\" " (string/join " " (map quote-arg args)))
+   (str dir)))
+
+(defn output
+  "What process `p` has printed so far (stdout and stderr)."
+  [p]
+  (cpp/jank_specs.harness.output p))
+
+(defn wait
+  "Process `p`'s exit code, after waiting up to `timeout-ms` for it; nil if it
+  hasn't ended."
+  [p timeout-ms]
+  (cpp/jank_specs.harness.wait p timeout-ms))
+
+(defn kill!
+  [p]
+  (cpp/jank_specs.harness.kill p)
+  nil)
+
+(defn run
+  "Runs `args` in `dir` to its end, or kills it after `timeout-s` seconds:
+  `{:exit code :out text}`, with `:exit` nil when it was killed."
+  [args dir timeout-s]
+  (let [p (spawn args dir)
+        exit (wait p (* 1000 timeout-s))]
+    (when (nil? exit)
+      (kill! p))
+    {:exit exit :out (output p)}))
+
+(defn jank-args
+  "jank's options for a module path (directories), a build directory and a
+  binary version."
+  [{:keys [module-path build-dir binary-version]}]
+  (cond-> []
+    (seq module-path) (into ["--module-path" (string/join ":" module-path)])
+    build-dir (into ["--build-dir" build-dir])
+    binary-version (into ["--force-binary-version" binary-version])))
+
+(defn run-jank
+  "Runs `jank args...` (`jank-binary`) in `dir` (600 s at most by default)."
+  ([args dir]
+   (run-jank args dir 600))
+  ([args dir timeout-s]
+   (run (into [(jank-binary)] args) dir timeout-s)))
+
+(defn run-clojure
+  "Runs `clojure args...` in `dir` (1800 s at most by default)."
+  ([args dir]
+   (run-clojure args dir 1800))
+  ([args dir timeout-s]
+   (run (into ["clojure"] args) dir timeout-s)))
+
+(defn sleep-ms
+  [ms]
+  (cpp/usleep (* 1000 ms))
+  nil)
+
+;;;; jank's nREPL server, and a client
+
+(defn server
+  "Starts `jank args... repl` in `dir` (a scratch directory: it writes
+  `.nrepl-port` there) and waits for its nREPL server: `{:process p :port n}`."
+  ([dir]
+   (server dir []))
+  ([dir args]
+   (let [p (spawn (concat [(jank-binary)] args ["repl"]) dir)]
+     (loop [waited 0]
+       (if-let [[_ port] (re-find #"nREPL server started on port (\d+)" (output p))]
+         {:process p :port (parse-long port)}
+         (if (or (> waited 300000) (some? (wait p 0)))
+           (do
+             (kill! p)
+             (throw (ex-info (str "the nREPL server didn't start:\n" (output p)) {})))
+           (do
+             (sleep-ms 50)
+             (recur (+ waited 50)))))))))
+
+(defn stop!
+  [srv]
+  (kill! (:process srv)))
+
+(defn server-output
+  [srv]
+  (output (:process srv)))
+
+(defn connect
+  [srv]
+  {:conn (cpp/jank_specs.harness.connect (:port srv)) :ids (atom 0)})
+
+(defn send!
+  "Sends `msg` (a map), with an `:id` if it has none, and returns the id."
+  [c msg]
+  (let [msg (if (contains? msg :id)
+              msg
+              (assoc msg :id (str (swap! (:ids c) inc))))]
+    (cpp/jank_specs.harness.send (:conn c) msg)
+    (:id msg)))
+
+(defn read!
+  "One response (a map with keyword keys), or nil after `timeout-ms` or when
+  the connection closed."
+  [c timeout-ms]
+  (cpp/jank_specs.harness.read (:conn c) timeout-ms))
+
+(defn close!
+  [c]
+  (cpp/jank_specs.harness.close (:conn c))
+  nil)
+
+(defn done?
+  [response]
+  (boolean (some #{"done"} (:status response))))
+
+(defn until-done
+  "Responses up to the one for `id` with the `done` status: `{:responses [...]
+  :done? bool}`."
+  [c id timeout-ms]
+  (loop [out []]
+    (let [r (read! c timeout-ms)]
+      (cond
+        (nil? r) {:responses out :done? false}
+        (and (= id (:id r)) (done? r)) {:responses (conj out r) :done? true}
+        :else (recur (conj out r))))))
+
+(defn nrepl-eval
+  "Evaluates `code`: `{:value [...] :out text :err text :ex [...] :status
+  [...] :responses [...]}`."
+  ([c code timeout-ms]
+   (nrepl-eval c code timeout-ms {}))
+  ([c code timeout-ms extra]
+   (let [rs (:responses (until-done c (send! c (merge {:op "eval" :code code} extra)) timeout-ms))]
+     {:value (vec (keep :value rs))
+      :out (apply str (keep :out rs))
+      :err (apply str (keep :err rs))
+      :ex (vec (keep :ex rs))
+      :status (vec (keep :status rs))
+      :responses rs})))
+
+;;;; Files
+
+(defn make-dirs!
+  [path]
+  (cpp/jank_specs.harness.make_dirs (str path))
+  nil)
+
+(defn scratch-dir
+  "A new directory under conformance/out/ (ignored by git)."
+  [prefix]
+  (let [root (str specs-dir "/conformance/out")]
+    (make-dirs! root)
+    (cpp/jank_specs.harness.make_temp_dir (str root "/" prefix))))
+
+(defn tail
+  "The last `n` characters of `s`, or all of it when it's shorter."
+  [s n]
+  ;; Not (max 0 (- (count s) n)): count's arithmetic is unsigned, so it wraps (RESULTS S9).
+  (if (> (count s) n)
+    (subs s (- (count s) n))
+    s))
+
+(defn write-file!
+  [path text]
+  (spit path text)
+  nil)
+
+(defn exists?
+  [path]
+  (cpp/jank_specs.harness.exists (str path)))
+
+(defn delete!
+  [path]
+  (cpp/jank_specs.harness.remove_file (str path))
+  nil)
+
+(defn set-mtime-ns!
+  [path ns]
+  (cpp/jank_specs.harness.set_mtime_ns (str path) ns)
+  nil)
+
+(defn set-mtime-s!
+  "Sets a file's times to `s` seconds. (Not `(set-mtime-ns! path (* s
+  1000000000))`: that product wraps at 32 bits, RESULTS S10.)"
+  [path s]
+  (cpp/jank_specs.harness.set_mtime_s (str path) s)
+  nil)
+
+(defn stamp
+  "A file's `[mtime-ns size inode]`, or nil when it doesn't exist."
+  [path]
+  (cpp/jank_specs.harness.stamp (str path)))
+
+;;;; A seeded random generator (an LCG), so that a seed reproduces a run
+
+(defn rng
+  [seed]
+  (atom (cpp/jank_specs.harness.lcg_next (mod seed 2147483648))))
+
+(defn- next!
+  [r]
+  ;; In C++: jank's products of small integers wrap at 32 bits (RESULTS S10).
+  (swap! r (fn [x] (cpp/jank_specs.harness.lcg_next x))))
+
+(defn rand-int!
+  "A random integer in [0, n)."
+  [r n]
+  (mod (quot (next! r) 16) n))
+
+(defn rand-float!
+  [r]
+  (/ (double (next! r)) 2147483648.0))
+
+(defn rand-between!
+  "A random integer in [lo, hi]."
+  [r lo hi]
+  (+ lo (rand-int! r (inc (- hi lo)))))
+
+(defn rand-nth!
+  [r coll]
+  (nth (vec coll) (rand-int! r (count coll))))
+
+(defn weighted!
+  "One of `choices`, with the given `weights`."
+  [r choices weights]
+  (let [x (* (rand-float! r) (reduce + weights))]
+    (loop [[c & cs] choices
+           [w & ws] weights
+           acc 0]
+      (if (or (empty? cs) (< x (+ acc w)))
+        c
+        (recur cs ws (+ acc w))))))
+
+(defn shuffle!
+  [r coll]
+  (let [v (vec coll)]
+    ;; (dec (count v)) of an empty vector wraps around (RESULTS S9).
+    (if (< (count v) 2)
+      v
+      (loop [v v
+             i (dec (count v))]
+        (if (pos? i)
+          (let [j (rand-int! r (inc i))]
+            (recur (assoc v i (nth v j) j (nth v i)) (dec i)))
+          v)))))
+
+(defn sample!
+  "`k` distinct items of `coll`."
+  [r coll k]
+  (vec (take k (shuffle! r coll))))
+
+;;;; The Lean models and checkers
+
+(def ^:private loaded (atom #{}))
+
+(defn load-lean!
+  "Loads Lean files (paths under specs/) into the Veil session, each once, in
+  order: a checker's imports first. A model's own checks (`#model_check`,
+  `#check_invariants`...) are left out: harnesses only need its definitions.
+  Throws when one has errors."
+  [& files]
+  (doseq [f files]
+    (when-not (contains? @loaded f)
+      (let [errors (filterv #(= :error (:severity %))
+                            (veil/load-file! @vs (str specs-dir "/" f) {:checks? false}))]
+        (when (seq errors)
+          (throw (ex-info (str f " doesn't elaborate: " (:text (first errors))) {:errors errors}))))
+      (swap! loaded conj f))))
+
+(defn fixed-term
+  "A model's `fixed` theory value (Lean) for the proposed fixes `fixes`
+  (keywords, as the model's `fix_t` names them): none is jank as it is."
+  [fixes]
+  (if (seq fixes)
+    (str "fun f => f ∈ [" (string/join ", " (map #(str "fix_t_IndT." (name %)) fixes)) "]")
+    "fun _ => false"))
+
+(defn call
+  "Calls Lean function `name` (a checker's) in the session."
+  [name & args]
+  (apply lean/call (:lean @vs) name args))
+
+(defn except
+  "A Lean `Except` as `{:ok value}` or `{:error message}`."
+  [r]
+  (let [v (first (vals (dissoc r :lean/ctor)))]
+    (if (= :ok (:lean/ctor r))
+      {:ok v}
+      {:error v})))
+
+(defn try-io
+  "Runs `f` (a call of a Lean `IO` checker): nil when it succeeds, its error's
+  message when it throws."
+  [f]
+  (try
+    (f)
+    nil
+    (catch jank.runtime.object_ref e
+      (ex-message e))))
+
+(defn counterexample
+  "The actions of the model checker's counterexample for `opts` (as for
+  `veil/model-check`) on loaded module `module`: `[action-keyword args-map]`
+  pairs, or nil when there's no violation."
+  [module opts]
+  (let [r (veil/model-check @vs module opts)]
+    (when (= :foundViolation (:result r))
+      {:violates (:violates r)
+       :actions (mapv (juxt :action :args) (rest (:trace r)))})))

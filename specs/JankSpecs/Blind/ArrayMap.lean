@@ -27,6 +27,13 @@ array maps (every map of up to 8 entries) in jank 0.1 (`f3d82d654`):
 Each object also has its logical contents (a ghost: what the operations
 should give); the properties compare what's in its slots with it. Maps stay
 below 8 entries, so there's no promotion to a hash map.
+
+`fixed` turns on a proposed fix of jank, to check it before it's written:
+
+- `a1`: `transient` clones the array (`to_transient` copies `data` with
+  `clone()`, as persistent `assoc` does), so a transient never writes into
+  the map it came from; `persistent!` can still move the array into its
+  result, since the next `transient` of the result clones it again.
 -/
 
 veil module ArrayMap
@@ -36,6 +43,8 @@ type buf
 type key
 type val
 type slot
+/- The proposed fixes (see above). -/
+enum fix_t = { a1 }
 /- Slots are numbered from 0 (`slotIdx`), `slotNext` is the next one; `maxCap`
 slots per array. -/
 immutable function slotIdx : slot → Nat
@@ -43,6 +52,7 @@ immutable function slotNext : slot → slot
 immutable individual maxCap : Nat
 immutable relation allowTransients : Bool
 immutable individual focus : Nat
+immutable relation fixed : fix_t → Bool
 /- Defaults for the initial (unused) memory. -/
 immutable individual buf0 : buf
 immutable individual key0 : key
@@ -149,10 +159,26 @@ action pDissoc (p : obj) (k : key) (q : obj) (b : buf) {
 
 /- `(transient p)`: a copy of `data`, the same array. -/
 action toTransient (p : obj) (t : obj) {
+  require ¬ fixed a1
   require allowTransients ∧ used p ∧ persistentObj p ∧ ¬ used t
   used t := true
   active t := true
   bufOf t := bufOf p
+  len t := len p
+  cap t := cap p
+  logical t K V := logical p K V
+}
+
+/- `(transient p)` with the fix `a1`: a clone of `data`, in a new array `b`. -/
+action toTransientCopy (p : obj) (t : obj) (b : buf) {
+  require fixed a1
+  require allowTransients ∧ used p ∧ persistentObj p ∧ ¬ used t ∧ ¬ bufUsed b
+  used t := true
+  active t := true
+  bufUsed b := true
+  cellKey b S := cellKey (bufOf p) S
+  cellVal b S := cellVal (bufOf p) S
+  bufOf t := b
   len t := len p
   cap t := cap p
   logical t K V := logical p K V
@@ -236,35 +262,58 @@ Four objects, five arrays, two keys, two values, three slots. -/
 -- Persistent maps alone: every map always holds what it should.
 #model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
   { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
-    allowTransients := false, focus := 1, buf0 := 0, key0 := 0, val0 := 0 }
+    allowTransients := false, focus := 1, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => false }
 
 -- T1, T4, T5 with transients.
 #guard_msgs (drop error) in
 #model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
   { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
-    allowTransients := true, focus := 1, buf0 := 0, key0 := 0, val0 := 0 } (sequential := true)
+    allowTransients := true, focus := 1, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => false } (sequential := true)
 set_option veil.violationIsError false in
 #model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
   { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
-    allowTransients := true, focus := 1, buf0 := 0, key0 := 0, val0 := 0 } (sequential := true)
+    allowTransients := true, focus := 1, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => false } (sequential := true)
 
 #guard_msgs (drop error) in
 #model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
   { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
-    allowTransients := true, focus := 4, buf0 := 0, key0 := 0, val0 := 0 } (sequential := true)
+    allowTransients := true, focus := 4, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => false } (sequential := true)
 set_option veil.violationIsError false in
 #model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
   { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
-    allowTransients := true, focus := 4, buf0 := 0, key0 := 0, val0 := 0 } (sequential := true)
+    allowTransients := true, focus := 4, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => false } (sequential := true)
 
 #guard_msgs (drop error) in
 #model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
   { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
-    allowTransients := true, focus := 5, buf0 := 0, key0 := 0, val0 := 0 } (sequential := true)
+    allowTransients := true, focus := 5, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => false } (sequential := true)
 set_option veil.violationIsError false in
 #model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
   { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
-    allowTransients := true, focus := 5, buf0 := 0, key0 := 0, val0 := 0 } (sequential := true)
+    allowTransients := true, focus := 5, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => false } (sequential := true)
+
+/- T1, T4 and T5 with the fix `a1`: no violation, up to depth 6 (their
+counterexamples above take 4, 6 and 5 steps; the whole state space with
+transients is too large: over 10 million states at depth 6). -/
+#model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
+  { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
+    allowTransients := true, focus := 1, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => true } (maxDepth := 6)
+#model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
+  { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
+    allowTransients := true, focus := 4, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => true } (maxDepth := 6)
+#model_check { obj := Fin 4, buf := Fin 5, key := Fin 2, val := Fin 2, slot := Fin 3 }
+  { slotIdx := fun s => s.val, slotNext := fun s => s + 1, maxCap := 3,
+    allowTransients := true, focus := 5, buf0 := 0, key0 := 0, val0 := 0,
+    fixed := fun _ => true } (maxDepth := 6)
 
 #gen_executable
 

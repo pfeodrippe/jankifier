@@ -37,6 +37,17 @@ behaviour from what it inherited.
 
 `prefer-method` (`:163`) throws if `y` is already preferred to `x`, checking
 with the hierarchy's value, so there ancestors count.
+
+`fixed` turns on proposed fixes of jank, to check them before they're written:
+
+- `a3`: `is_preferred` gets the hierarchy's value (`reset_cache` stores
+  `hierarchy.deref()`), so a preference between ancestors counts, as in
+  Clojure.
+- `a4`: after the loop, the result is the matching value which dominates
+  every other matching one, if there is one, and "multiple methods" only if
+  there's none, whatever the table's order. This goes beyond Clojure's
+  `MultiFn`, which has the same order dependence (A4), towards the rule
+  Clojure documents; with it, jank's loop no longer ends like Clojure's.
 -/
 
 veil module Multi
@@ -46,12 +57,15 @@ enum phase_t = { idle, looping, done }
 /- How a call ended: a method (`resKey`'s), the `:default` method, no
 method, or "multiple methods". -/
 enum res_t = { method, defaultMethod, noMethod, ambiguous }
+/- The proposed fixes (see above). -/
+enum fix_t = { a3, a4 }
 
 /- The `:default` dispatch value, and how many setup steps a program has. -/
 immutable individual defaultVal : dval
 immutable individual maxSetups : Nat
 immutable individual maxPrefs : Nat
 immutable individual focus : Nat
+immutable relation fixed : fix_t → Bool
 
 /- The hierarchy (`isa` is its reflexive, transitive closure), the method
 table and the prefer table. -/
@@ -161,11 +175,13 @@ order. -/
 action visit (k : dval) {
   require phase = looping ∧ hasMethod k ∧ ¬ visited k
   visited k := true
+  -- With the fix `a3`, preferences between ancestors count.
   if isa target k ∧ ¬ threw then
-    if ¬ hasBest ∨ pref k best ∨ isa k best then
+    if ¬ hasBest ∨ pref k best ∨ (fixed a3 ∧ ∃ X Y, isa k X ∧ isa best Y ∧ pref X Y) ∨
+        isa k best then
       best := k
       hasBest := true
-    if ¬ (pref best k ∨ isa best k) then
+    if ¬ (pref best k ∨ (fixed a3 ∧ ∃ X Y, isa best X ∧ isa k Y ∧ pref X Y) ∨ isa best k) then
       threw := true
   if isa target k ∧ ¬ threwC then
     if ¬ hasBestC ∨ (∃ X Y, isa k X ∧ isa bestC Y ∧ pref X Y) ∨ isa k bestC then
@@ -175,20 +191,38 @@ action visit (k : dval) {
       threwC := true
 }
 
-/- After the whole table: the best, or the `:default` method, or none. -/
+/- After the whole table: the best, or the `:default` method, or none (with
+the fix `a4`, the matching value which dominates the others, whatever the
+loop found). -/
 action finish {
   require phase = looping ∧ ∀ K, hasMethod K → visited K
-  if threw then
-    res := ambiguous
-  else
-    if hasBest then
+  if fixed a4 then
+    if ∃ M, matching M ∧ ∀ K, matching K →
+        (pref M K ∨ (fixed a3 ∧ ∃ X Y, isa M X ∧ isa K Y ∧ pref X Y) ∨ isa M K) then
+      let m :| matching m ∧ ∀ K, matching K →
+        (pref m K ∨ (fixed a3 ∧ ∃ X Y, isa m X ∧ isa K Y ∧ pref X Y) ∨ isa m K)
       res := method
-      resKey := best
+      resKey := m
     else
-      if hasMethod defaultVal then
-        res := defaultMethod
+      if ∃ K, matching K then
+        res := ambiguous
       else
-        res := noMethod
+        if hasMethod defaultVal then
+          res := defaultMethod
+        else
+          res := noMethod
+  else
+    if threw then
+      res := ambiguous
+    else
+      if hasBest then
+        res := method
+        resKey := best
+      else
+        if hasMethod defaultVal then
+          res := defaultMethod
+        else
+          res := noMethod
   if threwC then
     resC := ambiguous
   else
@@ -240,24 +274,44 @@ Without preferences, jank's loop is Clojure's (so `mm_like_clojure` holds),
 and MM1 still fails: the loop's result depends on the method table's order,
 in Clojure too. -/
 
-#model_check { dval := Fin 5 } { defaultVal := 4, maxSetups := 6, maxPrefs := 0, focus := 2 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 0, focus := 2, fixed := fun _ => false }
 
 #guard_msgs (drop error) in
-#model_check { dval := Fin 5 } { defaultVal := 4, maxSetups := 6, maxPrefs := 0, focus := 1 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 0, focus := 1, fixed := fun _ => false }
 set_option veil.violationIsError false in
-#model_check { dval := Fin 5 } { defaultVal := 4, maxSetups := 6, maxPrefs := 0, focus := 1 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 0, focus := 1, fixed := fun _ => false }
 
 -- With a preference, jank also differs from Clojure.
 
 #guard_msgs (drop error) in
-#model_check { dval := Fin 5 } { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 1 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 1, fixed := fun _ => false }
 set_option veil.violationIsError false in
-#model_check { dval := Fin 5 } { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 1 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 1, fixed := fun _ => false }
 
 #guard_msgs (drop error) in
-#model_check { dval := Fin 5 } { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 2 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 2, fixed := fun _ => false }
 set_option veil.violationIsError false in
-#model_check { dval := Fin 5 } { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 2 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 2, fixed := fun _ => false }
+
+/- With the fixes. `a3` alone: jank's loop ends like Clojure's, with a
+preference. `a4` alone: MM1 holds without preferences; with `a3` too, with a
+preference. -/
+
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 2,
+    fixed := fun f => f = fix_t_IndT.a3 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 0, focus := 1,
+    fixed := fun f => f = fix_t_IndT.a4 }
+#model_check { dval := Fin 5 }
+  { defaultVal := 4, maxSetups := 6, maxPrefs := 1, focus := 1, fixed := fun _ => true }
 
 #gen_executable
 

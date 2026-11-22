@@ -28,6 +28,14 @@ A model of how jank 0.1 keeps the dynamic bindings of each thread, and how
 One dynamic var, `*x*`, is modelled. A future's body reads `*x*` (after
 anything else it does), which is its result; futures don't bind `*x*`
 themselves. Bindings by the main thread (`binding`) nest.
+
+`fixed` turns on proposed fixes of jank, to check them before they're written:
+
+- `c3c4`: a future's thread pops the frame it pushed when it ends, whether its
+  body returned or it was cancelled (a `pthread_cleanup_push` handler, which
+  cancellation runs too). Fixes C3 and C4.
+- `c8`: `future-cancel` records the cancellation in the future, so deref
+  throws (Clojure's `CancellationException`), and `future-cancelled?` is true.
 -/
 
 veil module Bindings
@@ -35,6 +43,8 @@ veil module Bindings
 type thread
 type tid
 type val
+/- The proposed fixes (see above). -/
+enum fix_t = { c3c4, c8 }
 
 /- `main` is the main thread, with the OS thread id `mainTid`; `root` is
 `*x*`'s root value. -/
@@ -42,6 +52,7 @@ immutable individual main : thread
 immutable individual mainTid : tid
 immutable individual root : val
 immutable individual focus : Nat
+immutable relation fixed : fix_t → Bool
 
 /- Threads (futures). -/
 relation spawned : thread → Bool
@@ -61,9 +72,10 @@ bound), the top first. -/
 function frames : tid → List (Option val)
 
 /- What the main thread saw when it last dereffed a future: `some v`, or
-`none` for `nil`. -/
+`none` for `nil`; or whether that deref threw. -/
 individual lastDeref : Option val
 individual lastDerefOf : thread
+individual lastDerefThrew : Bool
 
 #gen_state
 
@@ -77,6 +89,8 @@ after_init {
   live mainTid := true
   frames I := []
   lastDeref := none
+  lastDerefOf := main
+  lastDerefThrew := false
 }
 
 /- `*x*`'s binding in the top frame of `i`. -/
@@ -112,28 +126,39 @@ action spawn (f : thread) (i : tid) {
                | none => top) :: frames i
 }
 
-/- The body reads `*x*`, and the thread ends, without popping its frame. -/
+/- The body reads `*x*`, and the thread ends, without popping its frame
+(with the fix `c3c4`, popping it). -/
 action finish (f : thread) {
   require spawned f ∧ ¬ finished f ∧ ¬ cancelled f
   finished f := true
   result f := ((frames (tidOf f)).head?.bind id).getD root
+  if fixed c3c4 then
+    frames (tidOf f) := (frames (tidOf f)).tail
 }
 
-/- `(future-cancel f)` while it runs: the thread is cancelled. -/
+/- `(future-cancel f)` while it runs: the thread is cancelled (with the fix
+`c3c4`, its cleanup handler pops its frame). -/
 action cancel (f : thread) {
   require spawned f ∧ ¬ finished f ∧ ¬ cancelled f
   cancelled f := true
+  if fixed c3c4 then
+    frames (tidOf f) := (frames (tidOf f)).tail
 }
 
 /- `@f` on the main thread: join the thread (its id can then be reused), and
-see its result, or `nil` if it was cancelled. -/
+see its result, or `nil` if it was cancelled (with the fix `c8`, throw). -/
 action deref (f : thread) {
   require spawned f ∧ (finished f ∨ cancelled f)
   if ¬ joined f then
     joined f := true
     live (tidOf f) := false
   lastDerefOf := f
-  lastDeref := if cancelled f then none else some (result f)
+  if cancelled f ∧ fixed c8 then
+    lastDeref := none
+    lastDerefThrew := true
+  else
+    lastDeref := if cancelled f then none else some (result f)
+    lastDerefThrew := false
 }
 
 /-! ## Properties -/
@@ -144,14 +169,14 @@ safety [c3_binding_isolation]
 /- A finished, joined thread leaves no binding frames. -/
 safety [c4_frames_released]
   focus = 4 → (¬ live I ∧ I ≠ mainTid → frames I = [])
-/- Dereffing a cancelled future doesn't return a value. -/
+/- Dereffing a cancelled future doesn't return a value: it throws. -/
 safety [c8_cancel_visible]
-  focus = 8 → (lastDeref ≠ none ∨ ¬ cancelled lastDerefOf)
+  focus = 8 → (lastDeref ≠ none ∨ lastDerefThrew ∨ ¬ cancelled lastDerefOf)
 
 /- These hold: a running future's top frame has the binding it was given, and
 a future given a binding sees it. -/
 safety [conveyed_on_top]
-  spawned F ∧ ¬ joined F ∧ conveyed F = some V → boundIn (tidOf F) V
+  spawned F ∧ ¬ finished F ∧ ¬ cancelled F ∧ conveyed F = some V → boundIn (tidOf F) V
 safety [bound_future_sees_binding]
   finished F ∧ conveyed F = some V → result F = V
 /- The main thread's id is never reused. -/
@@ -170,7 +195,7 @@ state_constraint [bounded] (frames mainTid).length ≤ 2
 0 (the root) and 1, 2. -/
 
 #model_check { thread := Fin 3, tid := Fin 3, val := Fin 3 }
-  { main := 0, mainTid := 0, root := 0, focus := 0 }
+  { main := 0, mainTid := 0, root := 0, focus := 0, fixed := fun _ => false }
 
 /- Each expected property, on its own: the first run fails the build unless
 the model checker finds a violation; the second prints the counterexample
@@ -179,29 +204,54 @@ without failing it, for the conformance harness to read from the build log. -/
 -- c3_binding_isolation
 #guard_msgs (drop error) in
 #model_check interpreted { thread := Fin 3, tid := Fin 3, val := Fin 3 }
-  { main := 0, mainTid := 0, root := 0, focus := 3 } (sequential := true)
+  { main := 0, mainTid := 0, root := 0, focus := 3, fixed := fun _ => false }
+  (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check interpreted { thread := Fin 3, tid := Fin 3, val := Fin 3 }
-  { main := 0, mainTid := 0, root := 0, focus := 3 } (sequential := true)
+  { main := 0, mainTid := 0, root := 0, focus := 3, fixed := fun _ => false }
+  (sequential := true)
 
 -- c4_frames_released
 #guard_msgs (drop error) in
 #model_check interpreted { thread := Fin 3, tid := Fin 3, val := Fin 3 }
-  { main := 0, mainTid := 0, root := 0, focus := 4 } (sequential := true)
+  { main := 0, mainTid := 0, root := 0, focus := 4, fixed := fun _ => false }
+  (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check interpreted { thread := Fin 3, tid := Fin 3, val := Fin 3 }
-  { main := 0, mainTid := 0, root := 0, focus := 4 } (sequential := true)
+  { main := 0, mainTid := 0, root := 0, focus := 4, fixed := fun _ => false }
+  (sequential := true)
 
 -- c8_cancel_visible
 #guard_msgs (drop error) in
 #model_check interpreted { thread := Fin 3, tid := Fin 3, val := Fin 3 }
-  { main := 0, mainTid := 0, root := 0, focus := 8 } (sequential := true)
+  { main := 0, mainTid := 0, root := 0, focus := 8, fixed := fun _ => false }
+  (sequential := true)
 
 set_option veil.violationIsError false in
 #model_check interpreted { thread := Fin 3, tid := Fin 3, val := Fin 3 }
-  { main := 0, mainTid := 0, root := 0, focus := 8 } (sequential := true)
+  { main := 0, mainTid := 0, root := 0, focus := 8, fixed := fun _ => false }
+  (sequential := true)
+
+/- Each expected property with the fixes: no violation (the whole state space,
+as for `focus = 0`). -/
+
+-- c3_binding_isolation, with `c3c4`
+#model_check { thread := Fin 3, tid := Fin 3, val := Fin 3 }
+  { main := 0, mainTid := 0, root := 0, focus := 3, fixed := fun f => f = fix_t_IndT.c3c4 }
+
+-- c4_frames_released, with `c3c4`
+#model_check { thread := Fin 3, tid := Fin 3, val := Fin 3 }
+  { main := 0, mainTid := 0, root := 0, focus := 4, fixed := fun f => f = fix_t_IndT.c3c4 }
+
+-- c8_cancel_visible, with `c8`
+#model_check { thread := Fin 3, tid := Fin 3, val := Fin 3 }
+  { main := 0, mainTid := 0, root := 0, focus := 8, fixed := fun f => f = fix_t_IndT.c8 }
+
+-- The properties which hold, with both fixes.
+#model_check { thread := Fin 3, tid := Fin 3, val := Fin 3 }
+  { main := 0, mainTid := 0, root := 0, focus := 0, fixed := fun _ => true }
 
 #gen_executable
 

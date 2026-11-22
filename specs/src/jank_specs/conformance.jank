@@ -1,0 +1,263 @@
+(ns jank-specs.conformance
+  "Conformance of jank with the models: every harness, run from jank, with the
+  models and their checkers loaded into this process (lean-sys and veil).
+
+  Here, atoms and run-once constructs (delay, promise, lazy seqs): the
+  outcomes a model allows come from exploring its states (veil/system), jank's
+  from running the same programs many times in this process, and every
+  outcome jank shows must be one the model allows. The other harnesses, in
+  jank-specs.conformance.*, run jank and Clojure in fresh processes.
+
+    lein run -m jank-specs.conformance                  (in specs/: all of them)
+    lein run -m jank-specs.conformance bindings multi   (some of them)
+
+  or, in the specs/ REPL, (check \"atoms\"), (check-all)."
+  (:require [clojure.string :as string]
+            [jank-specs.conformance.arraymap :as arraymap]
+            [jank-specs.conformance.bindings :as bindings]
+            [jank-specs.conformance.module-cache :as module-cache]
+            [jank-specs.conformance.multi :as multi]
+            [jank-specs.conformance.nrepl :as nrepl]
+            [jank-specs.conformance.transients :as transients]
+            [jank-specs.conformance.vars :as vars]
+            [jank-specs.harness :as h]
+            [jank-specs.tutorial :refer [vs]]
+            [veil.core :as veil]))
+
+(defn model-outcomes
+  "What `observe` gives for every state of `sys` with no successor (where the
+  program ends), reachable from its initial states."
+  [sys observe]
+  (into #{} (map observe) (veil/reachable-states sys {:terminal true})))
+
+(defn compare-outcomes
+  "jank's outcomes (with how often each happened) against the model's."
+  [scenario allowed observed]
+  {:scenario scenario
+   :model-outcomes (count allowed)
+   :observed observed
+   :unexpected (vec (remove allowed (keys observed)))})
+
+;;;; Atoms (JankSpecs/Concurrency/Atom.lean)
+
+(defn- atom-theory
+  [swaps cas-after fixes]
+  {:swaps (str "fun _ => " swaps)
+   :casAfter (str "fun _ => " cas-after)
+   :resetAfter "fun _ => false"
+   :resetTo "fun _ => 0"
+   :focus 0
+   :firstSlot 0
+   :slotAfter "fun i => i + 1"
+   :fixed (h/fixed-term fixes)})
+
+(defn- watch-log
+  "The watch's calls in a model state, oldest first: `[old new]` per slot
+  before `nextSlot`."
+  [s]
+  (mapv (fn [i]
+          [(get (:watchOld s) i 0) (get (:watchNew s) i 0)])
+        (range (:nextSlot s))))
+
+(defn swaps-run
+  "Two futures doing two swap! inc each on an atom with a watch: the final
+  value and the watch's calls."
+  []
+  (let [a (atom 0)
+        log (atom [])]
+    (add-watch a :w (fn [_ _ old new]
+                      (swap! log conj [old new])))
+    (let [fs (doall (for [_ (range 2)]
+                      (future (dotimes [_ 2] (swap! a inc)))))]
+      (doseq [f fs]
+        @f))
+    {:value @a :log @log}))
+
+(defn cas-run
+  "One swap! inc, then compare-and-set! from the value it returned to that
+  plus 10: whether it succeeded."
+  []
+  (let [a (atom 0)
+        v (swap! a inc)]
+    {:cas (compare-and-set! a v (+ v 10))}))
+
+(defn check-atoms
+  "With `fixes` (the model's proposed fixes, e.g. `[:c2]`), against the fixed
+  model: what jank should show once they're written."
+  [runs fixes]
+  (h/load-lean! "JankSpecs/Concurrency/Atom.lean")
+  (let [two (veil/system @vs "Atom" {:instance {:thread 2 :slot 6} :theory (atom-theory 2 false fixes)
+                                     :compiled true})
+        one (veil/system @vs "Atom" {:instance {:thread 1 :slot 6} :theory (atom-theory 1 true fixes)
+                                     :compiled true})]
+    [(compare-outcomes "two futures, two swap!s each"
+                       (model-outcomes two (fn [s] {:value (:value s) :log (watch-log s)}))
+                       (frequencies (repeatedly runs swaps-run)))
+     (compare-outcomes "swap!, then compare-and-set!"
+                       (model-outcomes one (fn [s] {:cas (= 11 (:value s))}))
+                       (frequencies (repeatedly runs cas-run)))]))
+
+;;;; Run once: delay, promise, lazy seq (JankSpecs/Concurrency/Once.lean)
+
+(defn once-run
+  "Three futures, each dereffing a delay (whose body returns, or throws),
+  delivering a promise and dereffing it, and realizing a lazy seq whose body
+  throws on its first call."
+  [throws?]
+  (let [runs (atom 0)
+        d (delay
+            (swap! runs inc)
+            (if throws?
+              (throw (ex-info "boom" {}))
+              :value))
+        p (promise)
+        calls (atom 0)
+        ls (lazy-seq
+             (when (= 1 (swap! calls inc))
+               (throw (ex-info "first" {})))
+             [1 2])
+        fs (doall (for [_ (range 3)]
+                    (future
+                      [(try @d :ok (catch :default _ :err))
+                       (do (deliver p (rand-int 2)) @p)
+                       (try (first ls) :ok (catch :default _ :err))])))
+        rs (mapv deref fs)]
+    {:delay-runs @runs
+     :got (sort (map first rs))
+     :promise (distinct (map second rs))
+     :lazy-calls @calls
+     :lazy-errors (count (filter #{:err} (map #(nth % 2) rs)))}))
+
+(defn- once-observe
+  [s]
+  (let [threads (range 3)]
+    {:delay-runs (:runs s)
+     :got (sort (map #(get (:got s) % :nothing) threads))
+     :promise (distinct (keep (fn [t]
+                                (some (fn [v]
+                                        (when (contains? (:promiseGot s) [t v]) v))
+                                      (range 2)))
+                              threads))
+     :lazy-calls (:lazyCalls s)
+     :lazy-errors (count (filter #(= :err (get (:lazyGot s) % :nothing)) threads))}))
+
+(def self-deref-program
+  "Three futures deref a delay whose body derefs it (C5): what each got, and how
+  many times the body ran. A separate process: on jank 0.1 it deadlocks."
+  "(ns once-self)
+(cpp/raw \"#include <cstdio>\")
+(cpp/raw \"#include <unistd.h>\")
+(def runs (atom 0))
+(declare d)
+(def d (delay (swap! runs inc) (inc @d)))
+(let [fs (doall (for [_ (range 3)] (future (try @d :ok (catch :default _ :err)))))]
+  (println \"OUTCOME\" (pr-str {:delay-runs @runs :got (sort (map deref fs))}))
+  (cpp/fflush cpp/stdout)
+  (cpp/_exit 0))
+")
+
+(defn check-self-deref
+  "C5's scenario, against the model with `fixes`: jank's outcome (`{:hung
+  true}` when it didn't end within 60 seconds) must be one the model allows."
+  [fixes]
+  (let [work (h/scratch-dir "once-")
+        path (str work "/once_self.jank")
+        _ (h/write-file! path self-deref-program)
+        {:keys [exit out]} (h/run-jank ["run" path] work 60)
+        line (first (filter #(string/starts-with? % "OUTCOME ") (string/split-lines out)))
+        observed (if (and (= 0 exit) line)
+                   (read-string (subs line 8))
+                   {:hung true})
+        sys (veil/system @vs "Once" {:instance {:thread 3 :value 2}
+                                     :theory {:delayBody "body_t_IndT.derefsSelf"
+                                              :lazyThrowsFirst "fun _ => false"
+                                              :focus 0
+                                              :fixed (h/fixed-term fixes)}
+                                     :compiled true})]
+    (compare-outcomes "delay whose body derefs it"
+                      (model-outcomes sys (fn [s]
+                                            {:delay-runs (:runs s)
+                                             :got (sort (map #(get (:got s) % :nothing) (range 3)))}))
+                      {observed 1})))
+
+(defn check-once
+  "With `fixes` (e.g. `[:c5]`), against the fixed model, and with `:c5`, also
+  the scenario of C5 (a delay whose body derefs it)."
+  [runs fixes]
+  (h/load-lean! "JankSpecs/Concurrency/Once.lean")
+  (cond-> (vec (for [[body throws?] [["returns" false] ["throws" true]]]
+                 (compare-outcomes (str "delay whose body " body ", promise, lazy seq")
+                                   (model-outcomes (veil/system @vs "Once"
+                                                                {:instance {:thread 3 :value 2}
+                                                                 :theory {:delayBody (str "body_t_IndT." body)
+                                                                          :lazyThrowsFirst "fun _ => true"
+                                                                          :focus 0
+                                                                          :fixed (h/fixed-term fixes)}
+                                                                 :compiled true})
+                                                   once-observe)
+                                   (frequencies (repeatedly runs #(once-run throws?))))))
+    (some #{:c5} fixes) (conj (check-self-deref fixes))))
+
+(defn- outcome-harness
+  [nm results]
+  {:harness nm
+   :ok? (every? (comp empty? :unexpected) results)
+   :results results})
+
+(def harnesses
+  "Each harness by name, in the order `check-all` runs them, with what it
+  checks."
+  [["atoms" "swap! and watches, compare-and-set! (Concurrency/Atom.lean)"
+    #(outcome-harness "atoms" (check-atoms (get % :runs 2000) (:fixes %)))]
+   ["once" "delay, promise, lazy seq (Concurrency/Once.lean)"
+    #(outcome-harness "once" (check-once (get % :runs 2000) (:fixes %)))]
+   ["bindings" "binding conveyance to futures (Concurrency/Bindings.lean)" bindings/check]
+   ["vars" "alter-var-root, with-redefs, defonce, require (Blind/Vars.lean, Blind/Require.lean)"
+    vars/check]
+   ["multi" "multimethod dispatch (Blind/Multi.lean)" multi/check]
+   ["transients" "transients, against the model and Clojure (Blind/Transients.lean)" transients/check]
+   ["arraymap" "array map storage, entry by entry (Blind/ArrayMap.lean)" arraymap/check]
+   ["nrepl" "the nREPL server (Nrepl.lean)" nrepl/check]
+   ["module-cache" "the module loader and its cache (ModuleCache.lean)" module-cache/check]])
+
+(defn check
+  "Runs harness `nm` (see `harnesses`), with its options: its result,
+  `{:harness nm :ok? bool ...}`."
+  ([nm]
+   (check nm {}))
+  ([nm opts]
+   (if-let [[_ _ f] (first (filter #(= nm (first %)) harnesses))]
+     (f opts)
+     (throw (ex-info (str "no harness " nm "; there are " (string/join ", " (map first harnesses)))
+                     {:harness nm})))))
+
+(defn check-all
+  "Every harness (or those named), in order: their results."
+  ([]
+   (check-all (map first harnesses)))
+  ([names]
+   (mapv check names)))
+
+(defn- failures
+  "What a harness's result says went wrong, for the report."
+  [r]
+  (let [results (:results r)]
+    (cond
+      (some #(contains? % :unexpected) results) (filterv #(seq (:unexpected %)) results)
+      (some #(contains? % :result) results) (filterv #(not= :conforms (:result %)) results)
+      :else (dissoc r :work :results))))
+
+(defn -main
+  [& names]
+  (let [names (if (seq names) names (map first harnesses))
+        results (vec (for [nm names]
+                       (let [r (check nm)]
+                         (println (str nm ": " (if (:ok? r) "conforms" "DOES NOT CONFORM")
+                                       (when-let [w (:work r)] (str " (" w ")"))))
+                         (when-not (:ok? r)
+                           (doseq [f (failures r)]
+                             (println "  " (pr-str f))))
+                         r)))]
+    (println (if (every? :ok? results)
+               "jank conforms to the models"
+               "jank doesn't conform"))))

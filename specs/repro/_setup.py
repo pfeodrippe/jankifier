@@ -1,13 +1,10 @@
-"""Shared by the reproduction scripts: the conformance harness's jank runner
-and nREPL client, and scratch directories (under conformance/out/, ignored by
+"""Shared by the reproduction scripts: a jank runner and nREPL client
+(jank_harness.py), and scratch directories (under conformance/out/, ignored by
 git; a `jank repl` writes `.nrepl-port` in its directory)."""
 
-import os
-import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "conformance", "lib"))
-from jank_harness import Server, jank_args, run_jank, scratch_dir  # noqa: E402,F401
+from jank_harness import Server, jank_args, run_jank, scratch_dir  # noqa: F401
 
 
 def write(path, text):
