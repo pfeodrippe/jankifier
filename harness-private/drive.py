@@ -262,9 +262,9 @@ def run_form(task, mode, seed):
     ask = t['ask'] + (verified_tail(t['file']) if verified else PLAIN_TAIL)
     recording = f'{OUT}/{task}-{mode}-{seed}.edn'
     return f'''
-(let [file {jstr(t['file'])}
+(let [file (str {jstr(t['file'])})
       verified {'true' if verified else 'false'}
-      live {jstr(OUT + '/live.edn')}
+      live (str {jstr(OUT + '/live.edn')})
       current (atom nil)
       system (str tools/situation (when verified (str "\\n\\n" (slurp "VERIFY.md"))))
       a (h/agent m {{:tools (vec (concat (tools/defaults) (when verified [(verify/tool)])))
@@ -337,6 +337,10 @@ def main():
                     print(f'RUN {task} {mode} seed {seed} ({time.time() - t0:.0f} s): {r}', flush=True)
                 except Exception as e:
                     print(f'RUN {task} {mode} seed {seed} FAILED after {time.time() - t0:.0f} s: {e}', flush=True)
+                    if time.time() - t0 < 120:
+                        # Failed before the model could do much: the harness's fault, not the run's.
+                        print('STOPPING: a run failed at its start', flush=True)
+                        return
                 finally:
                     if proc:
                         stop(port, proc)
