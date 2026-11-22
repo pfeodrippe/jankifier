@@ -178,10 +178,21 @@ Under the conversation is its timeline:
 - play or pause, from the start, to the end of the next entry, and the pace
   (1, 2, 4 or 8 times).
 
+The whole is small (380 points) and always as tall, whatever the conversation
+holds and however many there are (four lines in view, the wheel over them shows
+the others): the timeline stays in its place. "expand", at its right, opens it
+over the window as a modal, the cards dimmed beneath; "close", Esc or a click
+outside puts it back. The
+wheel, or the bar at the conversation's right, scrolls: what is looked at
+stays put while it plays or is sought in, until "latest" (or scrolling to the
+end) follows the end again. An entry opened is whole, and scrolls with the
+rest.
+
 While a turn runs, the end is followed as it is written ("live"). Pause stops
 the view there, and the turn itself goes on. A click on the line (or the mouse
-held and moved along it) goes to that moment and stops there; play goes on
-from there, at the pace things were written, and follows the turn again when it
+held and moved along it) goes to that moment, and plays on from there if it was
+playing; on a mark, to that entry's end, the entry shown whole. Playing is at
+the pace things were written, and follows the turn again when it
 gets to the end. So does a click at the line's end. Waits are shown short and marked on
 the line with a break: a tool running, a result being read (1.2 seconds at
 most each).

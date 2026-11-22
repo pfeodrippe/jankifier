@@ -3,12 +3,16 @@
 ;; and the one chosen written out as a conversation: the person's messages, the model's
 ;; thinking folded, each tool's call folded with its result, and what the model said, with
 ;; its headings, lists, tables, code and bold drawn. Clicking a conversation's line chooses
-;; it; clicking a folded entry opens it. The wheel looks back; without it the end is followed.
+;; it; clicking a folded entry opens it, whole. The wheel or the bar on the right looks back,
+;; and what is looked at stays put until the end is gone to again ("latest"). The whole is
+;; small and always as tall, whatever it holds. "expand", at the timeline's right, opens it
+;; over the window as a modal (close, Esc or a click outside puts it back).
 ;;
 ;; Under the conversation is its timeline: a mark for each entry, where the conversation is
 ;; shown up to, the time since it began and what was going on then. While a turn runs the
 ;; end is followed as it is written (a click at the line's end, or play reaching it, follows
-;; it again). A click on the timeline goes to that moment; play goes on from there at
+;; it again). A click on the timeline goes to that moment, playing on if it was playing, and
+;; one on a mark to the end of that entry; nothing else moves. Playing goes on from there at
 ;; the pace things were written (or 2, 4, 8 times it), with the waits (a tool running, a
 ;; result being read) shown short and marked. A conversation kept in a file
 ;; (harness.core/save!) is played the same way, without the model: `replay!`.
@@ -28,7 +32,11 @@
 (defonce ^:private watched (atom []))       ; [{:name :agent}], in the order they were watched
 (defonce ^:private chosen (atom nil))       ; the name of the conversation written out
 (defonce ^:private opened (atom #{}))       ; [name index]: the entries opened
-(defonce ^:private back (atom {}))          ; name -> points looked back from the end
+(defonce ^:private scrolls (atom {}))       ; name -> points looked down from the top; none: the end followed
+(defonce ^:private expanded (atom false))   ; whether the conversation is open as a modal
+(defonce ^:private rows-from (atom 0.0))    ; the first conversation's line in view, of many
+(defonce ^:private held (atom nil))         ; what the mouse drags: {:what :timeline|:scroll :name ...}
+(defonce ^:private was-down (atom false))   ; the mouse's button in the last frame
 (defonce ^:private built (atom {}))         ; [name index] -> {:entry :width :open :item}
 (defonce ^:private frame-panel (atom nil))  ; {:frame :width :panel}: once a frame
 (defonce ^:private drawn (atom nil))        ; where the last frame drew the panel's parts
@@ -40,7 +48,13 @@
 (def ^:private line-mono 19)
 (def ^:private line-small 16)
 (def ^:private row 28)
-(def ^:private most 640)
+(def ^:private small 380)                   ; the whole, not expanded: always this tall
+(def ^:private rows-small 4)                ; conversations' lines in view then; the wheel shows the others
+(def ^:private rows-large 10)               ; and expanded
+(def ^:private margin 24)                   ; around the modal
+(def ^:private above 62)                    ; where cards.core draws a header
+(def ^:private below 20)
+(def ^:private longest 4000)                ; lines of an opened entry
 (def ^:private bar 38)
 ;; A wait (a tool running, a result being read) is shown at most this long in a replay.
 (def ^:private wait-shown 1.2)
@@ -261,8 +275,15 @@
                (c/text! (- (+ x w) (c/text-width c/small note) 4) (+ y 4) c/muted c/small note)
                (when (seq body)
                  (c/rect! (+ x 18) (+ y 24) (+ x w) (+ y 24 (* line-small (count body)) 8) c/rule 0.2 4.0)
-                 (doseq [[i line] (map-indexed vector body)]
-                   (c/text! (+ x 26) (+ y 28 (* line-small i)) body-color c/small line)))))}))
+                 ;; Of a long one, only the lines in the window.
+                 (let [first-y (+ y 28)
+                       n (long (count body))
+                       from (max 0 (min n (long (/ (- 0.0 first-y) line-small))))
+                       to (max from (min n (+ 2 (long (max 0.0 (/ (- (c/window-height) first-y) line-small))))))]
+                   (loop [i from]
+                     (when (< i to)
+                       (c/text! (+ x 26) (+ first-y (* line-small i)) body-color c/small (nth body i))
+                       (recur (inc i))))))))}))
 
 (defn- seconds-said [s]
   (if (and s (>= s 0.05)) (str (c/fixed s 1) " s") (str "")))
@@ -284,23 +305,25 @@
                (first-line (:text entry))
                (str (count (str/split (str (:text entry)) #" ")) " words"
                     (when (:cut entry) (str ", cut")))
-               (mono-lines (:text entry) (- width 44) 60) c/muted)
+               (if open (mono-lines (:text entry) (- width 44) longest) []) c/muted)
 
     :call
     (let [args (:args entry)
           main (or (:code args) (:command args) (:path args) (:name args) (:namespace args)
                    (first (vals args)))
           failed (and result (or (:error result) (str/starts-with? (str (:text result)) "error:")))
-          body (vec (concat
+          body (if-not open
+                 []
+                 (vec (concat
                      (mapcat (fn [[k v]]
                                (concat [(str (subs (str k) 1) ":")]
                                        (map (fn [line] (str "  " line))
-                                            (mono-lines (if (string? v) v (pr-str v)) (- width 60) 40))))
+                                            (mono-lines (if (string? v) v (pr-str v)) (- width 60) longest))))
                              args)
                      (when result
                        (concat [(str "gave:")]
                                (map (fn [line] (str "  " line))
-                                    (mono-lines (:text result) (- width 60) 40))))))]
+                                    (mono-lines (:text result) (- width 60) longest)))))))]
       (fold-item width open (:name entry) (if failed c/red c/orange)
                  (first-line main)
                  (str (if failed "error  " "") (seconds-said (:seconds result)))
@@ -338,7 +361,7 @@
                   :tool (str "running " (:name live))
                   (str "calling " (:name live)))
           lines (let [all (c/wrap c/small (- width 26) (str (:text live)) 400)]
-                  (vec (drop (max 0 (- (count all) 5)) all)))]
+                  (vec (drop (max 0 (- (long (count all)) 5)) all)))]
       {:h (+ 24 (* line-small (count lines)) 4)
        :draw (fn [x y w]
                (c/text! (+ x 18) (+ y 3) c/orange c/mono label)
@@ -443,7 +466,8 @@
         total (:total sched)
         now (c/seconds)]
     (case (:mode p)
-      :playing (let [t (+ (:t p) (* (get p :speed 1.0) (- now (:at p))))
+      ;; (A frame that took long, the first one compiling, doesn't skip what it didn't show.)
+      :playing (let [t (+ (:t p) (* (get p :speed 1.0) (max 0.0 (min 0.25 (- now (:at p))))))
                      p (cond
                          (< t total) (assoc p :t t :at now)
                          (going? (:state v)) {:mode :live :speed (get p :speed 1.0)}
@@ -519,15 +543,28 @@
       (= (:role e) :result) (str "running " (:name e))
       :else (str (subs (str (:role e)) 1)))))
 
+(defn- small-height
+  "The whole's height when it is not expanded: nothing it holds changes it."
+  []
+  (if (empty? @watched) 0 (min small (max 200 (- (c/window-height) above below)))))
+
+(defn- modal?
+  "Whether the modal is open."
+  []
+  (boolean (and @expanded (seq @watched) @chosen)))
+
 (defn- panel
-  "What is drawn this frame for `width`: {:rows :items :tall :shown :value :sched :play
-  :height}."
-  [width]
+  "What is drawn this frame in `width` by `height`: {:rows :first :many :items :tall :shown
+  :value :sched :play :height}."
+  [width height most-rows]
   (let [kept @frame-panel
         frame (c/frames)]
-    (if (and kept (= (:frame kept) frame) (= (:width kept) width))
+    (if (and kept (= (:frame kept) frame) (= (:width kept) width) (= (:height kept) height))
       (:panel kept)
       (let [all @watched
+            many (long (count all))
+            in-view (min many most-rows)
+            from (long (max 0.0 (min (- many in-view) @rows-from)))
             named @chosen
             one (some (fn [w] (when (= (:name w) named) w)) all)
             v (when one @(:agent one))
@@ -537,12 +574,13 @@
             seen (when one (if (= (:mode play) :live) v (at-time v (:t play) sched)))
             its (when one (items named seen (- width 28)))
             tall (if its (apply + 0 (map :h its)) 0)
-            rows-h (* row (count all))
-            shown (if one (min tall (max 60 (- most rows-h 20 bar))) 0)
-            made {:rows all :one one :items its :tall tall :shown shown
-                  :value v :sched sched :play play
-                  :height (if (empty? all) 0 (+ rows-h (if one (+ shown 22 bar) 0) 8))}]
-        (reset! frame-panel {:frame frame :width width :panel made})
+            rows-h (* row in-view)
+            ;; The height is given: the conversation gets what is left of it.
+            shown (if one (max 24 (- height rows-h 30 bar)) 0)
+            made {:rows (subvec all from (+ from in-view)) :first from :many many
+                  :one one :items its :tall tall :shown shown
+                  :value v :sched sched :play play :height height}]
+        (reset! frame-panel {:frame frame :width width :height height :panel made})
         made))))
 
 (defn- draw-row [w x y width picked]
@@ -561,7 +599,7 @@
              (get state-said state (str state)))
     (c/text! (- (+ x width) (c/text-width c/small right) 10) (+ y 7) c/muted c/small right)
     (when (c/clicked? x y (+ x width) (+ y row -2))
-      (reset! chosen (if picked nil (:name w))))))
+      (reset! chosen (:name w)))))
 
 (defn- to-time!
   "The conversation `named` shown up to `t`, playing on from there or not."
@@ -576,12 +614,21 @@
   [named]
   (swap! plays (fn [all] (assoc all named {:mode :live :speed (get (get all named) :speed 1.0)}))))
 
+(defn- axis
+  "The seconds the timeline's whole line stands for. While a turn goes it grows by doubling,
+  so that the marks stay where they are between one doubling and the next."
+  [total running]
+  (if running
+    (loop [span 30.0] (if (>= span total) span (recur (* 2.0 span))))
+    (max 0.001 total)))
+
 (defn- draw-bar
   "The timeline of the conversation `named`, its top left at (x, y): play or pause, from
   the start, to the next entry's end, the line with a mark an entry and where it is shown
-  up to, the time since it began with what was going on, and the pace. Returns where its
+  up to, the time since it began with what was going on, the pace, and expand. `pressed`:
+  the mouse's button went down in this frame; `modal`: drawn in the modal. Returns where its
   parts are, for a script."
-  [named v sched play x y width]
+  [named v sched play x y width pressed modal]
   (let [total (max 0.001 (:total sched))
         t (min total (:t play))
         mode (:mode play)
@@ -594,11 +641,21 @@
         b2 (+ x 44)
         b3 (+ x 72)
         x1 (+ x 104)
-        x2 (- (+ x width) 232)
-        at (+ x1 (* (- x2 x1) (/ t total)))
+        x2 (- (+ x width) 310)
+        scale (axis total running)
+        x-of (fn [s] (+ x1 (* (- x2 x1) (min 1.0 (/ s scale)))))
+        at (x-of t)
         spans (:spans sched)
         entries (:entries v)
-        pace-x (- (+ x width) 34)
+        pace-x (- (+ x width) 102)
+        e1 (- (+ x width) 78)
+        e2 (- (+ x width) 10)
+        talls {:user 9 :model 8 :call 6 :thinking 3 :stopped 9}
+        ;; A mark is where its entry is done: a click there shows it whole.
+        marks (vec (keep (fn [i]
+                           (when (contains? talls (:role (nth entries i)))
+                             {:x (x-of (:to (nth spans i))) :to (:to (nth spans i)) :entry i}))
+                         (range (count spans))))
         hot (fn [bx] (c/inside? (- bx 12) (- cy 12) (+ bx 12) (+ cy 12)))
         hit (fn [bx] (c/clicked? (- bx 12) (- cy 12) (+ bx 12) (+ cy 12)))
         shade (fn [bx] (when (hot bx) (c/rect! (- bx 12) (- cy 12) (+ bx 12) (+ cy 12) c/rule 0.35 5.0)))]
@@ -632,25 +689,44 @@
     (c/line! x1 cy x2 cy c/rule 2.0)
     (c/line! x1 cy at cy c/ink 2.0)
     (doseq [[i s] (map-indexed vector spans)]
-      (let [mx (+ x1 (* (- x2 x1) (/ (:from s) total)))
+      (let [mx (x-of (:from s))
+            tx (x-of (:to s))
             role (:role (nth entries i))
-            tall (get {:user 9 :model 8 :call 6 :thinking 3 :stopped 9} role 0)
+            tall (get talls role 0)
             color (get {:user c/ink :model c/blue :call c/orange :thinking c/muted :stopped c/red} role c/muted)]
         (when (:cut s)
           (c/rect! (- mx 4) (- cy 2) (- mx 1) (+ cy 2) c/card 1.0 0.0)
           (c/line! (- mx 5) (+ cy 4) (- mx 2) (- cy 4) c/muted 1.0)
           (c/line! (- mx 3) (+ cy 4) mx (- cy 4) c/muted 1.0))
         (when (pos? tall)
-          (c/line! mx (- cy tall) mx (+ cy tall) color 2.0))))
+          (c/line! tx (- cy tall) tx (+ cy tall) color 2.0))))
     (c/circle! at cy 5.0 (if live c/orange c/ink) 1.0)
-    ;; A click on the line, or the mouse held and moved along it, goes to that time.
-    (when (and (c/inside? (- x1 6) (- cy 12) (+ x2 6) (+ cy 12))
-               (or (c/down?) (c/clicked? (- x1 6) (- cy 12) (+ x2 6) (+ cy 12))))
-      (let [share (max 0.0 (min 1.0 (/ (- (c/mouse-x) x1) (- x2 x1))))]
-        ;; (The line's end, while a turn goes, is now.)
-        (if (and running (> share 0.985))
-          (live! named)
-          (to-time! named (* total share) false))))
+    ;; Pressed on the line: that time, for as long as the button is held, wherever the mouse
+    ;; goes meanwhile. Let go, it plays on if it was playing.
+    (when (and pressed (c/inside? (- x1 6) (- cy 12) (+ x2 6) (+ cy 12)))
+      (reset! held {:what :timeline :name named :playing (or (= mode :playing) following)}))
+    (let [h @held]
+      (when (and (= (:what h) :timeline) (= (:name h) named))
+        (let [mx (c/mouse-x)
+              asked (* scale (max 0.0 (min 1.0 (/ (- mx x1) (- x2 x1)))))
+              near (fn [m] (let [d (- mx (:x m))] (if (neg? d) (- d) d)))
+              mark (reduce (fn [best m]
+                             (if (and (< (near m) 5) (or (nil? best) (< (near m) (near best)))) m best))
+                           nil marks)
+              to (if mark (:to mark) (min total asked))]
+          (if (c/down?)
+            (to-time! named to false)
+            (do (reset! held nil)
+                ;; (At the turn's end or past it, while it goes, is now.)
+                (if (and running (>= asked (* 0.985 total)))
+                  (live! named)
+                  (to-time! named to (:playing h))))))))
+    ;; The modal opened, or closed.
+    (c/rect! e1 (- cy 12) e2 (+ cy 12) c/rule (if (c/inside? e1 (- cy 12) e2 (+ cy 12)) 0.55 0.3) 5.0)
+    (let [label (if modal (str "close") (str "expand"))]
+      (c/text! (+ e1 (/ (- e2 e1 (c/text-width c/small label)) 2.0)) (- cy 7) c/ink c/small label))
+    (when (c/clicked? e1 (- cy 12) e2 (+ cy 12))
+      (reset! expanded (not modal)))
     ;; The time since the conversation began, and what was going on.
     (let [since (if (and live (:born v) (going? (:state v)) (seq spans))
                   (- (cpp/harness.seconds) (:born v) (:real-from (first spans)))
@@ -671,28 +747,73 @@
                            faster (if (>= speed 8.0) 1.0 (* 2.0 speed))]
                        (assoc all named (assoc p :speed faster :at (c/seconds)))))))
     {:y cy :play b1 :start b2 :next b3 :x1 x1 :x2 x2 :pace pace-x :total total :t t
+     :expand (/ (+ e1 e2) 2.0) :axis scale :marks marks
      :mode (subs (str mode) 1)}))
 
-(defn- draw-panel [x y width]
-  (let [p (panel width)
-        rows (:rows p)]
+(defn- draw-panel [x y width height modal]
+  (let [p (panel width height (if modal rows-large rows-small))
+        rows (:rows p)
+        over-rows (and (> (:many p) (count rows))
+                       (c/inside? x y (+ x width) (+ y 4 (* row (count rows)))))
+        down (c/down?)
+        pressed (and down (not @was-down))]
+    (reset! was-down down)
     (when (seq rows)
       (c/rect! x y (+ x width) (+ y (:height p)) c/card 1.0 6.0)
       (c/frame! x y (+ x width) (+ y (:height p)) c/rule 1.0)
       (doseq [[i w] (map-indexed vector rows)]
         (draw-row w (+ x 4) (+ y 4 (* row i)) (- width 8) (= (:name w) @chosen)))
+      ;; More conversations than lines: which are in view, and the wheel over them.
+      (when (> (:many p) (count rows))
+        (let [n (:many p)
+              in-view (long (count rows))
+              track (* row in-view)
+              tall (* track (/ (* 1.0 in-view) n))
+              at (+ y 4 (* track (/ (* 1.0 (:first p)) n)))]
+          (c/rect! (- (+ x width) 5) at (- (+ x width) 2) (+ at tall) c/muted 0.55 3.0)
+          (when over-rows
+            (swap! rows-from (fn [f] (max 0.0 (min (* 1.0 (- n in-view)) (- (min (* 1.0 (- n in-view)) f) (c/wheel)))))))))
       (when (:one p)
         (let [named (:name (:one p))
               top (+ y 4 (* row (count rows)) 10)
               shown (:shown p)
               tall (:tall p)
               furthest (max 0.0 (- tall shown))
-              over (c/inside? x top (+ x width) (+ top shown))
-              was (get @back named 0.0)
-              now (max 0.0 (min furthest (+ was (if over (* 48.0 (c/wheel)) 0.0))))
-              start (- top (- furthest now))]
-          (when (not= now was)
-            (swap! back assoc named now))
+              right (+ x width)
+              bottom (+ top shown)
+              over (c/inside? x top right bottom)
+              kept (get @scrolls named)
+              before (if kept (min furthest kept) furthest)
+              turned (if (and (not over-rows) (c/inside? x y right (+ y (:height p)))) (c/wheel) 0.0)
+              ;; The bar on the right: where the part shown is, of the whole. It drags.
+              thumb (if (pos? furthest) (max 28.0 (* shown (/ shown tall))) 0.0)
+              free (max 1.0 (- shown thumb))
+              thumb-y (fn [offset] (if (pos? furthest) (+ top (* free (/ offset furthest))) top))
+              _ (when (and pressed (pos? furthest) (c/inside? (- right 13) top right bottom))
+                  (let [ty (thumb-y before)
+                        my (c/mouse-y)]
+                    (reset! held {:what :scroll :name named
+                                  :grab (if (and (>= my ty) (<= my (+ ty thumb))) (- my ty) (/ thumb 2.0))})))
+              dragged (let [h @held] (when (and (= (:what h) :scroll) (= (:name h) named)) h))
+              wanted (cond
+                       dragged (* furthest (/ (- (c/mouse-y) (:grab dragged) top) free))
+                       (and (pos? furthest) (or (pos? turned) (neg? turned))) (- before (* 48.0 turned))
+                       :else nil)
+              looked (if wanted (max 0.0 (min furthest wanted)) before)
+              start (- top looked)
+              behind (< looked (- furthest 1.0))
+              lx1 (- right 92)
+              lx2 (- right 22)
+              ly1 (- bottom 28)
+              ly2 (- bottom 6)
+              on-latest (and behind (c/inside? lx1 ly1 lx2 ly2))]
+          (when wanted
+            ;; At the end again, it is followed.
+            (if behind
+              (swap! scrolls assoc named looked)
+              (swap! scrolls dissoc named)))
+          (when (and dragged (not down))
+            (reset! held nil))
           (c/line! (+ x 10) (- top 6) (- (+ x width) 10) (- top 6) c/rule 1.0)
           (c/clip-begin! x top (+ x width) (+ top shown))
           (let [folds
@@ -704,8 +825,10 @@
                           seen (and (> (+ at h) top) (< at (+ top shown)))]
                       (when seen
                         ((:draw item) (+ x 14) at (- width 28))
-                        (when (and (:fold item) (:key item) over
+                        (when (and (:fold item) (:key item) over (not on-latest)
                                    (c/clicked? (+ x 14) (max at top) (- (+ x width) 14) (min (+ at 22) (+ top shown))))
+                          ;; The line clicked stays under the mouse, whatever opens below it.
+                          (swap! scrolls assoc named looked)
                           (swap! opened (fn [s] (if (contains? s (:key item)) (disj s (:key item)) (conj s (:key item)))))))
                       (recur (rest its) (+ at h)
                              ;; A fold whose line is whole in the part shown: where a click opens it.
@@ -714,21 +837,59 @@
                                             :open (contains? @opened (:key item))})
                                folds)))))
                 _ (c/clip-end!)
-                timeline (draw-bar named (:value p) (:sched p) (:play p) x (+ top shown 8) width)
-                now-drawn {:x x :width width :top top :shown shown :tall tall :folds folds
-                           :bar timeline
+                timeline (draw-bar named (:value p) (:sched p) (:play p) x (+ top shown 8) width pressed modal)
+                now-drawn {:x x :y y :modal (boolean modal) :width width :top top :shown shown :tall tall :folds folds
+                           :bar timeline :height (:height p) :looked looked :furthest furthest
+                           :latest (when behind {:x (/ (+ lx1 lx2) 2.0) :y (/ (+ ly1 ly2) 2.0)})
                            :rows (vec (map-indexed (fn [i w] {:name (:name w) :y (+ y 4 (* row i) (quot row 2))}) rows))}]
             (when (not= now-drawn @drawn)
               (reset! drawn now-drawn)))
           (when (pos? furthest)
-            ;; Where the part shown is, of the whole.
-            (let [bar (max 24.0 (* shown (/ shown tall)))
-                  free (- shown bar)
-                  at (+ top (* free (/ (- furthest now) furthest)))]
-              (c/rect! (- (+ x width) 6) at (- (+ x width) 3) (+ at bar) c/muted 0.5 2.0))))))))
+            (let [at (thumb-y looked)
+                  near (or dragged (c/inside? (- right 13) top right bottom))
+                  left (if near (- right 10) (- right 7))]
+              (c/rect! left top (- right 3) bottom c/rule 0.2 3.0)
+              (c/rect! left at (- right 3) (+ at thumb) c/muted (if near 0.8 0.55) 3.0)))
+          (when behind
+            (c/rect! lx1 ly1 lx2 ly2 c/card 1.0 5.0)
+            (c/frame! lx1 ly1 lx2 ly2 c/rule 1.0)
+            (c/text! (+ lx1 (/ (- lx2 lx1 (c/text-width c/small (str "latest"))) 2.0)) (+ ly1 4) c/ink c/small (str "latest"))
+            (when (c/clicked? lx1 ly1 lx2 ly2)
+              (swap! scrolls dissoc named))))))))
 
-(c/header! {:height (fn [width] (:height (panel width)))
-            :draw draw-panel})
+(defn- draw-small
+  "The panel among the cards: always as tall. Under the modal, only its place."
+  [x y width]
+  (let [height (small-height)]
+    (if (modal?)
+      (do (c/rect! x y (+ x width) (+ y height) c/card 1.0 6.0)
+          (c/frame! x y (+ x width) (+ y height) c/rule 1.0))
+      (draw-panel x y width height false))))
+
+(defn- draw-modal
+  "The panel over the dimmed window. Esc, or a click outside it, closes it."
+  [window-w window-h]
+  (let [x margin
+        y margin
+        w (- window-w (* 2 margin))
+        h (- window-h (* 2 margin))
+        outside (not (c/inside? x y (+ x w) (+ y h)))
+        down (c/down?)]
+    (when (and down (not @was-down) outside)
+      (reset! held {:what :outside}))
+    (c/rect! 0 0 window-w window-h c/ink 0.4 0.0)
+    (draw-panel x y w h true)
+    (when (and (not down) (= (:what @held) :outside))
+      (reset! held nil)
+      (when outside
+        (reset! expanded false)))
+    (when (c/escape?)
+      (reset! expanded false))))
+
+(c/header! {:height (fn [width] (small-height))
+            :draw draw-small})
+
+(c/overlay! {:shown? modal? :draw draw-modal})
 
 (defn watch!
   "The agent in the window, as the conversation called `named` (\"agent\" when not given):
@@ -739,6 +900,8 @@
    (let [named (str named)]
      (swap! watched (fn [all] (conj (vec (remove (fn [w] (= (:name w) named)) all)) {:name named :agent a})))
      (reset! chosen named)
+     ;; (Its line, the last, in view.)
+     (reset! rows-from (* 1.0 (count @watched)))
      a)))
 
 (defn unwatch!
@@ -772,11 +935,19 @@
                  :else (into without (map (fn [i] [named i]) which))))))
     nil))
 
+(defn expand!
+  "The conversation opened over the window as a modal (or closed), as the timeline's button
+  does."
+  ([] (expand! true))
+  ([whole] (reset! expanded (boolean whole)) nil))
+
 (defn replay!
   "A conversation that was kept, shown and played from its start: `recording` is what
   harness.core/recording gives, or the path of a file harness.core/save! wrote. The model
-  is not needed. Returns the atom holding it."
-  ([recording] (replay! recording "a recording"))
+  is not needed. It is called `named`, else by its file's name. Returns the atom holding it."
+  ([recording] (replay! recording (if (string? recording)
+                                    (str/replace (last (str/split recording #"/")) ".edn" "")
+                                    (str "a recording"))))
   ([recording named]
    (let [r (if (string? recording) (h/load-recording recording) recording)
          a (atom (assoc r
@@ -785,6 +956,7 @@
                         :generated (or (:generated r) 0)
                         :seconds (or (:seconds r) 0.0)))]
      (watch! a named)
+     (swap! scrolls dissoc (str named))
      (to-time! (str named) 0.0 true)
      a)))
 
