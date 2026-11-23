@@ -42,7 +42,9 @@ namespace
                  "    --ctx N      context (default 8192)\n"
                  "    --top N      print the top N logits after the prompt\n"
                  "    --draft N    draft from the context (matches of at least N tokens) and check\n"
-                 "                 the drafts in one forward: the same tokens, sooner\n");
+                 "                 the drafts in one forward: the same tokens, sooner\n"
+                 "    --dspark K   draft up to K tokens with the draft model (when the context has\n"
+                 "                 no match), checked the same way\n");
   }
 
   double now()
@@ -412,6 +414,7 @@ int main(int argc, char **argv)
       int32_t ctx{ 8192 };
       int32_t top{ 0 };
       int32_t draft{ 0 };
+      int32_t dspark{ -1 };
       for(int i{ 3 }; i < argc; ++i)
       {
         std::string const a{ argv[i] };
@@ -455,6 +458,10 @@ int main(int argc, char **argv)
         {
           draft = std::stoi(next());
         }
+        else if(a == "--dspark")
+        {
+          dspark = std::stoi(next());
+        }
         else
         {
           usage();
@@ -464,6 +471,13 @@ int main(int argc, char **argv)
       std::unique_ptr<inkling::session, void (*)(inkling::session *)> s{ inkling::new_session(*m, ctx),
                                                                           inkling::free_session };
       auto const ids{ inkling::tokenize(*m, prompt, true) };
+      std::unique_ptr<inkling::drafter, void (*)(inkling::drafter *)> drafter{ nullptr, inkling::free_drafter };
+      if(dspark >= 0)
+      {
+        drafter.reset(inkling::new_drafter(*s));
+        inkling::set_draft_depth(*drafter, dspark);
+      }
+      bool const drafting{ draft > 0 || drafter };
       double const p0{ now() };
       inkling::eval(*s, ids);
       double const p1{ now() };
@@ -490,14 +504,19 @@ int main(int argc, char **argv)
       double const g0{ now() };
       int32_t produced{};
       int32_t checks{};
+      // Forwards by the number of tokens they gave.
+      std::vector<int32_t> gave(17);
       bool ended{};
       while(produced < n && !ended)
       {
         std::vector<int32_t> ids;
-        if(draft > 0)
+        if(drafting)
         {
-          ids = inkling::speculate(*s, temp, 0.95f, 0, seed + static_cast<uint64_t>(produced), n - produced, draft, 15);
+          // Without --draft, no copies from the context: a match can't be that long.
+          ids = inkling::speculate(*s, temp, 0.95f, 0, seed + static_cast<uint64_t>(produced), n - produced,
+                                   draft > 0 ? draft : 1 << 30, 15, drafter.get());
           ++checks;
+          ++gave[std::min<size_t>(ids.size(), 16)];
         }
         else
         {
@@ -519,9 +538,17 @@ int main(int argc, char **argv)
       }
       double const g1{ now() };
       std::fprintf(stderr, "\ngenerated %d tokens in %.2f s (%.2f tok/s)", produced, g1 - g0, produced / (g1 - g0));
-      if(draft > 0)
+      if(drafting)
       {
-        std::fprintf(stderr, ", %d forwards (%.2f tokens each)", checks, static_cast<double>(produced) / checks);
+        std::fprintf(stderr, ", %d forwards (%.2f tokens each; by tokens given:", checks, static_cast<double>(produced) / checks);
+        for(size_t i{ 1 }; i < gave.size(); ++i)
+        {
+          if(gave[i] > 0)
+          {
+            std::fprintf(stderr, " %zu: %d", i, gave[i]);
+          }
+        }
+        std::fprintf(stderr, ")");
       }
       std::fprintf(stderr, "\n");
       return 0;

@@ -945,6 +945,16 @@ namespace inkling
     }
   }
 
+  void cpu_linear(model const &m, tensor const *w, float const *x, int32_t const tokens, float *y)
+  {
+    linear(m, w, x, tokens, y);
+  }
+
+  void cpu_rmsnorm(float const *x, float const *w, int64_t const n, float const eps, float *out)
+  {
+    rmsnorm(x, w, n, eps, out);
+  }
+
   void forward(session &s, int32_t const *ids, int32_t const tokens)
   {
     auto const &m{ *s.model };
@@ -1443,7 +1453,8 @@ namespace inkling
   }
 
   std::vector<int32_t> speculate(session &s, float const temperature, float const top_p, int32_t const top_k,
-                                 uint64_t const seed, int32_t const limit, int32_t const least, int32_t const most)
+                                 uint64_t const seed, int32_t const limit, int32_t const least, int32_t const most,
+                                 drafter *const d)
   {
     if(limit < 1)
     {
@@ -1459,8 +1470,12 @@ namespace inkling
     std::vector<int32_t> rows{ first };
     if(room > 0)
     {
-      auto const draft{ context_draft(s, first, least, room) };
-      rows.insert(rows.end(), draft.begin(), draft.end());
+      auto proposed{ context_draft(s, first, least, room) };
+      if(proposed.empty() && d)
+      {
+        proposed = draft(*d, s, first, std::min(room, draft_depth(*d)));
+      }
+      rows.insert(rows.end(), proposed.begin(), proposed.end());
     }
     if(rows.size() == 1)
     {

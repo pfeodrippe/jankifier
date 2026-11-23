@@ -513,6 +513,20 @@ namespace inkling
   // one forward: drafts are kept while each equals the token sampled at its
   // place. Returns the tokens evaluated (at least one); the session ends as
   // after evaluating them one at a time, the same bits.
+  //
+  // With a drafter, when the context has no match, the draft model proposes up
+  // to its depth (set_draft_depth) tokens instead.
+  struct drafter;
   std::vector<int32_t> speculate(session &s, float temperature, float top_p, int32_t top_k, uint64_t seed,
-                                 int32_t limit, int32_t least, int32_t most);
+                                 int32_t limit, int32_t least, int32_t most, drafter *d = nullptr);
+
+  // The checkpoint's draft model (a DSpark drafter, docs/drafting.md) for the
+  // session, which keeps from now on the hidden states it reads (keep_taps).
+  drafter *new_drafter(session &s);
+  void free_drafter(drafter *d);
+  // Tokens speculate drafts with it at most (0 to block size - 1; 7 at first).
+  void set_draft_depth(drafter &d, int32_t depth);
+  // Up to `count` proposals for the tokens after `anchor`, the token sampled
+  // after the session's last one (not yet evaluated), greedy.
+  std::vector<int32_t> draft(drafter &d, session const &s, int32_t anchor, int32_t count);
 }

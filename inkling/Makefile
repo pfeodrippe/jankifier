@@ -6,7 +6,7 @@ SDK := $(shell xcrun --show-sdk-path)
 CXXFLAGS := -std=c++20 -O3 -mcpu=native -ffp-contract=off -fPIC -isysroot $(SDK) -Iinclude -Wall -Wextra -Wno-unused-parameter
 LDFLAGS := -nostdlib++ -L$(JANK_PREFIX)/lib -lc++ -lc++abi -Wl,-rpath,$(JANK_PREFIX)/lib
 
-SOURCES := native/model.cpp native/tokenizer.cpp native/cpu.cpp native/check.cpp
+SOURCES := native/model.cpp native/tokenizer.cpp native/cpu.cpp native/check.cpp native/draft.cpp
 OBJECTS := $(SOURCES:native/%.cpp=build/%.o) build/metal.o
 HEADERS := include/inkling/inkling.hpp native/internal.hpp native/json.hpp native/unicode_table.inc
 FRAMEWORKS := -framework Metal -framework Foundation

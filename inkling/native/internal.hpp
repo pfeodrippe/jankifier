@@ -105,6 +105,11 @@ namespace inkling
   metal_backend *metal_open(model &m);
   void metal_close(metal_backend *b);
   metal_session *metal_new_session(session &s);
+  // The CPU path's y[t] = W x[t] (W [rows, in]) and RMS norm, for the draft model.
+  void cpu_linear(model const &m, tensor const *w, float const *x, int32_t tokens, float *y);
+  void cpu_rmsnorm(float const *x, float const *w, int64_t n, float eps, float *out);
+  // A drafter's depth.
+  int32_t draft_depth(drafter const &d);
   // The session's ring of taps for a draft model, of n BF16 values, in memory
   // the GPU writes and the CPU reads.
   uint16_t *metal_tap_ring(session &s, size_t n);
