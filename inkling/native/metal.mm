@@ -1202,9 +1202,10 @@ namespace inkling
       auto const linear{ [&](tensor const *w, id<MTLBuffer> x, id<MTLBuffer> y, uint32_t count, uint32_t mode, float cap) {
         lin_params const p{ static_cast<uint32_t>(w->dim(0)), static_cast<uint32_t>(w->dim(1)), count, mode, cap };
         auto const name{ "linear " + std::to_string(p.rows) + "x" + std::to_string(p.in) };
-        if(count > 16 && p.rows >= 512 && w->type == dtype::bf16 && batched)
+        // A batch: the matrix-product kernel for a big matrix, and for any from 384
+        // tokens on (below that, measured slower for small matrices).
+        if(count > 16 && (p.rows >= 512 || count >= 384) && w->type == dtype::bf16 && batched)
         {
-          // A batch and a big matrix: the matrix-product kernel.
           use(b.linear_mm, name + " (mm)");
           [e setBytes:&p length:sizeof(p) atIndex:0];
           bind(1, half_weight(b, m, w));
