@@ -1,4 +1,5 @@
 - [x] macros
+- [ ] play mario
 - [ ] autocompletion and stuff
   - I start a nrepl from core-test, but unable to run tests or check autocompletion
   - [ ] autocompletion
