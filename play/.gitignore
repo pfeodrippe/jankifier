@@ -1,3 +1,5 @@
 vendor/
 target/
 _vizdoom.ini
+build/
+lib/

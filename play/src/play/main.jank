@@ -1,0 +1,12 @@
+;; The games' REPL with its window: jank's nREPL server and the cards (cards.main), with the
+;; games loaded.
+(ns play.main
+  (:require [cards.main :as main]
+            [play.core]
+            [play.nova]
+            [play.nethack]
+            [play.doom]
+            [play.wnw]))
+
+(defn -main [& args]
+  (main/run! (assoc (main/options args) :title "play")))

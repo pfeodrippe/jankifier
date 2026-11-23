@@ -1,0 +1,149 @@
+;; SPDX-License-Identifier: MIT
+;; Witch n' Wiz (a free NES puzzle platformer, built from its sources in vendor/games/): the
+;; room and the players read from RAM by the addresses its build names (BUILD/labels.txt) and
+;; the structs of its sources (game/main.h), the room as text, the actions a player has, and a
+;; scripted player that wanders.
+;;
+;;   (wnw/watch!)        ; its card, at the top of the window
+;;   (wnw/start!)        ; the game, through its menus into the first room
+;;   (wnw/play! 200)     ; the scripted player, 200 steps, in the background
+;;   (wnw/told)          ; what a model is told now
+(ns play.wnw
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [play.core :as p]
+            [play.wnw-tiles :as tiles]))
+
+(def game (p/vendor "games" "mbh-A53-witchnwiz" "game" "BUILD" "main.nes"))
+
+;; RAM (BUILD/labels.txt). A game_object is 17 bytes: its data (is_cur_player 0, is_wiz 2,
+;; facing_left 4; or object_def 0), then alive 9, start_x_grid 11, start_y_grid 12.
+(def addr {:state 0x65D :room-index 0x3DB :room 0x3DD :player1 0x551 :player2 0x562 :objects 0x575})
+(def object-size 17)
+(def max-objects 8)
+(def states ["boot" "logo" "sound test" "menu" "menu" "new game menu" "password" "level select" "game"
+             "level complete" "pause" "ending"])
+(def object-names ["block" "heavy monster" "floating monster" "web" "door" "key"])
+(def width 16)
+(def height 15)
+
+(defn- object-at [ram base]
+  {:alive (pos? (nth ram (+ base 9)))
+   :x (nth ram (+ base 11))
+   :y (nth ram (+ base 12))
+   :data [(nth ram base) (nth ram (+ base 2)) (nth ram (+ base 4))]})
+
+(defn state
+  "The game now, from its RAM: {:state :room :players [{:who :x :y :current :facing}]
+  :objects [{:kind :x :y}] :tiles [240 tile indices]}; x and y are grid cells (16 pixels)."
+  []
+  (let [ram (p/nes-ram)
+        players (for [k [:player1 :player2]
+                      :let [o (object-at ram (get addr k))]
+                      :when (:alive o)]
+                  (let [[current wiz facing-left] (:data o)]
+                    {:who (if (pos? wiz) "the wizard" "the witch") :x (:x o) :y (:y o)
+                     :current (pos? current) :facing (if (pos? facing-left) :left :right)}))
+        objects (for [i (range max-objects)
+                      :let [o (object-at ram (+ (get addr :objects) (* i object-size)))]
+                      :when (:alive o)]
+                  {:kind (get object-names (first (:data o)) "object") :x (:x o) :y (:y o)})]
+    {:state (get states (nth ram (get addr :state)) "unknown")
+     :room (nth ram (get addr :room-index))
+     :players (vec players)
+     :objects (vec objects)
+     :tiles (subvec ram (get addr :room) (+ (get addr :room) (* width height)))}))
+
+(defn tile-char [i]
+  (if (< i (count tiles/tile-chars)) (subs tiles/tile-chars i (inc i)) "?"))
+
+(defn view
+  "The room as text: @ a player, o an object, and the tiles (tools/wnw_tiles.py)."
+  [st]
+  (let [players (set (map (fn [pl] [(:x pl) (:y pl)]) (:players st)))
+        objects (set (map (fn [o] [(:x o) (:y o)]) (:objects st)))]
+    (str/join "\n"
+              (for [y (range height)]
+                (str/join ""
+                          (for [x (range width)]
+                            (cond
+                              (contains? players [x y]) "@"
+                              (contains? objects [x y]) "o"
+                              :else (tile-char (nth (:tiles st) (+ (* y width) x))))))))))
+
+(defn told
+  "What a model is told: where it is, the players, the objects, the room."
+  ([] (told (state)))
+  ([st]
+   (str "Screen: " (:state st) ", room " (inc (:room st)) ".\n"
+        (str/join "\n" (map (fn [pl] (str (str/capitalize (:who pl)) " at (" (:x pl) ", " (:y pl) "), facing "
+                                          (name (:facing pl)) (when (:current pl) ", the one you move")))
+                            (:players st)))
+        "\n"
+        (if (seq (:objects st))
+          (str "Objects: " (str/join ", " (map (fn [o] (str (:kind o) " at (" (:x o) ", " (:y o) ")")) (:objects st))) ".\n")
+          "No objects.\n")
+        "The room (x across, y down; @ a player, o an object, . empty, # solid, H ladder, w web, "
+        "B a block to push, c something to carry, m a monster):\n"
+        (view st))))
+
+;; Actions: buttons held for some frames (a move is a grid cell).
+
+(def actions
+  {:left [:left] :right [:right] :up [:up] :down [:down] :a [:a] :b [:b] :wait []})
+
+(def step-frames 16)
+
+(defn act! [action]
+  (p/nes-run! (get actions action []) step-frames)
+  (p/nes-run! [] 1))
+
+;; Into the game: Start three times, Up to "new game", A twice (the first room).
+(def to-room
+  [[0 []] [200 [:start]] [206 []] [296 [:start]] [302 []] [392 [:start]] [398 []] [488 [:up]] [494 []]
+   [584 [:a]] [590 []] [680 [:a]] [686 []] [840 []]])
+
+(defonce st (atom {}))
+
+(defn start!
+  "The game from power-on into its first room: nil, or what went wrong."
+  []
+  (or (p/nes-open! game)
+      (do
+        (doseq [[[f ks] [next-f _]] (partition 2 1 to-room)]
+          (p/nes-run! ks (- next-f f)))
+        (reset! st {:step 0 :told (told)})
+        nil)))
+
+;; A scripted player: mostly across, sometimes up or down, now and then A.
+(defn scripted [_]
+  (let [r (rand)]
+    (cond (< r 0.35) :left (< r 0.7) :right (< r 0.82) :up (< r 0.92) :down :else :a)))
+
+(defonce running (atom false))
+
+(defn play!
+  "`steps` steps of `chooser` (fn [state] action; the scripted player by default) in the
+  background, each shown in the card. (stop!) ends it."
+  ([steps] (play! steps scripted))
+  ([steps chooser]
+   (reset! running true)
+   (future
+     (try
+       (loop [i 0]
+         (when (and @running (< i steps))
+           (let [a (chooser (state))]
+             (act! a)
+             (reset! st {:step (inc i) :action a :told (told)})
+             (recur (inc i)))))
+       (catch :default _ nil))
+     (reset! running false))
+   :playing))
+
+(defn stop! [] (reset! running false))
+
+(defn watch!
+  "Witch n' Wiz's card at the top of the window: the picture as it is played, and what a
+  model is told."
+  []
+  (c/pin! "Witch n' Wiz" st (p/watch-card (p/picture-part :nes 300))))

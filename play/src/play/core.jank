@@ -1,0 +1,72 @@
+;; SPDX-License-Identifier: MIT
+;; The games from jank: where they are, opening them, and a card that shows one as it is
+;; played (its picture, and what a model is told of it).
+;;
+;;   (require '[play.core :as p] '[play.nova :as nova])
+;;   (nova/watch!)          ; a card of Nova the Squirrel, kept at the top of the window
+;;   (nova/play! 600)       ; 600 steps of its scripted player, shown as they go
+(ns play.core
+  (:require [clojure.string :as str]
+            [cards.core :as c]))
+
+(cpp/raw "#include <play/jank.hpp>")
+
+;; Where the games are: this project's vendor/ (README.md says how they are built).
+(def here (str (cpp/play.cwd)))
+
+(defn vendor [& parts] (str here "/vendor/" (str/join "/" parts)))
+
+;; The NES.
+
+(def nes-core (vendor "libretro-fceumm" "fceumm_libretro.dylib"))
+
+(def buttons
+  "The controller's buttons as libretro numbers them: a set of keywords becomes one number."
+  {:b 1 :select 4 :start 8 :up 16 :down 32 :left 64 :right 128 :a 256})
+
+(defn held [ks] (reduce + 0 (map (fn [k] (get buttons k 0)) (distinct ks))))
+
+(defn nes-open!
+  "The NES with the game at `path` (a .nes file): nil, or what went wrong."
+  [path]
+  (cpp/play.nes_open nes-core (str path)))
+
+(defn nes-run!
+  "`frames` frames with the buttons `ks` (keywords of `buttons`) held."
+  ([ks] (nes-run! ks 1))
+  ([ks frames] (cpp/play.nes_run (held ks) frames)))
+
+(defn nes-frames [] (cpp/play.nes_frames))
+(defn nes-ram "The console's 2 KiB of RAM: a vector of bytes." [] (cpp/play.nes_ram))
+(defn cartridge-ram "The cartridge's RAM from $6000: a vector of bytes." [] (cpp/play.nes_cartridge_ram))
+(defn nes-save! "The whole console kept: a number to go back to it with nes-restore!." [] (cpp/play.nes_save))
+(defn nes-restore! [saved] (cpp/play.nes_restore saved))
+
+;; Cards.
+
+(defn picture-part
+  "A layout's part drawing a game's picture (:nes or :doom), `height` points high, as wide
+  as its proportions say (at most the card's width)."
+  [game height]
+  [:draw height
+   (fn [x y width]
+     (let [ratio (if (= game :nes) (/ 256.0 240.0) (/ 4.0 3.0))
+           w (min width (* height ratio))
+           h (/ w ratio)]
+       (cpp/play.draw_picture (if (= game :nes) 0 1) x y w h)))])
+
+(defn watch-card
+  "A card for a game being played: its picture (`part`), the step, and what the model is told
+  (`:told`, text) from the state atom's value."
+  [part]
+  (fn [st]
+    (c/layout
+     [:col
+      part
+      [:space 6]
+      [:text {:size :small :color :muted}
+       (str "step " (:step st 0) (when-let [a (:action st)] (str "   action " (pr-str a)))
+            (when-let [r (:result st)] (str "   " r)))]
+      [:space 4]
+      ;; A part a line: the level's rows stay rows, and the card's height counts each.
+      (into [:col] (map (fn [line] [:text {:size :mono} line]) (str/split-lines (str (:told st "")))))])))

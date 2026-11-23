@@ -1,0 +1,172 @@
+;; SPDX-License-Identifier: MIT
+;; Nova the Squirrel (a free NES platformer, built from its sources in vendor/games/): its
+;; state read from RAM by the addresses its sources name (debug.dbg), the level around Nova
+;; as text, the actions a player has, and a scripted player that runs right and jumps.
+;;
+;;   (nova/watch!)        ; its card, at the top of the window
+;;   (nova/start!)        ; the game, through its menus into level 1-1
+;;   (nova/play! 400)     ; the scripted player, 400 steps, in the background
+;;   (nova/told)          ; what a model is told now
+(ns play.nova
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [play.core :as p]
+            [play.nova-blocks :as blocks]))
+
+(def game (p/vendor "games" "NovaTheSquirrel" "nova.nes"))
+
+;; RAM, from the game's sources (src/memory.s, its addresses in debug.dbg).
+(def addr {:player-x 0x26 :player-x-sub 0x25 :player-y 0x27 :player-y-sub 0x28
+           :player-vx 0x29 :player-vx-sub 0x2A :player-vy 0x2B :player-vy-sub 0x2C
+           :player-dir 0x43 :jumping 0x45 :on-ground 0x46 :health 0x4B
+           :object-f1 0x2D :object-x 0x3E3 :object-y 0x403 :level 0xA7})
+
+;; The level map is in the cartridge's RAM at $6000: 16 rows a column, a byte a block.
+(def rows 16)
+
+(defn one-place "x with one decimal, as text." [x] (str (/ (long (* (double x) 10.0)) 10.0)))
+
+(defn- signed [hi lo]
+  (+ (if (> hi 127) (- hi 256) hi) (/ lo 256.0)))
+
+(defn state
+  "The game now, from its RAM: {:x :y :vx :vy :facing :on-ground :jumping :health :level
+  :objects [{:type :x :y}] :map (fn [col row] block-id)}. x and y are in blocks (16
+  pixels); y grows downwards."
+  []
+  (let [ram (p/nes-ram)
+        cart (p/cartridge-ram)
+        at (fn [k] (nth ram (get addr k)))]
+    {:x (+ (at :player-x) (/ (at :player-x-sub) 256.0))
+     :y (+ (at :player-y) (/ (at :player-y-sub) 256.0))
+     :vx (signed (at :player-vx) (at :player-vx-sub))
+     :vy (signed (at :player-vy) (at :player-vy-sub))
+     :facing (if (zero? (at :player-dir)) :right :left)
+     :on-ground (pos? (at :on-ground))
+     :jumping (pos? (at :jumping))
+     :health (at :health)
+     :level (at :level)
+     :objects (vec (for [i (range 16)
+                         :let [f1 (nth ram (+ (get addr :object-f1) i))]
+                         :when (pos? f1)]
+                     {:type (get blocks/objects (bit-shift-right f1 1) (str "object " (bit-shift-right f1 1)))
+                      :x (nth ram (+ (get addr :object-x) i))
+                      :y (nth ram (+ (get addr :object-y) i))}))
+     :map (fn [col row]
+            (let [i (+ (* col rows) row)]
+              (if (and (>= col 0) (< i (count cart))) (nth cart i) 0)))}))
+
+(defn block-char [id]
+  (if (< id (count blocks/block-chars)) (subs blocks/block-chars id (inc id)) "?"))
+
+(defn view
+  "The level around Nova as text: `before` columns behind her and `after` ahead, every row.
+  N is Nova, e an object."
+  ([st] (view st 6 18))
+  ([st before after]
+   (let [px (long (:x st)) py (long (:y st))
+         objects (set (map (fn [o] [(:x o) (:y o)]) (:objects st)))
+         from (max 0 (- px before))]
+     (str/join "\n"
+               (for [row (range rows)]
+                 (str/join ""
+                           (for [col (range from (+ px after))]
+                             (cond
+                               (and (= col px) (= row py)) "N"
+                               (contains? objects [col row]) "e"
+                               :else (block-char ((:map st) col row))))))))))
+
+(defn told
+  "What a model is told of the game: Nova's state, the objects near, and the level around
+  her."
+  ([] (told (state)))
+  ([st]
+   (str "Nova is at column " (one-place (:x st)) ", row " (one-place (:y st))
+        " (rows go down), facing " (name (:facing st))
+        (cond (:on-ground st) ", on the ground" (:jumping st) ", jumping" :else ", in the air")
+        ", moving " (one-place (:vx st)) " across (blocks a frame). Health " (:health st) ".\n"
+        (if (seq (:objects st))
+          (str "Objects: " (str/join ", " (map (fn [o] (str (:type o) " at (" (:x o) ", " (:y o) ")")) (:objects st))) ".\n")
+          "No objects near.\n")
+        "The level around her (N Nova, e an object, . empty, # solid, = a ledge, o coin, ^ spikes, "
+        "s spring, ? sign, ! prize block, ~ water):\n"
+        (view st))))
+
+;; Actions: buttons held for some frames.
+
+(def actions
+  "What a player can do in a step: a name and the buttons held, for `step-frames` frames."
+  {:right [:right] :left [:left] :jump [:a] :jump-right [:a :right] :jump-left [:a :left]
+   :attack [:b] :wait []})
+
+(def step-frames 8)
+
+(defn act!
+  "One step: the action's buttons held for step-frames frames, then released for one (so a
+  jump can be pressed again)."
+  [action]
+  (p/nes-run! (get actions action []) step-frames)
+  (p/nes-run! [] 1))
+
+;; Into the game: the menus, then level 1-1.
+
+(def to-level
+  "The frames at which buttons change, from power-on to level 1-1 (worked out with
+  test/shot.cpp): Start twice, down to Level Select, A, down to Start!, A."
+  [[0 []] [200 [:start]] [206 []] [300 [:start]] [306 []] [480 [:down]] [486 []] [540 [:down]] [546 []]
+   [600 [:up]] [606 []] [660 [:a]] [666 []] [780 [:down]] [786 []] [840 [:a]] [846 []] [960 []]])
+
+(defonce st (atom {}))
+
+(defn start!
+  "The game from power-on into level 1-1: nil, or what went wrong."
+  []
+  (or (p/nes-open! game)
+      (do
+        (doseq [[[f ks] [next-f _]] (partition 2 1 to-level)]
+          (p/nes-run! ks (- next-f f)))
+        (reset! st {:step 0 :told (told)})
+        nil)))
+
+;; A scripted player: right, and a jump when a wall, a gap or spikes are ahead.
+
+(defn scripted
+  "The action for a state: jump right when something is in the way, else right."
+  [s]
+  (let [px (long (:x s)) py (long (:y s))
+        ahead (fn [dx dy] (block-char ((:map s) (+ px dx) (+ py dy))))
+        solid? (fn [ch] (contains? #{"#" "!" "L"} ch))
+        wall (or (solid? (ahead 1 0)) (solid? (ahead 1 -1)))
+        gap (and (:on-ground s) (= "." (ahead 1 1)) (= "." (ahead 2 1)))
+        danger (or (= "^" (ahead 1 0)) (= "^" (ahead 1 1)) (= "^" (ahead 2 1))
+                   (some (fn [o] (and (<= 0 (- (:x o) px) 3) (<= (max (- (:y o) py) (- py (:y o))) 1))) (:objects s)))]
+    (if (and (:on-ground s) (or wall gap danger)) :jump-right :right)))
+
+(defonce running (atom false))
+
+(defn play!
+  "`steps` steps of `chooser` (fn [state] action; the scripted player by default) in the
+  background, each shown in the card. (stop!) ends it."
+  ([steps] (play! steps scripted))
+  ([steps chooser]
+   (reset! running true)
+   (future
+     (try
+       (loop [i 0]
+         (when (and @running (< i steps))
+           (let [s (state)
+                 a (chooser s)]
+             (act! a)
+             (reset! st {:step (inc i) :action a :told (told (state))})
+             (recur (inc i)))))
+       (catch :default _ (reset! running false)))
+     (reset! running false))
+   :playing))
+
+(defn stop! [] (reset! running false))
+
+(defn watch!
+  "Nova's card at the top of the window: the picture as it is played, and what a model is
+  told."
+  []
+  (c/pin! "Nova the Squirrel" st (p/watch-card (p/picture-part :nes 300))))

@@ -1,0 +1,131 @@
+;; SPDX-License-Identifier: MIT
+;; Doom (ViZDoom, built in vendor/ViZDoom, with Freedoom's free game data): what a model is
+;; told is the player's numbers and the objects in view with how far and which way each is;
+;; an action is the buttons held for some tics. A scripted player turns to what's in view and
+;; shoots, else walks, turning when it is stuck, and uses doors.
+;;
+;;   (doom/watch!)      ; its card, at the top of the window
+;;   (doom/start! 7)    ; Freedoom's MAP01, seed 7
+;;   (doom/play! 300)   ; the scripted player, 300 steps, in the background
+;;   (doom/told)        ; what a model is told now
+(ns play.doom
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [play.core :as p]))
+
+(def engine (p/vendor "ViZDoom" "build" "bin" "vizdoom.app" "Contents" "MacOS" "vizdoom"))
+(def wad (p/vendor "ViZDoom" "src" "freedoom2.wad"))
+
+;; The buttons, as play.h orders them.
+(def buttons {:forward 1 :back 2 :turn-left 4 :turn-right 8 :attack 16 :use 32 :strafe-left 64 :strafe-right 128})
+
+(def actions
+  "What a player can do in a step: a name and the buttons held."
+  {:forward [:forward] :back [:back] :turn-left [:turn-left] :turn-right [:turn-right]
+   :attack [:attack] :use [:use] :strafe-left [:strafe-left] :strafe-right [:strafe-right]
+   :forward-left [:forward :turn-left] :forward-right [:forward :turn-right] :wait []})
+
+(def step-tics 4)
+
+(defonce st (atom {}))
+
+(defn state [] (cpp/play.doom_state))
+
+(def pi 3.141592653589793)
+
+(defn- degrees [r] (* r (/ 180.0 pi)))
+
+(defn bearing
+  "Where an object is from the player: [distance degrees], degrees to the left positive
+  (Doom's angles grow anticlockwise)."
+  [s o]
+  (let [dx (- (:x o) (:x s)) dy (- (:y o) (:y s))
+        to (degrees (cpp/play.atan2 dy dx))
+        rel (- to (:angle s))
+        rel (loop [r rel] (cond (> r 180.0) (recur (- r 360.0)) (< r -180.0) (recur (+ r 360.0)) :else r))]
+    [(cpp/play.sqrt (+ (* dx dx) (* dy dy))) rel]))
+
+(defn told
+  "What a model is told: the player's numbers, and each object in view with its distance
+  (map units; a corridor is about 128 wide) and its direction."
+  ([] (told (state)))
+  ([s]
+   (if-not s
+     "No game."
+     (str "Health " (long (:health s)) ", armor " (long (:armor s)) ", ammo " (long (:ammo s))
+          ", kills " (long (:kills s)) ", items " (long (:items s)) (when (pos? (:dead s 0)) ", dead") ".\n"
+          "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees.\n"
+          (if (seq (:objects s))
+            (str "In view:\n"
+                 (str/join "\n"
+                           (for [o (sort-by (fn [o] (first (bearing s o))) (:objects s))
+                                 :let [[d a] (bearing s o)]]
+                             (str "- " (:name o) ", " (long d) " away, "
+                                  (cond (< (max a (- a)) 5.0) "straight ahead"
+                                        (pos? a) (str (long a) " degrees to the left")
+                                        :else (str (long (- a)) " degrees to the right"))))))
+            "Nothing in view.")))))
+
+(defn start!
+  "Freedoom's MAP01 with `seed`: nil, or what went wrong."
+  ([] (start! 1))
+  ([seed]
+   (or (cpp/play.doom_open engine wad "map01" seed 320)
+       (do (reset! st {:step 0 :told (told)}) nil))))
+
+(defn act!
+  "One step: the action's buttons held step-tics tics; the reward."
+  [action]
+  (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) step-tics))
+
+;; A scripted player.
+
+(def enemies #{"Zombieman" "ShotgunGuy" "ChaingunGuy" "DoomImp" "Demon" "Spectre" "LostSoul" "Cacodemon"
+               "HellKnight" "BaronOfHell" "Arachnotron" "PainElemental" "Revenant" "Fatso" "Archvile"})
+
+(defonce memory (atom {:last nil :stuck 0}))
+
+(defn- abs-diff [a b] (let [d (- a b)] (if (neg? d) (- d) d)))
+
+(defn scripted [s]
+  (let [targets (filter (fn [o] (contains? enemies (:name o))) (:objects s))
+        stuck? (when-let [l (:last @memory)]
+                 (< (+ (abs-diff (:x l) (:x s)) (abs-diff (:y l) (:y s))) 2.0))]
+    (swap! memory (fn [m] {:last s :stuck (if stuck? (inc (:stuck m)) 0)}))
+    (if (seq targets)
+      (let [[_ a] (bearing s (first (sort-by (fn [o] (first (bearing s o))) targets)))]
+        (cond (> a 6.0) :turn-left (< a -6.0) :turn-right :else :attack))
+      (let [stuck (:stuck @memory)]
+        (cond
+          (= stuck 2) :use
+          (> stuck 2) (if (even? (quot stuck 6)) :turn-left :turn-right)
+          :else :forward)))))
+
+(defonce running (atom false))
+
+(defn play!
+  "`steps` steps of `chooser` (fn [state] action; the scripted player by default) in the
+  background, each shown in the card. (stop!) ends it; the episode's end too."
+  ([steps] (play! steps scripted))
+  ([steps chooser]
+   (reset! running true)
+   (future
+     (try
+       (loop [i 0]
+         (when (and @running (< i steps) (not (cpp/play.doom_finished)))
+           (let [s (state)
+                 a (chooser s)
+                 r (act! a)]
+             (reset! st {:step (inc i) :action a :told (told) :result (str "reward " r)})
+             (recur (inc i)))))
+       (catch :default _ nil))
+     (reset! running false))
+   :playing))
+
+(defn stop! [] (reset! running false))
+
+(defn watch!
+  "Doom's card at the top of the window: the picture as it is played, and what a model is
+  told."
+  []
+  (c/pin! "Doom" st (p/watch-card (p/picture-part :doom 300))))

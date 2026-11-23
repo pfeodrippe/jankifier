@@ -1,0 +1,140 @@
+;; SPDX-License-Identifier: MIT
+;; NetHack (the NetHack Learning Environment's core, built in vendor/nle): a step is a key; what
+;; a model is told is the terminal (24 lines), the bottom lines' numbers by name, the last
+;; message and the inventory. A scripted player explores at random and answers what it is
+;; asked.
+;;
+;;   (nethack/watch!)      ; its card, at the top of the window
+;;   (nethack/start! 7)    ; a game, seed 7
+;;   (nethack/play! 300)   ; the scripted player, 300 steps, in the background
+;;   (nethack/told)        ; what a model is told now
+(ns play.nethack
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [play.core :as p]))
+
+(def library (p/vendor "nle" "build" "libnethack.so"))
+(def nhdat (p/vendor "nle" "build" "dat" "nhdat"))
+(def run-dir (str p/here "/target/nethack-run"))
+
+;; The NetHack Learning Environment's options (nle/nethack/nethack.py).
+(def options
+  (str "autopickup,color,disclose:+i +a +v +g +c +o,mention_walls,nobones,nocmdassist,"
+       "nolegacy,nosparkle,pickup_burden:unencumbered,pickup_types:$?!/,runmode:teleport,showexp,"
+       "showscore,time"))
+
+(defonce st (atom {}))
+
+(defn state
+  "{:screen [24 lines] :cursor [row col] :stats {...} :message :normal :done :inventory}."
+  []
+  (let [s (cpp/play.nethack_state)
+        n (:stats s)
+        stat (fn [i] (nth n i 0))]
+    (assoc s :stats {:x (stat 0) :y (stat 1) :strength (stat 2) :dexterity (stat 4) :constitution (stat 5)
+                     :intelligence (stat 6) :wisdom (stat 7) :charisma (stat 8) :score (stat 9)
+                     :hp (stat 10) :hp-max (stat 11) :depth (stat 12) :gold (stat 13) :energy (stat 14)
+                     :energy-max (stat 15) :armor-class (stat 16) :xp-level (stat 18) :xp (stat 19)
+                     :turn (stat 20) :hunger (stat 21) :dungeon-level (stat 24)})))
+
+;; NetHack's hunger states (u.uhs): 0 satiated, 1 not hungry, 2 hungry, 3 weak, 4 fainting, 5
+;; fainted, 6 starved.
+(def hunger-names ["satiated" "not hungry" "hungry" "weak" "fainting" "fainted" "starved"])
+
+(defn told
+  "What a model is told: the terminal, then the numbers and the inventory in words."
+  ([] (told (state)))
+  ([s]
+   (let [st (:stats s)]
+     (str (str/join "\n" (map str/trimr (:screen s))) "\n"
+          "HP " (:hp st) "/" (:hp-max st) ", armor class " (:armor-class st) ", experience level "
+          (:xp-level st) ", dungeon level " (:depth st) ", gold " (:gold st) ", turn " (:turn st)
+          ", " (get hunger-names (:hunger st) "hunger unknown") ".\n"
+          (when (seq (str/trim (:message s))) (str "Message: " (str/trim (:message s)) "\n"))
+          (when-not (:normal s) "A menu or a question is open.\n")
+          "Inventory:\n" (:inventory s)))))
+
+(declare act!)
+
+(defn start!
+  "A new game with `seed`, past its opening: the character picked by the game (`y`), its
+  story and welcome passed (Enter), until the map is there. nil, or what went wrong."
+  ([] (start! 1))
+  ([seed]
+   (let [dir (cpp/play.nethack_prepare run-dir nhdat)]
+     (or (cpp/play.nethack_open library dir options seed)
+         (do
+           (act! :yes)
+           (loop [i 0]
+             (when (and (< i 20) (not (:normal (state))))
+               (act! :enter)
+               (recur (inc i))))
+           (reset! st {:step 0 :told (told)})
+           nil)))))
+
+;; Keys, by name.
+(def keys-by-name
+  {:north (int \k) :south (int \j) :east (int \l) :west (int \h)
+   :north-east (int \u) :north-west (int \y) :south-east (int \n) :south-west (int \b)
+   :down (int \>) :up (int \<) :search (int \s) :pick-up (int \,) :eat (int \e) :wait (int \.)
+   :open (int \o) :kick 4 :enter 13 :escape 27 :yes (int \y) :no (int \n) :more 13})
+
+(defn act!
+  "One key (a name of keys-by-name, a character or a number): whether the game ended."
+  [k]
+  (cpp/play.nethack_step (cond (keyword? k) (get keys-by-name k 27)
+                               (char? k) (int k)
+                               :else k)))
+
+;; A scripted player: answers what it is asked, goes down stairs it stands on, else walks in
+;; a random direction (and searches now and then).
+
+(def directions [:north :south :east :west :north-east :north-west :south-east :south-west])
+
+(defn scripted [s]
+  (let [msg (str/lower-case (str (:message s)))]
+    (cond
+      (not (:normal s)) :enter
+      (str/includes? msg "--more--") :more
+      (str/includes? msg "[yn") :no
+      (str/includes? msg "there is a staircase down here") :down
+      (< (rand) 0.08) :search
+      :else (rand-nth directions))))
+
+(defonce running (atom false))
+
+(defn play!
+  "`steps` keys of `chooser` (fn [state] key; the scripted player by default) in the
+  background, each shown in the card. (stop!) ends it; the game's end too."
+  ([steps] (play! steps scripted))
+  ([steps chooser]
+   (reset! running true)
+   (future
+     (try
+       (loop [i 0]
+         (when (and @running (< i steps))
+           (let [s (state)
+                 k (chooser s)
+                 done (act! k)]
+             (reset! st {:step (inc i) :action k :told (told) :result (when done "the game ended")})
+             (cpp/usleep 60000)
+             (when-not done (recur (inc i))))))
+       (catch :default _ nil))
+     (reset! running false))
+   :playing))
+
+(defn stop! [] (reset! running false))
+
+(defn watch!
+  "NetHack's card at the top of the window: the terminal as it is played, and the numbers a
+  model is told."
+  []
+  (c/pin! "NetHack" st
+          (fn [v]
+            (c/layout
+             [:col
+              [:draw 420 (fn [x y width] (cpp/play.draw_nethack x y width 420.0))]
+              [:space 6]
+              [:text {:size :small :color :muted}
+               (str "step " (:step v 0) (when-let [a (:action v)] (str "   key " (pr-str a)))
+                    (when-let [r (:result v)] (str "   " r)))]]))))

@@ -1,0 +1,479 @@
+// SPDX-License-Identifier: MIT
+// The games behind a plain C interface (include/play/play.h), so that jank calls them
+// whichever C++ library they were built with: an NES (a libretro core), NetHack (the NetHack
+// Learning Environment) and Doom (ViZDoom). One of each a process. What jank calls runs on
+// its REPL's thread; the window copies the pictures on its own, so each game has a lock.
+#include <play/play.h>
+#include <play/nes.hpp>
+
+#include <ViZDoom.h>
+
+extern "C"
+{
+#include <nledl.h>
+}
+
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace
+{
+  void say(char *error, int size, std::string const &what)
+  {
+    if(error && size > 0)
+    {
+      std::snprintf(error, static_cast<size_t>(size), "%s", what.c_str());
+    }
+  }
+
+  // The NES.
+
+  std::mutex nes_lock;
+  std::unique_ptr<play::nes> nes_now;
+  std::vector<uint32_t> nes_picture;
+  unsigned nes_width{}, nes_height{};
+  uint64_t nes_shown{}; // how many pictures there were: the window uploads a new one
+
+  // NetHack.
+
+  constexpr int rows{ 21 }, cols{ 79 }; // NetHack's map: ROWNO x (COLNO - 1)
+  std::mutex nethack_lock;
+  nledl_ctx *nethack_now{};
+  nle_obs nethack_obs{};
+  nle_settings nethack_settings{};
+  struct nethack_buffers
+  {
+    short glyphs[rows * cols];
+    unsigned char chars[rows * cols], colors[rows * cols], specials[rows * cols];
+    long blstats[NLE_BLSTATS_SIZE];
+    unsigned char message[NLE_MESSAGE_SIZE];
+    int program_state[NLE_PROGRAM_STATE_SIZE], internal[NLE_INTERNAL_SIZE], misc[NLE_MISC_SIZE];
+    short inv_glyphs[NLE_INVENTORY_SIZE];
+    unsigned char inv_strs[NLE_INVENTORY_SIZE * NLE_INVENTORY_STR_LENGTH];
+    unsigned char inv_letters[NLE_INVENTORY_SIZE], inv_oclasses[NLE_INVENTORY_SIZE];
+    unsigned char tty_chars[NLE_TERM_LI * NLE_TERM_CO];
+    signed char tty_colors[NLE_TERM_LI * NLE_TERM_CO];
+    unsigned char tty_cursor[2];
+  };
+  nethack_buffers nethack_b{};
+  uint64_t nethack_steps{};
+
+  void nethack_wire()
+  {
+    auto &o(nethack_obs);
+    auto &b(nethack_b);
+    o.glyphs = b.glyphs;
+    o.chars = b.chars;
+    o.colors = b.colors;
+    o.specials = b.specials;
+    o.blstats = b.blstats;
+    o.message = b.message;
+    o.program_state = b.program_state;
+    o.internal = b.internal;
+    o.misc = b.misc;
+    o.inv_glyphs = b.inv_glyphs;
+    o.inv_strs = b.inv_strs;
+    o.inv_letters = b.inv_letters;
+    o.inv_oclasses = b.inv_oclasses;
+    o.tty_chars = b.tty_chars;
+    o.tty_colors = b.tty_colors;
+    o.tty_cursor = b.tty_cursor;
+  }
+
+  // Doom.
+
+  std::mutex doom_lock;
+  std::unique_ptr<vizdoom::DoomGame> doom_now;
+  std::vector<uint32_t> doom_picture;
+  unsigned doom_width{}, doom_height{};
+  uint64_t doom_shown{};
+  std::vector<double> doom_vars;
+  std::string doom_objects;
+  int doom_tic{};
+  std::vector<vizdoom::GameVariable> const doom_variables{ vizdoom::HEALTH,     vizdoom::ARMOR,     vizdoom::AMMO2,
+                                                           vizdoom::POSITION_X, vizdoom::POSITION_Y, vizdoom::ANGLE,
+                                                           vizdoom::KILLCOUNT,  vizdoom::ITEMCOUNT, vizdoom::DEAD };
+  std::vector<vizdoom::Button> const doom_buttons{ vizdoom::MOVE_FORWARD, vizdoom::MOVE_BACKWARD, vizdoom::TURN_LEFT,
+                                                   vizdoom::TURN_RIGHT,   vizdoom::ATTACK,        vizdoom::USE,
+                                                   vizdoom::MOVE_LEFT,    vizdoom::MOVE_RIGHT };
+
+  // What the last state of Doom shows: its picture, variables and objects in view.
+  void doom_take()
+  {
+    auto const state(doom_now->getState());
+    if(!state)
+    {
+      return;
+    }
+    doom_tic = state->number;
+    doom_vars = state->gameVariables;
+    std::string objects;
+    for(auto const &l : state->labels)
+    {
+      if(l.objectName == "DoomPlayer")
+      {
+        continue;
+      }
+      char line[256];
+      std::snprintf(line, sizeof line, "%s %.0f %.0f %u %u %u %u\n", l.objectName.c_str(), l.objectPositionX,
+                    l.objectPositionY, l.x, l.y, l.width, l.height);
+      objects += line;
+    }
+    doom_objects = objects;
+    if(state->screenBuffer)
+    {
+      auto const &bytes(*state->screenBuffer);
+      std::vector<uint32_t> picture(size_t{ doom_width } * doom_height);
+      for(size_t i{}; i < picture.size() && 3 * i + 2 < bytes.size(); ++i)
+      {
+        picture[i] = uint32_t{ bytes[3 * i] } << 16 | uint32_t{ bytes[3 * i + 1] } << 8 | bytes[3 * i + 2];
+      }
+      std::lock_guard<std::mutex> hold{ doom_lock };
+      doom_picture = std::move(picture);
+      ++doom_shown;
+    }
+  }
+
+  int copy_picture(std::mutex &lock, std::vector<uint32_t> const &picture, unsigned w, unsigned h, uint64_t shown,
+                   uint32_t *out, int max, int *width, int *height, uint64_t *version)
+  {
+    std::lock_guard<std::mutex> hold{ lock };
+    *width = static_cast<int>(w);
+    *height = static_cast<int>(h);
+    *version = shown;
+    auto const n(std::min(picture.size(), static_cast<size_t>(std::max(max, 0))));
+    std::copy_n(picture.begin(), n, out);
+    return static_cast<int>(n);
+  }
+}
+
+extern "C"
+{
+  // The NES.
+
+  int play_nes_open(char const *core, char const *game, char *error, int size)
+  {
+    try
+    {
+      std::lock_guard<std::mutex> hold{ nes_lock };
+      nes_now.reset();
+      nes_now = std::make_unique<play::nes>(core);
+      nes_now->load(game);
+      nes_picture.clear();
+      nes_shown = 0;
+      return 0;
+    }
+    catch(std::exception const &e)
+    {
+      say(error, size, e.what());
+      nes_now.reset();
+      return -1;
+    }
+  }
+
+  int play_nes_run(unsigned buttons, unsigned frames)
+  {
+    if(!nes_now)
+    {
+      return -1;
+    }
+    nes_now->run(buttons, frames);
+    std::lock_guard<std::mutex> hold{ nes_lock };
+    nes_picture = nes_now->picture();
+    nes_width = nes_now->width();
+    nes_height = nes_now->height();
+    ++nes_shown;
+    return 0;
+  }
+
+  long long play_nes_frames()
+  {
+    return nes_now ? static_cast<long long>(nes_now->frames) : -1;
+  }
+
+  int play_nes_ram(unsigned char *out, int max)
+  {
+    if(!nes_now)
+    {
+      return -1;
+    }
+    auto const n(std::min(nes_now->ram_size(), static_cast<size_t>(max)));
+    std::memcpy(out, nes_now->ram(), n);
+    return static_cast<int>(n);
+  }
+
+  // The cartridge's RAM at $6000 (a game's work RAM, or its battery-backed RAM).
+  int play_nes_cartridge_ram(unsigned char *out, int max)
+  {
+    if(!nes_now)
+    {
+      return -1;
+    }
+    auto const data(static_cast<unsigned char const *>(nes_now->memory_data(RETRO_MEMORY_SAVE_RAM)));
+    auto const size(nes_now->memory_size(RETRO_MEMORY_SAVE_RAM));
+    if(!data)
+    {
+      return 0;
+    }
+    auto const n(std::min(size, static_cast<size_t>(max)));
+    std::memcpy(out, data, n);
+    return static_cast<int>(n);
+  }
+
+  int play_nes_picture(uint32_t *out, int max, int *width, int *height, uint64_t *version)
+  {
+    return copy_picture(nes_lock, nes_picture, nes_width, nes_height, nes_shown, out, max, width, height, version);
+  }
+
+  int play_nes_save(unsigned char *out, int max)
+  {
+    if(!nes_now)
+    {
+      return -1;
+    }
+    auto const s(nes_now->save());
+    if(!out)
+    {
+      return static_cast<int>(s.size());
+    }
+    auto const n(std::min(s.size(), static_cast<size_t>(max)));
+    std::memcpy(out, s.data(), n);
+    return static_cast<int>(n);
+  }
+
+  int play_nes_restore(unsigned char const *state, int size)
+  {
+    if(!nes_now)
+    {
+      return -1;
+    }
+    try
+    {
+      nes_now->restore({ state, state + size });
+      return 0;
+    }
+    catch(std::exception const &)
+    {
+      return -1;
+    }
+  }
+
+  // NetHack.
+
+  int play_nethack_open(char const *library, char const *hackdir, char const *options, unsigned long seed,
+                        char *error, int size)
+  {
+    std::lock_guard<std::mutex> hold{ nethack_lock };
+    if(nethack_now)
+    {
+      nle_end(nethack_now);
+      nethack_now = nullptr;
+    }
+    nethack_b = {};
+    nethack_obs = {};
+    nethack_wire();
+    nethack_settings = {};
+    std::snprintf(nethack_settings.hackdir, sizeof nethack_settings.hackdir, "%s", hackdir);
+    std::snprintf(nethack_settings.options, sizeof nethack_settings.options, "%s", options);
+    nethack_settings.spawn_monsters = 1;
+    // The same seed, the same game: both of NetHack's generators, and the moon's phase.
+    nethack_settings.initial_seeds.seeds[0] = seed;
+    nethack_settings.initial_seeds.seeds[1] = seed ^ 0x9e3779b97f4a7c15ul;
+    nethack_settings.initial_seeds.reseed = 0;
+    nethack_settings.initial_seeds.use_init_seeds = true;
+    nethack_settings.initial_seeds.lgen_seed = seed;
+    nethack_settings.initial_seeds.use_lgen_seed = true;
+    nethack_settings.fix_moon_phase = true;
+    nethack_settings.time_seed = seed;
+    nethack_settings.time_seed_is_set = true;
+    nethack_now = nle_start(library, &nethack_obs, nullptr, &nethack_settings);
+    if(!nethack_now)
+    {
+      say(error, size, "NetHack didn't start");
+      return -1;
+    }
+    nethack_steps = 0;
+    return 0;
+  }
+
+  // One key; whether the game has ended.
+  int play_nethack_step(int key)
+  {
+    std::lock_guard<std::mutex> hold{ nethack_lock };
+    if(!nethack_now)
+    {
+      return -1;
+    }
+    nethack_obs.action = key;
+    nethack_now = nle_step(nethack_now, &nethack_obs);
+    ++nethack_steps;
+    return nethack_obs.done;
+  }
+
+  // The terminal: 24 rows of 80 characters, their colours (0 to 15), the cursor.
+  int play_nethack_screen(char *chars, signed char *colors, int *cursor_row, int *cursor_col, uint64_t *version)
+  {
+    std::lock_guard<std::mutex> hold{ nethack_lock };
+    std::memcpy(chars, nethack_b.tty_chars, sizeof nethack_b.tty_chars);
+    std::memcpy(colors, nethack_b.tty_colors, sizeof nethack_b.tty_colors);
+    *cursor_row = nethack_b.tty_cursor[0];
+    *cursor_col = nethack_b.tty_cursor[1];
+    *version = nethack_steps;
+    return nethack_now ? 0 : -1;
+  }
+
+  // The bottom lines' numbers (NLE_BL_*), the last message, whether in a normal game (not a
+  // menu or a question), done.
+  int play_nethack_status(long *stats, char *message, int *in_normal_game, int *done)
+  {
+    std::lock_guard<std::mutex> hold{ nethack_lock };
+    std::memcpy(stats, nethack_b.blstats, sizeof nethack_b.blstats);
+    std::memcpy(message, nethack_b.message, sizeof nethack_b.message);
+    message[NLE_MESSAGE_SIZE - 1] = 0;
+    *in_normal_game = nethack_obs.in_normal_game;
+    *done = nethack_obs.done;
+    return nethack_now ? 0 : -1;
+  }
+
+  // The inventory, a line an item: "a - a +1 long sword (weapon in hand)".
+  int play_nethack_inventory(char *out, int max)
+  {
+    std::lock_guard<std::mutex> hold{ nethack_lock };
+    std::string all;
+    for(int i{}; i < NLE_INVENTORY_SIZE; ++i)
+    {
+      auto const letter(nethack_b.inv_letters[i]);
+      if(!letter)
+      {
+        continue;
+      }
+      std::string const item(reinterpret_cast<char const *>(nethack_b.inv_strs + i * NLE_INVENTORY_STR_LENGTH),
+                             strnlen(reinterpret_cast<char const *>(nethack_b.inv_strs + i * NLE_INVENTORY_STR_LENGTH),
+                                     NLE_INVENTORY_STR_LENGTH));
+      all += std::string(1, static_cast<char>(letter)) + " - " + item + "\n";
+    }
+    std::snprintf(out, static_cast<size_t>(max), "%s", all.c_str());
+    return static_cast<int>(all.size());
+  }
+
+  void play_nethack_close()
+  {
+    std::lock_guard<std::mutex> hold{ nethack_lock };
+    if(nethack_now)
+    {
+      nle_end(nethack_now);
+      nethack_now = nullptr;
+    }
+  }
+
+  // Doom.
+
+  int play_doom_open(char const *engine, char const *wad, char const *map, unsigned seed, int width, char *error,
+                     int size)
+  {
+    try
+    {
+      if(doom_now)
+      {
+        doom_now->close();
+        doom_now.reset();
+      }
+      auto game(std::make_unique<vizdoom::DoomGame>());
+      game->setViZDoomPath(engine);
+      game->setDoomGamePath(wad);
+      game->setDoomMap(map);
+      game->setScreenResolution(width >= 640 ? vizdoom::RES_640X480 : vizdoom::RES_320X240);
+      game->setScreenFormat(vizdoom::RGB24);
+      game->setWindowVisible(false);
+      game->setSoundEnabled(false);
+      game->setLabelsBufferEnabled(true);
+      game->setRenderHud(true);
+      game->setAvailableButtons(doom_buttons);
+      game->setAvailableGameVariables(doom_variables);
+      game->setEpisodeTimeout(0);
+      game->setSeed(seed);
+      game->setMode(vizdoom::PLAYER);
+      game->init();
+      game->newEpisode();
+      doom_width = game->getScreenWidth();
+      doom_height = game->getScreenHeight();
+      doom_now = std::move(game);
+      doom_shown = 0;
+      doom_take();
+      return 0;
+    }
+    catch(std::exception const &e)
+    {
+      say(error, size, e.what());
+      doom_now.reset();
+      return -1;
+    }
+  }
+
+  // The buttons held (a bit each, in doom_buttons' order: forward, back, turn left, turn
+  // right, attack, use, strafe left, strafe right) for `tics`; the reward. -1e9 when the
+  // episode had ended.
+  double play_doom_act(unsigned buttons, int tics)
+  {
+    if(!doom_now || doom_now->isEpisodeFinished())
+    {
+      return -1e9;
+    }
+    std::vector<double> held(doom_buttons.size());
+    for(size_t i{}; i < held.size(); ++i)
+    {
+      held[i] = (buttons >> i) & 1u ? 1.0 : 0.0;
+    }
+    try
+    {
+      auto const reward(doom_now->makeAction(held, static_cast<unsigned>(std::max(tics, 1))));
+      if(!doom_now->isEpisodeFinished())
+      {
+        doom_take();
+      }
+      return reward;
+    }
+    catch(std::exception const &)
+    {
+      return -1e9;
+    }
+  }
+
+  int play_doom_finished()
+  {
+    return !doom_now || doom_now->isEpisodeFinished() ? 1 : 0;
+  }
+
+  // health armor ammo x y angle kills items dead, the tic; and the objects in view, a line
+  // each: "name x y screen-x screen-y screen-width screen-height".
+  int play_doom_state(double *variables, int max, int *tic, char *objects, int size)
+  {
+    if(!doom_now)
+    {
+      return -1;
+    }
+    auto const n(std::min(doom_vars.size(), static_cast<size_t>(max)));
+    std::copy_n(doom_vars.begin(), n, variables);
+    *tic = doom_tic;
+    std::snprintf(objects, static_cast<size_t>(size), "%s", doom_objects.c_str());
+    return static_cast<int>(n);
+  }
+
+  int play_doom_picture(uint32_t *out, int max, int *width, int *height, uint64_t *version)
+  {
+    return copy_picture(doom_lock, doom_picture, doom_width, doom_height, doom_shown, out, max, width, height, version);
+  }
+
+  void play_doom_close()
+  {
+    if(doom_now)
+    {
+      doom_now->close();
+      doom_now.reset();
+    }
+  }
+}

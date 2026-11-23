@@ -1,5 +1,41 @@
 # play
 
+## Watching the games
+
+```sh
+make            # lib/libplay.dylib, once the games in vendor/ are built (below)
+./play.sh       # the REPL and its window (or: cider-jack-in with :jack-in-cmd "bash play.sh")
+```
+
+Then, in the REPL, one game at a time (each is a card at the top of the window: the game's
+picture as it is played, and what a model is told of it):
+
+```clojure
+(require '[play.nova :as nova] '[play.wnw :as wnw] '[play.nethack :as nethack] '[play.doom :as doom])
+
+(nova/watch!)  (nova/start!)  (nova/play! 400)        ; Nova the Squirrel, level 1-1
+(wnw/watch!)   (wnw/start!)   (wnw/play! 200)         ; Witch n' Wiz, its first room
+(nethack/watch!) (nethack/start! 7) (nethack/play! 300)  ; NetHack, seed 7
+(doom/watch!)  (doom/start! 7) (doom/play! 400)       ; Doom (Freedoom's MAP01), seed 7
+
+(nova/told)    ; what a model is told now, as text
+(nova/stop!)   ; the scripted player stopped
+```
+
+`play!` runs a scripted player (Nova: right, jumping over what is in the way; Witch n'
+Wiz: at random; NetHack: random steps, answering what it is asked; Doom: turns to an enemy
+in view and shoots, else walks and opens doors). A model takes its place through the same
+function: `(nova/play! 400 (fn [state] action))`.
+
+What each game tells a model comes from the game itself:
+- Nova and Witch n' Wiz: their RAM, at the addresses their builds name (Nova's debug.dbg,
+  Witch n' Wiz's labels.txt), and their blocks' meaning from their sources
+  (tools/nova_blocks.py, tools/wnw_tiles.py write src/play/nova_blocks.jank and
+  src/play/wnw_tiles.jank);
+- NetHack: its terminal, its bottom lines' numbers, its last message and its inventory;
+- Doom: ViZDoom's game variables and the objects in view, with each one's distance and
+  direction.
+
 Games for a model to play through the decision API (see `../todo.md`), each run from C++ so
 that jank can drive it in the process:
 
