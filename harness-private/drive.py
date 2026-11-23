@@ -304,7 +304,12 @@ def run_form(task, mode, seed):
                     :system system
                     :context 65536
                     :max-steps 80
-                    :sampling {{:temperature 0.7 :top-p 0.95 :seed {int(seed)}}}
+                    ;; As the publisher evaluates Inkling (temperature 1, top-p off, effort
+                    ;; 0.99), with room for the thinking that effort asks for.
+                    :effort :max
+                    :max-thinking 8192
+                    :max-tokens 12288
+                    :sampling {{:temperature 1.0 :seed {int(seed)}}}
                     :obligations (when verified (verify/gate file))
                     :on-entry (fn [_]
                                 (when-let [x @current]
