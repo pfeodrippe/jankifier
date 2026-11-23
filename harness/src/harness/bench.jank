@@ -184,6 +184,25 @@
     :ask "Which layers of the model you run on are visited more than once in a forward pass, and how many visits are there in all? Find out; do not guess."
     :check (says "48" "6" "17")}
 
+   ;; A session too small for the task: the conversation is compacted in the middle of the
+   ;; turn (the model summarizes it), and the turn goes on from the summary.
+   {:name "compacts"
+    :context 4096
+    :tools (fn [] [(h/tool {:name "measure" :doc "Measures a room: gives a long report, whose last line says its area."
+                            :params {:room {:type "string"}}
+                            :fn (fn [{:keys [room]}]
+                                  (str (apply str (repeat 120 (str "The " room " has walls, a floor and a ceiling. ")))
+                                       "\nArea of the " room ": " (* 7 (count (str room))) " square metres."))})])
+    :ask "Measure the kitchen, then the bedroom, then the garage, then the attic, one at a time, and tell me the four areas."
+    :check (all-of (says "49" "42" "35")
+                   (fn [{:keys [entries agent]}]
+                     (cond
+                       (not-any? (fn [e] (and (= :compacted (:role e)) (not (:failed e)))) entries)
+                       "the conversation was never compacted"
+                       (not= (vec (ink/tokens (:session @agent))) (h/given agent))
+                       "the session isn't what its view gives after the compaction"
+                       :else true)))}
+
    {:name "remembers"
     :asks ["Remember this word for later: zanzibar. Just say OK."
            "What was the word I asked you to remember? Answer with the word only."]
@@ -377,6 +396,7 @@
     (setup))
   (let [a (h/agent m {:tools (if (:tools task) ((:tools task)) (tools/defaults))
                       :system (when-not (:tools task) tools/situation)
+                      :context (get task :context 16384)
                       :effort (get opts :effort :high)
                       :max-tokens (get opts :max-tokens 4096)
                       :max-steps (get opts :max-steps 16)})
