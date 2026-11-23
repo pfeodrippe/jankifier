@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <thread>
 #include <cstdint>
 #include <cerrno>
 #include <cstdio>
@@ -790,5 +791,12 @@ namespace harness
   inline double seconds()
   {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  // The calling thread asleep for `s` seconds.
+  inline object_ref pause(object_ref const s)
+  {
+    std::this_thread::sleep_for(std::chrono::duration<double>(rt::to_real(s)));
+    return rt::jank_nil;
   }
 }

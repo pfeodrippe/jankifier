@@ -71,6 +71,19 @@
 (defn- threw [x]
   (when (and (map? x) (contains? x :threw)) (:threw x)))
 
+(defn- within
+  "What `f` returns, or {:timed-out seconds} when it takes longer than `seconds`: a run of
+  the code (or of a copy with a deliberate bug) can loop forever. `f` goes on in the
+  background until it ends or the process does (a thread can't be stopped)."
+  [seconds f]
+  (let [running (future (f))
+        began (cpp/harness.seconds)]
+    (loop []
+      (cond
+        (realized? running) @running
+        (> (- (cpp/harness.seconds) began) seconds) {:timed-out seconds}
+        :else (do (cpp/harness.pause 0.05) (recur))))))
+
 ;; The file.
 
 (defn- forms-of
@@ -451,8 +464,9 @@
         failed (load-text! text (str "mutant-" i ".jank"))
         spec (when-not failed (assoc (spec-in n) :model-text model-text))]
     (when (and spec (not failed))
-      (let [r (trying (real-checks spec {} written opts))]
-        (or (some? (threw r)) (boolean (seq (:problems r))))))))
+      ;; A copy whose checks never end behaves differently: caught.
+      (let [r (within 60 (fn [] (trying (real-checks spec {} written opts))))]
+        (or (contains? r :timed-out) (some? (threw r)) (boolean (seq (:problems r))))))))
 
 ;; The whole check.
 
@@ -489,7 +503,15 @@
            :else
            (let [written (assertion-names text)
                  m (model-checks spec)
-                 r (when (empty? (:problems m)) (real-checks spec (:witness-traces m) written opts))
+                 r (when (empty? (:problems m))
+                     (let [r (within 300 (fn [] (trying (real-checks spec (:witness-traces m) written opts))))]
+                       (cond
+                         (:timed-out r)
+                         {:problems [(str "The random runs of the real code didn't end within " (:timed-out r)
+                                          " seconds: a step that never returns (a loop that doesn't end?), or "
+                                          "code far slower than expected.")]}
+                         (threw r) {:problems [(str "The random runs of the real code threw: " (threw r))]}
+                         :else r)))
                  problems (vec (concat (:problems m) (:problems r)))
                  tried (when (and (empty? problems) (pos? (:mutants opts)))
                          (vec (keep-indexed
