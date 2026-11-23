@@ -506,6 +506,17 @@
 
 (declare compact! compaction-due?)
 
+(defn- steps-note
+  "What the model is told of its steps, after the last call of a few of them (the turn's
+  first, when half and a quarter are left, and near the end): nil after the others."
+  [step max-steps]
+  (let [used (inc step)
+        left (- max-steps used)]
+    (when (and (>= max-steps 12)
+               (contains? #{(dec max-steps) (quot max-steps 2) (quot max-steps 4) 8 4 2} left))
+      (str "\n\n[the harness] Step " used " of " max-steps " (" left " left). A step is your message "
+           "with its calls; the turn ends when the steps run out, finished or not."))))
+
 (defn- turn!
   "The model's turn: it speaks, its calls are run and their results given to it, and it
   speaks again, until it ends a step without calling anything."
@@ -559,13 +570,17 @@
             (swap! a assoc :state :steps))
 
         :else
-        (let [full (reduce
-                    (fn [full called]
+        (let [note (steps-note step (:max-steps @a))
+              last-call (dec (count calls))
+              full (reduce
+                    (fn [full [i called]]
                       (if full
                         full
                         (do
                           (swap! a assoc :state :tool :live {:kind :tool :name (:name called) :text (:text called)})
                           (let [[call result] (call! a called)
+                                ;; The steps left, said after the step's last call.
+                                result (if (and note (= i last-call)) (update result :text str note) result)
                                 s (:session @a)
                                 given (vec (frame @a :tool (:name result) :text (:text result)))]
                             (entry! a call)
@@ -582,7 +597,7 @@
 
                               :else true)))))
                     false
-                    calls)]
+                    (map-indexed vector calls))]
           (if full
             (do (entry! a {:role :stopped :why :context :began (clock a) :ended (clock a)})
                 (swap! a assoc :state :context))
@@ -889,9 +904,11 @@
      :seconds (:seconds v)}))
 
 (defn save!
-  "The agent's conversation written to a file, as `recording` gives it. Returns the path."
+  "The agent's conversation written to a file, as `recording` gives it. Returns the path. A
+  string cut inside a character (jank's strings are bytes) is written with U+FFFD for the
+  bytes left, so that the file is UTF-8 and readable anywhere."
   [a path]
-  (cpp/harness.write_file (str path) (pr-str (recording a)))
+  (cpp/harness.write_file (str path) (cpp/harness.utf8_clean (pr-str (recording a))))
   (str path))
 
 (defn load-recording

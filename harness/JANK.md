@@ -47,6 +47,15 @@ the syntax, the data structures and most of `clojure.core` and
   when what was thrown doesn't matter.
 - **Integer division by zero gives 0**: `(/ 1 0)` is 0, it doesn't throw.
 - **Sleeping**: `(cpp/usleep 250000)` (microseconds).
+- **`(deref f 2000 :late)` doesn't wait**: with a timeout, `deref` returns nil at
+  once (neither the value nor `:late`). Wait for a future with `@f`, or with a
+  loop: `(loop [] (when-not (realized? f) (cpp/usleep 10000) (recur)))`.
+- **Files**: `spit` into a directory that doesn't exist writes nothing and
+  returns nil, without an error; `slurp` of a missing file throws C++'s error
+  (above). There is no function to make a directory or to ask whether a file
+  exists: use C++'s (see [Files and directories](#files-and-directories)).
+- **The shell is macOS's**: `sed -i '' 's/a/b/' file` (BSD sed needs the `''`),
+  no GNU-only options.
 - **A `future` must catch everything it can throw.** What escapes one ends the
   whole process (an abort), not just the future. Wrap its body in `try` with
   the three `catch`es above and `(catch :default _ ...)`.
@@ -94,11 +103,38 @@ namespace mine
   types can't cross: an error says the type "is not convertible".
 - A compile error of the C++ comes back as the evaluation's error, with
   clang's message.
+- C++ names can't have `-` in them: `make-dir` is not a name there, `make_dir` is.
 - C++ does not allow defining the same thing twice. The same source evaluated
   again is fine (nothing happens); a changed function under the same name is
   an error ("redefinition"), and after that error the namespace it was in is
   no longer found at all. So give corrected or changed source a **new
   namespace name** (`mine2`, `mine3`), and call that one.
+
+### Files and directories
+
+```clojure
+(cpp/raw "#include <filesystem>
+namespace files
+{
+  inline bool make_dirs(std::string const &path)
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    return std::filesystem::is_directory(path);
+  }
+
+  inline bool exists(std::string const &path)
+  {
+    return std::filesystem::exists(path);
+  }
+}")
+
+(cpp/files.make_dirs "work/store")       ;=> true: made, with its parents, or already there
+(cpp/files.exists "work/store/log")      ;=> false
+```
+
+In a file of your own, put the `cpp/raw` form at the top level, after the
+`ns` form.
 
 ### A jank function called from C++
 

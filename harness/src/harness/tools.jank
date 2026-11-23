@@ -200,7 +200,9 @@
       text)))
 
 (defn write-file
-  "Writes text to a file, replacing what it had; the directories its path needs are made."
+  "Writes text to a file, replacing what it had; the directories its path needs are made.
+  For a new file, or one changed throughout: to change part of a file, edit_file is
+  quicker (only the part is written again)."
   [path content]
   (check-path! path)
   (cpp/harness.make_parents (str path))
@@ -216,7 +218,8 @@
 
 (defn edit-file
   "Replaces one piece of a text file: `old` must be in the file exactly once, as it is
-  written there (its line breaks and spaces included)."
+  written there (its line breaks and spaces included). The way to change part of a file:
+  only that part is written again."
   [path old new]
   (check-path! path)
   (when-not (cpp/harness.is_file (str path))
@@ -248,14 +251,15 @@
   in the background with its output sent to a file (python3 server.py > server.log 2>&1 &):
   the command then ends at once and the server stays."
   [command timeout]
-  (let [ran (cpp/harness.run (str command) 200000 (double (or timeout 120)))]
-    (str (:out ran)
-         (when (> (:bytes ran) (count (:out ran)))
-           (str "\n[output cut: " (:bytes ran) " bytes in all]"))
-         (when (:timed-out ran)
-           (str "\n[killed: it did not end in " (or timeout 120) " seconds]"))
-         (when (and (not (:timed-out ran)) (not (zero? (:exit ran))))
-           (str "\n[exit " (:exit ran) "]")))))
+  (let [ran (cpp/harness.run (str command) 200000 (double (or timeout 120)))
+        said (str (:out ran)
+                  (when (> (:bytes ran) (count (str (:out ran))))
+                    (str "\n[output cut: " (:bytes ran) " bytes in all]"))
+                  (when (:timed-out ran)
+                    (str "\n[killed: it did not end in " (or timeout 120) " seconds]"))
+                  (when (and (not (:timed-out ran)) (not (zero? (:exit ran))))
+                    (str "\n[exit " (:exit ran) "]")))]
+    (if (= "" said) "(no output)" said)))
 
 (def situation
   "What an agent with the default tools can be told first (its :system): where it is, and

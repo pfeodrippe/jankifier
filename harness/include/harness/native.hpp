@@ -541,6 +541,37 @@ namespace harness
     }
   }
 
+  /* A text with each byte that isn't part of a whole UTF-8 character (a string cut inside
+   * one: jank's strings are bytes) replaced by U+FFFD, so that the text is UTF-8 throughout. */
+  inline object_ref utf8_clean(object_ref const text)
+  {
+    auto const s{ to_std(text) };
+    std::string out;
+    out.reserve(s.size());
+    size_t i{};
+    while(i < s.size())
+    {
+      auto const c{ static_cast<unsigned char>(s[i]) };
+      size_t const n{ c < 0x80 ? 1u : (c >> 5) == 0x6 ? 2u : (c >> 4) == 0xE ? 3u : (c >> 3) == 0x1E ? 4u : 0u };
+      bool whole{ n > 0 && i + n <= s.size() };
+      for(size_t k{ 1 }; whole && k < n; ++k)
+      {
+        whole = (static_cast<unsigned char>(s[i + k]) & 0xC0) == 0x80;
+      }
+      if(whole)
+      {
+        out.append(s, i, n);
+        i += n;
+      }
+      else
+      {
+        out += "\xEF\xBF\xBD";
+        ++i;
+      }
+    }
+    return str(out);
+  }
+
   /* The first `bytes` of a text, less what would cut a character in two. */
   inline object_ref prefix(object_ref const text, object_ref const bytes)
   {

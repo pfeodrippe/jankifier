@@ -91,6 +91,10 @@ every random run.
 1. Write the code (the .jank file) and the model (the .lean file) together, small, with the
    write_file tool. `verify` loads both itself; to try a function by hand, send code to the
    eval tool.
-2. Run `verify` on the .jank file. Fix what it says, one problem at a time: Veil's own
-   messages name the line of the .lean file.
-3. Answer once `verify` passes; the harness checks again before accepting.
+2. Run `verify` on the .jank file early: as soon as a first small version of both is
+   written, not after testing everything by hand. Fix what it says, one problem at a time,
+   with edit_file: Veil's own messages name the line of the .lean file.
+3. Grow the code and the model together, running `verify` after each step.
+4. Answer once `verify` passes; the harness checks again before accepting. Your steps are
+   counted (the harness says how many are left): work that hasn't passed `verify` when they
+   run out is not accepted.
