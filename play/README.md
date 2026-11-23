@@ -54,4 +54,32 @@ their end.
 
 ## Games
 
-None are kept here. A game is an iNES file (`.nes`) given to `nes::load`.
+None are kept here. A game is an iNES file (`.nes`) given to `nes::load`. Free ones, built
+from their sources in `vendor/games/`:
+
+- Nova the Squirrel, a platformer (code GPL-3.0, art CC BY-NC 4.0); the closest to Super
+  Mario Bros., and its RAM can be read from its sources' labels. A tool-assisted run of it
+  exists (TASVideos), to compare with.
+
+  ```sh
+  git clone --depth 1 https://github.com/NovaSquirrel/NovaTheSquirrel.git && cd NovaTheSquirrel
+  python3 NtS1LevelConvert.py levels
+  ca65 src/nova.s -o src/nova.o -l nova.lst -g && ld65 -C src/nova.x src/nova.o -o nova.nes -m map.txt --dbgfile debug.dbg
+  ```
+
+- Witch n' Wiz, a puzzle platformer (MIT). Its music and map converters are Windows
+  programs and the Tiled editor, so the build uses their output, which its repository
+  keeps:
+
+  ```sh
+  git clone --depth 1 https://github.com/mhughson/mbh-A53-witchnwiz.git && cd mbh-A53-witchnwiz/game
+  # its script wants `python` and `wine` on PATH (wine isn't run with AUDIO=0)
+  AUDIO=0 MAPS=0 ./compile_master.sh      # BUILD/main.nes
+  ```
+
+- Super Tilt Bro. (WTFPL), a fighting game for two: not built yet. Its C sources need a 6502
+  GCC built from source (gcc-6502-bits) and a fork of the xa assembler; it has no releases
+  on GitHub.
+
+`brew install cc65` gives ca65 and ld65. `test/shot.cpp` runs a game with a plan of buttons
+and saves its picture every 120 frames (PPM), to see where it is.
