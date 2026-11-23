@@ -154,6 +154,8 @@
     (let [a @*agent*]
       {:agent *agent* :model (:model a) :session (:session a)})))
 
+(declare summarize)
+
 (defn agent
   "An agent on model `m`: an atom holding its session, its tools and its conversation.
     :tools       tools (`tool`, `wrap`): none when not given
@@ -171,13 +173,22 @@
                  when the work is done, else what isn't (harness.verify/gate checks a file
                  against its model). Then that is said to the model and the turn goes on.
     :max-checks  times the obligations may send the model back in a turn (6)
+    :compact     (fn [agent preparation]) what the conversation's older part becomes when the
+                 session nears its end: a summary's text, or nil to leave it as it is. By
+                 default `summarize` (the model writes a summary); nil turns compaction off
+                 (the turn then ends when the session is full). See `compact!`.
+    :compact-reserve tokens kept free before compacting (15% of the context, at least
+                 16384, at most a quarter of it)
+    :compact-keep    recent tokens kept as they are beside the summary (15000, at most 30%
+                 of the context)
   The tools and the system text are evaluated now, so the first question starts from them."
   ([m] (agent m {}))
   ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry
-              obligations max-checks]}]
+              obligations max-checks compact-reserve compact-keep] :as opts}]
    (let [tools (mapv tool tools)
          ids (into {} (map (fn [[k piece]] [k (ink/token-id m piece)]) pieces))
-         s (ink/session m (or context 16384))
+         size (or context 16384)
+         s (ink/session m size)
          a {:model m :session s :ids ids
             :tools tools
             :effort (get efforts (or effort :high) (str effort))
@@ -188,7 +199,15 @@
             :on-entry on-entry
             :obligations obligations
             :max-checks (or max-checks 6)
-            :entries [] :state :idle :live nil :stop false :turn nil
+            :compact (if (contains? opts :compact) (:compact opts) summarize)
+            :compact-reserve (or compact-reserve
+                                 (long (min (* 0.25 size) (max 16384.0 (* 0.15 size)))))
+            :compact-keep (or compact-keep (long (min 15000.0 (* 0.3 size))))
+            ;; :entries is the whole conversation; :view what the model sees of it (the
+            ;; same, until a compaction puts a summary in place of its older part).
+            :entries [] :view [] :state :idle :live nil :stop false :turn nil
+            ;; The model's steps so far: each entry is marked with the step it is part of.
+            :step-count 0
             :generated 0 :seconds 0.0
             ;; When the agent was made: an entry's times are seconds since then.
             :born (cpp/harness.seconds)}
@@ -198,7 +217,7 @@
                               (frame a :system nil :text system))))]
      (when (seq start)
        (ink/eval! s start))
-     (atom (assoc a :effort-said false)))))
+     (atom (assoc a :effort-said false :start start)))))
 
 (defn close!
   "The agent's session freed. A turn in progress is stopped first."
@@ -216,10 +235,9 @@
   (let [born (:born @a)]
     (if born (- (cpp/harness.seconds) born) 0.0)))
 
-(defn- entry!
-  "An entry added to the conversation."
+(defn- told!
+  "The agent's :on-entry told of an entry (what it throws is not the turn's business)."
   [a entry]
-  (swap! a (fn [v] (assoc v :entries (conj (:entries v) entry) :live nil)))
   (when-let [told (:on-entry @a)]
     (try
       (told entry)
@@ -228,6 +246,13 @@
       (catch cpp/std.exception _ nil)
       (catch :default _ nil)))
   entry)
+
+(defn- entry!
+  "An entry added to the conversation."
+  [a entry]
+  (let [entry (assoc entry :step (:step-count @a))]
+    (swap! a (fn [v] (assoc v :entries (conj (:entries v) entry) :view (conj (:view v) entry) :live nil)))
+    (told! a entry)))
 
 ;; The model speaking.
 
@@ -428,7 +453,8 @@
                (str "(This call gave exactly this result before, and nothing has changed since: "
                     "the result is earlier in this conversation.)")
                text)]
-    [{:role :call :name (str named) :args args
+    ;; :text and :kind are the call as the model wrote it (the session is made again from it).
+    [{:role :call :name (str named) :args args :text (str (:text called)) :kind (:kind called)
       :began (:began called) :ended (:ended called)}
      {:role :result :name (str named) :text text :error (boolean (:error outcome))
       :seconds (- (cpp/harness.seconds) began)
@@ -436,12 +462,17 @@
 
 ;; A turn.
 
+(declare compact! compaction-due?)
+
 (defn- turn!
   "The model's turn: it speaks, its calls are run and their results given to it, and it
   speaks again, until it ends a step without calling anything."
   [a]
   (loop [step 0]
-    (swap! a assoc :state :thinking)
+    ;; Near the session's end: the older part of the conversation summarized first.
+    (when (compaction-due? a 0)
+      (compact! a :threshold))
+    (swap! a (fn [v] (assoc v :state :thinking :step-count (inc (:step-count v)))))
     (let [[frames why] (speak! a)
           ;; (A call cut short is not run.)
           calls (filter (fn [f] (and (contains? #{:call :call-text} (:kind f)) (not (:partial f))))
@@ -497,12 +528,17 @@
                                 given (vec (frame @a :tool (:name result) :text (:text result)))]
                             (entry! a call)
                             (entry! a result)
-                            ;; A result the session has no room for ends the turn as a full
-                            ;; session does, not as an error.
-                            (if (>= (+ (ink/position s) (count given)) (- (:context (ink/info s)) 8))
-                              true
+                            ;; A result the session has no room for: the conversation compacted
+                            ;; (the result is in it now, kept as it is), else the turn ends as a
+                            ;; full session does, not as an error.
+                            (cond
+                              (< (+ (ink/position s) (count given)) (- (:context (ink/info s)) 8))
                               (do (ink/eval! s given)
-                                  false))))))
+                                  false)
+
+                              (compact! a :overflow) false
+
+                              :else true)))))
                     false
                     calls)]
           (if full
@@ -550,6 +586,229 @@
   (when-let [turn (:turn @a)]
     (deref turn))
   (:text (last (filter (fn [e] (= (:role e) :model)) (:entries @a)))))
+
+;; Compaction (as pi and opencode do it): when the session nears its end, the older part of
+;; the conversation is replaced by a summary, and the recent part kept as it is. The session
+;; is made again from the start (the tools, the system text), the summary, and the part kept.
+;; :entries keeps everything said; :view what the model now sees, the summary first, as a
+;; {:role :compacted :text summary} entry, which is also added to :entries where it happened.
+
+(defn- steps-of
+  "`entries` as the steps they were given in: the model's step (its thinking, words, calls and
+  their results, by the entries' :step), and alone, a person's message and what the harness
+  said. A call and its result are never apart."
+  [entries]
+  (let [key-of (fn [i e] (if (contains? #{:thinking :model :call :result} (:role e)) [:step (:step e)] [:alone i]))]
+    (mapv (fn [group] (mapv second group))
+          (partition-by (fn [[i e]] (key-of i e)) (map-indexed vector entries)))))
+
+(defn view-tokens
+  "The tokens the model is given for `entries` (of :view), as the turn gave them: a step's
+  frames (thinking, words, calls) closed by the end of the model's turn, then the calls'
+  results; a person's message; what the harness said (a check that failed, a summary)."
+  [v entries]
+  (let [ids (:ids v)
+        m (:model v)
+        model-frame (fn [kind named text]
+                      (vec (concat [(get ids :model)] (when (seq named) (plain m named)) [(get ids kind)]
+                                   (plain m text) [(get ids :end)])))
+        step-tokens (fn [step]
+                      (let [said (mapcat (fn [e]
+                                           (case (:role e)
+                                             :thinking (model-frame :thinking nil (:text e))
+                                             :model (model-frame :text nil (:text e))
+                                             :call (model-frame (or (:kind e) :call) (:name e)
+                                                                (or (:text e)
+                                                                    (str "{\"name\":" (json/write (:name e)) ",\"args\":" (json/write (:args e)) "}")))
+                                             nil))
+                                         step)
+                            results (mapcat (fn [e] (when (= :result (:role e)) (frame v :tool (:name e) :text (:text e))))
+                                            step)]
+                        (concat said [(get ids :end-turn)] results)))]
+    (vec (mapcat (fn [step]
+                   (let [e (first step)]
+                     (case (:role e)
+                       :user (frame v :user nil :text (:text e))
+                       :check (when-not (:passed e) (frame v :user nil :text (str "[the harness] " (:text e))))
+                       :compacted (frame v :user nil :text (str "[the harness] What happened before, in short:\n\n" (:text e)))
+                       (:thinking :model :call :result) (step-tokens step)
+                       nil)))
+                 (steps-of entries)))))
+
+(defn- recorded!
+  "An entry added to the whole conversation only (not to what the model sees): a compaction,
+  where it happened."
+  [a entry]
+  (let [entry (assoc entry :step (:step-count @a))]
+    (swap! a update :entries conj entry)
+    (told! a entry)))
+
+(defn- compaction-due?
+  "Whether the session, with `more` tokens to come, is within the reserve of its end."
+  [a more]
+  (let [v @a
+        s (:session v)]
+    (boolean (and (:compact v)
+                  (> (+ (ink/position s) more) (- (:context (ink/info s)) (:compact-reserve v)))))))
+
+(defn given
+  "Every token the model is given for the agent's :view, from the session's start: the tools
+  and system text, the effort, then the view (what `compact!` makes the session again from)."
+  [a]
+  (let [v @a]
+    (vec (concat (:start v)
+                 (frame v :system nil :text (str "Thinking effort level: " (:effort v)))
+                 (view-tokens v (:view v))))))
+
+(defn- rebuild!
+  "The session made again for :view (`given`)."
+  [a]
+  (let [v @a
+        s (:session v)
+        tokens (given a)]
+    (ink/reset! s)
+    (ink/eval! s tokens)
+    (count tokens)))
+
+(defn compact!
+  "The conversation's older part replaced by a summary (`reason` :threshold, :overflow or
+  :manual), the recent part (about :compact-keep tokens, whole steps) kept as it is. The
+  agent's :compact function is given {:entries (the part to summarize) :previous (the last
+  summary, or nil) :tokens-before :reason} and returns the summary's text, or nil to leave
+  the conversation as it is. Returns whether it compacted."
+  [a reason]
+  (let [v @a
+        f (:compact v)
+        view (:view v)
+        previous (when (= :compacted (:role (first view))) (first view))
+        rest-view (if previous (vec (rest view)) view)
+        steps (steps-of rest-view)
+        sizes (mapv (fn [st] (count (view-tokens v st))) steps)
+        ;; The first step kept: walking back from the end until :compact-keep tokens.
+        kept-from (loop [i (count steps) total 0]
+                    (if (and (pos? i) (< (+ total (nth sizes (dec i))) (:compact-keep v)))
+                      (recur (dec i) (+ total (nth sizes (dec i))))
+                      i))
+        summarized (vec (apply concat (take kept-from steps)))
+        kept (vec (apply concat (drop kept-from steps)))]
+    (if (or (nil? f) (empty? summarized))
+      false
+      (let [state (:state v)
+            _ (swap! a assoc :state :compacting :live {:kind :tool :name "compaction" :text ""})
+            began (clock a)
+            tokens-before (ink/position (:session v))
+            said (try
+                   (f a {:entries summarized :previous (:text previous) :tokens-before tokens-before :reason reason})
+                   (catch jank.runtime.object_ref e {:failed (or (ex-message e) (str e))})
+                   (catch cpp/jank.error_ref e {:failed (str (cpp/.-message (cpp/* e)))})
+                   (catch cpp/std.exception e {:failed (str (cpp/.what e))})
+                   (catch :default _ {:failed "the compaction threw something jank does not say"}))]
+        (if-not (and (string? said) (seq (str/trim said)))
+          (do (recorded! a {:role :compacted :failed true :reason reason
+                            :text (if (map? said) (:failed said) "the compaction gave no summary")
+                            :began began :ended (clock a)})
+              (swap! a assoc :state state :live nil)
+              false)
+          (let [e {:role :compacted :text (str/trim said) :reason reason
+                   :summarized (count summarized) :kept (count kept) :tokens-before tokens-before
+                   :began began}]
+            (swap! a assoc :view (vec (cons e kept)))
+            (let [tokens-after (rebuild! a)
+                  e (assoc e :tokens-after tokens-after :ended (clock a))]
+              (swap! a (fn [v] (assoc v :view (vec (cons e kept)) :state state :live nil)))
+              (recorded! a e)
+              true)))))))
+
+;; The default compaction: the model summarizes the older part, as pi and opencode have it
+;; do, in a fixed form, from a transcript of it (each tool's output cut to 2000 characters).
+
+(def ^:private summary-form
+  "## Goal
+- [what the person asked for, in one or two sentences]
+
+## Requirements
+- [constraints and requirements stated, or \"(none)\"]
+
+## Decisions
+- [decisions made and why, or \"(none)\"]
+
+## Progress
+### Done
+- [what is finished]
+### In progress
+- [what is being worked on]
+### Blocked
+- [what is blocked and why, or \"(none)\"]
+
+## Next steps
+1. [the next actions, in order]
+
+## Files
+- `[path]`: [why it matters; the files read and changed]
+
+## Critical context
+- [facts, errors, values needed to go on, which can't easily be found again; or \"(none)\"]")
+
+(def ^:private summary-rules
+  "Rules:
+- Short, single-line bullets.
+- Keep exact file paths, names, commands, error messages and values.
+- Keep the person's request word for word while it isn't done.
+- Do not continue the task and do not call tools.
+- Answer with the summary only, in the form above.")
+
+(defn- clipped
+  "`text` with its middle cut when longer than `n` characters: the first and last halves kept."
+  [text n]
+  (let [text (str text)
+        k (count text)]
+    (if (<= k n)
+      text
+      (str (subs text 0 (quot n 2)) "\n[... " (- k n) " characters cut ...]\n" (subs text (- k (quot n 2)))))))
+
+(defn transcript
+  "Entries as text for a summary: a line a kind, so that it reads as a record, not as a
+  conversation to go on with."
+  [entries]
+  (str/join "\n\n"
+            (keep (fn [e]
+                    (case (:role e)
+                      :user (str "[Person]: " (:text e))
+                      :thinking (str "[Model thinking]: " (:text e))
+                      :model (str "[Model]: " (:text e))
+                      :call (str "[Model called]: " (:name e) " " (json/write (:args e)))
+                      :result (str "[Tool result]: " (clipped (:text e) 2000))
+                      :check (when-not (:passed e) (str "[Harness]: " (:text e)))
+                      :compacted (str "[Earlier summary]:\n" (:text e))
+                      nil))
+                  entries)))
+
+(defn summarize
+  "The default :compact: a summary of `entries` written by the agent's own model, in a
+  session of its own (no tools), as pi and opencode do. With an earlier summary, it is
+  brought up to date."
+  [a {:keys [entries previous]}]
+  (let [v @a
+        writer (agent (:model v)
+                      {:system "You write summaries of an agent's work, for another agent to go on with it."
+                       :context (:context (ink/info (:session v)))
+                       :sampling (:sampling v)
+                       :effort :low
+                       :max-steps 1
+                       :compact nil})]
+    (try
+      (ask! writer
+            (str (if previous
+                   (str "An earlier summary of this work:\n\n" previous "\n\nWhat happened since:\n\n")
+                   "The work so far:\n\n")
+                 (transcript entries)
+                 "\n\n"
+                 (if previous
+                   "Bring the earlier summary up to date with what happened since, into one summary. Newer events take precedence; keep what is still true."
+                   "Summarize the work above for another agent who will go on with it.")
+                 "\n\nUse this form:\n\n" summary-form "\n\n" summary-rules))
+      (answer writer)
+      (finally (close! writer)))))
 
 (defn stop!
   "The turn in progress stopped after the token being made. The conversation stays as it

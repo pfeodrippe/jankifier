@@ -416,6 +416,18 @@
                       (c/rect! x y (+ x 3) (+ y 18 (:h shown)) color 1.0 0.0)
                       (c/text! (+ x 12) y color c/small label)
                       (draw-part shown (+ x 12) (+ y 18) c/ink :text y))})
+    ;; The conversation's older part replaced by a summary (what the model saw after it).
+    :compacted (let [shown (part (mono-lines (:text entry) (- width 30) longest) (contains? opened :text) false)
+                     color (if (:failed entry) c/red c/purple)
+                     label (if (:failed entry)
+                             "the harness couldn't compact the conversation"
+                             (str "the harness compacted the conversation: " (:summarized entry) " entries summarized, "
+                                  (:tokens-before entry) " tokens before, " (:tokens-after entry) " after"))]
+                 {:h (+ 22 (:h shown) 12)
+                  :draw (fn [x y w]
+                          (c/rect! x y (+ x 3) (+ y 18 (:h shown)) color 1.0 0.0)
+                          (c/text! (+ x 12) y color c/small label)
+                          (draw-part shown (+ x 12) (+ y 18) c/ink :text y))})
     :stopped {:h 24
               :draw (fn [x y w]
                       (c/text! x (+ y 3) c/red c/small
@@ -765,7 +777,7 @@
         pace-x (- (+ x width) 102)
         e1 (- (+ x width) 78)
         e2 (- (+ x width) 10)
-        talls {:user 9 :model 8 :call 5 :check 7 :stopped 9}
+        talls {:user 9 :model 8 :call 5 :check 7 :compacted 7 :stopped 9}
         ;; A mark a step: a person's message, a tool's call with what it gave, an answer of
         ;; the model's, a stop. It is where the step is done (a call's: its result); a click
         ;; there shows the step from its start.
@@ -825,7 +837,7 @@
     (doseq [m marks]
       (let [role (:role (nth entries (:entry m)))
             tall (get talls role 0)
-            color (get {:user c/ink :model c/blue :call c/orange :check c/green :stopped c/red} role c/muted)]
+            color (get {:user c/ink :model c/blue :call c/orange :check c/green :compacted c/purple :stopped c/red} role c/muted)]
         (c/line! (:x m) (- cy tall) (:x m) (+ cy tall) color 2.0)))
     (c/circle! at cy 5.0 (if live c/orange c/ink) 1.0)
     ;; Pressed on the line: that time, for as long as the button is held, wherever the mouse

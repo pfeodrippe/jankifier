@@ -239,6 +239,40 @@
           (fn [] (str/includes? (call-text a "nope" {}) "there is no tool named"))]
          ["call: a missing argument is an error the model is told"
           (fn [] (str/includes? (call-text a "add" {:a 1}) "the call lacks b"))]
+         ["compaction: the older part summarized, whole steps kept, the session made again"
+          (fn []
+            (let [c (h/agent m {:context 4096 :compact-keep 300
+                                :compact (fn [_ p] (str "summary of " (count (:entries p)) " entries"))})
+                  step (fn [n] [{:role :thinking :text (str "step " n ": I'll echo.") :step n}
+                                {:role :call :name "echo" :args {:text (str "text " n)} :step n}
+                                {:role :result :name "echo" :text (apply str (repeat 40 (str "text " n " "))) :step n}])
+                  es (vec (concat [{:role :user :text "Echo eight times." :step 0}] (mapcat step (range 1 9))))]
+              (swap! c assoc :entries es :view es :step-count 8)
+              (try
+                (let [done (h/compact! c :manual)
+                      v @c
+                      view (:view v)
+                      kept (rest view)
+                      e (first view)]
+                  (and done
+                       (= :compacted (:role e))
+                       (str/starts-with? (:text e) "summary of ")
+                       ;; Whole steps: every call kept has its result, and the first kept
+                       ;; entry starts a step.
+                       (= (count (filter (fn [x] (= :call (:role x))) kept))
+                          (count (filter (fn [x] (= :result (:role x))) kept)))
+                       (= :thinking (:role (first kept)))
+                       (< (count kept) (count es))
+                       (= (ink/position (:session v)) (:tokens-after e) (count (h/given c)))
+                       ;; In the whole conversation too, where it happened.
+                       (= :compacted (:role (last (:entries v))))
+                       (= (count (:entries v)) (inc (count es)))))
+                (finally (h/close! c)))))]
+         ["compaction: off when :compact is nil"
+          (fn []
+            (let [c (h/agent m {:context 4096 :compact nil})]
+              (swap! c assoc :view [{:role :user :text "x" :step 0}] :entries [{:role :user :text "x" :step 0}])
+              (try (false? (h/compact! c :manual)) (finally (h/close! c)))))]
          ["call: JSON that can't be read is an error the model is told"
           (fn [] (str/includes? (:text (second (h/call! a {:name "echo" :text "{\"name\":\"echo\",\"args\":{"})))
                                 "not valid JSON"))]

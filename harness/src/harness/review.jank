@@ -10,8 +10,8 @@
 ;;
 ;; The kinds are found mechanically, from the entries: tool errors by what they say, calls
 ;; repeated as they were, how long a run looked around before writing anything, thinking the
-;; harness cut, turns stopped short, checks of the gate that failed, and files read outside
-;; the run's folder. Reading the run around an example is still what says whether a kind is
+;; harness cut, turns stopped short, checks of the gate that failed, compactions, and files
+;; read outside the run's folder. Reading the run around an example is still what says whether a kind is
 ;; a problem of the harness, of the task, or of the model.
 (ns harness.review
   (:require [clojure.string :as str]
@@ -118,6 +118,9 @@
            :stopped (at i (keyword (str "stopped-" (name (:why e)))) (first-line (:text e)))
            :check (when-not (:passed e) (at i :gate-failed (first-line (second (str/split-lines (str (:text e)))))))
            :call (when-let [p (outside-read e)] (at i :read-outside p))
+           :compacted (if (:failed e)
+                        (at i :compaction-failed (first-line (:text e)))
+                        (at i :compacted (str (:summarized e) " entries summarized, " (:tokens-before e) " -> " (:tokens-after e) " tokens")))
            nil))
        es)
       ;; The same call made again, as it was.
