@@ -139,7 +139,11 @@ namespace inkling
     // The most drafts a check takes (set_draft_depth), and the depth chosen for
     // the next check (choose_depth): oMLX's adaptive depth, from each depth's
     // measured time and the acceptance at each position.
+    // The CPU version (the reference), even for a GPU session.
+    bool cpu{};
     int32_t depth{ 7 };
+    // Off: every check drafts `depth` tokens (for measuring acceptance).
+    bool adaptive{ true };
     struct control
     {
       // Acceptance of draft j + 1 when the drafts before it were accepted (-1:

@@ -29,6 +29,9 @@ namespace
                  "                                     on the CPU's inputs; --all prints every row\n"
                  "  inkling tapcheck MODEL.ink PROMPT  the hidden states kept for a draft model, against\n"
                  "                                     the captures, and through a check rolled back\n"
+                 "  inkling draftcheck MODEL.ink PROMPT\n"
+                 "                                     the draft model on the GPU against its CPU version,\n"
+                 "                                     from the same hidden states\n"
                  "  inkling rowcheck MODEL.ink PROMPT [ROWS]\n"
                  "                                     evaluates ROWS (8) tokens after the prompt in one\n"
                  "                                     forward, keeping each row's logits, and compares\n"
@@ -44,7 +47,8 @@ namespace
                  "    --draft N    draft from the context (matches of at least N tokens) and check\n"
                  "                 the drafts in one forward: the same tokens, sooner\n"
                  "    --dspark K   draft up to K tokens with the draft model (when the context has\n"
-                 "                 no match), checked the same way\n");
+                 "                 no match), checked the same way\n"
+                 "    --dspark-fixed K  the same, always K tokens (to measure how many are kept)\n");
   }
 
   double now()
@@ -222,6 +226,51 @@ int main(int argc, char **argv)
         std::printf("%2d rows: %6.1f ms\n", w, times[3]);
       }
       return 0;
+    }
+
+    if(cmd == "draftcheck" && argc == 4)
+    {
+      // The draft model on the GPU against its CPU version (the reference), from
+      // the same hidden states: after each token of a greedy continuation, both
+      // draft 7 tokens after the next one; how often they agree.
+      if(!m->gpu)
+      {
+        std::fprintf(stderr, "no Metal backend for this model\n");
+        return 1;
+      }
+      std::unique_ptr<inkling::session, void (*)(inkling::session *)> s{ inkling::new_session(*m, 4096), inkling::free_session };
+      std::unique_ptr<inkling::drafter, void (*)(inkling::drafter *)> cpu{ inkling::new_drafter(*s, true), inkling::free_drafter };
+      std::unique_ptr<inkling::drafter, void (*)(inkling::drafter *)> gpu{ inkling::new_drafter(*s), inkling::free_drafter };
+      inkling::eval(*s, inkling::tokenize(*m, argv[3], true));
+      int first{}, all{}, steps{};
+      std::vector<int> by_place(7);
+      for(int i{}; i < 48; ++i)
+      {
+        uint64_t rng{ 1 };
+        int32_t const next{ inkling::sample(s->logits.data(), static_cast<int32_t>(s->logits.size()), 0, 1, 0, rng) };
+        auto const g{ inkling::draft(*gpu, *s, next, 7) };
+        auto const c{ inkling::draft(*cpu, *s, next, 7) };
+        ++steps;
+        first += !g.empty() && !c.empty() && g[0] == c[0];
+        all += g == c;
+        for(size_t j{}; j < 7 && j < g.size() && j < c.size(); ++j)
+        {
+          if(g[j] != c[j])
+          {
+            break;
+          }
+          ++by_place[j];
+        }
+        inkling::eval(*s, &next, 1);
+      }
+      std::printf("%d drafts: the first proposal the same in %d, all 7 in %d; the same up to place:", steps, first, all);
+      for(auto const n : by_place) std::printf(" %d", n);
+      std::printf("\n");
+      // The two differ in rounding (BF16 logits, the fold of the output head), so
+      // a near tie can go either way; a mistake shows as many differences.
+      bool const ok{ first * 20 >= steps * 19 };
+      std::printf(ok ? "OK: the GPU drafts as the CPU version does\n" : "DIFFERENT: the GPU drafts otherwise\n");
+      return ok ? 0 : 1;
     }
 
     if(cmd == "tapcheck" && argc == 4)
@@ -417,6 +466,7 @@ int main(int argc, char **argv)
       int32_t top{ 0 };
       int32_t draft{ 0 };
       int32_t dspark{ -1 };
+      bool fixed{};
       for(int i{ 3 }; i < argc; ++i)
       {
         std::string const a{ argv[i] };
@@ -464,6 +514,11 @@ int main(int argc, char **argv)
         {
           dspark = std::stoi(next());
         }
+        else if(a == "--dspark-fixed")
+        {
+          dspark = std::stoi(next());
+          fixed = true;
+        }
         else
         {
           usage();
@@ -477,7 +532,7 @@ int main(int argc, char **argv)
       if(dspark >= 0)
       {
         drafter.reset(inkling::new_drafter(*s));
-        inkling::set_draft_depth(*drafter, dspark);
+        inkling::set_draft_depth(*drafter, dspark, !fixed);
       }
       bool const drafting{ draft > 0 || drafter };
       double const p0{ now() };

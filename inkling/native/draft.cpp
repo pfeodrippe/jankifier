@@ -85,7 +85,7 @@ namespace inkling
     }
   }
 
-  drafter *new_drafter(session &s)
+  drafter *new_drafter(session &s, bool const cpu)
   {
     auto &m{ *s.model };
     auto const files{ m.files.find("config.json") };
@@ -186,7 +186,8 @@ namespace inkling
     d->hidden_out = mat_of(m, "draft.markov_head.hidden_out.weight");
     d->hidden_bias = vec_of(m, "draft.markov_head.hidden_out.bias");
 
-    if(!s.gpu)
+    d->cpu = cpu || !s.gpu;
+    if(d->cpu)
     {
       size_t const ring{ static_cast<size_t>(d->kv_heads) * d->slots * d->head_dim };
       d->ring_k.assign(static_cast<size_t>(d->layers), std::vector<float>(ring));
@@ -198,7 +199,7 @@ namespace inkling
     }
     d->ring_pos.assign(static_cast<size_t>(d->slots), -1);
     keep_taps(s, d->visits);
-    if(s.gpu)
+    if(!d->cpu)
     {
       metal_prepare_drafter(*d, s);
     }
@@ -239,8 +240,9 @@ namespace inkling
     set_draft_depth(*s.draft_model, depth);
   }
 
-  void set_draft_depth(drafter &d, int32_t const depth)
+  void set_draft_depth(drafter &d, int32_t const depth, bool const adaptive)
   {
+    d.adaptive = adaptive;
     d.depth = std::clamp(depth, 0, d.block - 1);
   }
 
@@ -308,6 +310,10 @@ namespace inkling
   {
     auto &c{ d.ctl };
     int32_t const top{ d.depth };
+    if(!d.adaptive)
+    {
+      return top;
+    }
     auto const n{ static_cast<int64_t>(std::size(warmup)) };
     if(c.checks < n)
     {
@@ -410,7 +416,7 @@ namespace inkling
     }
     int64_t const from{ std::max<int64_t>(d.fed, total - (d.window - 1)) };
     int32_t const n_new{ static_cast<int32_t>(total - from) };
-    if(s.gpu)
+    if(!d.cpu)
     {
       for(int64_t pos{ from }; pos < total; ++pos)
       {

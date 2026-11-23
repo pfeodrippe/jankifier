@@ -2086,7 +2086,8 @@ kernel void draft_attention(constant datt_params &P [[buffer(0)]],
     if(i < P.slots)
     {
       int p = rpos[i];
-      ok = p >= P.lo && p < P.hi;
+      // An empty slot's position is -1 (and lo is negative early on).
+      ok = p >= 0 && p >= P.lo && p < P.hi;
       k = rk + (g * P.slots + i) * P.hd;
     }
     else

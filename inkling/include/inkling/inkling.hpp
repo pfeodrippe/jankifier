@@ -525,12 +525,14 @@ namespace inkling
 
   // The checkpoint's draft model (a DSpark drafter, docs/drafting.md) for the
   // session, which keeps from now on the hidden states it reads (keep_taps).
-  drafter *new_drafter(session &s);
+  // With cpu, its CPU version (the reference) even for a GPU session.
+  drafter *new_drafter(session &s, bool cpu = false);
   void free_drafter(drafter *d);
   // Tokens speculate drafts with it at most (0 to block size - 1; 7 at first);
   // each check takes the depth with the most tokens a millisecond expected,
   // from the times and acceptance measured (as oMLX does).
-  void set_draft_depth(drafter &d, int32_t depth);
+  // With adaptive false, every check drafts `depth` tokens (for measuring).
+  void set_draft_depth(drafter &d, int32_t depth, bool adaptive = true);
   // Up to `count` proposals for the tokens after `anchor`, the token sampled
   // after the session's last one (not yet evaluated), greedy.
   std::vector<int32_t> draft(drafter &d, session const &s, int32_t anchor, int32_t count);
