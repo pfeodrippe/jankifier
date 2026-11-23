@@ -1,5 +1,10 @@
 - [x] macros
 - [ ] play mario
+  - [ ] a decision API in inkling (as TypeSafe's Jev): a typed question (a choice among options, yes/no, a score) answered from one forward pass by the options' logits, with their probabilities, reusing the session's cache between steps
+  - [ ] its calibration measured on questions with known answers
+  - [ ] an NES emulator in the process (a libretro core, fceumm, behind a small C++ frontend): frames stepped, the controller set, RAM read, the picture shown in a card
+  - [ ] Super Mario Bros. through it (the ROM from the user): the state decoded from RAM every few frames, the action chosen by the decision API; compare with Jev's World 1-1 in 356 decisions
+  - [ ] a turn-based puzzle too, where each move takes reasoning
 - [ ] autocompletion and stuff
   - I start a nrepl from core-test, but unable to run tests or check autocompletion
   - [ ] autocompletion
@@ -17,3 +22,13 @@
   - [ ] no test run
 - [ ] outside the REPL (e.g. running tests), printing an exception or calling Throwable->map on one segfaults
 - [ ] ex-message on a non-exception throws in jank, Clojure returns nil
+
+## Inkling, after the trials (the GPU is theirs until then)
+
+- [ ] split attention measured alone (2k, 4k, 8k, 20k, 49k tokens of context), a threshold chosen, on by default, tokens/s of a real turn
+- [ ] a full agent turn profiled
+- [ ] other exact speedups: experts grouped for prefill, speculative decoding, batching
+- [ ] context trimming, only if the trials show it does no harm
+- [ ] proofs of the engine (inkling/specs): split attention, pool and stream for any size, the router, the session API (in progress)
+- [ ] the harness video
+
