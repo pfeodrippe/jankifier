@@ -1812,4 +1812,484 @@ kernel void down_mxfp8(constant dn_params &P [[buffer(0)]],
   }
 }
 
+// The draft model (a DSpark drafter, docs/drafting.md; draft.cpp is the CPU
+// version). Its activations are rounded to BF16 where oMLX's are BF16.
+
+// The Markov head's fold, once: fold[v, t] = bf16(unembed[v, :] . hidden_out[:, t])
+// and fold_b[v] = bf16(unembed[v, :] . hidden_out_bias), products in f32. A
+// threadgroup a row of the vocabulary, a thread a column t.
+struct fold_params
+{
+  uint h;
+  uint rank;
+};
+
+kernel void draft_fold(constant fold_params &P [[buffer(0)]],
+                       device const ushort *unembed [[buffer(1)]],
+                       device const ushort *hout [[buffer(2)]],
+                       device const ushort *hbias [[buffer(3)]],
+                       device ushort *fold [[buffer(4)]],
+                       device float *fold_b [[buffer(5)]],
+                       uint v [[threadgroup_position_in_grid]],
+                       uint t [[thread_position_in_threadgroup]])
+{
+  threadgroup float row[2304];
+  for(uint c = t; c < P.h; c += P.rank) row[c] = bf16(unembed[v * P.h + c]);
+  BARRIER;
+  float s = 0.0f;
+  for(uint c = 0; c < P.h; ++c) s += row[c] * bf16(hout[c * P.rank + t]);
+  fold[v * P.rank + t] = to_bf16(s);
+  if(t == 0u)
+  {
+    float b = 0.0f;
+    for(uint c = 0; c < P.h; ++c) b += row[c] * bf16(hbias[c]);
+    fold_b[v] = rbf(b);
+  }
+}
+
+// A context row for each position p0 + r: the mix of its taps (the session's
+// ring of BF16 hidden states) by alpha, RMS-normalized with w, rounded. 256
+// threads a row.
+struct dmix_params
+{
+  uint h;
+  uint p0;
+  uint tap_slots;
+  uint ntaps;
+  float alpha[4];
+  float eps;
+};
+
+kernel void draft_mix(constant dmix_params &P [[buffer(0)]],
+                      device const ushort *ring [[buffer(1)]],
+                      device const ushort *w [[buffer(2)]],
+                      device float *dst [[buffer(3)]],
+                      uint r [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]],
+                      ushort lane [[thread_index_in_simdgroup]],
+                      ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup float red[8];
+  device const ushort *row = ring + ((P.p0 + r) % P.tap_slots) * P.ntaps * P.h;
+  float x[9];
+  float ss = 0.0f;
+  for(uint k = 0; k < 9; ++k)
+  {
+    uint c = tid + 256u * k;
+    float v = 0.0f;
+    if(c < P.h)
+    {
+      for(uint t = 0; t < P.ntaps; ++t) v += P.alpha[t] * bf16(row[t * P.h + c]);
+    }
+    x[k] = v;
+    ss += v * v;
+  }
+  float part = simd_sum(ss);
+  if(lane == 0) red[sg] = part;
+  BARRIER;
+  float total = 0.0f;
+  for(uint i = 0; i < 8; ++i) total += red[i];
+  float inv = rsqrt(total / float(P.h) + P.eps);
+  for(uint k = 0; k < 9; ++k)
+  {
+    uint c = tid + 256u * k;
+    if(c < P.h) dst[r * P.h + c] = rbf(x[k] * inv * bf16(w[c]));
+  }
+}
+
+// dst[r] = bf16(rmsnorm(src[src_row + r]) * w). 256 threads a row.
+struct dnorm_params
+{
+  uint h;
+  uint src_row;
+  float eps;
+};
+
+kernel void draft_norm(constant dnorm_params &P [[buffer(0)]],
+                       device const float *src [[buffer(1)]],
+                       device const ushort *w [[buffer(2)]],
+                       device float *dst [[buffer(3)]],
+                       uint r [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]],
+                       ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup float red[8];
+  device const float *row = src + (P.src_row + r) * P.h;
+  float x[9];
+  float ss = 0.0f;
+  for(uint k = 0; k < 9; ++k)
+  {
+    uint c = tid + 256u * k;
+    x[k] = c < P.h ? row[c] : 0.0f;
+    ss += x[k] * x[k];
+  }
+  float part = simd_sum(ss);
+  if(lane == 0) red[sg] = part;
+  BARRIER;
+  float total = 0.0f;
+  for(uint i = 0; i < 8; ++i) total += red[i];
+  float inv = rsqrt(total / float(P.h) + P.eps);
+  for(uint k = 0; k < 9; ++k)
+  {
+    uint c = tid + 256u * k;
+    if(c < P.h) dst[r * P.h + c] = rbf(x[k] * inv * bf16(w[c]));
+  }
+}
+
+// The block's rows: the anchor's embedding RMS-normalized with the target's
+// norm (row 0), then the mask embedding. 256 threads a row.
+struct dblock_params
+{
+  uint h;
+  uint anchor;
+  float eps;
+};
+
+kernel void draft_block(constant dblock_params &P [[buffer(0)]],
+                        device const ushort *table [[buffer(1)]],
+                        device const ushort *norm [[buffer(2)]],
+                        device const ushort *mask [[buffer(3)]],
+                        device float *dst [[buffer(4)]],
+                        uint r [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup float red[8];
+  if(r > 0u)
+  {
+    for(uint c = tid; c < P.h; c += 256u) dst[r * P.h + c] = bf16(mask[c]);
+    return;
+  }
+  float x[9];
+  float ss = 0.0f;
+  for(uint k = 0; k < 9; ++k)
+  {
+    uint c = tid + 256u * k;
+    x[k] = c < P.h ? bf16(table[P.anchor * P.h + c]) : 0.0f;
+    ss += x[k] * x[k];
+  }
+  float part = simd_sum(ss);
+  if(lane == 0) red[sg] = part;
+  BARRIER;
+  float total = 0.0f;
+  for(uint i = 0; i < 8; ++i) total += red[i];
+  float inv = rsqrt(total / float(P.h) + P.eps);
+  for(uint k = 0; k < 9; ++k)
+  {
+    uint c = tid + 256u * k;
+    if(c < P.h) dst[c] = rbf(x[k] * inv * bf16(norm[c]));
+  }
+}
+
+// Each head of each row: RMS norm with w (when `norm`), rounded; rotated at
+// position p0 + row (when `rope`; MLX's halves), rounded; written in place, or
+// into a ring [heads][slots][hd] at slot (p0 + row) % slots. hd threads (128).
+struct dhead_params
+{
+  uint hd;
+  uint stride;
+  uint p0;
+  float eps;
+  float log2theta;
+  uint norm;
+  uint rope;
+  uint slots;
+  uint to_ring;
+};
+
+kernel void draft_head(constant dhead_params &P [[buffer(0)]],
+                       device float *x [[buffer(1)]],
+                       device const ushort *w [[buffer(2)]],
+                       device float *ring [[buffer(3)]],
+                       uint3 tg [[threadgroup_position_in_grid]],
+                       uint3 tp [[thread_position_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]],
+                       ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup float red[4];
+  threadgroup float vals[128];
+  uint head = tg.x, r = tg.y, j = tp.x;
+  device float *p = x + r * P.stride + head * P.hd;
+  float v = p[j];
+  if(P.norm != 0u)
+  {
+    float part = simd_sum(v * v);
+    if(lane == 0) red[sg] = part;
+    BARRIER;
+    float total = (red[0] + red[1]) + (red[2] + red[3]);
+    v = rbf(v * rsqrt(total / float(P.hd) + P.eps) * bf16(w[j]));
+  }
+  if(P.rope != 0u)
+  {
+    vals[j] = v;
+    BARRIER;
+    uint half_ = P.hd / 2u;
+    uint k = j % half_;
+    float inv_freq = exp2(-float(2u * k) / float(P.hd) * P.log2theta);
+    float angle = float(P.p0 + r) * inv_freq;
+    float c = precise::cos(angle), s = precise::sin(angle);
+    v = rbf(j < half_ ? vals[j] * c - vals[j + half_] * s : vals[j - half_] * s + vals[j] * c);
+  }
+  if(P.to_ring != 0u)
+  {
+    ring[(head * P.slots + (P.p0 + r) % P.slots) * P.hd + j] = v;
+  }
+  else
+  {
+    p[j] = v;
+  }
+}
+
+// Attention of the block: every row, every head, reads the ring's slots whose
+// positions are in [lo, hi) and all the block's rows (both ways), scale
+// 1/sqrt(hd); a query head reads KV head head / (heads / kv_heads). A
+// threadgroup a (head, row), 4 simdgroups; hd = 128.
+struct datt_params
+{
+  uint heads;
+  uint kv_heads;
+  uint hd;
+  uint slots;
+  int lo;
+  int hi;
+  uint rows;
+  float scale;
+};
+
+kernel void draft_attention(constant datt_params &P [[buffer(0)]],
+                            device const float *q [[buffer(1)]],
+                            device const float *kb [[buffer(2)]],
+                            device const float *vb [[buffer(3)]],
+                            device const float *rk [[buffer(4)]],
+                            device const float *rv [[buffer(5)]],
+                            device const int *rpos [[buffer(6)]],
+                            device float *out [[buffer(7)]],
+                            uint3 tg [[threadgroup_position_in_grid]],
+                            uint3 tp [[thread_position_in_threadgroup]],
+                            ushort lane [[thread_index_in_simdgroup]],
+                            ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup float sc[1040];
+  threadgroup float red[4];
+  uint head = tg.x, r = tg.y, tid = tp.x;
+  uint g = head / (P.heads / P.kv_heads);
+  uint kvw = P.kv_heads * P.hd;
+  uint nkeys = P.slots + P.rows;
+  float4 q4 = ((device const float4 *)(q + r * P.heads * P.hd + head * P.hd))[lane];
+  for(uint i = sg; i < nkeys; i += 4u)
+  {
+    float s = -INFINITY;
+    bool ok = true;
+    device const float *k;
+    if(i < P.slots)
+    {
+      int p = rpos[i];
+      ok = p >= P.lo && p < P.hi;
+      k = rk + (g * P.slots + i) * P.hd;
+    }
+    else
+    {
+      k = kb + (i - P.slots) * kvw + g * P.hd;
+    }
+    if(ok)
+    {
+      float4 k4 = ((device const float4 *)k)[lane];
+      s = simd_sum(dot(q4, k4)) * P.scale;
+    }
+    if(lane == 0) sc[i] = s;
+  }
+  BARRIER;
+  float m = -INFINITY;
+  for(uint i = tid; i < nkeys; i += 128u) m = max(m, sc[i]);
+  m = simd_max(m);
+  if(lane == 0) red[sg] = m;
+  BARRIER;
+  m = max(max(red[0], red[1]), max(red[2], red[3]));
+  BARRIER;
+  float den = 0.0f;
+  for(uint i = tid; i < nkeys; i += 128u)
+  {
+    float e = exp(sc[i] - m);
+    sc[i] = e;
+    den += e;
+  }
+  den = simd_sum(den);
+  if(lane == 0) red[sg] = den;
+  BARRIER;
+  den = (red[0] + red[1]) + (red[2] + red[3]);
+  float acc = 0.0f;
+  for(uint i = 0; i < nkeys; ++i)
+  {
+    float p = sc[i];
+    if(p == 0.0f) continue;
+    float v = i < P.slots ? rv[(g * P.slots + i) * P.hd + tid] : vb[(i - P.slots) * kvw + g * P.hd + tid];
+    acc += p * v;
+  }
+  out[r * P.heads * P.hd + head * P.hd + tid] = rbf(acc / den);
+}
+
+// Elementwise: the MLP's bf16(bf16(silu(gate)) * up) into gate (mode 0), or
+// the residual bf16(a + b) into a (mode 1).
+struct dew_params
+{
+  uint n;
+  uint mode;
+};
+
+kernel void draft_elementwise(constant dew_params &P [[buffer(0)]],
+                              device float *a [[buffer(1)]],
+                              device const float *b [[buffer(2)]],
+                              uint i [[thread_position_in_grid]])
+{
+  if(i >= P.n) return;
+  if(P.mode == 0u)
+  {
+    float g = a[i];
+    a[i] = rbf(rbf(g / (1.0f + exp(-g))) * b[i]);
+  }
+  else
+  {
+    a[i] = rbf(a[i] + b[i]);
+  }
+}
+
+// The Markov head's step i. Its input: [state, markov_w1[prev], dh[i], f],
+// prev = tokens[i] (tokens[0] is the anchor).
+struct dmk_params
+{
+  uint rank;
+  uint h;
+  uint step;
+  uint vocab; // used, for the pick
+  uint chunk; // values a threadgroup of the pick
+};
+
+kernel void draft_mk_input(constant dmk_params &P [[buffer(0)]],
+                           device const float *state [[buffer(1)]],
+                           device const ushort *w1 [[buffer(2)]],
+                           device const float *dh [[buffer(3)]],
+                           device const float *f [[buffer(4)]],
+                           device const uint *tokens [[buffer(5)]],
+                           device float *in [[buffer(6)]],
+                           uint i [[thread_position_in_grid]])
+{
+  uint r = P.rank, h = P.h;
+  if(i < r) in[i] = state[i];
+  else if(i < 2u * r) in[i] = bf16(w1[tokens[P.step] * r + (i - r)]);
+  else if(i < 2u * r + h) in[i] = dh[P.step * h + (i - 2u * r)];
+  else if(i < 2u * r + 2u * h) in[i] = f[i - 2u * r - h];
+}
+
+// u = bf16(proj + bias); gate = bf16(sigmoid(u0)); state = bf16(bf16(gate * state)
+// + bf16((1 - gate) * bf16(tanh(u1)))); z = bf16(tanh(u2)). rank threads.
+kernel void draft_mk_gates(constant dmk_params &P [[buffer(0)]],
+                           device const float *proj [[buffer(1)]],
+                           device const ushort *bias [[buffer(2)]],
+                           device float *state [[buffer(3)]],
+                           device float *z [[buffer(4)]],
+                           uint j [[thread_position_in_grid]])
+{
+  uint r = P.rank;
+  if(j >= r) return;
+  float u0 = rbf(proj[j] + bf16(bias[j]));
+  float u1 = rbf(proj[r + j] + bf16(bias[r + j]));
+  float u2 = rbf(proj[2u * r + j] + bf16(bias[2u * r + j]));
+  float g = rbf(1.0f / (1.0f + exp(-u0)));
+  state[j] = rbf(rbf(g * state[j]) + rbf((1.0f - g) * rbf(precise::tanh(u1))));
+  z[j] = rbf(precise::tanh(u2));
+}
+
+// The step's logits, base[i] + bf16(fold . z + fold_b), over the used
+// vocabulary (the softcap keeps the order): each threadgroup's largest (the
+// lowest index among equals) into part, 256 threads, `chunk` values each.
+kernel void draft_mk_pick(constant dmk_params &P [[buffer(0)]],
+                          device const float *base [[buffer(1)]],
+                          device const float *fz [[buffer(2)]],
+                          device const float *fold_b [[buffer(3)]],
+                          device float2 *part [[buffer(4)]],
+                          uint g [[threadgroup_position_in_grid]],
+                          uint tid [[thread_position_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup float bv[8];
+  threadgroup uint bi[8];
+  float best = -INFINITY;
+  uint at = 0xffffffffu;
+  uint v0 = g * P.chunk;
+  uint v1 = min(v0 + P.chunk, P.vocab);
+  device const float *row = base + P.step * P.vocab;
+  for(uint v = v0 + tid; v < v1; v += 256u)
+  {
+    float l = row[v] + rbf(fz[v] + fold_b[v]);
+    if(l > best)
+    {
+      best = l;
+      at = v;
+    }
+  }
+  for(ushort o = 16; o > 0; o /= 2)
+  {
+    float ob = simd_shuffle_down(best, o);
+    uint oa = simd_shuffle_down(at, o);
+    if(ob > best || (ob == best && oa < at))
+    {
+      best = ob;
+      at = oa;
+    }
+  }
+  if(lane == 0)
+  {
+    bv[sg] = best;
+    bi[sg] = at;
+  }
+  BARRIER;
+  if(tid == 0u)
+  {
+    for(uint i = 1; i < 8; ++i)
+    {
+      if(bv[i] > best || (bv[i] == best && bi[i] < at))
+      {
+        best = bv[i];
+        at = bi[i];
+      }
+    }
+    part[g] = float2(best, as_type<float>(at));
+  }
+}
+
+// The largest of the parts: tokens[step + 1]. One simdgroup.
+kernel void draft_mk_choose(constant dmk_params &P [[buffer(0)]],
+                            device const float2 *part [[buffer(1)]],
+                            device uint *tokens [[buffer(2)]],
+                            constant uint &nparts [[buffer(3)]],
+                            ushort lane [[thread_index_in_simdgroup]])
+{
+  float best = -INFINITY;
+  uint at = 0xffffffffu;
+  for(uint i = lane; i < nparts; i += 32u)
+  {
+    float b = part[i].x;
+    uint a = as_type<uint>(part[i].y);
+    if(b > best || (b == best && a < at))
+    {
+      best = b;
+      at = a;
+    }
+  }
+  for(ushort o = 16; o > 0; o /= 2)
+  {
+    float ob = simd_shuffle_down(best, o);
+    uint oa = simd_shuffle_down(at, o);
+    if(ob > best || (ob == best && oa < at))
+    {
+      best = ob;
+      at = oa;
+    }
+  }
+  if(lane == 0) tokens[P.step + 1u] = at;
+}
+
 )MSL"

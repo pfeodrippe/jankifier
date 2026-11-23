@@ -166,6 +166,9 @@ namespace inkling
     id<MTLComputePipelineState> embed, mix_norm, mix_pair, controller, linear1, linear4, linear_mm, multi1, multi4, tap_store, conv_fixed, conv_dyn, kv_store,
       q_prep, att1, att8, att32, att_split, att_merge, att_rows, att_rows_merge, rel_bias, att_scores, att_softmax, att_pv, route, gu_nv, gu_mx, act_quant, dn_nv,
       dn_mx;
+    // The draft model's kernels.
+    id<MTLComputePipelineState> draft_fold, draft_mix, draft_norm, draft_block, draft_head, draft_attention, draft_elementwise,
+      draft_mk_input, draft_mk_gates, draft_mk_pick, draft_mk_choose;
     std::unordered_map<void const *, id<MTLBuffer>> weights;
     // Half-float copies of projection weights, for the batched kernels.
     std::unordered_map<void const *, id<MTLBuffer>> halves;
@@ -394,6 +397,17 @@ namespace inkling
       b->dn_nv = pipeline(device, lib, "down_nvfp4", 32);
       b->dn_mx = pipeline(device, lib, "down_mxfp8", 32);
       b->dummy = scratch_buffer(*b, 16384);
+      b->draft_fold = pipeline(device, lib, "draft_fold", 256);
+      b->draft_mix = pipeline(device, lib, "draft_mix", 256);
+      b->draft_norm = pipeline(device, lib, "draft_norm", 256);
+      b->draft_block = pipeline(device, lib, "draft_block", 256);
+      b->draft_head = pipeline(device, lib, "draft_head", 128);
+      b->draft_attention = pipeline(device, lib, "draft_attention", 128);
+      b->draft_elementwise = pipeline(device, lib, "draft_elementwise", 32);
+      b->draft_mk_input = pipeline(device, lib, "draft_mk_input", 32);
+      b->draft_mk_gates = pipeline(device, lib, "draft_mk_gates", 32);
+      b->draft_mk_pick = pipeline(device, lib, "draft_mk_pick", 256);
+      b->draft_mk_choose = pipeline(device, lib, "draft_mk_choose", 32);
       b->e4m3 = scratch_buffer(*b, 256 * sizeof(float));
       auto *const table{ static_cast<float *>(b->e4m3.contents) };
       for(int i{}; i < 256; ++i)
@@ -551,6 +565,330 @@ namespace inkling
   void metal_free_session(metal_session *g)
   {
     delete g;
+  }
+
+  // The draft model's buffers.
+  struct metal_drafter
+  {
+    std::vector<id<MTLBuffer>> ring_k, ring_v;
+    id<MTLBuffer> ring_pos, fold, fold_b, mix, kc, vc, hs, x, q, kb, vb, att, o, gate, up, dh, base, f, state, in, proj, z, fz,
+      part, tokens;
+    uint32_t mix_rows{};
+  };
+
+  void metal_free_drafter(metal_drafter *g)
+  {
+    delete g;
+  }
+
+  namespace
+  {
+    struct fold_params
+    {
+      uint32_t h, rank;
+    };
+    struct dmix_params
+    {
+      uint32_t h, p0, tap_slots, ntaps;
+      float alpha[4];
+      float eps;
+    };
+    struct dnorm_params
+    {
+      uint32_t h, src_row;
+      float eps;
+    };
+    struct dblock_params
+    {
+      uint32_t h, anchor;
+      float eps;
+    };
+    struct dhead_params
+    {
+      uint32_t hd, stride, p0;
+      float eps, log2theta;
+      uint32_t norm, rope, slots, to_ring;
+    };
+    struct datt_params
+    {
+      uint32_t heads, kv_heads, hd, slots;
+      int32_t lo, hi;
+      uint32_t rows;
+      float scale;
+    };
+    struct dew_params
+    {
+      uint32_t n, mode;
+    };
+    struct dmk_params
+    {
+      uint32_t rank, h, step, vocab, chunk;
+    };
+  }
+
+  std::vector<int32_t> metal_draft(drafter &d, session const &s, int64_t const from, int32_t const anchor, int32_t const count)
+  {
+    @autoreleasepool
+    {
+      auto &m{ *d.m };
+      auto &b{ *s.gpu->backend };
+      auto const &c{ m.cfg };
+      uint32_t const h{ static_cast<uint32_t>(c.hidden) };
+      uint32_t const rows{ static_cast<uint32_t>(d.block) };
+      uint32_t const kvw{ static_cast<uint32_t>(d.kv_heads * d.head_dim) };
+      uint32_t const qw{ static_cast<uint32_t>(d.heads * d.head_dim) };
+      uint32_t const width{ static_cast<uint32_t>(d.lw[0].gate->dim(0)) };
+      uint32_t const vocab{ static_cast<uint32_t>(c.unpadded_vocab) };
+      uint32_t const ntaps{ static_cast<uint32_t>(d.visits.size() + 1) };
+      int64_t const total{ s.pos };
+      uint32_t const n_new{ static_cast<uint32_t>(total - from) };
+      size_t const f{ sizeof(float) };
+      std::lock_guard<std::mutex> const one{ m.running };
+
+      id<MTLCommandBuffer> cmd{ [b.queue commandBuffer] };
+      id<MTLComputeCommandEncoder> e{ [cmd computeCommandEncoder] };
+      auto const bind{ [&](NSUInteger i, id<MTLBuffer> buf) { [e setBuffer:buf offset:0 atIndex:i]; } };
+      auto const groups{ [&](NSUInteger x, NSUInteger y, NSUInteger threads) {
+        [e dispatchThreadgroups:MTLSizeMake(x, y, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+      } };
+      auto const threads{ [&](NSUInteger n) {
+        [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(n, 256), 1, 1)];
+      } };
+      // y[t] = W x[t] for `n` rows of x; mode 1 rounds to BF16.
+      auto const lin{ [&](id<MTLBuffer> w, uint32_t out_rows, uint32_t in, id<MTLBuffer> x, id<MTLBuffer> y, uint32_t n,
+                          uint32_t mode) {
+        lin_params const p{ out_rows, in, n, mode, 0.0f };
+        uint32_t const tb{ n > 1 ? 4u : 1u };
+        [e setComputePipelineState:tb == 4 ? b.linear4 : b.linear1];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, w);
+        bind(2, x);
+        bind(3, y);
+        groups(out_rows, (n + tb - 1) / tb, 32);
+      } };
+      auto const lin_t{ [&](tensor const *w, id<MTLBuffer> x, id<MTLBuffer> y, uint32_t n, uint32_t mode) {
+        lin(weight(b, w, dtype::bf16), static_cast<uint32_t>(w->dim(0)), static_cast<uint32_t>(w->dim(1)), x, y, n, mode);
+      } };
+
+      if(!d.gpu)
+      {
+        // The buffers, and the Markov head's fold of the output head (once).
+        auto g{ std::make_unique<metal_drafter>() };
+        size_t const ring{ static_cast<size_t>(kvw) * d.slots * f };
+        for(int32_t l{}; l < d.layers; ++l)
+        {
+          g->ring_k.push_back(scratch_buffer(b, ring));
+          g->ring_v.push_back(scratch_buffer(b, ring));
+        }
+        g->ring_pos = scratch_buffer(b, static_cast<size_t>(d.slots) * sizeof(int32_t));
+        g->fold = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * d.rank * sizeof(uint16_t));
+        g->fold_b = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * f);
+        g->hs = scratch_buffer(b, rows * h * f);
+        g->x = scratch_buffer(b, rows * h * f);
+        g->q = scratch_buffer(b, rows * qw * f);
+        g->kb = scratch_buffer(b, rows * kvw * f);
+        g->vb = scratch_buffer(b, rows * kvw * f);
+        g->att = scratch_buffer(b, rows * qw * f);
+        g->o = scratch_buffer(b, rows * h * f);
+        g->gate = scratch_buffer(b, rows * width * f);
+        g->up = scratch_buffer(b, rows * width * f);
+        g->dh = scratch_buffer(b, rows * h * f);
+        g->base = scratch_buffer(b, static_cast<size_t>(rows) * vocab * f);
+        g->f = scratch_buffer(b, h * f);
+        g->state = scratch_buffer(b, static_cast<size_t>(d.rank) * f);
+        g->in = scratch_buffer(b, static_cast<size_t>(d.rnn->dim(1)) * f);
+        g->proj = scratch_buffer(b, static_cast<size_t>(d.rnn->dim(0)) * f);
+        g->z = scratch_buffer(b, static_cast<size_t>(d.rank) * f);
+        g->fz = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * f);
+        g->part = scratch_buffer(b, 1024 * 2 * f);
+        g->tokens = scratch_buffer(b, 16 * sizeof(uint32_t));
+        fold_params const fp{ h, static_cast<uint32_t>(d.rank) };
+        [e setComputePipelineState:b.draft_fold];
+        [e setBytes:&fp length:sizeof(fp) atIndex:0];
+        bind(1, weight(b, m.unembed, dtype::bf16));
+        bind(2, weight(b, d.hidden_out, dtype::bf16));
+        bind(3, weight(b, d.hidden_bias, dtype::bf16));
+        bind(4, g->fold);
+        bind(5, g->fold_b);
+        groups(static_cast<NSUInteger>(m.unembed->dim(0)), 1, static_cast<NSUInteger>(d.rank));
+        d.gpu = g.release();
+      }
+      auto &g{ *d.gpu };
+      if(g.mix_rows < n_new)
+      {
+        g.mix_rows = std::max<uint32_t>(n_new, 64);
+        g.mix = scratch_buffer(b, g.mix_rows * h * f);
+        g.kc = scratch_buffer(b, g.mix_rows * kvw * f);
+        g.vc = scratch_buffer(b, g.mix_rows * kvw * f);
+      }
+      // The slots' positions (the CPU keeps them; the GPU work before is done).
+      auto *const pos{ static_cast<int32_t *>(g.ring_pos.contents) };
+      for(size_t i{}; i < static_cast<size_t>(d.slots); ++i)
+      {
+        pos[i] = static_cast<int32_t>(d.ring_pos[i]);
+      }
+      auto *const tokens{ static_cast<uint32_t *>(g.tokens.contents) };
+      tokens[0] = static_cast<uint32_t>(anchor);
+      std::fill_n(static_cast<float *>(g.state.contents), d.rank, 0.0f);
+      float const log2theta{ std::log2(d.theta) };
+
+      auto const mix_rows{ [&](uint32_t p0, uint32_t n, std::vector<float> const &alpha, tensor const *norm, id<MTLBuffer> dst) {
+        dmix_params p{ h, p0, static_cast<uint32_t>(tap_slots), ntaps, {}, d.eps };
+        for(size_t t{}; t < alpha.size(); ++t)
+        {
+          p.alpha[t] = alpha[t];
+        }
+        [e setComputePipelineState:b.draft_mix];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, s.gpu->taps);
+        bind(2, weight(b, norm, dtype::bf16));
+        bind(3, dst);
+        groups(n, 1, 256);
+      } };
+      auto const heads{ [&](id<MTLBuffer> x, uint32_t n_heads, uint32_t stride, uint32_t n, uint32_t p0, tensor const *norm,
+                            bool rope, id<MTLBuffer> ring) {
+        dhead_params const p{ static_cast<uint32_t>(d.head_dim), stride, p0, d.eps, log2theta, norm ? 1u : 0u, rope ? 1u : 0u,
+                              static_cast<uint32_t>(d.slots), ring ? 1u : 0u };
+        [e setComputePipelineState:b.draft_head];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, x);
+        bind(2, norm ? weight(b, norm, dtype::bf16) : b.dummy);
+        bind(3, ring ? ring : b.dummy);
+        groups(n_heads, n, static_cast<NSUInteger>(d.head_dim));
+      } };
+      auto const norm_rows{ [&](id<MTLBuffer> src, uint32_t src_row, uint32_t n, tensor const *w, id<MTLBuffer> dst) {
+        dnorm_params const p{ h, src_row, d.eps };
+        [e setComputePipelineState:b.draft_norm];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, src);
+        bind(2, weight(b, w, dtype::bf16));
+        bind(3, dst);
+        groups(n, 1, 256);
+      } };
+      auto const elementwise{ [&](id<MTLBuffer> a, id<MTLBuffer> bb, uint32_t n, uint32_t mode) {
+        dew_params const p{ n, mode };
+        [e setComputePipelineState:b.draft_elementwise];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, a);
+        bind(2, bb);
+        threads(n);
+      } };
+
+      // The new context rows into each layer's ring.
+      for(int32_t l{}; l < d.layers && n_new > 0; ++l)
+      {
+        auto const &w{ d.lw[static_cast<size_t>(l)] };
+        mix_rows(static_cast<uint32_t>(from), n_new, d.alpha[static_cast<size_t>(l)], w.mix_norm, g.mix);
+        lin_t(w.ctx_k, g.mix, g.kc, n_new, 1);
+        lin_t(w.ctx_v, g.mix, g.vc, n_new, 1);
+        heads(g.kc, static_cast<uint32_t>(d.kv_heads), kvw, n_new, static_cast<uint32_t>(from), w.ctx_k_norm, true,
+              g.ring_k[static_cast<size_t>(l)]);
+        heads(g.vc, static_cast<uint32_t>(d.kv_heads), kvw, n_new, static_cast<uint32_t>(from), nullptr, false,
+              g.ring_v[static_cast<size_t>(l)]);
+      }
+      // The block.
+      {
+        dblock_params const p{ h, static_cast<uint32_t>(anchor), c.norm_eps };
+        [e setComputePipelineState:b.draft_block];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, weight(b, m.embed, dtype::bf16));
+        bind(2, weight(b, m.embed_norm, dtype::bf16));
+        bind(3, weight(b, d.mask_embed, dtype::bf16));
+        bind(4, g.hs);
+        groups(rows, 1, 256);
+      }
+      uint32_t const p0{ static_cast<uint32_t>(total) };
+      for(int32_t l{}; l < d.layers; ++l)
+      {
+        auto const &w{ d.lw[static_cast<size_t>(l)] };
+        norm_rows(g.hs, 0, rows, w.input_norm, g.x);
+        lin_t(w.q, g.x, g.q, rows, 1);
+        lin_t(w.k, g.x, g.kb, rows, 1);
+        lin_t(w.v, g.x, g.vb, rows, 1);
+        heads(g.q, static_cast<uint32_t>(d.heads), qw, rows, p0, w.q_norm, true, nil);
+        heads(g.kb, static_cast<uint32_t>(d.kv_heads), kvw, rows, p0, w.k_norm, true, nil);
+        {
+          datt_params const p{ static_cast<uint32_t>(d.heads), static_cast<uint32_t>(d.kv_heads),
+                               static_cast<uint32_t>(d.head_dim), static_cast<uint32_t>(d.slots),
+                               static_cast<int32_t>(total - (d.window - 1)), static_cast<int32_t>(total), rows,
+                               1.0f / std::sqrt(static_cast<float>(d.head_dim)) };
+          [e setComputePipelineState:b.draft_attention];
+          [e setBytes:&p length:sizeof(p) atIndex:0];
+          bind(1, g.q);
+          bind(2, g.kb);
+          bind(3, g.vb);
+          bind(4, g.ring_k[static_cast<size_t>(l)]);
+          bind(5, g.ring_v[static_cast<size_t>(l)]);
+          bind(6, g.ring_pos);
+          bind(7, g.att);
+          groups(static_cast<NSUInteger>(d.heads), rows, 128);
+        }
+        lin_t(w.o, g.att, g.o, rows, 1);
+        elementwise(g.hs, g.o, rows * h, 1);
+        norm_rows(g.hs, 0, rows, w.post_norm, g.x);
+        lin_t(w.gate, g.x, g.gate, rows, 1);
+        lin_t(w.up, g.x, g.up, rows, 1);
+        elementwise(g.gate, g.up, rows * width, 0);
+        lin_t(w.down, g.gate, g.o, rows, 1);
+        elementwise(g.hs, g.o, rows * h, 1);
+      }
+      // The mask rows' hidden states, normed, and their base logits.
+      uint32_t const n_out{ static_cast<uint32_t>(count) };
+      norm_rows(g.hs, 1, n_out, d.final_norm, g.dh);
+      lin(weight(b, m.unembed, dtype::bf16), vocab, h, g.dh, g.base, n_out, 1);
+      // The Markov head: from the newest committed row, a step a token.
+      mix_rows(static_cast<uint32_t>(total - 1), 1, d.alpha[static_cast<size_t>(d.layers)], d.markov_norm, g.f);
+      uint32_t const chunk{ 1024 };
+      uint32_t const nparts{ (vocab + chunk - 1) / chunk };
+      for(uint32_t i{}; i < n_out; ++i)
+      {
+        dmk_params const p{ static_cast<uint32_t>(d.rank), h, i, vocab, chunk };
+        [e setComputePipelineState:b.draft_mk_input];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, g.state);
+        bind(2, weight(b, d.markov_embed, dtype::bf16));
+        bind(3, g.dh);
+        bind(4, g.f);
+        bind(5, g.tokens);
+        bind(6, g.in);
+        threads(static_cast<NSUInteger>(d.rnn->dim(1)));
+        lin_t(d.rnn, g.in, g.proj, 1, 0);
+        [e setComputePipelineState:b.draft_mk_gates];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, g.proj);
+        bind(2, weight(b, d.rnn_bias, dtype::bf16));
+        bind(3, g.state);
+        bind(4, g.z);
+        threads(static_cast<NSUInteger>(d.rank));
+        lin(g.fold, vocab, static_cast<uint32_t>(d.rank), g.z, g.fz, 1, 1);
+        [e setComputePipelineState:b.draft_mk_pick];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, g.base);
+        bind(2, g.fz);
+        bind(3, g.fold_b);
+        bind(4, g.part);
+        groups(nparts, 1, 256);
+        [e setComputePipelineState:b.draft_mk_choose];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, g.part);
+        bind(2, g.tokens);
+        [e setBytes:&nparts length:sizeof(nparts) atIndex:3];
+        groups(1, 1, 32);
+      }
+      [e endEncoding];
+      [cmd commit];
+      [cmd waitUntilCompleted];
+      if(cmd.error)
+      {
+        fail(std::string{ "Metal draft: " } + cmd.error.localizedDescription.UTF8String);
+      }
+      if(std::getenv("INK_GPU_TIMING"))
+      {
+        std::fprintf(stderr, "draft of %u tokens (%u new context rows): GPU %.2f ms\n", n_out, n_new,
+                     (cmd.GPUEndTime - cmd.GPUStartTime) * 1e3);
+      }
+      return { tokens + 1, tokens + 1 + n_out };
+    }
   }
 
   uint16_t *metal_tap_ring(session &s, size_t const n)

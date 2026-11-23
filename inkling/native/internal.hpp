@@ -108,8 +108,44 @@ namespace inkling
   // The CPU path's y[t] = W x[t] (W [rows, in]) and RMS norm, for the draft model.
   void cpu_linear(model const &m, tensor const *w, float const *x, int32_t tokens, float *y);
   void cpu_rmsnorm(float const *x, float const *w, int64_t n, float eps, float *out);
-  // A drafter's depth.
+  // The draft model (draft.cpp, docs/drafting.md).
+  struct metal_drafter;
+  struct drafter
+  {
+    struct layer_weights
+    {
+      tensor const *mix_norm{}, *ctx_k{}, *ctx_v{}, *ctx_k_norm{}, *input_norm{}, *q{}, *k{}, *v{}, *q_norm{}, *k_norm{},
+        *o{}, *post_norm{}, *gate{}, *up{}, *down{};
+    };
+
+    model *m{};
+    int32_t layers{}, heads{}, kv_heads{}, head_dim{}, block{}, rank{}, window{}, slots{};
+    float eps{}, theta{};
+    // The target visits whose partial sums the drafter reads, then the final
+    // norm's output: session::tap_visits.
+    std::vector<int32_t> visits;
+    // Softmax of the fuse weights, rounded: [layers + 1][taps].
+    std::vector<std::vector<float>> alpha;
+    std::vector<layer_weights> lw;
+    tensor const *mask_embed{}, *final_norm{}, *markov_norm{}, *markov_embed{}, *rnn{}, *rnn_bias{}, *hidden_out{},
+      *hidden_bias{};
+    // The context ring: each layer's keys (normed, rotated) and values,
+    // [kv_heads][slots][head_dim] (on the CPU; on the GPU in `gpu`), and each
+    // slot's position (-1: empty). Positions before `fed` are in the ring (or
+    // were dropped).
+    std::vector<std::vector<float>> ring_k, ring_v;
+    std::vector<int64_t> ring_pos;
+    int64_t fed{};
+    int32_t depth{ 7 };
+    metal_drafter *gpu{};
+
+    ~drafter();
+  };
   int32_t draft_depth(drafter const &d);
+  // The draft on the GPU: the context rows [from, s.pos) into the ring (whose
+  // positions d.ring_pos already has), then `count` proposals after `anchor`.
+  std::vector<int32_t> metal_draft(drafter &d, session const &s, int64_t from, int32_t anchor, int32_t count);
+  void metal_free_drafter(metal_drafter *g);
   // The session's ring of taps for a draft model, of n BF16 values, in memory
   // the GPU writes and the CPU reads.
   uint16_t *metal_tap_ring(session &s, size_t n);

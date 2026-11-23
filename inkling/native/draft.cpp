@@ -13,45 +13,16 @@
 
 namespace inkling
 {
-  struct drafter
-  {
-    struct layer_weights
-    {
-      std::vector<float> mix_norm, ctx_k_norm, input_norm, q_norm, k_norm, post_norm;
-      tensor const *ctx_k{}, *ctx_v{}, *q{}, *k{}, *v{}, *o{}, *gate{}, *up{}, *down{};
-    };
-
-    model *m{};
-    int32_t layers{}, heads{}, kv_heads{}, head_dim{}, block{}, rank{}, window{}, slots{};
-    float eps{}, theta{};
-    // The target visits whose partial sums the drafter reads, then the final
-    // norm's output: session::tap_visits.
-    std::vector<int32_t> visits;
-    // Softmax of the fuse weights, rounded: [layers + 1][taps].
-    std::vector<std::vector<float>> alpha;
-    std::vector<layer_weights> lw;
-    std::vector<float> mask_embed, final_norm, markov_norm, rnn_bias, hidden_bias;
-    tensor const *markov_embed{}, *rnn{}, *hidden_out{};
-    // The context ring: each layer's keys (normed, rotated) and values,
-    // [kv_heads][slots][head_dim], and each slot's position (-1: empty).
-    std::vector<std::vector<float>> ring_k, ring_v;
-    std::vector<int64_t> ring_pos;
-    // Positions before `fed` are in the ring (or were dropped).
-    int64_t fed{};
-    int32_t depth{ 7 };
-  };
-
   namespace
   {
-    std::vector<float> vec_of(model &m, std::string const &name)
+    tensor const *vec_of(model &m, std::string const &name)
     {
       auto const *t{ m.find(name) };
-      if(!t)
+      if(!t || t->type != dtype::bf16 || t->shape.size() != 1)
       {
-        fail("draft model: no tensor " + name);
+        fail("draft model: no BF16 vector " + name);
       }
-      auto const *p{ m.f32(t) };
-      return { p, p + t->numel() };
+      return t;
     }
 
     tensor const *mat_of(model &m, std::string const &name)
@@ -162,14 +133,15 @@ namespace inkling
     d->slots = d->window - 1 + d->block;
     size_t const taps{ d->visits.size() + 1 };
 
-    auto const fuse{ vec_of(m, "draft.fuse_weight") };
-    if(fuse.size() != (static_cast<size_t>(d->layers) + 1) * taps)
+    auto const *fuse_t{ m.find("draft.fuse_weight") };
+    if(!fuse_t || fuse_t->numel() != (static_cast<int64_t>(d->layers) + 1) * static_cast<int64_t>(taps))
     {
-      fail("draft model: fuse_weight has the wrong shape");
+      fail("draft model: no fuse_weight of the right shape");
     }
+    float const *fuse{ m.f32(fuse_t) };
     for(int32_t l{}; l <= d->layers; ++l)
     {
-      float const *row{ fuse.data() + static_cast<size_t>(l) * taps };
+      float const *row{ fuse + static_cast<size_t>(l) * taps };
       float const best{ *std::max_element(row, row + taps) };
       float den{};
       std::vector<float> a(taps);
@@ -214,12 +186,27 @@ namespace inkling
     d->hidden_out = mat_of(m, "draft.markov_head.hidden_out.weight");
     d->hidden_bias = vec_of(m, "draft.markov_head.hidden_out.bias");
 
-    size_t const ring{ static_cast<size_t>(d->kv_heads) * d->slots * d->head_dim };
-    d->ring_k.assign(static_cast<size_t>(d->layers), std::vector<float>(ring));
-    d->ring_v.assign(static_cast<size_t>(d->layers), std::vector<float>(ring));
+    if(!s.gpu)
+    {
+      size_t const ring{ static_cast<size_t>(d->kv_heads) * d->slots * d->head_dim };
+      d->ring_k.assign(static_cast<size_t>(d->layers), std::vector<float>(ring));
+      d->ring_v.assign(static_cast<size_t>(d->layers), std::vector<float>(ring));
+    }
+    else if(d->head_dim != 128 || d->window - 1 + d->block > 1040 || d->heads % d->kv_heads != 0 || taps > 4)
+    {
+      fail("draft model: the Metal kernels don't fit its sizes");
+    }
     d->ring_pos.assign(static_cast<size_t>(d->slots), -1);
     keep_taps(s, d->visits);
     return d.release();
+  }
+
+  drafter::~drafter()
+  {
+    if(gpu)
+    {
+      metal_free_drafter(gpu);
+    }
   }
 
   void free_drafter(drafter *d)
@@ -256,7 +243,7 @@ namespace inkling
       return s.tap_ring + static_cast<size_t>(pos % tap_slots) * taps * static_cast<size_t>(h);
     } };
     // The mix of a position's taps by alpha, RMS-normalized with `norm`, rounded.
-    auto const mixed{ [&](int64_t pos, std::vector<float> const &alpha, std::vector<float> const &norm, float *out) {
+    auto const mixed{ [&](int64_t pos, std::vector<float> const &alpha, tensor const *norm, float *out) {
       uint16_t const *row{ tap_row(pos) };
       for(int64_t i{}; i < h; ++i)
       {
@@ -267,7 +254,7 @@ namespace inkling
         }
         out[i] = x;
       }
-      cpu_rmsnorm(out, norm.data(), h, d.eps, out);
+      cpu_rmsnorm(out, m.f32(norm), h, d.eps, out);
       round_vec(out, static_cast<size_t>(h));
     } };
 
@@ -278,6 +265,15 @@ namespace inkling
     }
     int64_t const from{ std::max<int64_t>(d.fed, total - (d.window - 1)) };
     int32_t const n_new{ static_cast<int32_t>(total - from) };
+    if(s.gpu)
+    {
+      for(int64_t pos{ from }; pos < total; ++pos)
+      {
+        d.ring_pos[static_cast<size_t>(pos % d.slots)] = pos;
+      }
+      d.fed = total;
+      return metal_draft(d, s, from, anchor, n_out);
+    }
     int32_t const kvw{ d.kv_heads * d.head_dim };
     if(n_new > 0)
     {
@@ -294,7 +290,7 @@ namespace inkling
         for(int32_t r{}; r < n_new; ++r)
         {
           int64_t const pos{ from + r };
-          head_norm_rope(kc.data() + static_cast<size_t>(r) * kvw, d.kv_heads, d.head_dim, w.ctx_k_norm.data(), d.eps, pos,
+          head_norm_rope(kc.data() + static_cast<size_t>(r) * kvw, d.kv_heads, d.head_dim, m.f32(w.ctx_k_norm), d.eps, pos,
                          d.theta, true);
           auto const slot{ static_cast<size_t>(pos % d.slots) };
           for(int32_t hd{}; hd < d.kv_heads; ++hd)
@@ -323,7 +319,7 @@ namespace inkling
       round_vec(hs.data(), static_cast<size_t>(h));
       for(int32_t r{ 1 }; r < rows; ++r)
       {
-        std::copy(d.mask_embed.begin(), d.mask_embed.end(), hs.begin() + static_cast<ptrdiff_t>(r) * h);
+        std::copy(m.f32(d.mask_embed), m.f32(d.mask_embed) + h, hs.begin() + static_cast<ptrdiff_t>(r) * h);
       }
     }
     // The ring slots attended: positions in [total - (window - 1), total).
@@ -345,7 +341,7 @@ namespace inkling
       auto const &w{ d.lw[static_cast<size_t>(l)] };
       for(int32_t r{}; r < rows; ++r)
       {
-        cpu_rmsnorm(hs.data() + static_cast<size_t>(r) * h, w.input_norm.data(), h, d.eps, x.data() + static_cast<size_t>(r) * h);
+        cpu_rmsnorm(hs.data() + static_cast<size_t>(r) * h, m.f32(w.input_norm), h, d.eps, x.data() + static_cast<size_t>(r) * h);
       }
       round_vec(x.data(), x.size());
       lin(m, w.q, x.data(), rows, q);
@@ -353,9 +349,9 @@ namespace inkling
       lin(m, w.v, x.data(), rows, vb);
       for(int32_t r{}; r < rows; ++r)
       {
-        head_norm_rope(q.data() + static_cast<size_t>(r) * qw, d.heads, d.head_dim, w.q_norm.data(), d.eps, total + r, d.theta,
+        head_norm_rope(q.data() + static_cast<size_t>(r) * qw, d.heads, d.head_dim, m.f32(w.q_norm), d.eps, total + r, d.theta,
                        true);
-        head_norm_rope(kb.data() + static_cast<size_t>(r) * kvw, d.kv_heads, d.head_dim, w.k_norm.data(), d.eps, total + r,
+        head_norm_rope(kb.data() + static_cast<size_t>(r) * kvw, d.kv_heads, d.head_dim, m.f32(w.k_norm), d.eps, total + r,
                        d.theta, true);
       }
       // Attention: every block row reads the valid ring slots and all block rows.
@@ -415,7 +411,7 @@ namespace inkling
       }
       for(int32_t r{}; r < rows; ++r)
       {
-        cpu_rmsnorm(hs.data() + static_cast<size_t>(r) * h, w.post_norm.data(), h, d.eps, x.data() + static_cast<size_t>(r) * h);
+        cpu_rmsnorm(hs.data() + static_cast<size_t>(r) * h, m.f32(w.post_norm), h, d.eps, x.data() + static_cast<size_t>(r) * h);
       }
       round_vec(x.data(), x.size());
       lin(m, w.gate, x.data(), rows, g);
@@ -435,7 +431,7 @@ namespace inkling
     std::vector<float> dh(static_cast<size_t>(n_out) * h);
     for(int32_t i{}; i < n_out; ++i)
     {
-      cpu_rmsnorm(hs.data() + static_cast<size_t>(i + 1) * h, d.final_norm.data(), h, d.eps, dh.data() + static_cast<size_t>(i) * h);
+      cpu_rmsnorm(hs.data() + static_cast<size_t>(i + 1) * h, m.f32(d.final_norm), h, d.eps, dh.data() + static_cast<size_t>(i) * h);
     }
     round_vec(dh.data(), dh.size());
 
@@ -463,7 +459,7 @@ namespace inkling
       cpu_linear(m, d.rnn, in.data(), 1, proj.data());
       for(size_t j{}; j < proj.size(); ++j)
       {
-        proj[j] += d.rnn_bias[j];
+        proj[j] += m.f32(d.rnn_bias)[j];
       }
       for(int32_t j{}; j < rank; ++j)
       {
@@ -478,7 +474,7 @@ namespace inkling
       cpu_linear(m, d.hidden_out, z.data(), 1, shift.data());
       for(int64_t j{}; j < h; ++j)
       {
-        hidden[static_cast<size_t>(j)] = dh[static_cast<size_t>(i * h + j)] + shift[static_cast<size_t>(j)] + d.hidden_bias[static_cast<size_t>(j)];
+        hidden[static_cast<size_t>(j)] = dh[static_cast<size_t>(i * h + j)] + shift[static_cast<size_t>(j)] + m.f32(d.hidden_bias)[j];
       }
       cpu_linear(m, m.unembed, hidden.data(), 1, logits.data());
       prev = static_cast<int32_t>(std::max_element(logits.begin(), logits.begin() + v_used) - logits.begin());
