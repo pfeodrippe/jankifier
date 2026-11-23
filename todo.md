@@ -32,5 +32,10 @@
 - [ ] other exact speedups: experts grouped for prefill, speculative decoding, batching
 - [ ] context trimming, only if the trials show it does no harm
 - [ ] proofs of the engine (inkling/specs): split attention, pool and stream for any size, the router, the session API (in progress)
+- [ ] engine bugs the proofs found (fix after the trials: the trials load the engine):
+  - [ ] ban_experts takes more than experts - k bans, and then the router chooses banned experts with a normal weight (shown: 121 of 128 banned at layer 8, every route chose one); refuse more, or give banned experts weight 0
+  - [ ] generate! isn't atomic: when the context fills before n tokens, the session keeps the tokens evaluated and the exception loses the ids; check pos + n <= context first, or say so
+  - [ ] copy of a session onto itself calls memcpy with the same source and destination (undefined behaviour)
+  - [ ] eval's id check uses the padded vocabulary (201,024), not the real one (200,058)
 - [ ] the harness video
 
