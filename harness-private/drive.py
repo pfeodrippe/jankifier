@@ -302,7 +302,9 @@ def run_form(task, mode, seed):
       system (str tools/situation (when verified (str "\\n\\n" (slurp "VERIFY.md"))))
       a (h/agent m {{:tools (vec (concat (tools/defaults) (when verified [(verify/tool)])))
                     :system system
-                    :context 65536
+                    ;; 128k tokens: about 4.3 GB of the engine's caches. There is no compaction,
+                    ;; and the long thinking of effort 0.99 fills a context quickly.
+                    :context 131072
                     :max-steps 80
                     ;; As the publisher evaluates Inkling (temperature 1, top-p off, effort
                     ;; 0.99), with room for the thinking that effort asks for.
