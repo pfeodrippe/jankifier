@@ -1,0 +1,108 @@
+;; SPDX-License-Identifier: MIT
+;; A model choosing a game's actions (a decision API). The game is told as text, and the
+;; actions it allows are named: the model's answer is scored as each action's name in turn
+;; (the log-probability of its tokens and the end of the message), so it gives a
+;; probability for every allowed action and can't answer anything else. The likeliest is
+;; taken.
+;;
+;;   (def m (ink/open "../inkling/models/inkling-2-mini.ink"))
+;;   (def p (decide/player m {:rules "..." :actions [:right :left :jump]}))
+;;   (decide/choose! p "the game now, as text")   ; {:action :right :probs {...} :seconds s}
+(ns play.decide
+  (:require [clojure.string :as str]
+            [inkling.core :as ink]))
+
+(cpp/raw "#include <chrono>
+#include <cmath>
+namespace play_decide
+{
+  inline double exp_of(double const x)
+  {
+    return std::exp(x);
+  }
+
+  inline double seconds()
+  {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+}")
+
+(defn- id [m piece] (ink/token-id m piece))
+
+(defn- frame
+  "A message's tokens: `role` (:system, :user) and its text, none of it special."
+  [m role text]
+  (vec (concat [(id m (if (= role :system) "<|message_system|>" "<|message_user|>"))
+                (id m "<|content_text|>")]
+               (ink/tokenize m (str text) false)
+               [(id m "<|end_message|>")])))
+
+(defn- answer-start
+  "The model's message begun, its text at once (no thinking)."
+  [m]
+  [(id m "<|message_model|>") (id m "<|content_text|>")])
+
+(defn- answer-ids
+  "An action's name as the model's whole answer: its tokens and the message's end."
+  [m action]
+  (vec (concat (ink/tokenize m (name action) false) [(id m "<|end_message|>")])))
+
+(defn player
+  "A player of a game: `rules` (what the game is, what the actions do, what to aim for) and
+  `actions` (keywords: each one's name is how the model answers). Its session holds the rules;
+  every choice starts from there. :context is the session's size (8192)."
+  [m {:keys [rules actions context] :or {context 8192}}]
+  (let [base (ink/session m context)]
+    (ink/eval! base (frame m :system (str rules "\n\nEach turn you are told the game as it is now. "
+                                          "Answer with the name of one action only, one of: "
+                                          (str/join ", " (map name actions)) ".")))
+    {:model m :actions (vec actions)
+     :answers (into {} (map (fn [a] [a (answer-ids m a)]) actions))
+     :base base :work (ink/session m context) :scratch (ink/session m context)
+     :history (atom [])}))
+
+(defn- answer-logprob
+  "The log-probability of `ids` as the next tokens of `s` (evaluated in it, but the last)."
+  [s ids]
+  (loop [ids ids lp 0.0]
+    (if (empty? ids)
+      lp
+      (let [l (ink/logprob s (first ids))]
+        (when (next ids)
+          (ink/eval! s [(first ids)]))
+        (recur (rest ids) (+ lp l))))))
+
+(defn choose!
+  "The action for the game as `told`, with the last actions said: {:action :probs {action p}
+  :seconds}. Each action's probability is its answer's, over the allowed answers."
+  [p told]
+  (let [{:keys [model actions answers base work scratch history]} p
+        began (cpp/play_decide.seconds)
+        recent (take-last 6 @history)
+        text (str told
+                  (when (seq recent) (str "\nYour last actions, oldest first: " (str/join ", " (map name recent)) "."))
+                  "\nYour action?")
+        _ (ink/copy! work base)
+        _ (ink/eval! work (vec (concat (frame model :user text) (answer-start model))))
+        scores (into {} (map (fn [a]
+                               (ink/copy! scratch work)
+                               [a (answer-logprob scratch (get answers a))])
+                             actions))
+        best (apply max (vals scores))
+        weights (into {} (map (fn [[a l]] [a (cpp/play_decide.exp_of (- l best))]) scores))
+        total (reduce + (vals weights))
+        probs (into {} (map (fn [[a w]] [a (/ w total)]) weights))
+        action (key (apply max-key val probs))]
+    (swap! history conj action)
+    {:action action :probs probs :seconds (- (cpp/play_decide.seconds) began)}))
+
+(defn chooser
+  "A game's chooser for its `play!`: from a state, the decision {:action :probs :seconds}, the
+  state told with `told`; each decision kept in `log` (an atom of a vector) with what the
+  model was told."
+  [p told log]
+  (fn [state]
+    (let [t (told state)
+          d (choose! p t)]
+      (swap! log conj (assoc d :told t))
+      d)))

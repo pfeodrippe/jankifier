@@ -7,10 +7,18 @@
 ;;   (nova/start!)        ; the game, through its menus into level 1-1
 ;;   (nova/play! 400)     ; the scripted player, 400 steps, in the background
 ;;   (nova/told)          ; what a model is told now
+;;
+;; A model playing (play.decide: each step, every action's probability from the model):
+;;
+;;   (def m (ink/open "../inkling/models/inkling-2-mini.ink"))
+;;   (def player (nova/model-player m))
+;;   (nova/play-model! player 200)   ; in the background; (nova/stop!) ends it
+;;   @nova/decisions                 ; each step: what it was told, the probabilities, the action
 (ns play.nova
   (:require [clojure.string :as str]
             [cards.core :as c]
             [play.core :as p]
+            [play.decide :as decide]
             [play.nova-blocks :as blocks]))
 
 (def game (p/vendor "games" "NovaTheSquirrel" "nova.nes"))
@@ -144,9 +152,15 @@
 
 (defonce running (atom false))
 
+(defn- probs-said
+  "A decision's probabilities, likeliest first: \"right 0.62  jump-right 0.30 ...\"."
+  [probs]
+  (str/join "  " (map (fn [[a q]] (str (name a) " " (/ (long (* 100 q)) 100.0)))
+                      (sort-by (fn [[_ q]] (- q)) probs))))
+
 (defn play!
-  "`steps` steps of `chooser` (fn [state] action; the scripted player by default) in the
-  background, each shown in the card. (stop!) ends it."
+  "`steps` steps of `chooser` (fn [state] action, or a decision {:action :probs}; the
+  scripted player by default) in the background, each shown in the card. (stop!) ends it."
   ([steps] (play! steps scripted))
   ([steps chooser]
    (reset! running true)
@@ -155,13 +169,43 @@
        (loop [i 0]
          (when (and @running (< i steps))
            (let [s (state)
-                 a (chooser s)]
+                 d (chooser s)
+                 a (if (map? d) (:action d) d)]
              (act! a)
-             (reset! st {:step (inc i) :action a :told (told (state))})
+             (reset! st (cond-> {:step (inc i) :action a :told (told (state))}
+                          (map? d) (assoc :result (probs-said (:probs d)))))
              (recur (inc i)))))
        (catch :default _ (reset! running false)))
      (reset! running false))
    :playing))
+
+;; A model playing.
+
+(def rules
+  "What a model playing Nova is told of the game."
+  (str "You play Nova the Squirrel, a platform game on the NES. You move Nova, a squirrel, "
+       "through a level that goes from left to right: get as far right as you can. Solid "
+       "blocks stop her and she can stand on them; she falls through empty space; spikes hurt "
+       "her, and so do enemies she touches. Coins are worth taking. Each action holds the "
+       "controller's buttons for a moment (8 frames): right and left walk; jump jumps straight "
+       "up; jump-right and jump-left jump forward; attack uses Nova's ability (the B button); "
+       "wait does nothing. Holding a direction while in the air steers her."))
+
+(def model-actions [:right :jump-right :jump :left :jump-left :attack :wait])
+
+(defonce decisions (atom []))
+
+(defn model-player
+  "A player of Nova for model `m` (play.decide)."
+  [m]
+  (decide/player m {:rules rules :actions model-actions}))
+
+(defn play-model!
+  "`steps` steps chosen by `player` (model-player), in the background, each decision kept in
+  `decisions` and its probabilities shown in the card."
+  [player steps]
+  (reset! decisions [])
+  (play! steps (decide/chooser player told decisions)))
 
 (defn stop! [] (reset! running false))
 
