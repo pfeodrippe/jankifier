@@ -5,9 +5,14 @@
 ;; probability for every allowed action and can't answer anything else. The likeliest is
 ;; taken.
 ;;
+;; A player's settings are in an atom read at every choice, so they can be changed while a
+;; game goes on (tune!); changed rules or actions rebuild its starting session at the next
+;; choice. Several players can choose together (committee!).
+;;
 ;;   (def m (ink/open "../inkling/models/inkling-2-mini.ink"))
 ;;   (def p (decide/player m {:rules "..." :actions [:right :left :jump]}))
 ;;   (decide/choose! p "the game now, as text")   ; {:action :right :probs {...} :seconds s}
+;;   (decide/tune! p {:think 300})                ; from the next choice on
 (ns play.decide
   (:require [clojure.string :as str]
             [inkling.core :as ink]))
@@ -26,6 +31,17 @@ namespace play_decide
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
   }
 }")
+
+(def defaults
+  "A player's settings:
+    :rules     what the game is, what the actions do, what to aim for
+    :actions   the allowed actions (keywords: each one's name is how the model answers)
+    :think     tokens the model may think before each choice (0: it answers at once)
+    :effort    its thinking effort, as the model's publisher writes it
+    :temperature  the thinking's sampling temperature
+    :recent    how many of its last actions it is told
+    :context   its sessions' size (taken when it is made)"
+  {:rules "" :actions [] :think 0 :effort "0.2" :temperature 0.6 :recent 6 :context 8192})
 
 (defn- id [m piece] (ink/token-id m piece))
 
@@ -47,36 +63,41 @@ namespace play_decide
   [m action]
   (vec (concat (ink/tokenize m (name action) false) [(id m "<|end_message|>")])))
 
-(defn player
-  "A player of a game: `rules` (what the game is, what the actions do, what to aim for) and
-  `actions` (keywords: each one's name is how the model answers). Its session holds the rules;
-  every choice starts from there. :context is the session's size (8192). :think is how many
-  tokens the model may think before each choice (0: it answers at once); :effort its
-  thinking effort, as the publisher writes it (\"0.2\")."
-  [m {:keys [rules actions context think effort] :or {context 8192 think 0 effort "0.2"}}]
-  (let [base (ink/session m context)]
+(defn- start-key
+  "What a player's starting session depends on."
+  [config]
+  (select-keys config [:rules :actions :think :effort]))
+
+(defn- start!
+  "The player's starting session made again for its settings: what it is told once."
+  [p config]
+  (let [{:keys [model base]} p
+        {:keys [rules actions think effort]} config]
+    (ink/reset! base)
     (when (pos? think)
-      (ink/eval! base (frame m :system (str "Thinking effort level: " effort))))
-    (ink/eval! base (frame m :system (str rules "\n\nEach turn you are told the game as it is now. "
-                                          (when (pos? think) "Think briefly about what is around, then ")
-                                          "Answer with the name of one action only, one of: "
-                                          (str/join ", " (map name actions)) ".")))
-    {:model m :actions (vec actions) :think think
-     :answers (into {} (map (fn [a] [a (answer-ids m a)]) actions))
-     :base base :work (ink/session m context) :scratch (ink/session m context)
+      (ink/eval! base (frame model :system (str "Thinking effort level: " effort))))
+    (ink/eval! base (frame model :system (str rules "\n\nEach turn you are told the game as it is now. "
+                                              (when (pos? think) "Think briefly about what is around, then ")
+                                              "Answer with the name of one action only, one of: "
+                                              (str/join ", " (map name actions)) ".")))
+    (reset! (:started p) (start-key config))))
+
+(defn player
+  "A player of a game on model `m`, with `settings` over `defaults`."
+  [m settings]
+  (let [config (merge defaults settings)]
+    {:model m
+     :config (atom config)
+     :started (atom nil)
+     :base (ink/session m (:context config))
+     :work (ink/session m (:context config))
+     :scratch (ink/session m (:context config))
      :history (atom [])}))
 
-(defn- think!
-  "The model's thinking in `s`, up to `n` tokens, its message closed, and its answer begun
-  after it: the thinking's text."
-  [m s n seed]
-  (let [end (id m "<|end_message|>")
-        _ (ink/eval! s [(id m "<|message_model|>") (id m "<|content_thinking|>")])
-        ids (ink/generate! s n {:eos-token end :temperature 0.6 :seed seed})
-        said (vec (remove #{end} ids))]
-    ;; generate! leaves its end token unevaluated (and a cut thinking has none).
-    (ink/eval! s (vec (concat [end] (answer-start m))))
-    (ink/detokenize m said)))
+(defn tune!
+  "A player's settings changed (merged): they apply from its next choice."
+  [p settings]
+  (swap! (:config p) merge settings))
 
 (defn- answer-logprob
   "The log-probability of `ids` as the next tokens of `s` (evaluated in it, but the last)."
@@ -89,43 +110,87 @@ namespace play_decide
           (ink/eval! s [(first ids)]))
         (recur (rest ids) (+ lp l))))))
 
+(defn- think!
+  "The model's thinking in `s`, up to `n` tokens, its message closed, and its answer begun
+  after it: the thinking's text."
+  [m s n temperature seed]
+  (let [end (id m "<|end_message|>")
+        _ (ink/eval! s [(id m "<|message_model|>") (id m "<|content_thinking|>")])
+        ids (ink/generate! s n {:eos-token end :temperature temperature :seed seed})
+        said (vec (remove #{end} ids))]
+    ;; generate! leaves its end token unevaluated (and a cut thinking has none).
+    (ink/eval! s (vec (concat [end] (answer-start m))))
+    (ink/detokenize m said)))
+
+(defn- normalized
+  "Probabilities from log-probabilities: {k lp} to {k p}, over the keys."
+  [scores]
+  (let [best (apply max (vals scores))
+        weights (into {} (map (fn [[k l]] [k (cpp/play_decide.exp_of (- l best))]) scores))
+        total (reduce + (vals weights))]
+    (into {} (map (fn [[k w]] [k (/ w total)]) weights))))
+
 (defn choose!
-  "The action for the game as `told`, with the last actions said: {:action :probs {action p}
-  :seconds}, and :thinking when the player thinks first. Each action's probability is its
-  answer's (after the thinking), over the allowed answers."
+  "The action for the game as `told`, with its last actions said: {:action :probs {action p}
+  :seconds}, and :thinking when it thinks first. Each action's probability is its answer's
+  (after the thinking), over the allowed answers."
   [p told]
-  (let [{:keys [model actions answers base work scratch history]} p
+  (let [{:keys [model work scratch history]} p
+        config @(:config p)
+        {:keys [actions think temperature recent]} config
+        _ (when (not= @(:started p) (start-key config))
+            (start! p config))
         began (cpp/play_decide.seconds)
-        recent (take-last 6 @history)
+        last-actions (take-last recent @history)
         text (str told
-                  (when (seq recent) (str "\nYour last actions, oldest first: " (str/join ", " (map name recent)) "."))
+                  (when (seq last-actions)
+                    (str "\nYour last actions, oldest first: " (str/join ", " (map name last-actions)) "."))
                   "\nYour action?")
-        _ (ink/copy! work base)
-        thought (if (pos? (:think p))
+        _ (ink/copy! work (:base p))
+        thought (if (pos? think)
                   (do (ink/eval! work (frame model :user text))
-                      (think! model work (:think p) (inc (count @history))))
+                      (think! model work think temperature (inc (count @history))))
                   (do (ink/eval! work (vec (concat (frame model :user text) (answer-start model))))
                       nil))
-        scores (into {} (map (fn [a]
-                               (ink/copy! scratch work)
-                               [a (answer-logprob scratch (get answers a))])
-                             actions))
-        best (apply max (vals scores))
-        weights (into {} (map (fn [[a l]] [a (cpp/play_decide.exp_of (- l best))]) scores))
-        total (reduce + (vals weights))
-        probs (into {} (map (fn [[a w]] [a (/ w total)]) weights))
+        probs (normalized (into {} (map (fn [a]
+                                          (ink/copy! scratch work)
+                                          [a (answer-logprob scratch (answer-ids model a))])
+                                        actions)))
         action (key (apply max-key val probs))]
     (swap! history conj action)
     (cond-> {:action action :probs probs :seconds (- (cpp/play_decide.seconds) began)}
       thought (assoc :thinking thought))))
 
+(defn committee!
+  "Several players' choices for the game as `told`, combined: :combine :mean (the mean of
+  their probabilities, the default) or :vote (the most chosen; ties to the likeliest on
+  average). {:action :probs :members [decision ...] :votes :seconds}. Each member remembers
+  the committee's action as its last, not its own choice."
+  ([players told] (committee! players told {}))
+  ([players told {:keys [combine] :or {combine :mean}}]
+   (let [began (cpp/play_decide.seconds)
+         members (mapv (fn [p] (choose! p told)) players)
+         n (count members)
+         mean (reduce (fn [acc d] (merge-with + acc (into {} (map (fn [[a q]] [a (/ q n)]) (:probs d)))))
+                      {} members)
+         votes (frequencies (map :action members))
+         action (if (= combine :vote)
+                  (key (apply max-key (fn [[a c]] (+ c (get mean a 0.0))) votes))
+                  (key (apply max-key val mean)))]
+     (doseq [p players]
+       (swap! (:history p) (fn [h] (conj (pop h) action))))
+     {:action action :probs mean :members members :votes votes
+      :seconds (- (cpp/play_decide.seconds) began)})))
+
 (defn chooser
-  "A game's chooser for its `play!`: from a state, the decision {:action :probs :seconds}, the
-  state told with `told`; each decision kept in `log` (an atom of a vector) with what the
-  model was told."
-  [p told log]
-  (fn [state]
-    (let [t (told state)
-          d (choose! p t)]
-      (swap! log conj (assoc d :told t))
-      d)))
+  "A game's chooser for its `play!`: from a state, the decision. `told` is the function that
+  tells a state (pass its var, #'told, so that redefining it applies at once); `deciders` a
+  player or a vector of players (a committee, `opts` as committee!'s); each decision is kept
+  in `log` (an atom of a vector) with what the model was told."
+  ([deciders told log] (chooser deciders told log {}))
+  ([deciders told log opts]
+   (fn [state]
+     (let [t (told state)
+           d (if (vector? deciders) (committee! deciders t opts) (choose! deciders t))]
+       (swap! log conj (assoc d :told t))
+       d))))

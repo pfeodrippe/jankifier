@@ -217,17 +217,21 @@
 (defonce decisions (atom []))
 
 (defn model-player
-  "A player of Nova for model `m` (play.decide); `opts` as decide/player's (:think n: it
-  thinks up to n tokens before each choice)."
+  "A player of Nova for model `m` (play.decide); `settings` as decide/player's (:think n: it
+  thinks up to n tokens before each choice). (decide/tune! player {...}) changes them while
+  it plays."
   ([m] (model-player m {}))
-  ([m opts] (decide/player m (merge {:rules rules :actions model-actions} opts))))
+  ([m settings] (decide/player m (merge {:rules rules :actions model-actions} settings))))
 
 (defn play-model!
-  "`steps` steps chosen by `player` (model-player), in the background, each decision kept in
-  `decisions` and its probabilities shown in the card."
-  [player steps]
-  (reset! decisions [])
-  (play! steps (decide/chooser player told decisions)))
+  "`steps` steps chosen by `deciders` (a model-player, or a vector of them: a committee, `opts`
+  as decide/committee!'s), in the background, each decision kept in `decisions` and its
+  probabilities shown in the card. `told` is called through its var: redefining it changes
+  what the model is told from the next step."
+  ([deciders steps] (play-model! deciders steps {}))
+  ([deciders steps opts]
+   (reset! decisions [])
+   (play! steps (decide/chooser deciders #'told decisions opts))))
 
 (defn stop! [] (reset! running false))
 
