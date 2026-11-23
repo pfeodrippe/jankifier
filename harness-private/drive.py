@@ -183,7 +183,12 @@ def start(log):
             raise RuntimeError('the process ended: ' + open(log, errors='replace').read()[-1500:])
         try:
             port = int(open(port_file).read().strip())
-            if (nrepl_eval(port, '(cards.core/evaluations)', 10)["value"] or '').isdigit():
+            # Only a port this process listens on: another REPL started in harness/ (a
+            # person's) writes the same file, and a run must never go to it.
+            listening = subprocess.run(['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-t'],
+                                       capture_output=True, text=True).stdout.split()
+            ours = [p for p in listening if os.getpgid(int(p)) == proc.pid]
+            if ours and (nrepl_eval(port, '(cards.core/evaluations)', 10)["value"] or '').isdigit():
                 return port, proc
         except (OSError, ValueError):
             pass
