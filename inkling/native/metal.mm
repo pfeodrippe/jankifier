@@ -1375,7 +1375,7 @@ namespace inkling
           bind(6, g.chosen);
           bind(8, b.e4m3);
           bind(9, g.ffn);
-          groups(p.rows / (dn.nvfp4 ? 4 : 2), nt, 1, 32); // DN_ROWS
+          groups(p.rows / 4, nt, 1, 32); // DN_ROWS, and 4 for MXFP8
         }
         if(stage())
         {

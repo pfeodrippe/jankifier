@@ -1579,7 +1579,7 @@ kernel void gate_up_nvfp4(constant gu_params &P [[buffer(0)]],
 }
 
 kernel void gate_up_mxfp8(constant gu_params &P [[buffer(0)]],
-                          device const uchar4 *w [[buffer(1)]],
+                          device const uint4 *w [[buffer(1)]],
                           device const uchar *sc [[buffer(2)]],
                           device const float4 *xq [[buffer(4)]],
                           device const uint *chosen [[buffer(6)]],
@@ -1588,22 +1588,25 @@ kernel void gate_up_mxfp8(constant gu_params &P [[buffer(0)]],
                           uint3 tg [[threadgroup_position_in_grid]],
                           ushort lane [[thread_index_in_simdgroup]])
 {
+  // 4 rows a simdgroup; a lane reads 16 values of a row at once (half of a
+  // scale's block).
   uint route = tg.y;
   uint t = route / P.topk;
   uint e = chosen[route];
   uint row0 = tg.x * 4u;
-  uint nb = P.cols / 32u;
+  uint nh = P.cols / 16u;
   float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-  for(uint b = lane; b < nb; b += 32u)
+  for(uint hb = lane; hb < nh; hb += 32u)
   {
-    float4 xb[8];
-    for(uint i = 0; i < 8; ++i) xb[i] = xq[t * (P.cols / 4u) + b * 8u + i];
+    float4 xb[4];
+    for(uint i = 0; i < 4; ++i) xb[i] = xq[t * (P.cols / 4u) + hb * 4u + i];
     for(uint r = 0; r < 4; ++r)
     {
       uint off = e * P.rows + row0 + r;
-      float4 d = float4(0.0f);
-      for(uint i = 0; i < 8; ++i) d += e4m3v(w[off * (P.cols / 4u) + b * 8u + i]) * xb[i];
-      acc[r] += hsum(d) * exp2(float(sc[off * nb + b]) - 127.0f);
+      uint4 q = w[off * nh + hb];
+      float4 d = e4m3v(as_type<uchar4>(q.x)) * xb[0] + e4m3v(as_type<uchar4>(q.y)) * xb[1]
+                 + e4m3v(as_type<uchar4>(q.z)) * xb[2] + e4m3v(as_type<uchar4>(q.w)) * xb[3];
+      acc[r] += hsum(d) * exp2(float(sc[off * (nh / 2u) + hb / 2u]) - 127.0f);
     }
   }
   float a[4];
@@ -1732,7 +1735,7 @@ kernel void down_nvfp4(constant dn_params &P [[buffer(0)]],
 }
 
 kernel void down_mxfp8(constant dn_params &P [[buffer(0)]],
-                       device const uchar4 *w [[buffer(1)]],
+                       device const uint4 *w [[buffer(1)]],
                        device const uchar *sc [[buffer(2)]],
                        device const float4 *act [[buffer(4)]],
                        device const uint *chosen [[buffer(6)]],
@@ -1740,32 +1743,34 @@ kernel void down_mxfp8(constant dn_params &P [[buffer(0)]],
                        uint3 tg [[threadgroup_position_in_grid]],
                        ushort lane [[thread_index_in_simdgroup]])
 {
+  // 4 rows a simdgroup; a lane reads 16 values of a row at once.
   uint t = tg.y;
-  uint row0 = tg.x * 2u;
-  uint nb = P.cols / 32u;
-  float total[2] = { 0.0f, 0.0f };
+  uint row0 = tg.x * 4u;
+  uint nh = P.cols / 16u;
+  float total[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
   for(uint j = 0; j < P.topk; ++j)
   {
     uint route = t * P.topk + j;
     uint e = chosen[route];
-    float acc[2] = { 0.0f, 0.0f };
-    for(uint b = lane; b < nb; b += 32u)
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for(uint hb = lane; hb < nh; hb += 32u)
     {
-      float4 xb[8];
-      for(uint i = 0; i < 8; ++i) xb[i] = act[route * (P.cols / 4u) + b * 8u + i];
-      for(uint r = 0; r < 2; ++r)
+      float4 xb[4];
+      for(uint i = 0; i < 4; ++i) xb[i] = act[route * (P.cols / 4u) + hb * 4u + i];
+      for(uint r = 0; r < 4; ++r)
       {
         uint off = e * P.rows + row0 + r;
-        float4 d = float4(0.0f);
-        for(uint i = 0; i < 8; ++i) d += e4m3v(w[off * (P.cols / 4u) + b * 8u + i]) * xb[i];
-        acc[r] += hsum(d) * exp2(float(sc[off * nb + b]) - 127.0f);
+        uint4 q = w[off * nh + hb];
+        float4 d = e4m3v(as_type<uchar4>(q.x)) * xb[0] + e4m3v(as_type<uchar4>(q.y)) * xb[1]
+                   + e4m3v(as_type<uchar4>(q.z)) * xb[2] + e4m3v(as_type<uchar4>(q.w)) * xb[3];
+        acc[r] += hsum(d) * exp2(float(sc[off * (nh / 2u) + hb / 2u]) - 127.0f);
       }
     }
-    for(uint r = 0; r < 2; ++r) total[r] += rbf(simd_sum(acc[r]));
+    for(uint r = 0; r < 4; ++r) total[r] += rbf(simd_sum(acc[r]));
   }
   if(lane == 0)
   {
-    for(uint r = 0; r < 2; ++r) ffn[t * P.rows + row0 + r] = rbf(total[r]);
+    for(uint r = 0; r < 4; ++r) ffn[t * P.rows + row0 + r] = rbf(total[r]);
   }
 }
 
