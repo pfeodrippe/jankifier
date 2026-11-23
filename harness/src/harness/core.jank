@@ -181,10 +181,12 @@
                  16384, at most a quarter of it)
     :compact-keep    recent tokens kept as they are beside the summary (15000, at most 30%
                  of the context)
-    :draft       drafting (inkling.core/speculate!): from the context, and with the draft
-                 model up to :model tokens a check (inkling.core/draft-model!);
-                 {:least 6 :most 15 :model 7} by default, nil off. The tokens are the same
-                 either way; text that repeats the context or is easy to guess comes sooner.
+    :draft       drafting (inkling.core/speculate!): from the context, {:least 6 :most 15}
+                 by default, nil off; with :model K also with the draft model, up to K
+                 tokens a check (inkling.core/draft-model!). The tokens are the same either
+                 way; text that repeats the context comes sooner. The draft model pays on
+                 code at low temperature; an agent's turn at temperature 1, mostly thinking,
+                 measured 5% slower with it (38.1 against 40.2 tokens/s), so it is off.
   The tools and the system text are evaluated now, so the first question starts from them."
   ([m] (agent m {}))
   ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry
@@ -204,7 +206,7 @@
             :obligations obligations
             :max-checks (or max-checks 6)
             :compact (if (contains? opts :compact) (:compact opts) summarize)
-            :draft (if (contains? opts :draft) draft {:least 6 :most 15 :model 7})
+            :draft (if (contains? opts :draft) draft {:least 6 :most 15})
             :compact-reserve (or compact-reserve
                                  (long (min (* 0.25 size) (max 16384.0 (* 0.15 size)))))
             :compact-keep (or compact-keep (long (min 15000.0 (* 0.3 size))))
