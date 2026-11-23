@@ -361,6 +361,17 @@
                                :else "")))
                       (:params t))))
 
+(defn- same-before?
+  "Whether agent `a` made this call before (the same tool and arguments) and it gave exactly
+  `text`."
+  [a named args text]
+  (let [es (vec (:entries @a))]
+    (boolean (some (fn [i]
+                     (let [e (nth es i)]
+                       (and (= :call (:role e)) (= (str named) (:name e)) (= args (:args e))
+                            (= text (:text (nth es (inc i)))))))
+                   (range (max 0 (dec (count es))))))))
+
 (defn call!
   "A call's frame run for agent `a`: its JSON read, its tool found and called. `called` is
   {:name :text}, the frame's name and its JSON text. Returns the entries [call result]; the
@@ -410,7 +421,13 @@
                         (catch :default _ {:error "the tool threw something jank does not say"})))))
         text (if (:error outcome)
                (str "error: " (:error outcome))
-               (str (:note outcome) (result-text (:value outcome) (or (:limit found) 8000))))]
+               (str (:note outcome) (result-text (:value outcome) (or (:limit found) 8000))))
+        ;; The same call again, with the same result: said, rather than given again (a model
+        ;; going round in a loop re-reads what it already has).
+        text (if (and (not (:error outcome)) (same-before? a named args text))
+               (str "(This call gave exactly this result before, and nothing has changed since: "
+                    "the result is earlier in this conversation.)")
+               text)]
     [{:role :call :name (str named) :args args
       :began (:began called) :ended (:ended called)}
      {:role :result :name (str named) :text text :error (boolean (:error outcome))
