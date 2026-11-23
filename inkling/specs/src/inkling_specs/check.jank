@@ -2,23 +2,32 @@
   "Runs the checks from the command line: `lein run -m inkling-specs.check`
   (all of them), or with names: `ring`, `ring-model`, `conv`, `pool`,
   `stream`, `session`. In a REPL, call the namespaces' functions instead."
-  (:require [inkling-specs.conv :as conv]
+  (:require [inkling-specs.attention :as attention]
+            [inkling-specs.conv :as conv]
             [inkling-specs.core :as c]
             [inkling-specs.pool :as pool]
             [inkling-specs.ring :as ring]
+            [inkling-specs.router :as router]
             [inkling-specs.session :as session]
+            [inkling-specs.session-model :as session-model]
             [inkling-specs.stream :as stream]))
 
 (cpp/raw "#include <unistd.h>")
 
 (def checks
-  {"ring" #(ring/run)
+  {"attention" #(attention/run)
+   "attention-model" #(attention/run {:engine false})
+   "router" #(router/run)
+   "router-model" #(router/run {:engine false})
+   "ring" #(ring/run)
    "ring-model" #(ring/run {:engine false})
    "conv" #(conv/run)
    "conv-model" #(conv/run {:engine false})
    "pool" #(pool/run)
    "pool-model" #(pool/run {:engine false})
    "session" #(session/run)
+   "session-model" #(session-model/run)
+   "session-model-model" #(session-model/run {:engine false})
    "stream" #(stream/run)
    "stream-model" #(stream/run {:engine false})})
 
