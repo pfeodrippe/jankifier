@@ -14,7 +14,10 @@ extern "C"
 }
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -101,6 +104,83 @@ namespace
                                                    vizdoom::TURN_RIGHT,   vizdoom::ATTACK,        vizdoom::USE,
                                                    vizdoom::MOVE_LEFT,    vizdoom::MOVE_RIGHT };
 
+  // How far the player can walk in some directions (degrees to the left of where it faces),
+  // from the map's lines: a line stops it when it is one-sided or impassable, or when the
+  // opening between its two sectors is lower than the player (56 units); a door is a line of
+  // a sector whose ceiling is down on its floor.
+  std::array<double, 7> const doom_ray_angles{ 90, 45, 20, 0, -20, -45, -90 };
+  // Each direction's distance and whether a closed door ends it.
+  std::vector<std::pair<double, bool>> doom_rays;
+
+  void doom_cast(vizdoom::GameState const &state, double const px, double const py, double const angle)
+  {
+    struct wall
+    {
+      double x1, y1, x2, y2;
+      bool blocking;
+      double ceiling, floor;
+      bool door;
+    };
+    // A line is in each of its sectors' lists: keyed by its ends, either way round.
+    std::map<std::array<long long, 4>, wall> walls;
+    for(auto const &sector : state.sectors)
+    {
+      for(auto const &l : sector.lines)
+      {
+        std::array<long long, 4> key{ std::llround(l.x1), std::llround(l.y1), std::llround(l.x2), std::llround(l.y2) };
+        if(std::make_pair(key[2], key[3]) < std::make_pair(key[0], key[1]))
+        {
+          key = { key[2], key[3], key[0], key[1] };
+        }
+        bool const closed{ sector.ceilingHeight - sector.floorHeight < 8.0 };
+        auto const at(walls.find(key));
+        if(at == walls.end())
+        {
+          walls.emplace(key, wall{ l.x1, l.y1, l.x2, l.y2, l.isBlocking, sector.ceilingHeight, sector.floorHeight, closed });
+        }
+        else
+        {
+          auto &w(at->second);
+          w.blocking = w.blocking || l.isBlocking;
+          w.ceiling = std::min(w.ceiling, sector.ceilingHeight);
+          w.floor = std::max(w.floor, sector.floorHeight);
+          w.door = w.door || closed;
+        }
+      }
+    }
+    doom_rays.clear();
+    for(double const a : doom_ray_angles)
+    {
+      double const th{ (angle + a) * M_PI / 180.0 };
+      double const dx{ std::cos(th) }, dy{ std::sin(th) };
+      double best{ 2048.0 };
+      bool door{};
+      for(auto const &[_, w] : walls)
+      {
+        if(!w.blocking && w.ceiling - w.floor >= 56.0)
+        {
+          continue;
+        }
+        // The ray p + t d meets the line a + u e (0 <= u <= 1) where t d - u e = a - p.
+        double const ex{ w.x2 - w.x1 }, ey{ w.y2 - w.y1 };
+        double const det{ ex * dy - dx * ey };
+        if(std::abs(det) < 1e-9)
+        {
+          continue;
+        }
+        double const wx{ w.x1 - px }, wy{ w.y1 - py };
+        double const t{ (ex * wy - wx * ey) / det };
+        double const u{ (dx * wy - dy * wx) / det };
+        if(t > 0.0 && u >= 0.0 && u <= 1.0 && t < best)
+        {
+          best = t;
+          door = w.door;
+        }
+      }
+      doom_rays.emplace_back(best, door);
+    }
+  }
+
   // What the last state of Doom shows: its picture, variables and objects in view.
   void doom_take()
   {
@@ -111,6 +191,10 @@ namespace
     }
     doom_tic = state->number;
     doom_vars = state->gameVariables;
+    if(doom_vars.size() > 5)
+    {
+      doom_cast(*state, doom_vars[3], doom_vars[4], doom_vars[5]);
+    }
     std::string objects;
     for(auto const &l : state->labels)
     {
@@ -391,6 +475,7 @@ extern "C"
       game->setWindowVisible(false);
       game->setSoundEnabled(false);
       game->setLabelsBufferEnabled(true);
+      game->setSectorsInfoEnabled(true);
       game->setRenderHud(true);
       game->setAvailableButtons(doom_buttons);
       game->setAvailableGameVariables(doom_variables);
@@ -461,6 +546,20 @@ extern "C"
     *tic = doom_tic;
     std::snprintf(objects, static_cast<size_t>(size), "%s", doom_objects.c_str());
     return static_cast<int>(n);
+  }
+
+  // How far the player can walk in each of doom_ray_angles' directions: angle, distance and
+  // 1 when a closed door ends it, three numbers a direction; the count of directions.
+  int play_doom_rays(double *out, int max)
+  {
+    int n{};
+    for(size_t i{}; i < doom_rays.size() && 3 * (n + 1) <= max; ++i, ++n)
+    {
+      out[3 * n] = doom_ray_angles[i];
+      out[3 * n + 1] = doom_rays[i].first;
+      out[3 * n + 2] = doom_rays[i].second ? 1.0 : 0.0;
+    }
+    return n;
   }
 
   int play_doom_picture(uint32_t *out, int max, int *width, int *height, uint64_t *version)

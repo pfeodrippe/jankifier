@@ -38,6 +38,7 @@ extern "C"
   double play_doom_act(unsigned buttons, int tics);
   int play_doom_finished(void);
   int play_doom_state(double *variables, int max, int *tic, char *objects, int size);
+  int play_doom_rays(double *out, int max);
   int play_doom_picture(uint32_t *out, int max, int *width, int *height, uint64_t *version);
   void play_doom_close(void);
 

@@ -11,7 +11,8 @@
 (ns play.doom
   (:require [clojure.string :as str]
             [cards.core :as c]
-            [play.core :as p]))
+            [play.core :as p]
+            [play.decide :as decide]))
 
 (def engine (p/vendor "ViZDoom" "build" "bin" "vizdoom.app" "Contents" "MacOS" "vizdoom"))
 (def wad (p/vendor "ViZDoom" "src" "freedoom2.wad"))
@@ -26,6 +27,12 @@
    :forward-left [:forward :turn-left] :forward-right [:forward :turn-right] :wait []})
 
 (def step-tics 4)
+
+(def action-tics
+  "Actions held longer than step-tics (measured: walking builds up speed, 4 tics move 0 to 3
+  units and 8 about 34; turning too, 8 tics turn 16 degrees and 12 about 33)."
+  {:forward 12 :back 12 :strafe-left 12 :strafe-right 12 :forward-left 12 :forward-right 12
+   :turn-left 10 :turn-right 10 :attack 8})
 
 (defonce st (atom {}))
 
@@ -45,16 +52,47 @@
         rel (loop [r rel] (cond (> r 180.0) (recur (- r 360.0)) (< r -180.0) (recur (+ r 360.0)) :else r))]
     [(cpp/play.sqrt (+ (* dx dx) (* dy dy))) rel]))
 
+(defn- direction [a]
+  (cond (< (max a (- a)) 1.0) "ahead"
+        (pos? a) (str (long a) " degrees left")
+        :else (str (long (- a)) " degrees right")))
+
+(defn- walls
+  "How far the player can walk in some directions (cpp/play.doom_rays), as a sentence."
+  []
+  (str "Free way before a wall: "
+       (str/join ", " (map (fn [r] (str (direction (:angle r)) " " (long (:distance r))
+                                        (when (:door r) " (closed: a door or a pillar; use opens a door)")))
+                           (cpp/play.doom_rays)))
+       ".\n"))
+
+(defn- moved
+  "How the player moved from `before` to `s`, as a sentence."
+  [before s]
+  (let [dx (- (:x s) (:x before)) dy (- (:y s) (:y before))
+        far (cpp/play.sqrt (+ (* dx dx) (* dy dy)))
+        turn (- (:angle s) (:angle before))
+        turn (loop [r turn] (cond (> r 180.0) (recur (- r 360.0)) (< r -180.0) (recur (+ r 360.0)) :else r))]
+    (str "Since the last action you "
+         (if (< far 2.0) "didn't move" (str "moved " (long far)))
+         (when (>= (max turn (- turn)) 1.0) (str " and turned " (direction turn)))
+         (when (< (- (:health s) (:health before)) 0) (str ", and lost " (long (- (:health before) (:health s))) " health"))
+         ".\n")))
+
 (defn told
-  "What a model is told: the player's numbers, and each object in view with its distance
-  (map units; a corridor is about 128 wide) and its direction."
+  "What a model is told: the player's numbers (and how it moved since `before`, the state a
+  step ago), how far it can walk each way, and each object in view with its distance (map
+  units; a corridor is about 128 wide) and its direction."
   ([] (told (state)))
-  ([s]
+  ([s] (told s nil))
+  ([s before]
    (if-not s
      "No game."
-     (str "Health " (long (:health s)) ", armor " (long (:armor s)) ", ammo " (long (:ammo s))
+     (str (when before (moved before s))
+          "Health " (long (:health s)) ", armor " (long (:armor s)) ", ammo " (long (:ammo s))
           ", kills " (long (:kills s)) ", items " (long (:items s)) (when (pos? (:dead s 0)) ", dead") ".\n"
           "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees.\n"
+          (walls)
           (if (seq (:objects s))
             (str "In view:\n"
                  (str/join "\n"
@@ -76,7 +114,7 @@
 (defn act!
   "One step: the action's buttons held step-tics tics; the reward."
   [action]
-  (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) step-tics))
+  (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) (get action-tics action step-tics)))
 
 ;; A scripted player.
 
@@ -104,8 +142,9 @@
 (defonce running (atom false))
 
 (defn play!
-  "`steps` steps of `chooser` (fn [state] action; the scripted player by default) in the
-  background, each shown in the card. (stop!) ends it; the episode's end too."
+  "`steps` steps of `chooser` (fn [state] action, or a decision {:action :probs}; the scripted
+  player by default) in the background, each shown in the card: a future, done when they
+  are. (stop!) ends it; the episode's end too."
   ([steps] (play! steps scripted))
   ([steps chooser]
    (reset! running true)
@@ -114,18 +153,56 @@
        (loop [i 0]
          (when (and @running (< i steps) (not (cpp/play.doom_finished)))
            (let [s (state)
-                 a (chooser s)
+                 d (chooser s)
+                 a (if (map? d) (:action d) d)
                  r (act! a)]
-             (reset! st {:step (inc i) :action a :told (told) :result (str "reward " r)})
+             (reset! st (cond-> {:step (inc i) :action a :told (told) :result (str "reward " r)}
+                          (map? d) (assoc :decision d :told (:told d))))
              (recur (inc i)))))
        (catch :default _ nil))
-     (reset! running false))
-   :playing))
+     (reset! running false)
+     :done)))
 
 (defn stop! [] (reset! running false))
 
+;; A model playing.
+
+(def rules
+  "What a model playing Doom is told of the game."
+  (str "You play Doom (Freedoom's first map), seen from the player's eyes. Find the way to the "
+       "exit, and shoot the monsters that attack you. Each action holds the keys for a moment: "
+       "forward and back walk (about 50 units), turn-left and turn-right turn about 30 degrees, forward-left and "
+       "forward-right walk while turning, strafe-left and strafe-right step sideways, attack "
+       "shoots straight ahead (turn until a monster is ahead first), use opens a door or "
+       "presses a switch right in front of you, wait does nothing. Distances are in map units: "
+       "the player is 32 wide, a corridor about 128."))
+
+(def model-actions
+  [:forward :turn-left :turn-right :forward-left :forward-right :back :strafe-left :strafe-right :attack :use
+   :wait])
+
+(defonce decisions (atom []))
+
+(defn model-player
+  "A player of Doom for model `m` (play.decide); `settings` as decide/player's."
+  ([m] (model-player m {}))
+  ([m settings] (decide/player m (merge {:rules rules :actions model-actions} settings))))
+
+(defn play-model!
+  "`steps` steps chosen by `deciders` (a model-player, or a vector of them: a committee) in
+  the background, each decision kept in `decisions`: a future, done when they are. Each
+  state is told with how the player moved since the one before."
+  ([deciders steps] (play-model! deciders steps {}))
+  ([deciders steps opts]
+   (reset! decisions [])
+   (let [before (atom nil)
+         telling (fn [s] (let [t (#'told s @before)] (reset! before s) t))]
+     (play! steps (decide/chooser deciders telling decisions opts)))))
+
 (defn watch!
-  "Doom's card at the top of the window: the picture as it is played, and what a model is
-  told."
+  "Doom's card at the top of the window: the picture as it is played and, when a model plays,
+  its side (the probabilities, its thinking, what it was told)."
   []
-  (c/pin! "Doom" st (p/watch-card (p/picture-part :doom 300))))
+  (c/pin! "Doom" st (p/decision-card (p/picture-part :doom 300))))
+
+(defn picture "The game's picture as a layout's part (for replays)." [] (p/picture-part :doom 300))

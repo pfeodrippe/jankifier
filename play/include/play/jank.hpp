@@ -315,6 +315,24 @@ namespace play
     return m;
   }
 
+  // How far the player can walk: [{:angle :distance :door} ...], angles to the left of
+  // where it faces.
+  inline object_ref doom_rays()
+  {
+    double v[64]{};
+    int const n(play_doom_rays(v, 64));
+    object_ref list{ rt::obj::persistent_vector::empty() };
+    for(int i{}; i < n; ++i)
+    {
+      object_ref r{ rt::obj::persistent_array_map::empty() };
+      r = rt::assoc(r, kw("angle"), num(v[3 * i]));
+      r = rt::assoc(r, kw("distance"), num(v[3 * i + 1]));
+      r = rt::assoc(r, kw("door"), v[3 * i + 2] > 0.5 ? object_ref{ rt::jank_true } : object_ref{ rt::jank_false });
+      list = rt::conj(list, r);
+    }
+    return list;
+  }
+
   inline object_ref doom_close()
   {
     play_doom_close();
