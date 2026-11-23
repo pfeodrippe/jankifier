@@ -496,8 +496,9 @@ namespace inkling
       g->act = scratch_buffer(b, t * c.top_k * c.expert_width * f);
       g->amax = scratch_buffer(b, t * c.top_k * f);
       g->ffn = scratch_buffer(b, t * h * f);
-      g->hidden = scratch_buffer(b, h * f);
-      g->logits = scratch_buffer(b, static_cast<size_t>(c.unpadded_vocab + 4) * f);
+      // Up to max_rows tokens' outputs (all_logits).
+      g->hidden = scratch_buffer(b, static_cast<size_t>(max_rows) * h * f);
+      g->logits = scratch_buffer(b, static_cast<size_t>(max_rows) * (c.unpadded_vocab + 4) * f);
       return g.release();
     }
   }
@@ -1269,15 +1270,18 @@ namespace inkling
       vf = nullptr;
       std::vector<uint32_t> src{ blocks };
       src.push_back(partial);
+      // Every token's (all_logits), or the last one's.
+      uint32_t const outs{ s.all_logits ? nt : 1u };
       {
-        vec(nt - 1, 1, src, m.out_query, 0, nullptr, 0, m.out_norm, g.hidden);
-        lin_params const p{ static_cast<uint32_t>(c.unpadded_vocab), h, 1, 2, c.logit_cap };
-        use(b.linear1, "unembed");
+        vec(nt - outs, outs, src, m.out_query, 0, nullptr, 0, m.out_norm, g.hidden);
+        lin_params const p{ static_cast<uint32_t>(c.unpadded_vocab), h, outs, 2, c.logit_cap };
+        uint32_t const tb{ outs > 1 ? 4u : 1u };
+        use(tb == 4 ? b.linear4 : b.linear1, "unembed");
         [e setBytes:&p length:sizeof(p) atIndex:0];
         bind(1, weight(b, m.unembed, dtype::bf16));
         bind(2, g.hidden);
         bind(3, g.logits);
-        groups(p.rows, 1, 1, 32);
+        groups(p.rows, (outs + tb - 1) / tb, 1, 32);
       }
       auto const encoded{ std::chrono::steady_clock::now() };
       finish();
@@ -1307,7 +1311,12 @@ namespace inkling
       }
 
       auto const *const logits{ static_cast<float const *>(g.logits.contents) };
-      s.logits.assign(logits, logits + c.unpadded_vocab);
+      size_t const v{ static_cast<size_t>(c.unpadded_vocab) };
+      if(s.all_logits)
+      {
+        s.row_logits.insert(s.row_logits.end(), logits, logits + static_cast<size_t>(nt) * v);
+      }
+      s.logits.assign(logits + static_cast<size_t>(outs - 1) * v, logits + static_cast<size_t>(outs) * v);
       if(mine)
       {
         auto const *const hidden{ static_cast<float const *>(g.hidden.contents) };

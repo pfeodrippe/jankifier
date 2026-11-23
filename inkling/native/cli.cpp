@@ -24,6 +24,10 @@ namespace
                  "                                     log-probability of each of the ids (comma separated)\n"
                  "                                     after the prompt: id, logprob, our argmax\n"
                  "  inkling gpucheck MODEL.ink PROMPT [--all]\n"
+                 "  inkling rowcheck MODEL.ink PROMPT [ROWS]\n"
+                 "                                     evaluates ROWS (8) tokens after the prompt in one\n"
+                 "                                     forward, keeping each row's logits, and compares\n"
+                 "                                     them bit by bit with one token at a time\n"
                  "                                     checks every GPU stage of every visit against the CPU\n"
                  "                                     on the CPU's inputs; --all prints every row\n"
                  "    -p TEXT      prompt, used as is (special tokens allowed)\n"
@@ -105,6 +109,56 @@ int main(int argc, char **argv)
       }
       return 0;
     }
+    if(cmd == "rowcheck" && (argc == 4 || argc == 5))
+    {
+      // A draft's check must give each row the bits a decode step gives it: the
+      // tokens after the prompt are its own greedy continuation.
+      int const rows{ argc == 5 ? std::atoi(argv[4]) : 8 };
+      auto const prompt{ inkling::tokenize(*m, argv[3], true) };
+      std::unique_ptr<inkling::session, void (*)(inkling::session *)> serial{ inkling::new_session(*m, 8192),
+                                                                               inkling::free_session };
+      inkling::eval(*serial, prompt);
+      std::vector<int32_t> next;
+      std::vector<std::vector<float>> logits;
+      uint64_t rng{ 1 };
+      for(int i{}; i < rows; ++i)
+      {
+        auto const id{ inkling::sample(serial->logits.data(), static_cast<int32_t>(serial->logits.size()), 0.0f,
+                                       1.0f, 0, rng) };
+        next.push_back(id);
+        inkling::eval(*serial, &next.back(), 1);
+        logits.push_back(serial->logits);
+      }
+      std::unique_ptr<inkling::session, void (*)(inkling::session *)> batch{ inkling::new_session(*m, 8192),
+                                                                              inkling::free_session };
+      inkling::eval(*batch, prompt);
+      batch->all_logits = true;
+      inkling::eval(*batch, next);
+      size_t const v{ logits[0].size() };
+      bool all_same{ true };
+      for(int r{}; r < rows; ++r)
+      {
+        size_t differ{};
+        double worst{};
+        for(size_t i{}; i < v; ++i)
+        {
+          float const a{ logits[static_cast<size_t>(r)][i] };
+          float const b{ batch->row_logits[static_cast<size_t>(r) * v + i] };
+          if(std::memcmp(&a, &b, sizeof a) != 0)
+          {
+            ++differ;
+            worst = std::max(worst, static_cast<double>(std::fabs(a - b)));
+          }
+        }
+        all_same = all_same && differ == 0;
+        std::printf("row %d (position %zu): %zu of %zu logits differ, worst %.3g\n", r, prompt.size() + r, differ, v,
+                    worst);
+      }
+      std::printf(all_same ? "OK: every row is the same bits as one token at a time\n"
+                           : "DIFFERENT: rows of one forward aren't one token at a time\n");
+      return all_same ? 0 : 1;
+    }
+
     if(cmd == "gpucheck" && (argc == 4 || argc == 5))
     {
       if(!m->gpu)

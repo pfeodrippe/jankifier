@@ -401,6 +401,10 @@ namespace inkling
     std::vector<int32_t> tokens;
     std::vector<visit_cache> caches;
     std::vector<float> logits;
+    // With all_logits on, an eval also keeps every token's logits, row after
+    // row (a draft's check), in row_logits; `logits` is still the last one's.
+    bool all_logits{};
+    std::vector<float> row_logits;
     // Tracing: evals run on the CPU and record the named values of their
     // last token.
     bool trace{};
@@ -427,6 +431,8 @@ namespace inkling
 
   // Tokens evaluated per forward (longer inputs are split into chunks).
   inline constexpr int32_t max_chunk{ 64 };
+  // Tokens an eval with all_logits takes at most (one forward on the GPU).
+  inline constexpr int32_t max_rows{ 16 };
 
   session *new_session(model &m, int32_t context);
   void free_session(session *s);

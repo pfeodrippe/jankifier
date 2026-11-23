@@ -1134,29 +1134,45 @@ namespace inkling
       }
     }
 
-    // Output: mix, norm, unembed (FP32), softcap; for the last token.
+    // Output: mix, norm, unembed (FP32), softcap; for the last token, or for
+    // every token with all_logits.
     w.hidden.resize(static_cast<size_t>(h));
-    {
-      std::vector<float const *> last;
+    auto const output{ [&](int32_t t, float *logits) {
+      std::vector<float const *> rows;
       for(auto const &b : w.blocks)
       {
-        last.push_back(b.data() + (tokens - 1) * h);
+        rows.push_back(b.data() + t * h);
       }
-      last.push_back(w.partial.data() + (tokens - 1) * h);
-      mix(last, m.f32(m.out_query), 1, h, w.hidden.data());
+      rows.push_back(w.partial.data() + t * h);
+      mix(rows, m.f32(m.out_query), 1, h, w.hidden.data());
       rmsnorm(w.hidden.data(), m.f32(m.out_norm), h, c.norm_eps, w.hidden.data());
       round_all(w.hidden.data(), static_cast<size_t>(h));
+      auto const *un{ static_cast<uint16_t const *>(m.unembed->data) };
+      m.workers->run(c.unpadded_vocab, 512, [&](int64_t a, int64_t b) {
+        rows_bf16(un, h, w.hidden.data(), 1, logits, c.unpadded_vocab, a, b);
+      });
+      for(int32_t i{}; i < c.unpadded_vocab; ++i)
+      {
+        logits[i] = softcap(logits[i], c.logit_cap);
+      }
+    } };
+    if(s.all_logits)
+    {
+      size_t const v{ static_cast<size_t>(c.unpadded_vocab) };
+      size_t const before{ s.row_logits.size() };
+      s.row_logits.resize(before + static_cast<size_t>(tokens) * v);
+      for(int32_t t{}; t < tokens; ++t)
+      {
+        output(t, s.row_logits.data() + before + static_cast<size_t>(t) * v);
+      }
+      s.logits.assign(s.row_logits.end() - static_cast<ptrdiff_t>(v), s.row_logits.end());
+    }
+    else
+    {
+      s.logits.resize(static_cast<size_t>(c.unpadded_vocab));
+      output(tokens - 1, s.logits.data());
     }
     top.put("hidden", w.hidden.data(), { h });
-    s.logits.resize(static_cast<size_t>(c.unpadded_vocab));
-    auto const *un{ static_cast<uint16_t const *>(m.unembed->data) };
-    m.workers->run(c.unpadded_vocab, 512, [&](int64_t a, int64_t b) {
-      rows_bf16(un, h, w.hidden.data(), 1, s.logits.data(), c.unpadded_vocab, a, b);
-    });
-    for(auto &l : s.logits)
-    {
-      l = softcap(l, c.logit_cap);
-    }
     if(s.capturing)
     {
       s.captured.hidden = w.hidden;
@@ -1295,8 +1311,13 @@ namespace inkling
         fail("token id " + std::to_string(ids[i]) + " is outside the vocabulary");
       }
     }
+    if(s.all_logits && n > static_cast<size_t>(max_rows))
+    {
+      fail("an eval keeping every token's logits takes at most " + std::to_string(max_rows) + " tokens");
+    }
     std::lock_guard<std::mutex> const one{ s.model->running };
     bool const gpu{ s.gpu && s.model->use_gpu && !s.trace && !s.model->ablated() };
+    s.row_logits.clear();
     for(size_t i{}; i < n; i += max_chunk)
     {
       auto const len{ static_cast<int32_t>(std::min<size_t>(max_chunk, n - i)) };
