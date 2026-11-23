@@ -616,10 +616,33 @@ namespace inkling::jank_layer
   inline object_ref session_info(object_ref const o)
   {
     auto const s{ session_of(o) };
-    return map_builder{}("position", num(s->pos))("context", num(s->context))("logits", boolean(!s->logits.empty()))(
-             "gpu",
-             boolean(s->gpu && s->model->use_gpu && !s->trace && !s->model->ablated()))
-      .m;
+    map_builder b{};
+    b("position", num(s->pos))("context", num(s->context))("logits", boolean(!s->logits.empty()))(
+      "gpu",
+      boolean(s->gpu && s->model->use_gpu && !s->trace && !s->model->ablated()));
+    if(s->draft_model)
+    {
+      // The draft model's checks: [depth checks drafts-kept ms-a-check] for each
+      // depth used, and the acceptance at each place.
+      auto const st{ inkling::stats_of(*s->draft_model) };
+      object_ref depths{ rt::obj::persistent_vector::empty() };
+      object_ref accept{ rt::obj::persistent_vector::empty() };
+      for(int i{}; i < 8; ++i)
+      {
+        if(st.at_depth[i] > 0)
+        {
+          object_ref row{ rt::obj::persistent_vector::empty() };
+          row = rt::conj(row, num(i));
+          row = rt::conj(row, num(st.at_depth[i]));
+          row = rt::conj(row, num(st.kept_at[i]));
+          row = rt::conj(row, real(st.ms[i]));
+          depths = rt::conj(depths, row);
+        }
+        accept = rt::conj(accept, real(st.accept[i]));
+      }
+      b("draft", map_builder{}("checks", num(st.checks))("depths", depths)("accept", accept).m);
+    }
+    return b.m;
   }
 
   // The text of the session's last `count` tokens.

@@ -528,13 +528,13 @@ int main(int argc, char **argv)
       std::unique_ptr<inkling::session, void (*)(inkling::session *)> s{ inkling::new_session(*m, ctx),
                                                                           inkling::free_session };
       auto const ids{ inkling::tokenize(*m, prompt, true) };
-      std::unique_ptr<inkling::drafter, void (*)(inkling::drafter *)> drafter{ nullptr, inkling::free_drafter };
+      // The session's own draft model (its forwards keep the drafter's context).
       if(dspark >= 0)
       {
-        drafter.reset(inkling::new_drafter(*s));
-        inkling::set_draft_depth(*drafter, dspark, !fixed);
+        inkling::use_draft_model(*s, dspark);
+        inkling::set_draft_depth(*s->draft_model, dspark, !fixed);
       }
-      bool const drafting{ draft > 0 || drafter };
+      bool const drafting{ draft > 0 || dspark >= 0 };
       double const p0{ now() };
       inkling::eval(*s, ids);
       double const p1{ now() };
@@ -571,7 +571,7 @@ int main(int argc, char **argv)
         {
           // Without --draft, no copies from the context: a match can't be that long.
           ids = inkling::speculate(*s, temp, 0.95f, 0, seed + static_cast<uint64_t>(produced), n - produced,
-                                   draft > 0 ? draft : 1 << 30, 15, drafter.get());
+                                   draft > 0 ? draft : 1 << 30, 15);
           ++checks;
           ++gave[std::min<size_t>(ids.size(), 16)];
         }

@@ -219,7 +219,21 @@ namespace inkling
     delete d;
   }
 
-  void forget_context(drafter &d)
+  draft_stats stats_of(drafter const &d)
+  {
+    draft_stats st;
+    st.checks = d.ctl.checks;
+    for(size_t i{}; i < 8; ++i)
+    {
+      st.at_depth[i] = d.ctl.at_depth[i];
+      st.kept_at[i] = d.ctl.kept_at[i];
+      st.ms[i] = d.ctl.ms[i];
+      st.accept[i] = d.ctl.accept[i];
+    }
+    return st;
+  }
+
+    void forget_context(drafter &d)
   {
     d.fed = 0;
     std::fill(d.ring_pos.begin(), d.ring_pos.end(), -1);
@@ -348,6 +362,8 @@ namespace inkling
   {
     auto &c{ d.ctl };
     ++c.checks;
+    ++c.at_depth[std::clamp(drafted, 0, 7)];
+    c.kept_at[std::clamp(drafted, 0, 7)] += accepted;
     for(int32_t j{}; j < drafted && j < 8; ++j)
     {
       bool const yes{ j < accepted };

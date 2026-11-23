@@ -154,6 +154,8 @@ namespace inkling
       int32_t cur{};
       // Checks so far; the first ones measure each depth once.
       int64_t checks{};
+      // Checks and drafts kept by depth (stats_of).
+      int64_t at_depth[8]{}, kept_at[8]{};
     } ctl;
     metal_drafter *gpu{};
 

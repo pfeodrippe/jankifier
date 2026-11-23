@@ -696,6 +696,75 @@ namespace inkling
     }
   }
 
+  namespace
+  {
+    // The draft model's context rows for positions [from, from + n) (their taps
+    // are in the session's ring) into each layer's ring of keys and values, on
+    // `e`; the drafter's CPU side (ring_pos, fed) is the caller's.
+    void encode_context(id<MTLComputeCommandEncoder> e, metal_backend &b, drafter &d, session const &s, uint32_t const from,
+                        uint32_t const n)
+    {
+      if(n == 0)
+      {
+        return;
+      }
+      auto &m{ *d.m };
+      auto &g{ *d.gpu };
+      uint32_t const h{ static_cast<uint32_t>(m.cfg.hidden) };
+      uint32_t const kvw{ static_cast<uint32_t>(d.kv_heads * d.head_dim) };
+      uint32_t const ntaps{ static_cast<uint32_t>(d.visits.size() + 1) };
+      size_t const f{ sizeof(float) };
+      if(g.mix_rows < n)
+      {
+        g.mix_rows = std::max<uint32_t>(n, 64);
+        g.mix = scratch_buffer(b, g.mix_rows * h * f);
+        g.kc = scratch_buffer(b, g.mix_rows * kvw * f);
+        g.vc = scratch_buffer(b, g.mix_rows * kvw * f);
+      }
+      auto const bind{ [&](NSUInteger i, id<MTLBuffer> buf) { [e setBuffer:buf offset:0 atIndex:i]; } };
+      auto const lin_t{ [&](tensor const *w, id<MTLBuffer> x, id<MTLBuffer> y) {
+        lin_params const p{ static_cast<uint32_t>(w->dim(0)), static_cast<uint32_t>(w->dim(1)), n, 1, 0.0f };
+        uint32_t const tb{ n > 1 ? 4u : 1u };
+        [e setComputePipelineState:tb == 4 ? b.linear4 : b.linear1];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, weight(b, w, dtype::bf16));
+        bind(2, x);
+        bind(3, y);
+        [e dispatchThreadgroups:MTLSizeMake(p.rows, (n + tb - 1) / tb, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      } };
+      auto const heads{ [&](id<MTLBuffer> x, tensor const *norm, bool rope, id<MTLBuffer> ring) {
+        dhead_params const p{ static_cast<uint32_t>(d.head_dim), kvw, from, d.eps, std::log2(d.theta), norm ? 1u : 0u,
+                              rope ? 1u : 0u, static_cast<uint32_t>(d.slots), 1u };
+        [e setComputePipelineState:b.draft_head];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, x);
+        bind(2, norm ? weight(b, norm, dtype::bf16) : b.dummy);
+        bind(3, ring);
+        [e dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(d.kv_heads), n, 1)
+          threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(d.head_dim), 1, 1)];
+      } };
+      for(int32_t l{}; l < d.layers; ++l)
+      {
+        auto const &w{ d.lw[static_cast<size_t>(l)] };
+        dmix_params p{ h, from, static_cast<uint32_t>(tap_slots), ntaps, {}, d.eps };
+        for(size_t t{}; t < d.alpha[static_cast<size_t>(l)].size(); ++t)
+        {
+          p.alpha[t] = d.alpha[static_cast<size_t>(l)][t];
+        }
+        [e setComputePipelineState:b.draft_mix];
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, s.gpu->taps);
+        bind(2, weight(b, w.mix_norm, dtype::bf16));
+        bind(3, g.mix);
+        [e dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        lin_t(w.ctx_k, g.mix, g.kc);
+        lin_t(w.ctx_v, g.mix, g.vc);
+        heads(g.kc, w.ctx_k_norm, true, g.ring_k[static_cast<size_t>(l)]);
+        heads(g.vc, nullptr, false, g.ring_v[static_cast<size_t>(l)]);
+      }
+    }
+  }
+
   std::vector<int32_t> metal_draft(drafter &d, session const &s, int64_t const from, int32_t const anchor, int32_t const count)
   {
     @autoreleasepool
@@ -712,7 +781,6 @@ namespace inkling
       uint32_t const ntaps{ static_cast<uint32_t>(d.visits.size() + 1) };
       int64_t const total{ s.pos };
       uint32_t const n_new{ static_cast<uint32_t>(total - from) };
-      size_t const f{ sizeof(float) };
       std::lock_guard<std::mutex> const one{ m.running };
 
       id<MTLCommandBuffer> cmd{ [b.queue commandBuffer] };
@@ -745,13 +813,6 @@ namespace inkling
         fail("draft: the drafter has no GPU buffers");
       }
       auto &g{ *d.gpu };
-      if(g.mix_rows < n_new)
-      {
-        g.mix_rows = std::max<uint32_t>(n_new, 64);
-        g.mix = scratch_buffer(b, g.mix_rows * h * f);
-        g.kc = scratch_buffer(b, g.mix_rows * kvw * f);
-        g.vc = scratch_buffer(b, g.mix_rows * kvw * f);
-      }
       // The slots' positions (the CPU keeps them; the GPU work before is done).
       auto *const pos{ static_cast<int32_t *>(g.ring_pos.contents) };
       for(size_t i{}; i < static_cast<size_t>(d.slots); ++i)
@@ -805,18 +866,9 @@ namespace inkling
         threads(n);
       } };
 
-      // The new context rows into each layer's ring.
-      for(int32_t l{}; l < d.layers && n_new > 0; ++l)
-      {
-        auto const &w{ d.lw[static_cast<size_t>(l)] };
-        mix_rows(static_cast<uint32_t>(from), n_new, d.alpha[static_cast<size_t>(l)], w.mix_norm, g.mix);
-        lin_t(w.ctx_k, g.mix, g.kc, n_new, 1);
-        lin_t(w.ctx_v, g.mix, g.vc, n_new, 1);
-        heads(g.kc, static_cast<uint32_t>(d.kv_heads), kvw, n_new, static_cast<uint32_t>(from), w.ctx_k_norm, true,
-              g.ring_k[static_cast<size_t>(l)]);
-        heads(g.vc, static_cast<uint32_t>(d.kv_heads), kvw, n_new, static_cast<uint32_t>(from), nullptr, false,
-              g.ring_v[static_cast<size_t>(l)]);
-      }
+      // The context rows not in the rings yet (the forwards bring each in as
+      // it is evaluated; these are those before the drafter was made).
+      encode_context(e, b, d, s, static_cast<uint32_t>(from), n_new);
       // The block.
       {
         dblock_params const p{ h, static_cast<uint32_t>(anchor), c.norm_eps };
@@ -1827,6 +1879,17 @@ namespace inkling
         [e setBuffer:g.hidden offset:static_cast<NSUInteger>(normed - outs) * h * sizeof(float) atIndex:2];
         bind(3, g.logits);
         groups(p.rows, (outs + tb - 1) / tb, 1, 32);
+      }
+      // The session's draft model: these positions' context rows into its rings
+      // now, so that a draft never has rows to catch up on.
+      if(auto *const dm{ s.draft_model }; dm && dm->gpu && !dm->cpu)
+      {
+        encode_context(e, b, *dm, s, p0, nt);
+        for(uint32_t t{}; t < nt; ++t)
+        {
+          dm->ring_pos[static_cast<size_t>((p0 + t) % static_cast<uint32_t>(dm->slots))] = p0 + t;
+        }
+        dm->fed = p0 + nt;
       }
       auto const encoded{ std::chrono::steady_clock::now() };
       finish();

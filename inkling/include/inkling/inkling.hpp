@@ -539,4 +539,15 @@ namespace inkling
   // The session's own draft model, at most `depth` drafts a check (made the
   // first time); a negative depth removes it.
   void use_draft_model(session &s, int32_t depth);
+  // What a drafter's checks did: by depth (drafts a check), the checks, the
+  // drafts kept and the milliseconds a check (as measured for choosing); the
+  // acceptance at each place.
+  struct draft_stats
+  {
+    int64_t checks{};
+    int64_t at_depth[8]{}, kept_at[8]{};
+    double ms[8]{};
+    float accept[8]{};
+  };
+  draft_stats stats_of(drafter const &d);
 }
