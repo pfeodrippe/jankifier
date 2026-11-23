@@ -379,3 +379,28 @@
                (conj out id)
                (do (eval! s [id])
                    (recur (conj out id) (inc i) (inc seed)))))))))))
+
+(defn generate-batch!
+  "Up to `n` tokens for each session (or n a vector: each one's own), sampled and evaluated
+  together (eval-batch!): each session's ids as (generate! s n opts) would give them with
+  its own seed (:seeds, one a session; else :seed for all), each stopping at the end token
+  on its own (left unevaluated). A vector of each session's ids."
+  ([sessions n] (generate-batch! sessions n {}))
+  ([sessions n opts]
+   (let [sessions (vec sessions)
+         k (count sessions)
+         eos (:eos-token opts 200006)
+         limits (if (number? n) (vec (repeat k n)) (vec n))
+         seeds (or (:seeds opts) (vec (repeat k (:seed opts 1))))]
+     (loop [out (vec (repeat k [])) active (vec (filter (fn [j] (pos? (nth limits j))) (range k))) i 0]
+       (if (empty? active)
+         out
+         (let [picked (mapv (fn [j] (sample (nth sessions j) (assoc opts :seed (+ (nth seeds j) i)))) active)
+               out (reduce (fn [o [j id]] (update o j conj id)) out (map vector active picked))
+               going (vec (keep (fn [[j id]] (when (and (not= id eos) (< (inc i) (nth limits j))) [j id]))
+                                (map vector active picked)))
+               ;; Every non-end token is evaluated, also a session's last (as generate! does).
+               to-eval (vec (keep (fn [[j id]] (when (not= id eos) [j id])) (map vector active picked)))]
+           (when (seq to-eval)
+             (eval-batch! (mapv (fn [[j _]] (nth sessions j)) to-eval) (mapv second to-eval)))
+           (recur out (mapv first going) (inc i))))))))

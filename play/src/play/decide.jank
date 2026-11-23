@@ -46,10 +46,11 @@ namespace play_decide
     :memory    :fresh, each choice starts from the rules; or :conversation, the choices are one
                conversation (what it was told and what it answered), started again from the
                rules when the context is nearly full
+    :seed      added to the thinking's seeds (players otherwise alike think differently)
     :recent    how many of its last actions it is told
     :context   its sessions' size (taken when it is made)"
   {:rules "" :actions [] :think 0 :effort "0.2" :temperature 0.6 :style nil :answer :scored :memory :fresh
-   :recent 6 :context 8192})
+   :seed 0 :recent 6 :context 8192})
 
 (def terse
   "A :style asking for short thinking: fragments, no filler, the numbers kept (after the
@@ -134,13 +135,16 @@ namespace play_decide
           (ink/eval! s [(first ids)]))
         (recur (rest ids) (+ lp l))))))
 
-(defn- think!
-  "The model's thinking in `s`, up to `n` tokens, its message closed, and its answer begun
-  after it: {:text :tokens :cut} (cut: it reached `n` before it ended)."
-  [m s n temperature seed]
+(defn- thinking-start!
+  "The model's message begun with its thinking, in `s`."
+  [m s]
+  (ink/eval! s [(id m "<|message_model|>") (id m "<|content_thinking|>")]))
+
+(defn- thinking-end!
+  "The thinking `ids` (generated in `s`) closed and the answer begun after it: {:text :tokens
+  :cut} (cut: it reached its budget before it ended)."
+  [m s ids]
   (let [end (id m "<|end_message|>")
-        _ (ink/eval! s [(id m "<|message_model|>") (id m "<|content_thinking|>")])
-        ids (ink/generate! s n {:eos-token end :temperature temperature :seed seed})
         said (vec (remove #{end} ids))]
     ;; generate! leaves its end token unevaluated (and a cut thinking has none).
     (ink/eval! s (vec (concat [end] (answer-start m))))
@@ -172,15 +176,13 @@ namespace play_decide
         total (reduce + (vals weights))]
     (into {} (map (fn [[k w]] [k (/ w total)]) weights))))
 
-(defn choose!
-  "The action for the game as `told`, with its last actions said: {:action :probs {action p}
-  :seconds}, and :thinking, :thought-tokens and :cut (the thinking reached its budget) when it
-  thinks first. Each action's probability is its answer's (after the thinking), over the
-  allowed answers."
+(defn- begin!
+  "A player's turn begun: the game as `told` (with its last actions said) in its work
+  session, and its thinking begun when it thinks. What the rest of the turn needs."
   [p told]
-  (let [{:keys [model work scratch history talking]} p
+  (let [{:keys [model work history talking]} p
         config @(:config p)
-        {:keys [actions think temperature recent answer memory context]} config
+        {:keys [think recent memory context]} config
         _ (when (not= @(:started p) (start-key config))
             (start! p config)
             (reset! talking false))
@@ -196,15 +198,23 @@ namespace play_decide
         ;; Going on with the conversation when this turn fits in it (with room for the
         ;; thinking and the answer); else from the rules, told its last actions.
         go-on (and plain (< (+ (ink/position work) (count plain) think 64) (- context 256)))
-        frame-ids (if go-on plain (user (take-last recent @history)))
-        _ (when-not go-on
-            (ink/copy! work (:base p)))
-        seed (inc (count @history))
-        thought (if (pos? think)
-                  (do (ink/eval! work frame-ids)
-                      (think! model work think temperature seed))
-                  (do (ink/eval! work (vec (concat frame-ids (answer-start model))))
-                      nil))
+        frame-ids (if go-on plain (user (take-last recent @history)))]
+    (when-not go-on
+      (ink/copy! work (:base p)))
+    (if (pos? think)
+      (do (ink/eval! work frame-ids)
+          (thinking-start! model work))
+      (ink/eval! work (vec (concat frame-ids (answer-start model)))))
+    {:config config :began began :seed (+ (inc (count @history)) (* 1000 (:seed config)))
+     :conversation conversation :go-on go-on}))
+
+(defn- finish!
+  "A player's turn ended after its thinking (`thought`, or nil): the actions scored, its
+  answer, the decision."
+  [p turn thought]
+  (let [{:keys [model work scratch history talking]} p
+        {:keys [config began seed conversation go-on]} turn
+        {:keys [actions answer]} config
         probs (normalized (into {} (map (fn [a]
                                           (ink/copy! scratch work)
                                           [a (answer-logprob scratch (answer-ids model a))])
@@ -223,15 +233,42 @@ namespace play_decide
       said (assoc :said (:text said) :missed (nil? picked))
       conversation (assoc :restarted (not go-on) :context-used (ink/position work)))))
 
+(defn choose!
+  "The action for the game as `told`, with its last actions said: {:action :probs {action p}
+  :seconds}, and :thinking, :thought-tokens and :cut (the thinking reached its budget) when it
+  thinks first. Each action's probability is its answer's (after the thinking), over the
+  allowed answers."
+  [p told]
+  (let [{:keys [model work]} p
+        turn (begin! p told)
+        {:keys [think temperature]} (:config turn)
+        thought (when (pos? think)
+                  (thinking-end! model work
+                                 (ink/generate! work think {:eos-token (id model "<|end_message|>")
+                                                            :temperature temperature :seed (:seed turn)})))]
+    (finish! p turn thought)))
+
 (defn committee!
   "Several players' choices for the game as `told`, combined: :combine :mean (the mean of
   their probabilities, the default) or :vote (the most chosen; ties to the likeliest on
-  average). {:action :probs :members [decision ...] :votes :seconds}. Each member remembers
-  the committee's action as its last, not its own choice."
+  average). {:action :probs :members [decision ...] :votes :seconds}. The members that think
+  think together, a token each in one forward (with the first thinker's temperature). Each
+  member remembers the committee's action as its last, not its own choice."
   ([players told] (committee! players told {}))
   ([players told {:keys [combine] :or {combine :mean}}]
    (let [began (cpp/play_decide.seconds)
-         members (mapv (fn [p] (choose! p told)) players)
+         turns (mapv (fn [p] (begin! p told)) players)
+         ;; The members that think, thinking together: one forward a token for all of them.
+         thinkers (filterv (fn [i] (pos? (:think (:config (nth turns i))))) (range (count players)))
+         m (:model (first players))
+         thoughts (when (seq thinkers)
+                    (let [ids (ink/generate-batch! (mapv (fn [i] (:work (nth players i))) thinkers)
+                                                   (mapv (fn [i] (:think (:config (nth turns i)))) thinkers)
+                                                   {:eos-token (id m "<|end_message|>")
+                                                    :temperature (:temperature (:config (nth turns (first thinkers))))
+                                                    :seeds (mapv (fn [i] (:seed (nth turns i))) thinkers)})]
+                      (into {} (map (fn [i got] [i (thinking-end! m (:work (nth players i)) got)]) thinkers ids))))
+         members (mapv (fn [i] (finish! (nth players i) (nth turns i) (get thoughts i))) (range (count players)))
          n (count members)
          mean (reduce (fn [acc d] (merge-with + acc (into {} (map (fn [[a q]] [a (/ q n)]) (:probs d)))))
                       {} members)
