@@ -1,0 +1,81 @@
+(ns inkling-specs.attention
+  "The attention kernels' softmax (models/SoftmaxMerge.lean: theorems in exact
+  arithmetic) and the split attention's reads and records
+  (models/SplitAttention.lean: a Veil model, proved), and check-gpu with the
+  split attention on, for one token past position 1,024."
+  (:require [clojure.string :as string]
+            [inkling-specs.core :as c :refer [engine vs]]
+            [inkling-specs.ring :as ring]
+            [inkling.core :as ink]
+            [lean-sys.session :as lean]
+            [veil.core :as veil]))
+
+(def ^:private theorems-result (atom nil))
+
+(defn theorems
+  "Elaborates SoftmaxMerge.lean (plain Lean, no Veil): its errors (none), and
+  the axioms each theorem depends on (Lean's standard ones: propext,
+  Classical.choice, Quot.sound; no sorryAx)."
+  []
+  (or @theorems-result
+      (let [msgs (veil/load-file! @vs (c/path "models" "SoftmaxMerge.lean"))
+            axioms (vec (keep #(re-find #"'.*' depends on axioms: .*" (str (:text %))) msgs))]
+        (reset! theorems-result
+                {:errors (mapv :text (lean/errors msgs))
+                 :axioms axioms
+                 :sorry (boolean (some #(re-find #"sorryAx" %) axioms))}))))
+
+(defn proof
+  "Elaborates SplitAttention.lean: #check_invariants (any number of keys,
+  chunks and simdgroups; kernel-checked)."
+  []
+  (c/check "SplitAttention.lean"))
+
+(defn check-gpu-split
+  "check-gpu with the split attention on: a session filled to position `:at`
+  on the CPU (`:at` + 1 keys, at least 1,024, so that att_split runs), then one
+  token evaluated on the CPU and on the GPU with the CPU's values forced in
+  after every stage, compared stage by stage. Returns the totals, and the rows
+  of the global visits' attention output (the split kernels' result)."
+  [{:keys [at seed split] :or {at 1030 seed 51 split true}}]
+  (let [m @engine
+        _ (ink/set-option! m :gpu false)
+        _ (ink/set-option! m :split-attention split)
+        s (ink/session m 2048)
+        ids (ring/ids (inc at) seed)
+        _ (ring/eval-chunks! s (vec (take at ids)) (vec (repeat (quot at 64) 64)))
+        _ (ring/eval-chunks! s (vec (drop (* 64 (quot at 64)) (take at ids))) [(rem at 64)])
+        position (ink/position s)
+        report (ink/check-gpu s [(last ids)])
+        global (set (keep #(when-not (:local %) (:visit %)) (ink/plan m)))
+        attended (filterv #(and (contains? global (:visit %)) (= :attended (:field %))) (:rows report))]
+    (ink/set-option! m :split-attention false)
+    (ink/set-option! m :gpu true)
+    (ink/free! s)
+    {:split split
+     :position position
+     :keys (inc position)
+     :ok (:ok report)
+     :compared (:compared report)
+     :beyond (:beyond report)
+     :global-visits (count global)
+     :attended-rows (count attended)
+     :attended-beyond (reduce + (map :beyond attended))
+     :attended-worst (when (seq attended) (apply max (map :worst attended)))
+     :attended-worst-by-visit (mapv (juxt :visit :worst) attended)
+     :rows-beyond (filterv #(pos? (:beyond %)) (:rows report))}))
+
+(defn run
+  ([] (run {}))
+  ([{:keys [engine] :or {engine true}}]
+   (let [th (c/report "attention/theorems" (theorems))
+         pr (c/report "attention/split-proof" (select-keys (proof) [:proven :not-proven :errors]))
+         model-ok (and (empty? (:errors th)) (not (:sorry th)) (c/ok? pr))]
+     (if-not engine
+       {:ok model-ok}
+       (let [g (c/report "attention/check-gpu-split" (check-gpu-split {}))
+             ;; The same token with the plain kernel: the attention outputs'
+             ;; differences from the CPU change, so the split kernels ran.
+             plain (c/report "attention/check-gpu-plain" (check-gpu-split {:split false}))]
+         {:ok (and model-ok (:ok g) (pos? (:attended-rows g)) (:ok plain)
+                   (not= (:attended-worst-by-visit g) (:attended-worst-by-visit plain)))})))))
