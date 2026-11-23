@@ -1,0 +1,155 @@
+;; SPDX-License-Identifier: MIT
+;; Games a model played, kept and played again. A recording holds what the model was told at
+;; each step, its probabilities, thinking and committee votes, and the action taken; the
+;; NES is deterministic, so playing the game again from power-on with the same actions
+;; shows the same pictures. A replay keeps a save of the console at every step: any step
+;; can be gone to at once.
+;;
+;;   (replay/save! :nova @nova/decisions {:player-settings ...})   ; the file's path
+;;   (replay/open! "path.edn")      ; the game again, in a card: the picture and the model's side
+;;   (replay/play! 4)               ; steps a second, in the background; (replay/stop!) pauses
+;;   (replay/go! 120)               ; to step 120
+(ns play.replay
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [play.core :as p]
+            [play.nethack :as nethack]
+            [play.nova :as nova]
+            [play.wnw :as wnw]))
+
+(cpp/raw "#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <string>
+namespace play_replay
+{
+  inline bool make_dirs(std::string const &path)
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    return std::filesystem::is_directory(path);
+  }
+
+  inline std::string stamp()
+  {
+    std::time_t const t{ std::time(nullptr) };
+    char out[32];
+    std::strftime(out, sizeof out, \"%Y%m%d-%H%M%S\", std::localtime(&t));
+    return out;
+  }
+
+  inline std::string home()
+  {
+    char const *const h{ std::getenv(\"HOME\") };
+    return h ? h : \".\";
+  }
+}")
+
+(def folder
+  "Where recordings are kept."
+  (str (cpp/play_replay.home) "/Documents/jankifier/replay/games"))
+
+(def games
+  "Each game a replay can play again: how it starts from power-on and how a step is done
+  (vars, so that a redefinition applies)."
+  {:nova {:title "Nova the Squirrel" :start! #'nova/start! :act! #'nova/act!
+          :play-model! #'nova/play-model! :decisions #'nova/decisions}
+   :nethack {:title "NetHack" :start! #'nethack/start! :act! #'nethack/act! :picture #'nethack/picture
+             :play-model! #'nethack/play-model! :decisions #'nethack/decisions :restore? false}
+   :wnw {:title "Witch n' Wiz" :start! #'wnw/start! :act! #'wnw/act!}})
+
+(defn save!
+  "A game's decisions (each {:action :probs :told ...}) written to a file of `folder`, with
+  `about` (the players' settings, notes): its path."
+  ([game decisions] (save! game decisions {}))
+  ([game decisions about]
+   (cpp/play_replay.make_dirs folder)
+   (let [path (str folder "/" (name game) "-" (cpp/play_replay.stamp) ".edn")]
+     (spit path (pr-str {:game game :about about :steps (vec decisions)}))
+     path)))
+
+(defn record!
+  "A game played from power-on by `deciders` (a player, or a vector of them: a committee,
+  `opts` as the game's play-model!'s) for `steps` steps, in the background, and kept when it
+  ends (also when stopped): a future of the recording's path."
+  ([game deciders steps] (record! game deciders steps {}))
+  ([game deciders steps opts]
+   (let [{:keys [start! play-model! decisions]} (get games game)]
+     (when-let [failed (start!)]
+       (throw (ex-info (str "the game didn't start: " failed) {})))
+     (let [playing (play-model! deciders steps opts)]
+       (future
+         @playing
+         (save! game @@decisions
+                {:steps steps :opts opts
+                 :settings (if (vector? deciders) (mapv (fn [d] @(:config d)) deciders) @(:config deciders))}))))))
+
+(defonce st (atom {}))
+(defonce replaying (atom nil))
+(defonce running (atom false))
+
+(defn- show!
+  "Step `i` of the replay shown: the picture is the console's now (after the steps before it)."
+  [i]
+  (let [{:keys [steps]} @replaying
+        d (get steps i)]
+    (reset! st {:step i :action (:action d) :decision d :told (:told d)
+                :result (str "replay, step " i " of " (count steps))})))
+
+(defn go!
+  "To step `i`: the console as it was when the model decided step `i` (from the save kept
+  there, or played up to it)."
+  [i]
+  (let [{:keys [game steps saves]} @replaying
+        act! (get-in games [game :act!])
+        i (max 0 (min i (dec (count steps))))
+        known (dec (count @saves))]
+    (if (<= i known)
+      (p/nes-restore! (get @saves i))
+      (do (p/nes-restore! (get @saves known))
+          (doseq [k (range known i)]
+            (act! (:action (get steps k)))
+            (swap! saves conj (p/nes-save!)))))
+    (swap! replaying assoc :at i)
+    (show! i)
+    i))
+
+(defn open!
+  "A recording played again from its start, in a card pinned at the top of the window: the
+  game's picture and, beside it, the model's side of each step."
+  [path]
+  (reset! running false)
+  (let [r (read-string (slurp path))
+        {:keys [start! title]} (get games (:game r))]
+    (when-let [failed (start!)]
+      (throw (ex-info (str "the game didn't start: " failed) {})))
+    (reset! replaying (assoc r :at 0 :path path :saves (atom [(p/nes-save!)])))
+    ;; In the game's own card's place: there is one console.
+    (c/pin! title st (p/decision-card ((or (:picture (get games (:game r))) (fn [] (p/picture-part :nes 300))))))
+    (show! 0)
+    (count (:steps r))))
+
+(defn step!
+  "One step on: the action of the step shown done, the next shown."
+  []
+  (let [{:keys [at steps]} @replaying]
+    (when (< (inc at) (count steps))
+      (go! (inc at)))))
+
+(defn play!
+  "The replay going on by itself, `per-second` steps a second, in the background; stop!
+  pauses it."
+  ([] (play! 2))
+  ([per-second]
+   (reset! running true)
+   (future
+     (try
+       (loop []
+         (when (and @running (step!))
+           (cpp/usleep (long (/ 1000000 per-second)))
+           (recur)))
+       (catch :default _ nil))
+     (reset! running false))
+   :playing))
+
+(defn stop! [] (reset! running false))

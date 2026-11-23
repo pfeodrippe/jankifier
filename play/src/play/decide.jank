@@ -39,9 +39,17 @@ namespace play_decide
     :think     tokens the model may think before each choice (0: it answers at once)
     :effort    its thinking effort, as the model's publisher writes it
     :temperature  the thinking's sampling temperature
+    :style     how to think, said to the model with the rules (nil: nothing said)
     :recent    how many of its last actions it is told
     :context   its sessions' size (taken when it is made)"
-  {:rules "" :actions [] :think 0 :effort "0.2" :temperature 0.6 :recent 6 :context 8192})
+  {:rules "" :actions [] :think 0 :effort "0.2" :temperature 0.6 :style nil :recent 6 :context 8192})
+
+(def terse
+  "A :style asking for short thinking: fragments, no filler, the numbers kept (after the
+  caveman skill's rules, github.com/JuliusBrussee/caveman)."
+  (str "Think in short fragments, one fact per line: what is near, what each action would do, "
+       "the choice. No articles, filler, hedging or restating the question. Keep numbers and "
+       "negations exact."))
 
 (defn- id [m piece] (ink/token-id m piece))
 
@@ -66,20 +74,21 @@ namespace play_decide
 (defn- start-key
   "What a player's starting session depends on."
   [config]
-  (select-keys config [:rules :actions :think :effort]))
+  (select-keys config [:rules :actions :think :effort :style]))
 
 (defn- start!
   "The player's starting session made again for its settings: what it is told once."
   [p config]
   (let [{:keys [model base]} p
-        {:keys [rules actions think effort]} config]
+        {:keys [rules actions think effort style]} config]
     (ink/reset! base)
     (when (pos? think)
       (ink/eval! base (frame model :system (str "Thinking effort level: " effort))))
     (ink/eval! base (frame model :system (str rules "\n\nEach turn you are told the game as it is now. "
                                               (when (pos? think) "Think briefly about what is around, then ")
                                               "Answer with the name of one action only, one of: "
-                                              (str/join ", " (map name actions)) ".")))
+                                              (str/join ", " (map name actions)) "."
+                                              (when (and (pos? think) style) (str "\n\n" style)))))
     (reset! (:started p) (start-key config))))
 
 (defn player
@@ -191,6 +200,6 @@ namespace play_decide
   ([deciders told log opts]
    (fn [state]
      (let [t (told state)
-           d (if (vector? deciders) (committee! deciders t opts) (choose! deciders t))]
-       (swap! log conj (assoc d :told t))
+           d (assoc (if (vector? deciders) (committee! deciders t opts) (choose! deciders t)) :told t)]
+       (swap! log conj d)
        d))))

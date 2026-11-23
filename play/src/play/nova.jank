@@ -67,12 +67,18 @@
 (defn block-char [id]
   (if (< id (count blocks/block-chars)) (subs blocks/block-chars id (inc id)) "?"))
 
+(defn feet-row
+  "The row of the level Nova's feet are in: her y is her top, and she is a block and a half
+  tall (standing on row 8, her y is 6.5)."
+  [st]
+  (long (+ (:y st) 1)))
+
 (defn view
   "The level around Nova as text: `before` columns behind her and `after` ahead, every row.
-  N is Nova, e an object."
+  N is Nova (where her feet are), e an object."
   ([st] (view st 6 18))
   ([st before after]
-   (let [px (long (:x st)) py (long (:y st))
+   (let [px (long (:x st)) py (feet-row st)
          objects (set (map (fn [o] [(:x o) (:y o)]) (:objects st)))
          from (max 0 (- px before))]
      (str/join "\n"
@@ -88,14 +94,16 @@
   "What is next to Nova, from the map: the wall on her right and how high, a gap or spikes
   ahead on the ground, as sentences."
   [st]
-  (let [px (long (:x st)) py (long (:y st))
+  (let [px (long (:x st)) py (feet-row st)
         at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
         solid? (fn [ch] (contains? #{"#" "!" "L"} ch))
         wall (count (take-while (fn [dy] (solid? (at 1 (- dy)))) (range 0 6)))
         gap (when (:on-ground st)
               (count (take-while (fn [dx] (= "." (at dx 1))) (range 1 6))))
-        spikes (first (filter (fn [dx] (or (= "^" (at dx 0)) (= "^" (at dx 1)))) (range 1 5)))]
-    (str (cond
+        spikes (first (filter (fn [dx] (or (= "^" (at dx 0)) (= "^" (at dx 1)))) (range 1 5)))
+        ledge (and (:on-ground st) (= "=" (at 0 1)))]
+    (str (when ledge "She stands on a ledge (=): down drops her through it. ")
+         (cond
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
                             (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
            (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide: jump-right to cross it.")
@@ -107,7 +115,7 @@
   the level around her (positions relative to her, as the map shows them)."
   ([] (told (state)))
   ([st]
-   (let [px (long (:x st)) py (long (:y st))]
+   (let [px (long (:x st)) py (feet-row st)]
      (str "Nova is facing " (name (:facing st))
           (cond (:on-ground st) ", on the ground" (:jumping st) ", jumping" :else ", in the air")
           ", moving " (one-place (:vx st)) " blocks a frame across. Health " (:health st) ".\n"
@@ -126,15 +134,20 @@
 (def actions
   "What a player can do in a step: a name and the buttons held, for `step-frames` frames."
   {:right [:right] :left [:left] :jump [:a] :jump-right [:a :right] :jump-left [:a :left]
-   :attack [:b] :wait []})
+   :down [:down] :attack [:b] :wait []})
 
 (def step-frames 8)
 
+(def action-frames
+  "Actions held longer than step-frames: down drops through a ledge once held 8 frames
+  (player.s), so it is held 12."
+  {:down 12})
+
 (defn act!
-  "One step: the action's buttons held for step-frames frames, then released for one (so a
-  jump can be pressed again)."
+  "One step: the action's buttons held for its frames, then released for one (so a jump can
+  be pressed again)."
   [action]
-  (p/nes-run! (get actions action []) step-frames)
+  (p/nes-run! (get actions action []) (get action-frames action step-frames))
   (p/nes-run! [] 1))
 
 ;; Into the game: the menus, then level 1-1.
@@ -162,7 +175,7 @@
 (defn scripted
   "The action for a state: jump right when something is in the way, else right."
   [s]
-  (let [px (long (:x s)) py (long (:y s))
+  (let [px (long (:x s)) py (feet-row s)
         ahead (fn [dx dy] (block-char ((:map s) (+ px dx) (+ py dy))))
         solid? (fn [ch] (contains? #{"#" "!" "L"} ch))
         wall (or (solid? (ahead 1 0)) (solid? (ahead 1 -1)))
@@ -181,7 +194,8 @@
 
 (defn play!
   "`steps` steps of `chooser` (fn [state] action, or a decision {:action :probs}; the
-  scripted player by default) in the background, each shown in the card. (stop!) ends it."
+  scripted player by default) in the background, each shown in the card: a future, done
+  when they are. (stop!) ends it."
   ([steps] (play! steps scripted))
   ([steps chooser]
    (reset! running true)
@@ -194,11 +208,11 @@
                  a (if (map? d) (:action d) d)]
              (act! a)
              (reset! st (cond-> {:step (inc i) :action a :told (told (state))}
-                          (map? d) (assoc :result (probs-said (:probs d)))))
+                          (map? d) (assoc :decision d :told (:told d) :result (probs-said (:probs d)))))
              (recur (inc i)))))
        (catch :default _ (reset! running false)))
-     (reset! running false))
-   :playing))
+     (reset! running false)
+     :done)))
 
 ;; A model playing.
 
@@ -209,10 +223,12 @@
        "blocks stop her and she can stand on them; she falls through empty space; spikes hurt "
        "her, and so do enemies she touches. Coins are worth taking. Each action holds the "
        "controller's buttons for a moment (8 frames): right and left walk; jump jumps straight "
-       "up; jump-right and jump-left jump forward; attack uses Nova's ability (the B button); "
-       "wait does nothing. Holding a direction while in the air steers her."))
+       "up; jump-right and jump-left jump forward; down, standing on a ledge (=), drops her "
+       "through it; attack uses Nova's ability (the B button); wait does nothing. Holding a "
+       "direction while in the air steers her. When a wall is too high, look for another way: "
+       "under a ledge, or back."))
 
-(def model-actions [:right :jump-right :jump :left :jump-left :attack :wait])
+(def model-actions [:right :jump-right :jump :left :jump-left :down :attack :wait])
 
 (defonce decisions (atom []))
 
@@ -236,7 +252,7 @@
 (defn stop! [] (reset! running false))
 
 (defn watch!
-  "Nova's card at the top of the window: the picture as it is played, and what a model is
-  told."
+  "Nova's card at the top of the window: the picture as it is played and, when a model
+  plays, its side (the probabilities, its thinking, what it was told)."
   []
-  (c/pin! "Nova the Squirrel" st (p/watch-card (p/picture-part :nes 300))))
+  (c/pin! "Nova the Squirrel" st (p/decision-card (p/picture-part :nes 300))))

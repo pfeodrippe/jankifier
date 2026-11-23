@@ -55,6 +55,53 @@
            h (/ w ratio)]
        (cpp/play.draw_picture (if (= game :nes) 0 1) x y w h)))])
 
+(defn- bar [q] (apply str (repeat (long (+ 0.5 (* 20 q))) "█")))
+
+(defn- text-parts
+  "Long text as a layout's text parts (a text part shows at most 40 lines)."
+  [attrs text]
+  (map (fn [lines] [:text attrs (str/join "\n" lines)])
+       (partition-all 30 (str/split-lines (str text)))))
+
+(defn decision-part
+  "The model's side of a step, as a layout's part: each action's probability (likeliest
+  first), a committee's votes and members, the thinking, and what it was told."
+  [st]
+  (let [d (:decision st)
+        probs (sort-by (fn [[_ q]] (- q)) (:probs d))]
+    (into [:col]
+          (concat
+           [[:text {:size :small :color :muted}
+             (str "step " (:step st 0) (when-let [a (:action st)] (str "   action " (name a)))
+                  (when-let [s (:seconds d)] (str "   " (/ (long (* 10 s)) 10.0) " s")))]]
+           (map (fn [[a q]] [:text {:size :mono :color (if (= a (:action st)) :blue :ink)}
+                             (str (subs (str (name a) "            ") 0 12) " "
+                                  (subs (str (/ (long (* 100 q)) 100.0) "    ") 0 4) " " (bar q))])
+                probs)
+           (when-let [v (:votes d)]
+             [[:text {:size :small :color :purple}
+               (str "votes: " (str/join ", " (map (fn [[a c]] (str (name a) " " c)) v))
+                    "   members: " (str/join ", " (map (fn [m] (name (:action m))) (:members d))))]])
+           (when-let [t (or (:thinking d) (some :thinking (:members d)))]
+             (concat [[:space 4] [:text {:size :small :color :muted} "thinking"]]
+                     (text-parts {:size :small} t)))
+           [[:space 4] [:text {:size :small :color :muted} "told"]]
+           (text-parts {:size :mono} (:told st ""))))))
+
+(defn decision-card
+  "A card for a game a model plays, live or replayed: its picture (`picture`, a layout's part)
+  on the left, with the step and action under it, and the model's side on the right
+  (decision-part), from the state atom's value {:step :action :decision :told}."
+  [picture]
+  (fn [st]
+    (c/layout
+     [:row {:widths [1 1]}
+      [:col picture
+       [:text {:size :small :color :muted}
+        (str "step " (:step st 0) (when-let [a (:action st)] (str "   " (name a)))
+             (when-let [r (:result st)] (str "   " r)))]]
+      (decision-part st)])))
+
 (defn watch-card
   "A card for a game being played: its picture (`part`), the step, and what the model is told
   (`:told`, text) from the state atom's value."
