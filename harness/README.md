@@ -307,8 +307,8 @@ The harness can refuse to take the model's word that its code works. With
                    :obligations (verify/gate "work/lru.jank")}))
 ```
 
-A file checked is a namespace with the code, a Veil model of it
-(`veil/defmodel`), assertions (`harness.observe`: `always!`, `sometimes!`,
+A file checked is a namespace with the code, a Veil model of it (a `.lean`
+file, VEIL.md), assertions (`harness.observe`: `always!`, `sometimes!`,
 `reachable!`, `unreachable!`) and a map `verification` tying them: the
 model's types' sizes, states the code must be able to reach, how to start a
 real system, how each of the model's actions is done on it, and how its state

@@ -1,9 +1,8 @@
 ;; SPDX-License-Identifier: MIT
 ;; A worked example of a file harness.verify checks (VERIFY.md): a parking lot whose spots
-;; are taken and left, its Veil model, and the map that ties them.
+;; are taken and left, and the map that ties it to its Veil model (examples/parking.lean).
 (ns parking
-  (:require [veil.core :as veil]
-            [harness.observe :refer [always! sometimes! reachable!]]))
+  (:require [harness.observe :refer [always! sometimes! reachable!]]))
 
 ;; The code: a lot is an atom of the spots taken, out of `spots` (0 to spots - 1).
 
@@ -28,32 +27,13 @@
   (when (empty? (:taken @lot))
     (reachable! "the lot is empty again")))
 
-;; The model: spots, which are taken, and how many cars are parked.
-
-(veil/defmodel model ParkingLot
-  (type spot)
-  (relation taken [spot])
-  (individual parked Nat)
-  (after-init
-    (set! (taken S) false)
-    (set! parked 0))
-  (action park [s spot]
-    (require (not (taken s)))
-    (set! (taken s) true)
-    (set! parked (+ parked 1)))
-  (action leave [s spot]
-    (require (taken s))
-    (set! (taken s) false)
-    (set! parked (- parked 1)))
-  (safety a_car_a_spot (<= parked 2)))
-
 ;; How the model and the code are tied.
 
 (def verification
-  {:model model
+  {:model "examples/parking.lean"
    :instance {:spot 2}
-   ;; A state the code must be able to reach: every spot taken.
-   :sometimes {:full '(forall [s spot] (taken s))}
+   ;; A state the code must be able to reach, as a Veil term: every spot taken.
+   :sometimes {:full "∀ s, taken s"}
    :start (fn [] (new-lot 2))
    ;; Each action of the model, on the real lot, with the model's arguments.
    :step {:park (fn [lot {:keys [s]}] (park! lot s))

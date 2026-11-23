@@ -3,9 +3,11 @@
 ;; it did. A file of jank code (a namespace) has, besides its code, a map `verification`:
 ;;
 ;;   (def verification
-;;     {:model     a Veil model of the code (veil/defmodel), its actions the code's operations
+;;     {:model     the path of a Veil file (.lean) modelling the code: its actions the code's
+;;                 operations (VEIL.md says how to write one)
 ;;      :instance  the model's types' sizes: {:key 3 :val 2}
-;;      :sometimes {:name term ...}: states the code must be able to reach, as Veil terms
+;;      :sometimes {:name "term" ...}: states the code must be able to reach, as Veil terms
+;;                 (Lean text)
 ;;      :start     (fn [] system): a fresh real system
 ;;      :step      {:action (fn [system args] ...) ...}: each of the model's actions done on the
 ;;                 real system, with the model's arguments ({:k 0 :v 1})
@@ -128,36 +130,86 @@
                         (str "  " (name k) ": real " (pr-str (get real k)) ", model " (pr-str (get model k)))))
                     (distinct (concat (keys model) (keys real)))))))
 
-;; The model.
+;; The model: a Veil file, elaborated in the session under a name of the check's own (a
+;; file is loaded again when its text changes; the same text isn't).
+
+(defn- lines-of [text] (str/split-lines (str text)))
+
+(defn- module-of
+  "The name in a Veil file's `veil module Name` line, or nil."
+  [text]
+  (some (fn [l] (second (re-find #"^veil module (\S+)\s*$" (str/trim l)))) (lines-of text)))
 
 (defn- veil-name [k]
   (str/replace (str (name k)) #"[^A-Za-z0-9_]" "_"))
 
 (defn- witness [k] (keyword (str "sometimes_" (veil-name k))))
 
-(defn- with-witnesses
-  "The model with, for each :sometimes state, a safety property it breaks there."
-  [model sometimes]
-  (assoc model
-         :name (str (:name model) "Witnessed")
-         :decls (into (vec (:decls model))
-                      (map (fn [[k t]] (list 'safety (symbol (name (witness k))) (list 'not t))))
-                      sometimes)))
+(defn- safety-names
+  "The safety properties and invariants a Veil file declares: #{:name ...}."
+  [text]
+  (set (keep (fn [l] (when-let [[_ _ n] (re-find #"^(safety|invariant)\s*\[([^\]]+)\]" (str/trim l))]
+                       (keyword n)))
+             (lines-of text))))
 
-(defn- safety-names [model]
-  (set (keep (fn [d] (when (and (seq? d) (contains? #{'safety 'invariant} (first d))) (keyword (str (second d)))))
-             (:decls model))))
+(defn- with-witnesses
+  "A Veil file's text with, for each :sometimes state, a safety property it breaks there,
+  put before `#gen_spec`: nil when the file has no `#gen_spec` line."
+  [text sometimes]
+  (let [ls (lines-of text)
+        at (first (keep-indexed (fn [i l] (when (= "#gen_spec" (str/trim l)) i)) ls))]
+    (when at
+      (str/join "\n" (concat (take at ls)
+                             (map (fn [[k t]] (str "safety [" (name (witness k)) "] ¬ (" t ")")) sometimes)
+                             (drop at ls))))))
+
+(defonce ^:private loaded (atom {:names {} :count 0}))
+
+(defn- renamed
+  "A Veil file's text with its module called `as`."
+  [text from as]
+  (str/join "\n" (map (fn [l]
+                         (let [t (str/trim l)]
+                           (cond (= t (str "veil module " from)) (str "veil module " as)
+                                 (= t (str "end " from)) (str "end " as)
+                                 :else l)))
+                       (lines-of text))))
+
+(defn- load-model!
+  "A Veil file's text elaborated into the session (its checking commands, such as
+  `#model_check`, left out): the module's name in the session, or {:threw Veil's messages}.
+  `path` is where the text is from, for the messages; the text is written next to it while
+  it is loaded."
+  [text path]
+  (or (get-in @loaded [:names text])
+      (let [vs (veil-session)
+            from (module-of text)]
+        (if-not from
+          {:threw "the file has no `veil module Name` line"}
+          (let [n (:count (swap! loaded update :count inc))
+                as (str from "_v" n)
+                copy (str path ".loading-" n ".lean")
+                written (trying (spit copy (renamed text from as)))
+                messages (when-not (threw written) (trying (veil/load-file! vs copy {:checks? false})))
+                _ (cpp/harness.run (str "rm -f '" copy "'") 10000 10.0)
+                errors (when (sequential? messages) (filterv (fn [m] (= :error (:severity m))) messages))]
+            (cond
+              (threw written) {:threw (str "the file couldn't be copied to be loaded: " (threw written))}
+              (threw messages) {:threw (threw messages)}
+              (seq errors) {:threw (str/join "\n" (map (fn [m] (str path ":" (:line m) ": " (:text m))) errors))}
+              :else (do (swap! loaded assoc-in [:names text] as) as)))))))
 
 (defn- model-checks
-  "The model's own checks: {:problems [...] :witness-traces {name trace} :checked n}."
+  "The model's own checks: {:problems [...] :witness-traces {name trace} :explored n}."
   [spec]
   (let [vs (veil-session)
-        model (:model spec)
+        text (:model-text spec)
+        path (:model spec)
         opts {:instance (:instance spec) :max-depth (or (:max-depth spec) (:max-depth defaults))}
-        loaded (trying (veil/load! vs model))]
-    (if-let [t (threw loaded)]
+        m (load-model! text path)]
+    (if-let [t (threw m)]
       {:problems [(str "The model doesn't elaborate (Veil's messages):\n" t)]}
-      (let [mc (trying (veil/model-check vs model opts))]
+      (let [mc (trying (veil/model-check vs m opts))]
         (cond
           (threw mc)
           {:problems [(str "The model checker failed on the model: " (threw mc))]}
@@ -170,7 +222,11 @@
 
           :else
           (reduce (fn [acc [k t]]
-                    (let [w (trying (veil/model-check vs (with-witnesses model {k t}) opts))]
+                    (let [wt (with-witnesses text {k t})
+                          w (if wt
+                              (let [wm (load-model! wt path)]
+                                (if (threw wm) wm (trying (veil/model-check vs wm opts))))
+                              {:threw "the file has no `#gen_spec` line to put it before"})]
                       (cond
                         (threw w)
                         (update acc :problems conj (str "The :sometimes " (name k) " doesn't elaborate: " (threw w)))
@@ -228,7 +284,7 @@
   {:problem text-or-nil :hits #{witness...} :steps n}."
   [spec sys steps]
   (let [system (trying ((:start spec)))
-        safety (safety-names (:model spec))]
+        safety (safety-names (:model-text spec))]
     (if-let [t (threw system)]
       {:problem (str "(:start) threw: " t)}
       (let [v0 (trying ((:view spec) system))
@@ -294,12 +350,10 @@
                      nil)))
                names))))
 
-(defn- real-checks
-  "Random runs and the witness runs, the assertions counted: {:problems [...] :runs n :steps n}."
-  [spec witness-traces written opts]
-  (let [vs (veil-session)
-        sys (veil/system vs (with-witnesses (:model spec) (:sometimes spec)) {:instance (:instance spec)})
-        counted (atom {})
+(defn- real-runs
+  "real-checks' runs on the model's executable system `sys`."
+  [spec witness-traces written opts sys]
+  (let [counted (atom {})
         runs (:runs opts)
         steps (:steps opts)
         result (observe/recording
@@ -325,6 +379,15 @@
                             (when-not (:problem result) (assertion-problems @counted written))))
      :notes missed
      :runs (:runs result) :steps (:steps result)}))
+
+(defn- real-checks
+  "Random runs and the witness runs, the assertions counted: {:problems [...] :runs n :steps n}."
+  [spec witness-traces written opts]
+  (let [vs (veil-session)
+        m (load-model! (with-witnesses (:model-text spec) (:sometimes spec)) (:model spec))]
+    (if-let [t (threw m)]
+      {:problems [(str "The model with its :sometimes states doesn't elaborate (Veil's messages):\n" t)]}
+      (real-runs spec witness-traces written opts (veil/system vs m {:instance (:instance spec)})))))
 
 ;; Deliberate bugs.
 
@@ -374,12 +437,12 @@
 
 (defn- mutant-caught?
   "Whether the checks fail on a mutant: true, false, or nil when it couldn't be loaded."
-  [spec-ns forms said i written opts]
+  [spec-ns forms said i written opts model-text]
   (let [n (symbol (str spec-ns "-mutant-" i))
         forms (assoc forms 0 (apply list (concat ['ns n] (drop 2 (first forms)))))
         text (str/join "\n" (map pr-str forms))
         failed (load-text! text (str "mutant-" i ".jank"))
-        spec (when-not failed (spec-in n))]
+        spec (when-not failed (assoc (spec-in n) :model-text model-text))]
     (when (and spec (not failed))
       (let [r (trying (real-checks spec {} written opts))]
         (or (some? (threw r)) (boolean (seq (:problems r))))))))
@@ -403,11 +466,19 @@
                       :else (load-text! text (str path)))
              spec (when-not failed (spec-in spec-ns))
              missing (when (and spec (not failed))
-                       (seq (remove (fn [k] (contains? spec k)) [:model :instance :start :step :view])))]
+                       (seq (remove (fn [k] (contains? spec k)) [:model :instance :start :step :view])))
+             model-text (when (and spec (not missing) (string? (:model spec)))
+                          (trying (slurp (str (:model spec)))))
+             spec (when spec (assoc spec :model-text model-text))]
          (cond
            failed {:ok false :problems [(str "Loading " path " failed: " failed)]}
            (nil? spec) {:ok false :problems [(str "The namespace " spec-ns " has no `verification` map.")]}
            missing {:ok false :problems [(str "`verification` lacks " (str/join ", " missing) ".")]}
+           (not (string? (:model spec)))
+           {:ok false :problems [(str "`verification`'s :model is the path of the Veil file (a .lean file, "
+                                      "VEIL.md says how to write one), not " (pr-str (type (:model spec))) ".")]}
+           (threw model-text)
+           {:ok false :problems [(str "There is no Veil file " (:model spec) ": " (threw model-text))]}
            :else
            (let [written (assertion-names text)
                  m (model-checks spec)
@@ -417,7 +488,8 @@
                          (vec (keep-indexed
                                (fn [i mu]
                                  (let [c (mutant-caught? spec-ns (:forms mu) (:said mu) i written
-                                                         (assoc opts :runs (max 8 (quot (:runs opts) 3))))]
+                                                         (assoc opts :runs (max 8 (quot (:runs opts) 3)))
+                                                         (:model-text spec))]
                                    (when (some? c) (assoc mu :caught c))))
                                (mutants (vec forms) (:mutants opts)))))
                  survivors (filterv (fn [mu] (not (:caught mu))) tried)
@@ -457,7 +529,7 @@
   ([] (tool {}))
   ([opts]
    {:name "verify"
-    :doc (str "Checks a jank file against the Veil model in its `verification` map (VERIFY.md says what "
+    :doc (str "Checks a jank file against the Veil model (a .lean file) its `verification` map names (VERIFY.md says what "
               "it must hold): the model, random runs of the real code matched to it step by step, the "
               "model's runs replayed on the code, the code's assertions, and copies of the code with "
               "deliberate bugs. Says what failed, or that everything passed.")

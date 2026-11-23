@@ -82,9 +82,11 @@ PLAIN_TAIL = "\n\nTest it with the eval tool until you are sure it is right, the
 
 
 def verified_tail(file):
-    return ("\n\nMake it verified work: VERIFY.md (in the system text) says what the harness checks; "
-            "read examples/parking.jank, a file that passes. Put in " + file + " the code, a Veil model "
-            "of it, assertions, and the `verification` map, and run the verify tool on " + file +
+    model = file[:-len('.jank')] + '.lean'
+    return ("\n\nMake it verified work: VERIFY.md (in the system text) says what the harness checks, and "
+            "VEIL.md how to write a Veil model; examples/parking.jank and examples/parking.lean are a pair "
+            "that passes. Put the code, its assertions and the `verification` map in " + file + ", and "
+            "the Veil model of the code in " + model + ", and run the verify tool on " + file +
             " until it passes. Your answer is accepted only once it does.")
 
 
@@ -224,9 +226,14 @@ def make_home(mode):
     os.makedirs(HOME + '/work')
     shutil.copy(HARNESS + '/JANK.md', HOME)
     if mode == 'verified':
-        shutil.copy(HARNESS + '/VERIFY.md', HOME)
+        # The verified mode's guides and examples: what the check asks (VERIFY.md), how to
+        # write Veil (VEIL.md, examples/veil/), and a pair that passes.
+        for f in ['VERIFY.md', 'VEIL.md']:
+            shutil.copy(HARNESS + '/' + f, HOME)
         os.makedirs(HOME + '/examples')
-        shutil.copy(HARNESS + '/examples/parking.jank', HOME + '/examples/')
+        for f in ['parking.jank', 'parking.lean']:
+            shutil.copy(HARNESS + '/examples/' + f, HOME + '/examples/')
+        shutil.copytree(HARNESS + '/examples/veil', HOME + '/examples/veil')
 
 
 CACHE = subprocess.run(['getconf', 'DARWIN_USER_CACHE_DIR'], capture_output=True, text=True).stdout.strip()

@@ -159,17 +159,16 @@ up each time; here it holds the function it was started with.
 ## Veil
 
 `veil.core` (with `HARNESS_PROFILES=extras`) runs
-[Veil](https://github.com/verse-lab/veil) in this process: a model is written
-with `veil/defmodel`, as s-expressions, and checked with `veil/model-check`,
-which returns a counterexample as jank data. Require it **before** including
+[Veil](https://github.com/verse-lab/veil) in this process. A model is a Veil
+file (`.lean`, VEIL.md says how to write one), elaborated into a session with
+`veil/load-file!`; `veil/model-check` then checks it by its module's name and
+returns a counterexample as jank data. Require it **before** including
 `httplib.h` (a macOS header that comes with it defines `nil` as a macro, and
 Lean's header then fails to compile).
 
 ```clojure
 (require '[veil.core :as veil])
 (def vs (veil/session {:lake-project "../specs"}))                                ; about 12 s
+(veil/load-file! vs "work/lot.lean" {:checks? false})   ; Lean's messages: [{:severity :line :text}]
+(veil/model-check vs "ParkingLot" {:instance {:spot 2} :max-depth 8})
 ```
-
-`veil/defmodel`'s documentation (the describe tool, `veil.core/defmodel`)
-lists the declarations, statements and terms. `../veil/README.md` has a small
-model with its results.
