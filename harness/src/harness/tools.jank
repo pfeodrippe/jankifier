@@ -275,24 +275,33 @@
        "runs in, says what differs and how C++ is called. Read it before writing code that "
        "goes beyond plain Clojure functions."))
 
+(def system-paths
+  "What any process here reads, which holds nobody's files: the system, its tools and
+  libraries, Homebrew's."
+  ["/System" "/usr" "/bin" "/sbin" "/Library" "/opt/homebrew" "/private/etc" "/private/var/db"
+   "/dev" "/Applications/Xcode.app"])
+
 (defn confine!
   "This process sandboxed from now on (macOS; once, and only when it wasn't started inside a
   sandbox): for running a model's code once the harness is loaded, so that its tools and
-  everything they start can't read what the harness could. Under `home` (the user's home
-  directory) only `read`'s directories can be read; `hide` can't be read anywhere; files can
-  be written only in `write` (and outside `home` and the system's directories); the
-  network reaches only this machine. Each is a list of absolute paths. Returns the
-  profile applied."
-  [{:keys [home read write hide]}]
+  everything they start can't read what the harness could. Only `system-paths` and `read`
+  can be read (and the names of the files at the top, in /); `hide` can't be read even
+  there; files can be written only in `write` and /dev; the network reaches only this
+  machine. Each is a list of absolute paths. Point TMPDIR at one of `read` and `write`
+  before starting the process: the shared temporary directory holds other programs' files.
+  Returns the profile applied."
+  [{:keys [read write hide]}]
   (let [real (fn [p] (str (cpp/harness.real_path (str p))))
         paths (fn [ps] (str/join " " (map (fn [p] (str "(subpath " (pr-str (real p)) ")")) ps)))
         profile (str "(version 1)\n(allow default)\n"
-                     "(deny file-read-data (subpath " (pr-str (real home)) "))\n"
-                     (when (seq read) (str "(allow file-read-data " (paths read) ")\n"))
+                     "(deny file-read-data)\n"
+                     "(allow file-read-data (literal \"/\") " (paths (concat system-paths read)) ")\n"
+                     ;; The data volume seen again under /System (the sandbox resolves it to
+                     ;; the paths above, but said anyway).
+                     "(deny file-read-data (subpath \"/System/Volumes/Data\"))\n"
                      (when (seq hide) (str "(deny file-read-data " (paths hide) ")\n"))
-                     "(deny file-write* (subpath " (pr-str (real home)) ") (subpath \"/opt/homebrew\") "
-                     "(subpath \"/usr/local\") (subpath \"/Applications\") (subpath \"/Library\"))\n"
-                     (when (seq write) (str "(allow file-write* " (paths write) ")\n"))
+                     "(deny file-write*)\n"
+                     "(allow file-write* " (paths (cons "/dev" write)) ")\n"
                      "(deny network*)\n"
                      "(allow network* (local ip \"localhost:*\") (remote ip \"localhost:*\") "
                      "(local unix-socket) (remote unix-socket))\n")

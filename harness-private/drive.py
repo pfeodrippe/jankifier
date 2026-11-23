@@ -34,6 +34,7 @@ HARNESS = PROJECT + '/harness'
 PRIVATE = PROJECT + '/harness-private'
 OUT = PROJECT + '/trials-out'
 HOME = '/private/tmp/jank-agent/home'
+TMP = '/private/tmp/jank-agent/tmp'   # the process's TMPDIR: the shared one holds other programs' files
 USER_HOME = os.path.expanduser('~')
 
 TASKS = {
@@ -173,6 +174,7 @@ def start(log):
     env = dict(os.environ, HARNESS_PROFILES='extras', GC_LARGE_ALLOC_WARN_INTERVAL='1000000')
     for k in ('HARNESS_HIDE', 'HARNESS_WORK'):
         env.pop(k, None)
+    env['TMPDIR'] = TMP + '/'
     proc = subprocess.Popen([HARNESS + '/harness.sh', '--hidden', '--announce'], cwd=HARNESS,
                             stdout=open(log, 'w'), stderr=subprocess.STDOUT, start_new_session=True, env=env)
     deadline = time.monotonic() + 900
@@ -212,6 +214,8 @@ def stop(port, proc):
 
 def make_home(mode):
     shutil.rmtree(HOME, ignore_errors=True)
+    shutil.rmtree(TMP, ignore_errors=True)
+    os.makedirs(TMP)
     os.makedirs(HOME + '/work')
     shutil.copy(HARNESS + '/JANK.md', HOME)
     if mode == 'verified':
@@ -220,14 +224,20 @@ def make_home(mode):
         shutil.copy(HARNESS + '/examples/parking.jank', HOME + '/examples/')
 
 
+CACHE = subprocess.run(['getconf', 'DARWIN_USER_CACHE_DIR'], capture_output=True, text=True).stdout.strip()
+
+
 def confine_form():
-    read = [HARNESS + '/target/debug', HARNESS + '/include', PROJECT + '/inkling/include',
+    # Readable besides the system's directories: the run's directory and temporary one, and
+    # what compiling and running need (the build's cache and headers, the engine, Lean's
+    # toolchain, Veil's build, the system's caches such as Metal's).
+    read = [HOME, TMP, CACHE, HARNESS + '/target/debug', HARNESS + '/include', PROJECT + '/inkling/include',
             PROJECT + '/inkling/lib', USER_HOME + '/.cache/jank',
             USER_HOME + '/.elan/toolchains/leanprover--lean4---v4.35.0', PROJECT + '/specs/.lake']
-    write = [OUT, HARNESS + '/target/debug', USER_HOME + '/.cache/jank']
+    write = [HOME, TMP, CACHE, OUT, HARNESS + '/target/debug', USER_HOME + '/.cache/jank']
     hide = ['/private/tmp/claude-501']
     v = lambda xs: '[' + ' '.join(jstr(x) for x in xs) + ']'
-    return f'(tools/confine! {{:home {jstr(USER_HOME)} :read {v(read)} :write {v(write)} :hide {v(hide)}}})'
+    return f'(tools/confine! {{:read {v(read)} :write {v(write)} :hide {v(hide)}}})'
 
 
 def setup(port):
@@ -242,17 +252,31 @@ def setup(port):
     ev(port, f'(reset! tools/hidden-paths [{jstr(PROJECT)}])')
     ev(port, confine_form())
     # What the run must not reach, tried from inside: each must be refused.
-    probe = ev(port, '(tools/shell ' + jstr(
-        f'pwd; ls; cat {HARNESS}/README.md; head -1 {HARNESS}/src/harness/core.jank; ls {PRIVATE}; '
-        f'ls {OUT}; ls {USER_HOME}; ls /private/tmp/claude-501') + ' nil)')
-    probe = unstr(probe)
-    refused = probe.count('Operation not permitted')
-    if not probe.startswith(HOME) or refused < 6:
+    shared_tmp = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True).stdout.strip()
+    forbidden = [HARNESS + '/README.md', HARNESS + '/src/harness/core.jank', PRIVATE, OUT, USER_HOME,
+                 '/private/tmp', shared_tmp, '/Users/Shared', '/private/tmp/claude-501', '/Volumes']
+    script = 'pwd; ls; ' + ' '.join(f'(cat {p} || ls {p}) >/dev/null 2>&1 && echo READABLE {p};' for p in forbidden)
+    # Skipped: the system's directories, and the caches readable on purpose (checked to hold
+    # nothing of the tasks or the trials: library sources, compiled modules, Veil's build).
+    skipped = ['/System', '/usr', '/bin', '/sbin', '/Library', '/opt/homebrew', '/private/etc', '/private/var/db',
+               '/dev', '/Applications/Xcode.app', CACHE.rstrip('/'), HARNESS + '/target/debug', HARNESS + '/include',
+               PROJECT + '/inkling/include', PROJECT + '/inkling/lib', USER_HOME + '/.cache/jank',
+               USER_HOME + '/.elan/toolchains/leanprover--lean4---v4.35.0', PROJECT + '/specs/.lake']
+    system = ' -o '.join(f'-path {p}' for p in skipped)
+    script += (f' find / \\( {system} \\) -prune -o \\( -name "*.jank" -o -name "*.jank~" -o -name "*.edn" -o -name "*.md" \\) -print 2>/dev/null'
+               f' | grep -v "^{HOME}/" | sed "s/^/FOUND /" | head -20')
+    probe = unstr(ev(port, '(tools/shell ' + jstr(script) + ' nil)', 600))
+    if not probe.startswith(HOME) or 'READABLE' in probe or 'FOUND' in probe:
         raise RuntimeError('the run could reach what it must not:\n' + probe[:1500])
     slurped = ev(port, '(try (subs (slurp ' + jstr(HARNESS + '/src/harness/core.jank') + ') 0 10) '
                        '(catch cpp/std.exception e :refused) (catch :default e :refused))')
     if slurped != ':refused':
         raise RuntimeError('slurp read the harness\'s sources: ' + slurped)
+    # The engine still works inside the sandbox.
+    said = ev(port, '(let [s (ink/session m 512)] (ink/eval! s "The capital of France is") '
+                    '(let [t (ink/top s 1)] (ink/free! s) (pr-str (mapv :piece t))))', 300)
+    if not said or 'Paris' not in said:
+        raise RuntimeError('the engine inside the sandbox said ' + str(said))
     return probe
 
 
@@ -319,6 +343,9 @@ def main():
     for task in tasks:
         for seed in seeds:
             for mode in modes:
+                if any(f'{task}-{mode}-{seed}.edn"' in r for r in results):
+                    print(f'SKIP {task} {mode} seed {seed}: already in results.edn', flush=True)
+                    continue
                 t0 = time.time()
                 port = proc = None
                 try:
