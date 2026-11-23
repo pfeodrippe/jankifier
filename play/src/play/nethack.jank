@@ -11,7 +11,8 @@
 (ns play.nethack
   (:require [clojure.string :as str]
             [cards.core :as c]
-            [play.core :as p]))
+            [play.core :as p]
+            [play.decide :as decide]))
 
 (def library (p/vendor "nle" "build" "libnethack.so"))
 (def nhdat (p/vendor "nle" "build" "dat" "nhdat"))
@@ -41,15 +42,50 @@
 ;; fainted, 6 starved.
 (def hunger-names ["satiated" "not hungry" "hungry" "weak" "fainting" "fainted" "starved"])
 
+(def char-names
+  {"." "floor" "#" "a corridor" "|" "a wall" "-" "a wall or an open door" "+" "a closed door (or a spellbook)"
+   " " "nothing seen (rock or dark)" "<" "stairs up" ">" "stairs down" "$" "gold" "%" "food" ")" "a weapon"
+   "[" "armor" "!" "a potion" "?" "a scroll" "/" "a wand" "=" "a ring" "\"" "an amulet" "*" "a gem or rock"
+   "^" "a trap" "{" "a fountain" "_" "an altar" "`" "a boulder or stone"})
+
+(defn- char-name [ch]
+  (cond (contains? char-names ch) (get char-names ch)
+        (re-matches #"[a-zA-Z@&;:']" ch) (str "a monster or person (" ch ")")
+        :else (str "'" ch "'")))
+
+(defn- around
+  "What is next to the @ (the cursor) in each direction, as a sentence."
+  [s]
+  (let [[row col] (:cursor s)
+        screen (:screen s)
+        at (fn [dr dc]
+             (let [line (get screen (+ row dr) "")
+                   c (+ col dc)]
+               (if (and (>= c 0) (< c (count line))) (subs line c (inc c)) " ")))]
+    (when (= "@" (at 0 0))
+      (str "Next to you: "
+           (str/join ", " (for [[label dr dc] [["north" -1 0] ["north-east" -1 1] ["east" 0 1] ["south-east" 1 1]
+                                               ["south" 1 0] ["south-west" 1 -1] ["west" 0 -1] ["north-west" -1 -1]]]
+                            (str label " " (char-name (at dr dc)))))
+           ".\n"))))
+
 (defn told
   "What a model is told: the terminal, then the numbers and the inventory in words."
   ([] (told (state)))
   ([s]
-   (let [st (:stats s)]
-     (str (str/join "\n" (map str/trimr (:screen s))) "\n"
+   (let [st (:stats s)
+         ;; The top lines joined (a long message wraps, --More-- with it).
+         top (str/replace (str/join "" (take 3 (:screen s))) #"\s+" " ")
+         waiting (cond (str/includes? (str/replace top " " "") "--More--")
+                       "The game waits for you to read its message (--More--): answer more.\n"
+                       (re-find #"\[[yn]+[^\]]*\]" top)
+                       "The game asks a question: answer yes or no (or escape).\n")]
+     (str waiting
+          (str/join "\n" (map str/trimr (:screen s))) "\n"
           "HP " (:hp st) "/" (:hp-max st) ", armor class " (:armor-class st) ", experience level "
           (:xp-level st) ", dungeon level " (:depth st) ", gold " (:gold st) ", turn " (:turn st)
           ", " (get hunger-names (:hunger st) "hunger unknown") ".\n"
+          (around s)
           (when (seq (str/trim (:message s))) (str "Message: " (str/trim (:message s)) "\n"))
           (when-not (:normal s) "A menu or a question is open.\n")
           "Inventory:\n" (:inventory s)))))
@@ -104,8 +140,9 @@
 (defonce running (atom false))
 
 (defn play!
-  "`steps` keys of `chooser` (fn [state] key; the scripted player by default) in the
-  background, each shown in the card. (stop!) ends it; the game's end too."
+  "`steps` keys of `chooser` (fn [state] key, or a decision {:action :probs}; the scripted
+  player by default) in the background, each shown in the card: a future, done when they
+  are. (stop!) ends it; the game's end too."
   ([steps] (play! steps scripted))
   ([steps chooser]
    (reset! running true)
@@ -114,27 +151,60 @@
        (loop [i 0]
          (when (and @running (< i steps))
            (let [s (state)
-                 k (chooser s)
+                 d (chooser s)
+                 k (if (map? d) (:action d) d)
                  done (act! k)]
-             (reset! st {:step (inc i) :action k :told (told) :result (when done "the game ended")})
+             (reset! st (cond-> {:step (inc i) :action k :told (told) :result (when done "the game ended")}
+                          (map? d) (assoc :decision d :told (:told d))))
              (cpp/usleep 60000)
              (when-not done (recur (inc i))))))
        (catch :default _ nil))
-     (reset! running false))
-   :playing))
+     (reset! running false)
+     :done)))
 
 (defn stop! [] (reset! running false))
 
+;; A model playing.
+
+(def rules
+  "What a model playing NetHack is told of the game."
+  (str "You play NetHack, a game in a terminal: you are the @ on the map, exploring a dungeon. "
+       "Go down as deep as you can and stay alive. Walk with the direction actions (north is up "
+       "the screen); walking into a monster attacks it. Letters on the map are monsters, + is a "
+       "door or a spellbook, > stairs down, < stairs up, # a corridor, . floor, $ gold, ) a "
+       "weapon, [ armor, % food, ! a potion, ? a scroll. When a message ends with --More--, "
+       "answer more; when you are asked a question or a menu is open, answer it (yes, no, "
+       "escape, or enter). Eat when you are hungry. down goes down stairs you stand on, search "
+       "looks for hidden doors, pick-up picks up what is here, open opens a door next to you "
+       "(a direction follows), kick kicks (a direction follows), wait waits a turn."))
+
+(def model-actions
+  [:north :south :east :west :north-east :north-west :south-east :south-west :down :up :search
+   :pick-up :eat :open :kick :wait :more :enter :escape :yes :no])
+
+(defonce decisions (atom []))
+
+(defn model-player
+  "A player of NetHack for model `m` (play.decide); `settings` as decide/player's."
+  ([m] (model-player m {}))
+  ([m settings] (decide/player m (merge {:rules rules :actions model-actions} settings))))
+
+(defn play-model!
+  "`steps` keys chosen by `deciders` (a model-player, or a vector of them: a committee) in the
+  background, each decision kept in `decisions`: a future, done when they are."
+  ([deciders steps] (play-model! deciders steps {}))
+  ([deciders steps opts]
+   (reset! decisions [])
+   (play! steps (decide/chooser deciders #'told decisions opts))))
+
+(defn- terminal-part [] [:draw 420 (fn [x y width] (cpp/play.draw_nethack x y width 420.0))])
+
 (defn watch!
-  "NetHack's card at the top of the window: the terminal as it is played, and the numbers a
-  model is told."
+  "NetHack's card at the top of the window: the terminal as it is played and, when a model
+  plays, its side (the probabilities, its thinking, what it was told)."
   []
-  (c/pin! "NetHack" st
-          (fn [v]
-            (c/layout
-             [:col
-              [:draw 420 (fn [x y width] (cpp/play.draw_nethack x y width 420.0))]
-              [:space 6]
-              [:text {:size :small :color :muted}
-               (str "step " (:step v 0) (when-let [a (:action v)] (str "   key " (pr-str a)))
-                    (when-let [r (:result v)] (str "   " r)))]]))))
+  (c/pin! "NetHack" st (p/decision-card (terminal-part))))
+
+(def picture
+  "The game's picture as a layout's part (for replays)."
+  terminal-part)
