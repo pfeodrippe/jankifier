@@ -27,17 +27,21 @@ the long-context rows 2026-11-22):
 | Generation with the draft model, counting to 60 | about 99 tokens/s (6.9 tokens a forward) | |
 | Generation, rewriting text of the context, drafts from the context | about 80 tokens/s (5.8 tokens a forward) | not measured |
 | Generation at 20,000 tokens of context | about 33 tokens/s | not measured |
-| Prompt processing, 3,400 tokens | 160 tokens/s | about 400 tokens/s |
+| Prompt processing, 3,650 tokens | about 550 tokens/s | about 400 tokens/s (3,400 tokens) |
 | CPU reference path | about 8 tokens/s | |
 
 Not done:
 
 - images (the checkpoint's vision encoder);
 - a chat template, an HTTP server, samplers beyond temperature, top-p and top-k;
-- prompt processing is 2.5 times slower than Ollama's: three quarters of it
-  is the routed experts, which run one route at a time (running the routes by
-  expert, to decode an expert's weights once for several tokens, was tried
-  and was slower);
+- a prompt is evaluated in chunks of 512 tokens; a chunk runs the routed
+  experts by expert (`group_routes`, then matrix products over 32 of an
+  expert's routes and 64 rows, `gate_up_grouped`, `down_grouped` and their
+  MXFP8 versions), so that each expert's weights are read once a chunk: a
+  3,652-token prompt went from 176 to 547 tokens/s. A chunk's sums are not in
+  one token's order (as its other matrix products' aren't), so its numbers
+  differ from evaluating the tokens one at a time within `gpucheck`'s
+  tolerance;
 - single-token attention over a long context is split across the keys (the
   global layers' attention in chunks, then merged: `att_split`, `att_merge`)
   from 2,048 tokens on, by default (`:split-attention false` turns it off).

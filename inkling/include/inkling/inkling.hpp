@@ -451,7 +451,7 @@ namespace inkling
   };
 
   // Tokens evaluated per forward (longer inputs are split into chunks).
-  inline constexpr int32_t max_chunk{ 256 };
+  inline constexpr int32_t max_chunk{ 512 };
   // Tokens an eval with all_logits takes at most (one forward on the GPU).
   inline constexpr int32_t max_rows{ 16 };
   // Positions a session keeps hidden states for a draft model (a window of
