@@ -40,9 +40,16 @@ namespace play_decide
     :effort    its thinking effort, as the model's publisher writes it
     :temperature  the thinking's sampling temperature
     :style     how to think, said to the model with the rules (nil: nothing said)
+    :answer    :scored, the likeliest of the actions' names as the answer; or :free, the model
+               writes its answer (up to 12 tokens) and the first action named in it is taken
+               (none named: the likeliest, and :missed says so)
+    :memory    :fresh, each choice starts from the rules; or :conversation, the choices are one
+               conversation (what it was told and what it answered), started again from the
+               rules when the context is nearly full
     :recent    how many of its last actions it is told
     :context   its sessions' size (taken when it is made)"
-  {:rules "" :actions [] :think 0 :effort "0.2" :temperature 0.6 :style nil :recent 6 :context 8192})
+  {:rules "" :actions [] :think 0 :effort "0.2" :temperature 0.6 :style nil :answer :scored :memory :fresh
+   :recent 6 :context 8192})
 
 (def terse
   "A :style asking for short thinking: fragments, no filler, the numbers kept (after the
@@ -101,7 +108,15 @@ namespace play_decide
      :base (ink/session m (:context config))
      :work (ink/session m (:context config))
      :scratch (ink/session m (:context config))
+     ;; Whether :work holds a conversation to go on with.
+     :talking (atom false)
      :history (atom [])}))
+
+(defn free!
+  "A player's sessions let go (it can't choose after)."
+  [p]
+  (doseq [k [:base :work :scratch]]
+    (ink/free! (get p k))))
 
 (defn tune!
   "A player's settings changed (merged): they apply from its next choice."
@@ -131,6 +146,24 @@ namespace play_decide
     (ink/eval! s (vec (concat [end] (answer-start m))))
     {:text (ink/detokenize m said) :tokens (count said) :cut (= (count said) (count ids))}))
 
+(defn- named
+  "The first of `actions` named in `text` (at the same place, the longest name): or nil."
+  [actions text]
+  (let [t (str/lower-case (str text))
+        found (keep (fn [a] (when-let [i (str/index-of t (name a))] [i (- (count (name a))) a])) actions)]
+    (when (seq found)
+      (nth (first (sort found)) 2))))
+
+(defn- free-answer!
+  "The model's own answer in `s` (its message begun), up to 12 tokens: {:text :ids}, the ids
+  with the message's end (evaluated in `s`)."
+  [m s seed]
+  (let [end (id m "<|end_message|>")
+        ids (ink/generate! s 12 {:eos-token end :temperature 0.0 :seed seed})
+        said (vec (remove #{end} ids))]
+    (ink/eval! s [end])
+    {:text (ink/detokenize m said) :ids said}))
+
 (defn- normalized
   "Probabilities from log-probabilities: {k lp} to {k p}, over the keys."
   [scores]
@@ -145,31 +178,50 @@ namespace play_decide
   thinks first. Each action's probability is its answer's (after the thinking), over the
   allowed answers."
   [p told]
-  (let [{:keys [model work scratch history]} p
+  (let [{:keys [model work scratch history talking]} p
         config @(:config p)
-        {:keys [actions think temperature recent]} config
+        {:keys [actions think temperature recent answer memory context]} config
         _ (when (not= @(:started p) (start-key config))
-            (start! p config))
+            (start! p config)
+            (reset! talking false))
         began (cpp/play_decide.seconds)
-        last-actions (take-last recent @history)
-        text (str told
-                  (when (seq last-actions)
-                    (str "\nYour last actions, oldest first: " (str/join ", " (map name last-actions)) "."))
-                  "\nYour action?")
-        _ (ink/copy! work (:base p))
+        user (fn [last-actions]
+               (frame model :user (str told
+                                       (when (seq last-actions)
+                                         (str "\nYour last actions, oldest first: "
+                                              (str/join ", " (map name last-actions)) "."))
+                                       "\nYour action?")))
+        conversation (= memory :conversation)
+        plain (when (and conversation @talking) (user nil))
+        ;; Going on with the conversation when this turn fits in it (with room for the
+        ;; thinking and the answer); else from the rules, told its last actions.
+        go-on (and plain (< (+ (ink/position work) (count plain) think 64) (- context 256)))
+        frame-ids (if go-on plain (user (take-last recent @history)))
+        _ (when-not go-on
+            (ink/copy! work (:base p)))
+        seed (inc (count @history))
         thought (if (pos? think)
-                  (do (ink/eval! work (frame model :user text))
-                      (think! model work think temperature (inc (count @history))))
-                  (do (ink/eval! work (vec (concat (frame model :user text) (answer-start model))))
+                  (do (ink/eval! work frame-ids)
+                      (think! model work think temperature seed))
+                  (do (ink/eval! work (vec (concat frame-ids (answer-start model))))
                       nil))
         probs (normalized (into {} (map (fn [a]
                                           (ink/copy! scratch work)
                                           [a (answer-logprob scratch (answer-ids model a))])
                                         actions)))
-        action (key (apply max-key val probs))]
+        likeliest (key (apply max-key val probs))
+        said (when (= answer :free) (free-answer! model work seed))
+        picked (when said (named actions (:text said)))
+        action (or picked likeliest)]
+    (when (and conversation (not said))
+      ;; The conversation keeps the answer taken.
+      (ink/eval! work (answer-ids model action)))
+    (reset! talking conversation)
     (swap! history conj action)
     (cond-> {:action action :probs probs :seconds (- (cpp/play_decide.seconds) began)}
-      thought (assoc :thinking (:text thought) :thought-tokens (:tokens thought) :cut (:cut thought)))))
+      thought (assoc :thinking (:text thought) :thought-tokens (:tokens thought) :cut (:cut thought))
+      said (assoc :said (:text said) :missed (nil? picked))
+      conversation (assoc :restarted (not go-on) :context-used (ink/position work)))))
 
 (defn committee!
   "Several players' choices for the game as `told`, combined: :combine :mean (the mean of

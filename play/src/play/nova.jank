@@ -90,6 +90,36 @@
                                (contains? objects [col row]) "e"
                                :else (block-char ((:map st) col row))))))))))
 
+(def char-names
+  {"#" "solid" "=" "ledge" "H" "ladder" "D" "door" "o" "coins" "^" "spikes" "s" "spring" "?" "sign"
+   "!" "prize block" "~" "water or lava" "L" "lock" "k" "key" "+" "heart" "E" "exit" "e" "object"})
+
+(defn runs
+  "The level around Nova as runs of the same thing on a row, positions relative to her (x
+  right, y down; her feet at 0, 0): one line a row that has something, in the columns
+  `before` behind her to `after` ahead."
+  ([st] (runs st 6 18))
+  ([st before after]
+   (let [px (long (:x st)) py (feet-row st)
+         objects (set (map (fn [o] [(:x o) (:y o)]) (:objects st)))
+         ch (fn [col row] (if (contains? objects [col row]) "e" (block-char ((:map st) col row))))]
+     (str/join "\n"
+               (for [row (range rows)
+                     :let [cells (for [col (range (max 0 (- px before)) (+ px after))] [(- col px) (ch col row)])
+                           groups (->> (partition-by second cells)
+                                       (remove (fn [g] (= "." (second (first g))))))]
+                     :when (seq groups)]
+                 (str "y " (- row py) ": "
+                      (str/join ", " (map (fn [g] (let [[x0 c] (first g) [x1 _] (last g)]
+                                                    (str (get char-names c c) " "
+                                                         (if (= x0 x1) (str "at x " x0) (str "x " x0 " to " x1)))))
+                                          groups))))))))
+
+(defonce telling
+  ;; How the level is told: :grid, a character a block; :runs, runs of the same thing with
+  ;; positions relative to Nova (no counting needed).
+  (atom {:map :grid}))
+
 (defn- around
   "What is next to Nova, from the map: the wall on her right and how high, a gap or spikes
   ahead on the ground, as sentences."
@@ -103,9 +133,19 @@
         spikes (first (filter (fn [dx] (or (= "^" (at dx 0)) (= "^" (at dx 1)))) (range 1 5)))
         ledge (and (:on-ground st) (= "=" (at 0 1)))
         ladder (or (= "H" (at 0 0)) (= "H" (at 0 -1)))
-        door (= "D" (at 0 0))]
+        door (= "D" (at 0 0))
+        ;; The nearest ladder or door on her row within 4 blocks, when she isn't at one.
+        near (first (for [dx [1 -1 2 -2 3 -3 4 -4]
+                          :let [ch (at dx 0)]
+                          :when (contains? #{"H" "D"} ch)]
+                      [dx ch]))]
     (str (when ladder "She is at a ladder (H): up climbs it. ")
          (when door "She is at a door (D): up goes through it. ")
+         (when (and near (not ladder) (not door))
+           (let [[dx ch] near
+                 n (max dx (- dx))]
+             (str "A " (if (= ch "H") "ladder (H)" "door (D)") " is " n (if (= 1 n) " block" " blocks")
+                  " to her " (if (pos? dx) "right" "left") ". ")))
          (when ledge "She stands on a ledge (=): down drops her through it. ")
          (cond
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
@@ -114,13 +154,29 @@
            :else "On her right the way is clear.")
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right.")))))
 
+(defn- moved
+  "How far Nova went from `before` to `st`, as a sentence."
+  [before st]
+  (let [dx (- (:x st) (:x before))
+        dy (- (:y st) (:y before))
+        far (fn [d] (one-place (max d (- d))))
+        across (when (>= (max dx (- dx)) 0.05) (str (far dx) " blocks " (if (pos? dx) "right" "left")))
+        down (when (>= (max dy (- dy)) 0.05) (str (far dy) " blocks " (if (pos? dy) "down" "up")))
+        parts (remove nil? [across down])]
+    (if (seq parts)
+      (str "Since the last action she moved " (str/join " and " parts) ".\n")
+      "Since the last action she hasn't moved.\n")))
+
 (defn told
-  "What a model is told of the game: Nova's state, what is next to her, the objects near, and
-  the level around her (positions relative to her, as the map shows them)."
+  "What a model is told of the game: Nova's state (and how she moved since `before`, the
+  state a step ago), what is next to her, the objects near, and the level around her
+  (positions relative to her, as the map shows them)."
   ([] (told (state)))
-  ([st]
+  ([st] (told st nil))
+  ([st before]
    (let [px (long (:x st)) py (feet-row st)]
-     (str "Nova is facing " (name (:facing st))
+     (str (when before (moved before st))
+          "Nova is facing " (name (:facing st))
           (cond (:on-ground st) ", on the ground" (:jumping st) ", jumping" :else ", in the air")
           ", moving " (one-place (:vx st)) " blocks a frame across. Health " (:health st) ".\n"
           (around st) "\n"
@@ -128,11 +184,15 @@
             (str "Objects (blocks from her: + is right, + is down): "
                  (str/join ", " (map (fn [o] (str (:type o) " at (" (- (long (:x o)) px) ", " (- (long (:y o)) py) ")")) (:objects st))) ".\n")
             "No objects near.\n")
-          "The level around her, a character a block (N Nova, e an object, . empty, # solid, = a ledge, "
-          "H a ladder, D a door, o coin, ^ spikes, s spring, ? sign, ! prize block, ~ water or lava, "
-          "L a lock, k a key, + a heart, E the exit); rows go down, and it shows a few columns behind "
-          "her and more ahead:\n"
-          (view st)))))
+          (if (= :runs (:map @telling))
+            (str "The level around her, by row (y: blocks down from her feet, negative above; x: blocks "
+                 "right of her, negative behind; empty space left out):\n"
+                 (runs st))
+            (str "The level around her, a character a block (N Nova, e an object, . empty, # solid, = a ledge, "
+                 "H a ladder, D a door, o coin, ^ spikes, s spring, ? sign, ! prize block, ~ water or lava, "
+                 "L a lock, k a key, + a heart, E the exit); rows go down, and it shows a few columns behind "
+                 "her and more ahead:\n"
+                 (view st)))))))
 
 ;; Actions: buttons held for some frames.
 
@@ -253,7 +313,10 @@
   ([deciders steps] (play-model! deciders steps {}))
   ([deciders steps opts]
    (reset! decisions [])
-   (play! steps (decide/chooser deciders #'told decisions opts))))
+   (let [before (atom nil)
+         ;; Each state told with the one a step before it.
+         telling (fn [st] (let [t (#'told st @before)] (reset! before st) t))]
+     (play! steps (decide/chooser deciders telling decisions opts)))))
 
 (defn stop! [] (reset! running false))
 

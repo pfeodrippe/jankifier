@@ -78,6 +78,13 @@
                              (str (subs (str (name a) "            ") 0 12) " "
                                   (subs (str (/ (long (* 100 q)) 100.0) "    ") 0 4) " " (bar q))])
                 probs)
+           (when-let [said (:said d)]
+             [[:text {:size :small :color (if (:missed d) :red :purple)}
+               (str "answered: " (str/trim said) (when (:missed d) "   (no action named: the likeliest taken)"))]])
+           (when (contains? d :restarted)
+             [[:text {:size :small :color :muted}
+               (str (if (:restarted d) "conversation started again" "conversation goes on")
+                    ", " (:context-used d) " tokens")]])
            (when-let [v (:votes d)]
              [[:text {:size :small :color :purple}
                (str "votes: " (str/join ", " (map (fn [[a c]] (str (name a) " " c)) v))

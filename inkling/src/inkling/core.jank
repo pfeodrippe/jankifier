@@ -339,15 +339,33 @@
 
 (defn generate!
   "Samples up to n tokens after the session's tokens, evaluating each. Stops
-  at the end-of-sampling token. Returns the generated ids."
+  at the end-of-sampling token (left unevaluated). Returns the generated ids.
+  With :speculate, the same tokens through `speculate!` (:least and :most as
+  its), sooner when the text repeats the context or the session has a draft
+  model."
   ([s n] (generate! s n {}))
   ([s n opts]
    (let [eos (:eos-token opts 200006)]
-     (loop [out [] i 0 seed (:seed opts 1)]
-       (if (= i n)
-         out
-         (let [id (sample s (assoc opts :seed seed))]
-           (if (= id eos)
-             (conj out id)
-             (do (eval! s [id])
-                 (recur (conj out id) (inc i) (inc seed))))))))))
+     (if (:speculate opts)
+       (loop [out [] seed (:seed opts 1)]
+         (if (>= (count out) n)
+           out
+           (let [first-id (sample s (assoc opts :seed seed))]
+             (if (= first-id eos)
+               (conj out first-id)
+               (let [ids (speculate! s (assoc opts :seed seed :limit (- n (count out))))
+                     at (first (keep-indexed (fn [i id] (when (= id eos) i)) ids))]
+                 (if at
+                   ;; The end token (at 1 or later: drafted, so in a check) and what
+                   ;; follows it taken back.
+                   (do (truncate! s (- (position s) (- (count ids) at)))
+                       (into out (subvec ids 0 (inc at))))
+                   (recur (into out ids) (+ seed (count ids)))))))))
+       (loop [out [] i 0 seed (:seed opts 1)]
+         (if (= i n)
+           out
+           (let [id (sample s (assoc opts :seed seed))]
+             (if (= id eos)
+               (conj out id)
+               (do (eval! s [id])
+                   (recur (conj out id) (inc i) (inc seed)))))))))))
