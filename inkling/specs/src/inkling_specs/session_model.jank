@@ -1,0 +1,135 @@
+(ns inkling-specs.session-model
+  "The session API's model (models/SessionApi.lean): its proof, and random
+  runs of its steps on the engine (CPU path): each step's call either returns
+  or throws as the model's action says, and afterwards every session's
+  position, logits and tokens are what the model (and the tokens kept here)
+  say."
+  (:require [inkling-specs.core :as c :refer [engine vs]]
+            [inkling.core :as ink]
+            [veil.core :as veil]))
+
+(defn proof
+  "Elaborates SessionApi.lean: #check_invariants (any number of sessions,
+  tokens and contexts; kernel-checked)."
+  []
+  (c/check "SessionApi.lean"))
+
+(def contexts
+  "The sessions' contexts: sessions 0 and 1 the same, session 2 another."
+  [3 3 4])
+
+(defn- system []
+  (c/load-model! "SessionApi.lean")
+  (veil/system @vs "SessionApi" {:instance {:sess (count contexts) :tok 3}
+                                 :theory {:ctx "fun s => if s.val = 2 then 4 else 3"
+                                          :valid "fun t => t.val < 2"}}))
+
+(def throwing
+  #{:eval1Full :eval2Full :eval1BadId :eval2BadId :copyBad :sampleNone :generate2Partial :generate2Full
+    :generate2None})
+
+(defn- id-of
+  "Token t of the model: two valid ids and one outside the vocabulary."
+  [vocab t]
+  (case (long t) 0 1000 1 1001 (+ vocab 7)))
+
+(defn- call!
+  "Does the model's step on the engine. Returns {:threw b :generated ids}."
+  [m sessions {:keys [action args]}]
+  (let [vocab (:vocab (ink/config m))
+        s (fn [k] (nth sessions (long (get args k))))
+        id (fn [k] (id-of vocab (get args k)))
+        attempt (fn [f] (try {:threw false :value (f)} (catch :default _ {:threw true})))]
+    (case action
+      (:eval1 :eval1Full :eval1BadId) (attempt #(ink/eval! (s :s) [(id :t)]))
+      (:eval2 :eval2Full :eval2BadId) (attempt #(ink/eval! (s :s) [(id :t) (id :u)]))
+      :reset (attempt #(ink/reset! (s :s)))
+      (:copy :copyBad) (attempt #(ink/copy! (s :d) (s :s)))
+      (:sample :sampleNone) (attempt #(ink/sample (s :s)))
+      (:generate2 :generate2Partial :generate2Full :generate2None)
+      (let [before (ink/position (s :s))
+            r (attempt #(ink/generate! (s :s) 2))]
+        (assoc r :generated (vec (drop before (ink/tokens (s :s)))))))))
+
+(defn- expected-tokens
+  "The tokens kept here, after the model's step (generated ones come from the engine)."
+  [m tokens {:keys [action args]} {:keys [generated]}]
+  (let [vocab (:vocab (ink/config m))
+        k (fn [a] (long (get args a)))]
+    (case action
+      :eval1 (update tokens (k :s) conj (id-of vocab (get args :t)))
+      :eval2 (update tokens (k :s) into [(id-of vocab (get args :t)) (id-of vocab (get args :u))])
+      :reset (assoc tokens (k :s) [])
+      :copy (assoc tokens (k :d) (get tokens (k :s)))
+      (:generate2 :generate2Partial) (update tokens (k :s) into generated)
+      tokens)))
+
+(defn random-run
+  "`:steps` random steps of the model, done on three sessions of the engine.
+  Returns the steps and the first disagreement (nil when none)."
+  [{:keys [steps seed] :or {steps 14 seed 1}}]
+  (let [m @engine
+        _ (ink/set-option! m :gpu false)
+        sys (system)
+        sessions (mapv #(ink/session m %) contexts)
+        rng (atom (+ 7 (* 7919 seed)))
+        pick (fn [xs] (swap! rng #(mod (+ (* % 1103515245) 12345) 2147483648)) (nth xs (mod (quot @rng 65536) (count xs))))]
+    (try
+      (loop [state (first (veil/initial-states sys))
+             tokens (vec (repeat (count contexts) []))
+             done []
+             i 0]
+        (if (= i steps)
+          {:steps done :disagreement nil}
+          ;; A kind of call first, then its arguments: the rarer calls get their share.
+          (let [by-action (group-by :action (veil/successors sys state))
+                step (pick (get by-action (pick (vec (sort (keys by-action))))))
+                out (call! m sessions step)
+                tokens (expected-tokens m tokens step out)
+                model (:state step)
+                engine-state (mapv (fn [s] {:pos (ink/position s) :logits (boolean (:logits (ink/info s))) :tokens (ink/tokens s)})
+                                   sessions)
+                wanted (mapv (fn [j] {:pos (get (:pos model) j) :logits (contains? (set (:logits model)) j) :tokens (get tokens j)})
+                             (range (count contexts)))
+                done (conj done [(:action step) (:args step)])]
+            (cond
+              (not= (:threw out) (contains? throwing (:action step)))
+              {:steps done :disagreement {:step (last done) :threw (:threw out)}}
+              (not= engine-state wanted)
+              {:steps done :disagreement {:step (last done) :engine engine-state :model wanted}}
+              :else (recur model tokens done (inc i))))))
+      (finally
+        (doseq [s sessions] (ink/free! s))
+        (ink/set-option! m :gpu true)))))
+
+(defn generate-at-the-end
+  "generate! of 2 tokens with one position left (the model's
+  generate2Partial): the call throws, and the session keeps the first token
+  it generated."
+  []
+  (let [m @engine
+        _ (ink/set-option! m :gpu false)
+        s (ink/session m 3)
+        _ (ink/eval! s [1000 1001])
+        threw (try (ink/generate! s 2) false (catch :default _ true))
+        result {:threw threw :position (ink/position s) :logits (boolean (:logits (ink/info s)))}]
+    (ink/free! s)
+    (ink/set-option! m :gpu true)
+    result))
+
+(defn run
+  ([] (run {}))
+  ([{:keys [engine] :or {engine true}}]
+   (let [pr (c/report "session-model/proof" (select-keys (proof) [:proven :not-proven :errors]))
+         model-ok (c/ok? pr)]
+     (if-not engine
+       {:ok model-ok}
+       (let [runs (mapv #(random-run {:steps 16 :seed %}) (range 1 7))
+             _ (c/report "session-model/random-runs"
+                         {:runs (count runs)
+                          :steps (reduce + (map (comp count :steps) runs))
+                          :actions (frequencies (map first (mapcat :steps runs)))
+                          :disagreements (filterv :disagreement runs)})]
+         (let [g (c/report "session-model/generate-at-the-end" (generate-at-the-end))]
+           {:ok (and model-ok (every? (comp nil? :disagreement) runs)
+                     (:threw g) (= 3 (:position g)) (:logits g))}))))))

@@ -1,0 +1,160 @@
+(ns inkling-specs.router
+  "The router (models/Router.lean, models/RouterWeights.lean): its proof, the
+  counterexample to \"a banned expert is never chosen\", and the engine's
+  routing captures (CPU path) against the model's rules."
+  (:require [clojure.string :as string]
+            [inkling-specs.core :as c :refer [engine vs]]
+            [inkling-specs.ring :as ring]
+            [inkling.core :as ink]
+            [lean-sys.session :as lean]
+            [veil.core :as veil]))
+
+(cpp/raw "#include <cmath>
+namespace inkling_specs_router
+{
+  inline double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+}")
+
+(defn sigmoid [x] (cpp/inkling_specs_router.sigmoid (double x)))
+
+;;;; The model
+
+(defn proof
+  "Elaborates Router.lean: #check_invariants (any number of experts and k;
+  kernel-checked)."
+  []
+  (c/check "Router.lean"))
+
+(def ^:private weights-result (atom nil))
+
+(defn weights-theorem
+  "Elaborates RouterWeights.lean: errors (none) and axioms."
+  []
+  (or @weights-result
+      (let [msgs (veil/load-file! @vs (c/path "models" "RouterWeights.lean"))]
+        (reset! weights-result
+                {:errors (mapv :text (lean/errors msgs))
+                 :axioms (vec (keep #(re-find #"'.*' depends on axioms: .*" (str (:text %))) msgs))}))))
+
+(defn banned-chosen
+  "The model with the property \"a banned expert is never chosen\" added:
+  with 3 experts, 2 of them banned and k = 2 (more than experts - k banned),
+  the model checker finds a run where a banned expert is chosen."
+  []
+  (let [m (c/variant! "Router.lean" "RouterBanned"
+                      (fn [text]
+                        ;; Without the positions of the choice (a function of Nat, which
+                        ;; the model checker can't enumerate); the choice is in `chosen`.
+                        (-> (string/join "\n" (remove #(string/includes? % "slotExpert")
+                                                      (string/split-lines text)))
+                            (string/replace "#gen_spec"
+                                            "safety [banned_never_chosen] chosen E → ¬ banned E\n\n#gen_spec"))))
+        r (veil/model-check @vs m {:instance {:expert 3}
+                                   :theory {:k 2 :before "fun e f => e.val < f.val" :banned "fun e => e.val ≥ 1"}})]
+    {:result (:result r) :violates (:violates r) :steps (mapv (juxt :action :args) (:trace r))}))
+
+;;;; The engine
+
+(defn- check-route
+  "One token of one visit: the chosen experts against the model's rules,
+  recomputed from the captured router logits and the layer's bias."
+  [{:keys [logits experts weights bias banned scale k]}]
+  (let [ne (count logits)
+        sel (mapv (fn [e] (if (contains? banned e)
+                            ##-Inf
+                            (+ (sigmoid (nth logits e)) (nth bias e))))
+                  (range ne))
+        chosen (set experts)
+        others (remove chosen (range ne))
+        allowed (remove banned (range ne))
+        worst-chosen (apply min (map sel experts))
+        best-other (if (seq others) (apply max (map sel others)) ##-Inf)
+        ps (mapv #(sigmoid (nth logits %)) experts)
+        den (reduce + ps)
+        expected (mapv #(* scale (/ % den)) ps)
+        wsum (reduce + weights)]
+    {:distinct (and (= k (count experts)) (= k (count chosen)))
+     ;; Top k: no unchosen expert scores above a chosen one (up to float ties).
+     :top (or (= ##-Inf best-other) (>= worst-chosen (- best-other 1e-6)))
+     :ordered (every? (fn [[a b]] (>= (sel a) (- (sel b) 1e-6))) (partition 2 1 experts))
+     :banned-chosen (count (filter banned experts))
+     :banned-only-when-needed (or (zero? (count (filter banned experts)))
+                                  (every? chosen allowed))
+     :weight-sum-error (abs (- wsum scale))
+     :weight-error (apply max (map (fn [w e] (abs (- w e))) weights expected))}))
+
+(defn engine-routing
+  "Evaluates `:tokens` tokens on the CPU with capturing on, with `:ban` (a map
+  layer -> experts) banned, and checks every visit's routing of every token.
+  Returns the counts of (visit, token) routes, those breaking a rule, the
+  routes that chose banned experts, and the largest weight errors."
+  [{:keys [tokens ban seed] :or {tokens 6 ban {} seed 61}}]
+  (let [m @engine
+        cfg (ink/config m)
+        k (:top-k cfg)
+        scale (:route-scale cfg)
+        plan (ink/plan m)
+        _ (ink/set-option! m :gpu false)
+        _ (doseq [[layer ids] ban] (ink/ban-experts! m layer ids))
+        s (ink/session m 64)
+        _ (ink/capture! s true)
+        _ (ink/eval! s (ring/ids tokens seed))
+        biases (into {} (map (fn [l] [l (ink/tensor-values m (str "model.llm.layers." l ".mlp.gate.bias") (:experts cfg))])
+                             (distinct (map :layer plan))))
+        rows (vec (for [{:keys [visit layer]} plan
+                        t (range tokens)]
+                    (assoc (check-route {:logits (ink/captured s visit :router t)
+                                         :experts (mapv long (ink/captured s visit :experts t))
+                                         :weights (ink/captured s visit :expert_weights t)
+                                         :bias (get biases layer)
+                                         :banned (set (get ban layer))
+                                         :scale scale
+                                         :k k})
+                           :visit visit :layer layer :token t)))]
+    (ink/free! s)
+    (doseq [[layer _] ban] (ink/ban-experts! m layer []))
+    (ink/set-option! m :gpu true)
+    {:routes (count rows)
+     :not-distinct (count (remove :distinct rows))
+     :not-top (count (remove :top rows))
+     :not-ordered (count (remove :ordered rows))
+     :choosing-banned (count (filter #(pos? (:banned-chosen %)) rows))
+     :banned-when-not-needed (count (remove :banned-only-when-needed rows))
+     :max-weight-sum-error (apply max (map :weight-sum-error rows))
+     :max-weight-error (apply max (map :weight-error rows))
+     :first-bad (first (remove #(and (:distinct %) (:top %) (:banned-only-when-needed %)) rows))}))
+
+(defn chosen-at
+  "The experts the engine chose at `layer`'s first visit for the first token."
+  [layer]
+  (let [m @engine
+        visit (:visit (first (filter #(= layer (:layer %)) (ink/plan m))))
+        _ (ink/set-option! m :gpu false)
+        s (ink/session m 64)]
+    (ink/capture! s true)
+    (ink/eval! s (ring/ids 6 61))
+    (let [ex (mapv long (ink/captured s visit :experts 0))]
+      (ink/free! s)
+      (ink/set-option! m :gpu true)
+      ex)))
+
+(defn run
+  ([] (run {}))
+  ([{:keys [engine] :or {engine true}}]
+   (let [pr (c/report "router/proof" (select-keys (proof) [:proven :not-proven :errors]))
+         wt (c/report "router/weights-theorem" (weights-theorem))
+         bc (c/report "router/banned-chosen" (banned-chosen))
+         model-ok (and (c/ok? pr) (empty? (:errors wt)) (= [:banned_never_chosen] (:violates bc)))]
+     (if-not engine
+       {:ok model-ok}
+       (let [plain (c/report "router/engine, no ban" (engine-routing {}))
+             top8 (chosen-at 8)
+             few (c/report "router/engine, layer 8's first choices banned" (engine-routing {:ban {8 top8}}))
+             ne (:experts (ink/config @c/engine))
+             k (:top-k (ink/config @c/engine))
+             many (vec (take (- ne (dec k)) (range ne)))
+             lots (c/report "router/engine, all but 7 of layer 8 banned" (engine-routing {:ban {8 many}}))
+             clean? (fn [r] (and (zero? (:not-distinct r)) (zero? (:not-top r)) (zero? (:banned-when-not-needed r))
+                                 (< (:max-weight-sum-error r) 1e-4) (< (:max-weight-error r) 1e-4)))]
+         {:ok (and model-ok (clean? plain) (clean? few) (zero? (:choosing-banned few)) (clean? lots))
+          :finding {:banned-chosen-with-121-banned (:choosing-banned lots)}})))))
