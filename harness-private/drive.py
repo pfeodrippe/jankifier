@@ -298,6 +298,7 @@ def run_form(task, mode, seed):
       verified {'true' if verified else 'false'}
       live (str {jstr(OUT + '/live.edn')})
       current (atom nil)
+      looped (atom false)
       system (str tools/situation (when verified (str "\\n\\n" (slurp "VERIFY.md"))))
       a (h/agent m {{:tools (vec (concat (tools/defaults) (when verified [(verify/tool)])))
                     :system system
@@ -305,7 +306,18 @@ def run_form(task, mode, seed):
                     :max-steps 80
                     :sampling {{:temperature 0.7 :top-p 0.95 :seed {int(seed)}}}
                     :obligations (when verified (verify/gate file))
-                    :on-entry (fn [_] (when-let [x @current] (h/save! x live)))}})
+                    :on-entry (fn [_]
+                                (when-let [x @current]
+                                  (h/save! x live)
+                                  ;; Going round in a loop: the last six results all the
+                                  ;; harness's "the same result as before". Ended, as the step
+                                  ;; limit would end it later.
+                                  (let [rs (take-last 6 (filter (fn [e] (= :result (:role e))) (h/entries x)))]
+                                    (when (and (= 6 (count rs))
+                                               (every? (fn [e] (clojure.string/starts-with? (str (:text e)) "(This call gave exactly this result before")) rs))
+                                      (reset! looped true)
+                                      ;; (Not h/stop!, which waits for the turn: this runs inside it.)
+                                      (swap! x assoc :stop true)))))}})
       _ (reset! current a)
       began (cpp/harness.seconds)
       _ (h/ask! a {jstr(ask)})
@@ -317,7 +329,7 @@ def run_form(task, mode, seed):
       r {{:task :{task} :mode :{mode} :seed {int(seed)} :file file
          :verified (when verified (boolean (:ok check)))
          :checks (count (filter (fn [e] (= :check (:role e))) (h/entries a)))
-         :tokens (:generated st) :seconds seconds :state (:state st)
+         :tokens (:generated st) :seconds seconds :state (:state st) :looped @looped
          :recording {jstr(recording)}}}]
   (h/close! a)
   (pr-str r))'''
