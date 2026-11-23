@@ -126,14 +126,19 @@ namespace play_replay_native
     (when (and (:conversation @replaying) (:entry d))
       (hc/to-entry! "replay agent" (:entry d)))))
 
+(defn- act-of
+  "The game's action as the recording played it (its version)."
+  [r]
+  (let [{:keys [acts] :as g} (get games (:game r))]
+    (if acts (get acts (:version (:about r) 1)) (:act! g))))
+
 (defn go!
   "To step `i`: the game as it was when the model decided step `i` (from the save kept
   there, or played up to it)."
   [i]
-  (let [{:keys [game steps saves at about]} @replaying
-        {:keys [start! acts] :as g} (get games game)
-        ;; The action as the recording played it.
-        act! (if acts (get acts (:version about 1)) (:act! g))
+  (let [{:keys [game steps saves at]} @replaying
+        {:keys [start!]} (get games game)
+        act! (act-of @replaying)
         i (max 0 (min i (dec (count steps))))
         known (dec (count @saves))]
     (cond
@@ -181,18 +186,48 @@ namespace play_replay_native
     (when (< (inc at) (count steps))
       (go! (inc at)))))
 
+(defn- step-played!
+  "One step on, its action played from the step shown (not taken from a save: its frames are
+  run, to be seen)."
+  []
+  (let [{:keys [game at steps saves] :as r} @replaying
+        savable (not (false? (get-in games [game :saves])))]
+    (when (< (inc at) (count steps))
+      (when savable
+        (p/nes-restore! (get @saves at)))
+      ((act-of r) (:action (get steps at)))
+      (when (and savable (= (count @saves) (inc at)))
+        (swap! saves conj (p/nes-save!)))
+      (swap! replaying assoc :at (inc at))
+      (show! (inc at))
+      (inc at))))
+
 (defn play!
-  "The replay going on by itself, `per-second` steps a second, in the background; stop!
+  "The replay going on by itself, in the background, `per-second` steps a second (2 when not
+  said), or with :fluid (`(play! :fluid)`) each step's frames shown at the game's own speed
+  (60 a second), the conversation of an agent's game moved to the step's call first. stop!
   pauses it."
   ([] (play! 2))
-  ([per-second]
+  ([pace]
    (reset! running true)
    (future
      (try
        (loop []
-         (when (and @running (step!))
-           (cpp/usleep (long (/ 1000000 per-second)))
-           (recur)))
+         (when @running
+           (let [{:keys [at steps]} @replaying
+                 more (< (inc at) (count steps))]
+             (when more
+               (if (= pace :fluid)
+                 ;; The conversation at the call, then the action played frame by frame.
+                 (do (when-let [e (:entry (get steps at))]
+                       (when (:conversation @replaying)
+                         (hc/to-entry! "replay agent" e)))
+                     (cpp/usleep 400000)
+                     (binding [p/*frame-pause* 16667]
+                       (step-played!)))
+                 (do (step!)
+                     (cpp/usleep (long (/ 1000000 pace)))))
+               (recur)))))
        (catch :default _ nil))
      (reset! running false))
    :playing))

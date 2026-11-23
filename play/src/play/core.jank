@@ -31,10 +31,20 @@
   [path]
   (cpp/play.nes_open nes-core (str path)))
 
+(def ^:dynamic *frame-pause*
+  "Microseconds waited after each frame (0: the frames as fast as they run). A replay played
+  at the game's own speed binds it (16667: 60 frames a second), so that each frame is seen."
+  0)
+
 (defn nes-run!
   "`frames` frames with the buttons `ks` (keywords of `buttons`) held."
   ([ks] (nes-run! ks 1))
-  ([ks frames] (cpp/play.nes_run (held ks) frames)))
+  ([ks frames]
+   (if (pos? *frame-pause*)
+     (dotimes [_ frames]
+       (cpp/play.nes_run (held ks) 1)
+       (cpp/usleep *frame-pause*))
+     (cpp/play.nes_run (held ks) frames))))
 
 (defn nes-frames [] (cpp/play.nes_frames))
 (defn nes-ram "The console's 2 KiB of RAM: a vector of bytes." [] (cpp/play.nes_ram))

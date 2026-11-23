@@ -112,7 +112,7 @@ conversation.
 | `:context` | tokens the session has room for (16384) |
 | `:sampling` | as `ink/sample` takes: `{:temperature :top-p :top-k :seed}` (greedy) |
 | `:max-tokens` | tokens a step may generate (4096) |
-| `:max-thinking` | tokens one stretch of thinking may take (1536): at that the harness closes the thinking, and the model goes on from what it has thought |
+| `:max-thinking` | tokens one stretch of thinking may take (1536): at that the harness closes the thinking, and the model goes on from what it has thought. Thinking that says a sentence (of 30 characters or more) three times is closed the same way |
 | `:max-steps` | steps a turn may take: a step is the model speaking, then its calls (24) |
 
 | | |

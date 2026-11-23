@@ -281,6 +281,13 @@
       nil))
   f)
 
+(defn repeating?
+  "Whether thinking `text` goes round in the same words: a sentence of 30 characters or more
+  said three times."
+  [text]
+  (let [parts (remove (fn [x] (< (count x) 30)) (map str/trim (str/split (str text) #"[.?!\n]")))]
+    (boolean (some (fn [[_ n]] (>= n 3)) (frequencies parts)))))
+
 (defn- speak!
   "The model's frames from where the session is, until its turn ends: a token sampled, then
   evaluated, one at a time. Returns [frames why]: frames are {:kind :name :text} (kinds
@@ -358,9 +365,12 @@
         (>= (- (ink/position s) (count @queue)) room) (cut frames :context n where kind header body)
 
         ;; Thinking that goes on and on (the model can circle around a detail for a whole
-        ;; step and never act): closed here, as the model would close it, so that what comes
-        ;; next is from what it has thought so far.
-        (and (= where :body) (= kind :thinking) (>= (count body) max-thinking))
+        ;; step and never act), or that says the same sentence again and again: closed
+        ;; here, as the model would close it, so that what comes next is from what it has
+        ;; thought so far.
+        (and (= where :body) (= kind :thinking)
+             (or (>= (count body) max-thinking)
+                 (and (zero? (mod (count body) 32)) (repeating? (second @shown)))))
         (do (unqueue!)
             (ink/eval! s [closes])
             (recur (inc n) :between nil [] []
