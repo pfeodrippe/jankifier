@@ -255,7 +255,10 @@ def setup(port):
     shared_tmp = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True).stdout.strip()
     forbidden = [HARNESS + '/README.md', HARNESS + '/src/harness/core.jank', PRIVATE, OUT, USER_HOME,
                  '/private/tmp', shared_tmp, '/Users/Shared', '/private/tmp/claude-501', '/Volumes']
-    script = 'pwd; ls; ' + ' '.join(f'(cat {p} || ls {p}) >/dev/null 2>&1 && echo READABLE {p};' for p in forbidden)
+    # A file read (its bytes), a directory listed: `ls` of a file needs only what the sandbox
+    # leaves (the file's metadata).
+    script = 'pwd; ls; ' + ' '.join(
+        f'(if [ -d {p} ]; then ls {p}; else head -c 1 {p}; fi) >/dev/null 2>&1 && echo READABLE {p};' for p in forbidden)
     # Skipped: the system's directories, and the caches readable on purpose (checked to hold
     # nothing of the tasks or the trials: library sources, compiled modules, Veil's build).
     skipped = ['/System', '/usr', '/bin', '/sbin', '/Library', '/opt/homebrew', '/private/etc', '/private/var/db',
