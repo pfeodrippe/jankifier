@@ -10,6 +10,28 @@
 
 ;;;; The model
 
+(defn proof
+  "Elaborates StreamProof.lean: the bookkeeping for every plan the engine
+  accepts, #check_invariants (kernel-checked; it takes several minutes)."
+  []
+  (c/check "StreamProof.lean"))
+
+(defn proof-instance
+  "StreamProof's model run on Inkling 2 Mini's plan (its assumptions hold
+  there): the states where the run ends. There must be one, after the output's
+  read, with the plan accepted (the proof isn't about an empty set of runs)."
+  []
+  (c/load-model! "StreamProof.lean")
+  (let [sys (veil/system @vs "StreamProof"
+                         {:instance {:slot 12 :bidx 8}
+                          :theory {:layers 24 :boundary "fun l => l % 6 = 0" :hasLoop true
+                                   :loopStart 6 :loopEnd 18 :passes 3 :nSlots 12
+                                   :bord "fun b => b.val" :blockAt "fun n => ⟨n % 8, Nat.mod_lt _ (by decide)⟩"
+                                   :maxSrc 6 :maxPrev 2 :sidx "fun s => s.val"}})
+        ends (veil/reachable-states sys {:terminal true})]
+    {:ends (count ends)
+     :end (mapv #(select-keys % [:step :layer :pass :refused :ok]) ends)}))
+
 (def mini
   "Inkling 2 Mini's plan, and the engine's constants."
   {:layers 24 :block 6 :loop {:start 6 :end 18 :passes 3} :slots 12})
@@ -206,9 +228,14 @@
 (defn run
   ([] (run {}))
   ([{:keys [engine] :or {engine true}}]
-   (let [mcs (model-checks)
+   (let [pr (c/report "stream/proof" (select-keys (proof) [:proven :not-proven :errors]))
+         inst (c/report "stream/proof-instance" (proof-instance))
+         mcs (model-checks)
          _ (doseq [[k v] mcs] (c/report (str "stream/" (name k)) v))
-         model-ok (and (= :noViolationFound (:result (:mini mcs)))
+         model-ok (and (c/ok? pr)
+                       (= 1 (:ends inst))
+                       (every? #(and (not (:refused %)) (= 24 (:layer %))) (:end inst))
+                       (= :noViolationFound (:result (:mini mcs)))
                        (zero? (:shapes-violating mcs)))
          rule (c/report "stream/engine-against-model" (engine-against-model))
          rule-ok (zero? (:gpu-but-model-violates rule))]

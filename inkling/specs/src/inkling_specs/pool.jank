@@ -69,6 +69,13 @@
      ;; The other fix of that, which the engine doesn't use.
      :stop-in-wait-stuck (stuck-states {:fixes [:seq_cst :stop_in_wait] :runs 1})}))
 
+(defn proof
+  "Elaborates PoolProof.lean: the engine's pool, with active and remaining as
+  sets, #check_invariants for any number of workers, indices, chunk size and
+  runs (kernel-checked)."
+  []
+  (c/check "PoolProof.lean"))
+
 ;;;; The engine
 
 (defn stress
@@ -110,9 +117,10 @@
 (defn run
   ([] (run {}))
   ([{:keys [engine] :or {engine true}}]
-   (let [mcs (model-checks)
+   (let [pr (c/report "pool/proof" (select-keys (proof) [:proven :not-proven :errors]))
+         mcs (model-checks)
          _ (doseq [[k v] mcs] (c/report (str "pool/" (name k)) v))
-         model-ok (and (every? #(= :noViolationFound (:result (get mcs %))) [:now :now-chunks-of-2 :now-3-workers])
+         model-ok (and (c/ok? pr) (every? #(= :noViolationFound (:result (get mcs %))) [:now :now-chunks-of-2 :now-3-workers])
                        (zero? (:stuck (:now-stuck mcs)))
                        (zero? (:stuck (:now-stuck-2-runs mcs)))
                        ;; The model still tells the earlier versions apart.
