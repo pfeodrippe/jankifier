@@ -23,6 +23,7 @@ namespace
                  "  inkling score MODEL.ink PROMPT IDS [--cpu]\n"
                  "                                     log-probability of each of the ids (comma separated)\n"
                  "                                     after the prompt: id, logprob, our argmax\n"
+                 "  inkling bench MODEL.ink [W...]     milliseconds of a forward over W rows (1 2 4 8 16)\n"
                  "  inkling gpucheck MODEL.ink PROMPT [--all]\n"
                  "                                     checks every GPU stage of every visit against the CPU\n"
                  "                                     on the CPU's inputs; --all prints every row\n"
@@ -176,6 +177,47 @@ int main(int argc, char **argv)
       std::printf(all_same ? "OK: every row is the same bits as one token at a time\n"
                            : "DIFFERENT: rows of one forward aren't one token at a time\n");
       return all_same ? 0 : 1;
+    }
+
+    if(cmd == "bench" && argc >= 3)
+    {
+      // Milliseconds of one forward over W rows at position 1000 (each the median
+      // of 7, from the same state), for W in the arguments (1 2 4 8 16 by default).
+      std::vector<int32_t> widths;
+      for(int i{ 3 }; i < argc; ++i)
+      {
+        widths.push_back(std::stoi(argv[i]));
+      }
+      if(widths.empty())
+      {
+        widths = { 1, 2, 4, 8, 16 };
+      }
+      auto const piece{ inkling::tokenize(*m, "The quick brown fox jumps over the lazy dog while the cat watches from the window. ", false) };
+      std::vector<int32_t> filler;
+      while(filler.size() < 1100)
+      {
+        filler.insert(filler.end(), piece.begin(), piece.end());
+      }
+      std::unique_ptr<inkling::session, void (*)(inkling::session *)> s{ inkling::new_session(*m, 8192), inkling::free_session };
+      std::unique_ptr<inkling::session, void (*)(inkling::session *)> snap{ inkling::new_session(*m, 8192),
+                                                                             inkling::free_session };
+      inkling::eval(*s, filler.data(), 1000);
+      inkling::copy(*snap, *s);
+      for(auto const w : widths)
+      {
+        inkling::eval(*s, filler.data() + 1000, w);
+        std::vector<double> times;
+        for(int i{}; i < 7; ++i)
+        {
+          inkling::copy(*s, *snap);
+          auto const t0{ std::chrono::steady_clock::now() };
+          inkling::eval(*s, filler.data() + 1000, w);
+          times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        std::sort(times.begin(), times.end());
+        std::printf("%2d rows: %6.1f ms\n", w, times[3]);
+      }
+      return 0;
     }
 
     if(cmd == "tapcheck" && argc == 4)
