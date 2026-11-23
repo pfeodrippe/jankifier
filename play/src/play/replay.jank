@@ -72,6 +72,8 @@ namespace play_replay_native
    :doom {:title "Doom" :start! #'doom/start! :act! #'doom/act! :stop! #'doom/stop! :picture #'doom/picture
           :play-model! #'doom/play-model! :decisions #'doom/decisions :saves false}
    :wnw {:title "Witch n' Wiz" :start! #'wnw/start! :act! #'wnw/act! :stop! #'wnw/stop!
+         ;; How actions were played by version (a recording says its own; 1 when it doesn't).
+         :version 2 :acts {1 #'wnw/act-v1! 2 #'wnw/act!}
          :play-model! #'wnw/play-model! :decisions #'wnw/decisions}})
 
 (defn save!
@@ -81,7 +83,8 @@ namespace play_replay_native
   ([game decisions about]
    (cpp/play_replay_native.make_dirs folder)
    (let [path (str folder "/" (name game) "-" (cpp/play_replay_native.stamp) ".edn")]
-     (spit path (pr-str {:game game :about about :steps (vec decisions)}))
+     (spit path (pr-str {:game game :about (assoc about :version (get-in games [game :version] 1))
+                         :steps (vec decisions)}))
      path)))
 
 (defn record!
@@ -127,8 +130,10 @@ namespace play_replay_native
   "To step `i`: the game as it was when the model decided step `i` (from the save kept
   there, or played up to it)."
   [i]
-  (let [{:keys [game steps saves at]} @replaying
-        {:keys [act! start!]} (get games game)
+  (let [{:keys [game steps saves at about]} @replaying
+        {:keys [start! acts] :as g} (get games game)
+        ;; The action as the recording played it.
+        act! (if acts (get acts (:version about 1)) (:act! g))
         i (max 0 (min i (dec (count steps))))
         known (dec (count @saves))]
     (cond

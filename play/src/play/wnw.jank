@@ -150,7 +150,9 @@
           (str/join "\n" (map (fn [pl] (str (str/capitalize (:who pl)) " at (" (:x pl) ", " (:y pl) "), facing "
                                             (name (:facing pl)) (when (:current pl) ", the one you move")))
                               (:players st)))
-          "No player is in the room now (gone through the door, or lost): if the room doesn't end, undo or restart.")
+          (if (= "game" (:state st))
+            "No player is in the room now (gone through the door, or lost): if the room doesn't end, undo or restart."
+            ""))
         "\n"
         (around st)
         (if (seq (:objects st))
@@ -179,10 +181,11 @@
 
 (def step-frames 16)
 
-(defn act!
-  "One step: the action's buttons held for step-frames frames, then released for one. When it
-  took the last player through the door, the frames until the room ends (a player told of an
-  empty room that hasn't ended yet doesn't know what to do)."
+(defn act-v1!
+  "An action as recordings made before the 23rd of November 2026 played it (`act!` is the
+  action now): the buttons held step-frames frames, released for one, and, when that took
+  the last player through the door, the frames until the room ends. A move can still be
+  under way after it (a move takes about 16 frames, and the position changes halfway)."
   [action]
   (p/nes-run! (get actions action []) step-frames)
   (p/nes-run! [] 1)
@@ -191,6 +194,20 @@
       (when (and (< i 60) (= "game" (:state s)) (empty? (:players s)))
         (p/nes-run! [] 1)
         (recur (inc i))))))
+
+(def press-frames 4)
+
+(defn act!
+  "One action, finished: its buttons pressed for press-frames frames, then frames until the
+  room has stayed the same for 20 of them (moves, falls and the room's end done; at most 150):
+  what is told after it is what the action did."
+  [action]
+  (p/nes-run! (get actions action []) press-frames)
+  (loop [i 0 same 0 before (state)]
+    (when (and (< i 150) (< same 20))
+      (p/nes-run! [] 1)
+      (let [now (state)]
+        (recur (inc i) (if (= now before) (inc same) 0) now)))))
 
 ;; Into the game: Start three times, Up to "new game", A twice (the first room).
 (def to-room
