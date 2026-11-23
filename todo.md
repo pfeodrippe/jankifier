@@ -30,10 +30,7 @@
 
 - [ ] split attention measured alone (2k, 4k, 8k, 20k, 49k tokens of context), a threshold chosen, on by default, tokens/s of a real turn
 - [ ] a full agent turn profiled
-- [x] experts grouped for prefill (a prompt 176 -> 587 tokens/s), speculative decoding (copies from the context; the checkpoint's draft model with adaptive depth: code about 64 tokens/s, counting 99, prose unchanged)
-- [ ] batching several sessions: one forward over the next token of 8 or 16 sessions (rows computed as one token at a time, so each session's tokens stay exactly those it gets alone). Measured with one session's rows: 1 row 24 ms, 8 rows 67 ms (about 120 tokens/s in all), 16 rows 131 ms, 512 rows 748 ms. Memory: about 4.3 GB of cache a session at 128k tokens of context (0.5 GB at 16k), beside the 20 GB model: 3-4 sessions for the trials' context, 8 or more at 32k. Then the trials' runs in parallel. Steps: 8 sessions at about 64k tokens of context each, then 16 at about 32k, and if those go well 32 at about 16k (each about 17 GB of caches beside the model); for each, tokens/s in all and per session, and every session's tokens compared with the same session run alone.
-- [ ] the grouped expert kernels are bound by decoding and staging the weights (6 TFLOPS of the GPU's ~14): double buffering, or decoding straight into registers
-- [ ] specs/models/SplitAttention.lean models the old chunking; att_rows changed it
+- [ ] other exact speedups: experts grouped for prefill, speculative decoding, batching
 - [ ] context trimming, only if the trials show it does no harm
 - [ ] proofs of the engine (inkling/specs): split attention, pool and stream for any size, the router, the session API (in progress)
 - [ ] engine bugs the proofs found (fix after the trials: the trials load the engine):
