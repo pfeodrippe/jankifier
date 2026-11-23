@@ -85,8 +85,22 @@
                  (if (and (< -1 x width) (< -1 y height))
                    (get tile-names (tile-char (nth (:tiles st) (+ (* y width) x))) "something")
                    "the edge")))]
-      (str "Where " (:who pl) " is: " (at 0 0) (when (= "a ladder" (at 0 0)) " (up and down climb it)")
-           "; left " (at -1 0) ", right " (at 1 0) ", above " (at 0 -1) ", below " (at 0 1) ".\n"))))
+      (let [open? (fn [t] (not (contains? #{"solid" "the edge" "the closed door"} t)))
+            ladder? (= "a ladder" (at 0 0))
+            move (fn [label dx dy ok]
+                   (str label " " (if ok
+                                    (str "to (" (+ (:x pl) dx) ", " (+ (:y pl) dy) "), " (at dx dy))
+                                    "does nothing")))]
+        (str "Where " (:who pl) " is: " (at 0 0) (when ladder? " (up and down climb it)")
+             "; left " (at -1 0) ", right " (at 1 0) ", above " (at 0 -1) ", below " (at 0 1) ".\n"
+             ;; The moves by the game's rules: walking into what isn't solid; up only on a
+             ;; ladder; down on a ladder or onto one.
+             "Moves from here: "
+             (str/join "; " [(move "left" -1 0 (open? (at -1 0)))
+                             (move "right" 1 0 (open? (at 1 0)))
+                             (move "up" 0 -1 (and ladder? (open? (at 0 -1))))
+                             (move "down" 0 1 (or (= "a ladder" (at 0 1)) (and ladder? (open? (at 0 1)))))])
+             ".\n")))))
 
 (defn- moved
   "What changed from `before` to `st`: the players' moves, objects gone."
@@ -220,7 +234,8 @@
   "What a model playing Witch n' Wiz is told of the game (from its sources, game/PRG0.c)."
   (str "You play Witch n' Wiz, a puzzle game on the NES. A room is a grid seen from the side, "
        "16 cells across (x) and 15 down (y). You move one cell an action: left and right walk; "
-       "up and down climb ladders (H); with nothing under you, you fall. Walking into a monster "
+       "up and down climb ladders (H), and do nothing off a ladder; with nothing under you, you "
+       "fall. Each turn says which moves work from where you are. Walking into a monster "
        "(m) defeats it. Walking into a block (B) pushes it, and it falls when nothing is under "
        "it. Standing on something to carry (c, or a key k), a picks it up, and a again puts it "
        "down ahead of you; a key put into the closed door (D) opens it. When every monster is "
