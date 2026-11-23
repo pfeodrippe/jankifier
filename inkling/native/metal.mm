@@ -188,7 +188,7 @@ namespace inkling
     // The draft model's Markov head's fold of the output head (made once).
     id<MTLBuffer> fold, fold_b;
     // A batch's routes by expert.
-    id<MTLComputePipelineState> group_routes, gate_up_grouped, down_grouped, down_combine;
+    id<MTLComputePipelineState> group_routes, gate_up_grouped, down_grouped, down_combine, gate_up_grouped_mx, down_grouped_mx;
     // The draft model's kernels.
     id<MTLComputePipelineState> draft_fold, draft_mix, draft_norm, draft_block, draft_head, draft_attention, draft_elementwise,
       draft_mk_input, draft_mk_gates, draft_mk_pick, draft_mk_choose;
@@ -427,6 +427,8 @@ namespace inkling
       b->gate_up_grouped = pipeline(device, lib, "gate_up_grouped", 128);
       b->down_grouped = pipeline(device, lib, "down_grouped", 128);
       b->down_combine = pipeline(device, lib, "down_combine", 32);
+      b->gate_up_grouped_mx = pipeline(device, lib, "gate_up_grouped_mx", 128);
+      b->down_grouped_mx = pipeline(device, lib, "down_grouped_mx", 128);
       b->dummy = scratch_buffer(*b, 16384);
       b->draft_fold = pipeline(device, lib, "draft_fold", 256);
       b->draft_mix = pipeline(device, lib, "draft_mix", 256);
@@ -1804,7 +1806,7 @@ namespace inkling
         // A prompt's chunk: the routes by expert, each expert's weights read once
         // for all its routes (matrix products; the sums' order is not one
         // token's, as the batch's other kernels' isn't).
-        bool const grouped{ nt > 16 && batched && quant && gu.nvfp4 && dn.nvfp4 && !std::getenv("INK_NO_GROUPED") };
+        bool const grouped{ nt > 16 && batched && quant && !std::getenv("INK_NO_GROUPED") };
         if(grouped)
         {
           {
@@ -1819,14 +1821,17 @@ namespace inkling
           }
           {
             ggu_params const p{ static_cast<uint32_t>(c.top_k), static_cast<uint32_t>(gu.rows), static_cast<uint32_t>(gu.cols),
-                                c.gate_cap, c.up_cap, m.f32(gu.denominator)[0] };
-            use(b.gate_up_grouped, "gate_up grouped");
+                                c.gate_cap, c.up_cap, gu.nvfp4 ? m.f32(gu.denominator)[0] : 1.0f };
+            use(gu.nvfp4 ? b.gate_up_grouped : b.gate_up_grouped_mx, gu.nvfp4 ? "gate_up grouped" : "gate_up grouped mxfp8");
             [e setBytes:&p length:sizeof(p) atIndex:0];
             bind(1, weight(b, gu.weight, dtype::u32));
             bind(2, weight(b, gu.scales, dtype::u8));
-            bind(3, weight(b, gu.amax, dtype::f32));
+            if(gu.nvfp4)
+            {
+              bind(3, weight(b, gu.amax, dtype::f32));
+              bind(5, g.xmax);
+            }
             bind(4, g.xq);
-            bind(5, g.xmax);
             bind(6, g.order);
             bind(7, g.cw);
             bind(8, b.e4m3);
@@ -1897,14 +1902,18 @@ namespace inkling
         if(grouped)
         {
           {
-            gdn_params const p{ static_cast<uint32_t>(dn.rows), static_cast<uint32_t>(dn.cols), m.f32(dn.denominator)[0] };
-            use(b.down_grouped, "down grouped");
+            gdn_params const p{ static_cast<uint32_t>(dn.rows), static_cast<uint32_t>(dn.cols),
+                                dn.nvfp4 ? m.f32(dn.denominator)[0] : 1.0f };
+            use(dn.nvfp4 ? b.down_grouped : b.down_grouped_mx, dn.nvfp4 ? "down grouped" : "down grouped mxfp8");
             [e setBytes:&p length:sizeof(p) atIndex:0];
             bind(1, weight(b, dn.weight, dtype::u32));
             bind(2, weight(b, dn.scales, dtype::u8));
-            bind(3, weight(b, dn.amax, dtype::f32));
+            if(dn.nvfp4)
+            {
+              bind(3, weight(b, dn.amax, dtype::f32));
+              bind(5, g.amax);
+            }
             bind(4, g.act);
-            bind(5, g.amax);
             bind(6, g.order);
             bind(8, b.e4m3);
             bind(9, g.route_out);

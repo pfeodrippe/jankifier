@@ -1716,8 +1716,8 @@ kernel void group_routes(constant grp_params &P [[buffer(0)]],
 // halves) row `xrow(j)` of x holds: acc[route][row] in out. 4 simdgroups,
 // 32 columns (two NVFP4 blocks) at a time.
 #define GROUPED_PRODUCT(XROW)                                                                                 \
-  threadgroup half ws[64 * 32];                                                                               \
-  threadgroup half xs[32 * 32];                                                                               \
+  threadgroup half *ws = (threadgroup half *)shared;                                                          \
+  threadgroup half *xs = ws + 64 * 32;                                                                        \
   simdgroup_float8x8 mc[4][2];                                                                                \
   for(uint a = 0; a < 4; ++a)                                                                                 \
     for(uint b = 0; b < 2; ++b) mc[a][b] = make_filled_simdgroup_matrix<float, 8>(0.0f);                      \
@@ -1763,7 +1763,56 @@ kernel void group_routes(constant grp_params &P [[buffer(0)]],
     }                                                                                                         \
     BARRIER;                                                                                                  \
   }                                                                                                           \
-  threadgroup float out[32 * 64];                                                                             \
+  threadgroup float *out = shared;                                                                            \
+  for(uint a = 0; a < 4; ++a)                                                                                 \
+    for(uint b = 0; b < 2; ++b) simdgroup_store(mc[a][b], out + (8u * a) * 64u + 16u * sg + 8u * b, 64);     \
+  BARRIER;
+
+// The same for MXFP8 matrices (E4M3 values, a power-of-two scale for 32): in
+// floats (the scales can leave a half's range), 16 columns at a time.
+#define GROUPED_PRODUCT_MX(XROW)                                                                              \
+  threadgroup float *ws = shared;                                                                             \
+  threadgroup float *xs = shared + 64 * 16;                                                                   \
+  simdgroup_float8x8 mc[4][2];                                                                                \
+  for(uint a = 0; a < 4; ++a)                                                                                 \
+    for(uint b = 0; b < 2; ++b) mc[a][b] = make_filled_simdgroup_matrix<float, 8>(0.0f);                      \
+  for(uint k0 = 0; k0 < P.cols; k0 += 16u)                                                                    \
+  {                                                                                                           \
+    if(tid < 64u)                                                                                             \
+    {                                                                                                         \
+      uint off = e * P.rows + row0 + tid;                                                                     \
+      uint4 q = ((device const uint4 *)w)[(off * P.cols + k0) / 16u];                                         \
+      float scale = exp2(float(sc[off * (P.cols / 32u) + k0 / 32u]) - 127.0f);                                \
+      uint parts[4] = { q.x, q.y, q.z, q.w };                                                                 \
+      for(uint i = 0; i < 4; ++i)                                                                             \
+      {                                                                                                       \
+        float4 v = e4m3v(as_type<uchar4>(parts[i])) * scale;                                                  \
+        for(uint c = 0; c < 4; ++c) ws[tid * 16u + 4u * i + c] = v[c];                                        \
+      }                                                                                                       \
+    }                                                                                                         \
+    else                                                                                                      \
+    {                                                                                                         \
+      uint j = (tid - 64u) / 2u, part = (tid - 64u) % 2u;                                                     \
+      bool live = j < n;                                                                                      \
+      device const float4 *xr = x + (XROW) * (P.cols / 4u) + (k0 + 8u * part) / 4u;                          \
+      for(uint c = 0; c < 2; ++c)                                                                             \
+      {                                                                                                       \
+        float4 v = live ? xr[c] : float4(0.0f);                                                               \
+        for(uint i = 0; i < 4; ++i) xs[j * 16u + 8u * part + 4u * c + i] = v[i];                             \
+      }                                                                                                       \
+    }                                                                                                         \
+    BARRIER;                                                                                                  \
+    for(uint kk = 0; kk < 16u; kk += 8u)                                                                      \
+    {                                                                                                         \
+      simdgroup_float8x8 mx[4], mw[2];                                                                        \
+      for(uint a = 0; a < 4; ++a) simdgroup_load(mx[a], xs + (8u * a) * 16u + kk, 16);                       \
+      for(uint b = 0; b < 2; ++b) simdgroup_load(mw[b], ws + (16u * sg + 8u * b) * 16u + kk, 16, 0, true);    \
+      for(uint a = 0; a < 4; ++a)                                                                             \
+        for(uint b = 0; b < 2; ++b) simdgroup_multiply_accumulate(mc[a][b], mx[a], mw[b], mc[a][b]);          \
+    }                                                                                                         \
+    BARRIER;                                                                                                  \
+  }                                                                                                           \
+  threadgroup float *out = shared;                                                                            \
   for(uint a = 0; a < 4; ++a)                                                                                 \
     for(uint b = 0; b < 2; ++b) simdgroup_store(mc[a][b], out + (8u * a) * 64u + 16u * sg + 8u * b, 64);     \
   BARRIER;
@@ -1799,6 +1848,7 @@ kernel void gate_up_grouped(constant ggu_params &P [[buffer(0)]],
   uint4 tile = tiles[tg.y];
   uint e = tile.x, start = tile.y, n = tile.z;
   uint row0 = tg.x * 64u;
+  threadgroup float shared[32 * 64];
   GROUPED_PRODUCT(order[start + min(j, n - 1u)] / P.topk)
   // Gate and up pairs: rows 2 i and 2 i + 1.
   for(uint i = tid; i < 32u * 32u; i += 128u)
@@ -1842,6 +1892,7 @@ kernel void down_grouped(constant gdn_params &P [[buffer(0)]],
   uint4 tile = tiles[tg.y];
   uint e = tile.x, start = tile.y, n = tile.z;
   uint row0 = tg.x * 64u;
+  threadgroup float shared[32 * 64];
   GROUPED_PRODUCT(order[start + min(j, n - 1u)])
   for(uint i = tid; i < 32u * 64u; i += 128u)
   {
@@ -1850,6 +1901,65 @@ kernel void down_grouped(constant gdn_params &P [[buffer(0)]],
     uint route = order[start + j];
     float outer = (amax[route] * wmax[e]) / (P.den * 1536.0f);
     route_out[route * P.rows + row0 + r] = rbf(out[j * 64u + r] * outer);
+  }
+}
+
+kernel void gate_up_grouped_mx(constant ggu_params &P [[buffer(0)]],
+                               device const uint *w [[buffer(1)]],
+                               device const uchar *sc [[buffer(2)]],
+                               device const float4 *x [[buffer(4)]],
+                               device const uint *order [[buffer(6)]],
+                               device const float *cw [[buffer(7)]],
+                               device float *act [[buffer(9)]],
+                               device const uint4 *tiles [[buffer(10)]],
+                               device const uint *ntiles [[buffer(11)]],
+                               uint3 tg [[threadgroup_position_in_grid]],
+                               uint3 tp [[thread_position_in_threadgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  uint tid = tp.x;
+  if(tg.y >= ntiles[0]) return;
+  uint4 tile = tiles[tg.y];
+  uint e = tile.x, start = tile.y, n = tile.z;
+  uint row0 = tg.x * 64u;
+  threadgroup float shared[32 * 64];
+  GROUPED_PRODUCT_MX(order[start + min(j, n - 1u)] / P.topk)
+  for(uint i = tid; i < 32u * 32u; i += 128u)
+  {
+    uint j = i / 32u, pr = i % 32u;
+    if(j >= n) continue;
+    uint route = order[start + j];
+    float gate = rbf(out[j * 64u + 2u * pr]);
+    float up = rbf(out[j * 64u + 2u * pr + 1u]);
+    act[route * (P.rows / 2u) + row0 / 2u + pr]
+      = rbf(softcap(gate, P.gate_cap) * sigmoidf(gate) * softcap(up, P.up_cap) * cw[route]);
+  }
+}
+
+kernel void down_grouped_mx(constant gdn_params &P [[buffer(0)]],
+                            device const uint *w [[buffer(1)]],
+                            device const uchar *sc [[buffer(2)]],
+                            device const float4 *x [[buffer(4)]],
+                            device const uint *order [[buffer(6)]],
+                            device float *route_out [[buffer(9)]],
+                            device const uint4 *tiles [[buffer(10)]],
+                            device const uint *ntiles [[buffer(11)]],
+                            uint3 tg [[threadgroup_position_in_grid]],
+                            uint3 tp [[thread_position_in_threadgroup]],
+                            ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  uint tid = tp.x;
+  if(tg.y >= ntiles[0]) return;
+  uint4 tile = tiles[tg.y];
+  uint e = tile.x, start = tile.y, n = tile.z;
+  uint row0 = tg.x * 64u;
+  threadgroup float shared[32 * 64];
+  GROUPED_PRODUCT_MX(order[start + min(j, n - 1u)])
+  for(uint i = tid; i < 32u * 64u; i += 128u)
+  {
+    uint j = i / 64u, r = i % 64u;
+    if(j >= n) continue;
+    route_out[order[start + j] * P.rows + row0 + r] = rbf(out[j * 64u + r]);
   }
 }
 
