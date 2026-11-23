@@ -5,8 +5,9 @@
 ;; shows the same pictures. A replay keeps a save of the console at every step: any step
 ;; can be gone to at once. A game that can't be saved (NetHack: :saves false) is played again
 ;; from its start to go back. A game a harness agent played (play.agent) has its
-;; conversation beside it, shown as the harness shows any (harness.cards), at each step as
-;; it was then.
+;; conversation above it, as the harness shows any (harness.cards), and that conversation's
+;; timeline leads: played, dragged or stepped there, the game goes to the actions whose
+;; calls it shows (a few on, played frame by frame).
 ;;
 ;;   (replay/save! :nova @nova/decisions {:player-settings ...})   ; the file's path
 ;;   (replay/open! "path.edn")      ; the game again, in a card: the picture and the model's side
@@ -117,13 +118,15 @@ namespace play_replay_native
 (defonce running (atom false))
 
 (defn- show!
-  "Step `i` of the replay shown: the picture is the console's now (after the steps before it)."
-  [i]
+  "Step `i` of the replay shown: the picture is the console's now (after the steps before it).
+  With `push`, an agent's conversation is moved to the step's call (when the game moved it;
+  not when the conversation's timeline did)."
+  [i push]
   (let [{:keys [steps]} @replaying
         d (get steps i)]
     (reset! st {:step i :action (:action d) :decision d :told (:told d)
                 :result (str "replay, step " i " of " (count steps))})
-    (when (and (:conversation @replaying) (:entry d))
+    (when (and push (:conversation @replaying) (:entry d))
       (hc/to-entry! "replay agent" (:entry d)))))
 
 (defn- act-of
@@ -132,10 +135,9 @@ namespace play_replay_native
   (let [{:keys [acts] :as g} (get games (:game r))]
     (if acts (get acts (:version (:about r) 1)) (:act! g))))
 
-(defn go!
-  "To step `i`: the game as it was when the model decided step `i` (from the save kept
-  there, or played up to it)."
-  [i]
+(defn- go-to!
+  "To step `i` (go!), the conversation moved there too when `push`."
+  [i push]
   (let [{:keys [game steps saves at]} @replaying
         {:keys [start!]} (get games game)
         act! (act-of @replaying)
@@ -156,8 +158,16 @@ namespace play_replay_native
             (act! (:action (get steps k)))
             (swap! saves conj (p/nes-save!)))))
     (swap! replaying assoc :at i)
-    (show! i)
+    (show! i push)
     i))
+
+(defn go!
+  "To step `i`: the game as it was when the model decided step `i` (from the save kept
+  there, or played up to it), and an agent's conversation at that step's call."
+  [i]
+  (go-to! i true))
+
+(declare follow!)
 
 (defn open!
   "A recording played again from its start, in a card pinned at the top of the window: the
@@ -172,11 +182,15 @@ namespace play_replay_native
           conversation (when (and (:agent (:about r)) (cpp/play_replay_native.exists conversation)) conversation)]
       (when conversation
         (hc/replay! conversation "replay agent"))
-      (reset! replaying (assoc r :at 0 :path path :conversation conversation
+      (reset! replaying (assoc r :at 0 :path path :conversation conversation :token (str path "@" (cpp/play_decide.seconds))
                                :saves (atom (if (false? (get-in games [(:game r) :saves])) [] [(p/nes-save!)])))))
     ;; In the game's own card's place: there is one console.
     (c/pin! title st (p/decision-card ((or (:picture (get games (:game r))) (fn [] (p/picture-part :nes 300))))))
-    (show! 0)
+    (show! 0 false)
+    ;; An agent's game follows its conversation's timeline.
+    (when (:conversation @replaying)
+      (hc/pause! "replay agent")
+      (follow! (:token @replaying)))
     (count (:steps r))))
 
 (defn step!
@@ -188,8 +202,8 @@ namespace play_replay_native
 
 (defn- step-played!
   "One step on, its action played from the step shown (not taken from a save: its frames are
-  run, to be seen)."
-  []
+  run, to be seen); the conversation moved to the next call when `push`."
+  [push]
   (let [{:keys [game at steps saves] :as r} @replaying
         savable (not (false? (get-in games [game :saves])))]
     (when (< (inc at) (count steps))
@@ -199,37 +213,70 @@ namespace play_replay_native
       (when (and savable (= (count @saves) (inc at)))
         (swap! saves conj (p/nes-save!)))
       (swap! replaying assoc :at (inc at))
-      (show! (inc at))
+      (show! (inc at) push)
       (inc at))))
 
+(defn- follow!
+  "While replay `token` is the one open: the game kept where the agent's conversation is
+  shown (its timeline played, dragged or stepped): after the actions whose calls it shows.
+  A few actions on are played frame by frame, a jump is gone to at once."
+  [token]
+  (future
+    (try
+      (loop []
+        (when (= token (:token @replaying))
+          (when-let [n (hc/shown-entries "replay agent")]
+            (let [{:keys [at steps]} @replaying
+                  target (min (dec (count steps))
+                              (count (filter (fn [d] (and (:entry d) (< (:entry d) n))) steps)))]
+              (cond
+                (and (> target at) (<= (- target at) 4))
+                (binding [p/*frame-pause* 16667]
+                  (dotimes [_ (- target at)]
+                    (step-played! false)))
+
+                (not= target at)
+                (go-to! target false))))
+          (cpp/usleep 100000)
+          (recur)))
+      (catch :default _ nil))))
+
+(defn- play-steps!
+  "play! of a game without a conversation: `pace` steps a second, or :fluid."
+  [pace]
+  (reset! running true)
+  (future
+    (try
+      (loop []
+        (when @running
+          (let [{:keys [at steps]} @replaying]
+            (when (< (inc at) (count steps))
+              (if (= pace :fluid)
+                ;; Each action played frame by frame.
+                (binding [p/*frame-pause* 16667]
+                  (step-played! true))
+                (do (step!)
+                    (cpp/usleep (long (/ 1000000 pace)))))
+              (recur)))))
+      (catch :default _ nil))
+    (reset! running false))
+  :playing)
+
 (defn play!
-  "The replay going on by itself, in the background, `per-second` steps a second (2 when not
-  said), or with :fluid (`(play! :fluid)`) each step's frames shown at the game's own speed
-  (60 a second), the conversation of an agent's game moved to the step's call first. stop!
-  pauses it."
+  "The replay going on by itself, in the background. An agent's game: its conversation's
+  timeline played (the game follows it, each action's frames at the game's own speed).
+  Else `per-second` steps a second (2 when not said), or with :fluid (`(play! :fluid)`) each
+  step's frames at the game's own speed. stop! pauses it."
   ([] (play! 2))
   ([pace]
-   (reset! running true)
-   (future
-     (try
-       (loop []
-         (when @running
-           (let [{:keys [at steps]} @replaying
-                 more (< (inc at) (count steps))]
-             (when more
-               (if (= pace :fluid)
-                 ;; The conversation at the call, then the action played frame by frame.
-                 (do (when-let [e (:entry (get steps at))]
-                       (when (:conversation @replaying)
-                         (hc/to-entry! "replay agent" e)))
-                     (cpp/usleep 400000)
-                     (binding [p/*frame-pause* 16667]
-                       (step-played!)))
-                 (do (step!)
-                     (cpp/usleep (long (/ 1000000 pace)))))
-               (recur)))))
-       (catch :default _ nil))
-     (reset! running false))
-   :playing))
+   (if (:conversation @replaying)
+     (do (hc/play! "replay agent") :playing)
+     (play-steps! pace))))
 
-(defn stop! [] (reset! running false))
+(defn stop!
+  "The replay paused (an agent's conversation with it)."
+  []
+  (reset! running false)
+  (when (:conversation @replaying)
+    (hc/pause! "replay agent"))
+  nil)

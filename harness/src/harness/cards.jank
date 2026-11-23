@@ -1135,6 +1135,30 @@
     (to-time! named (if (= (:mode p) :paused) (:t p) 0.0) true)
     nil))
 
+(defn shown-entries
+  "How many of the conversation `named`'s entries are shown whole where its timeline is now
+  (playing, paused, dragged or live): for something kept beside it (a game's replay) to
+  follow it. nil when it isn't watched."
+  [named]
+  (let [named (str named)]
+    (when-let [a (conversation named)]
+      (let [v @a
+            sched (schedule-of named (:entries v))
+            p (get @plays named {:mode :live})
+            t (if (= (:mode p) :live) (:total sched) (min (:total sched) (:t p)))]
+        (count (:entries (at-time v t sched)))))))
+
+(defn pause!
+  "The conversation `named` stopped where it is shown."
+  [named]
+  (let [named (str named)]
+    (when-let [a (conversation named)]
+      (let [sched (schedule-of named (:entries @a))
+            p (get @plays named {:mode :live})
+            t (if (= (:mode p) :live) (:total sched) (min (:total sched) (:t p)))]
+        (to-time! named t false))))
+  nil)
+
 (defn seek!
   "The conversation `named` shown up to a share of its length (0 its start, 1 its end), and
   stopped there."
