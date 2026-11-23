@@ -248,8 +248,10 @@ namespace inkling
 
   namespace
   {
-    // The first checks: each depth once, from the deepest, then plain steps.
-    int32_t const warmup[]{ 7, 7, 6, 5, 4, 3, 2, 1, 0, 0 };
+    // The first checks measure a few depths (the first one's time is not
+    // counted); the others' times are estimated from them, and measured when
+    // they become the best or the best rival.
+    int32_t const warmup[]{ 3, 3, 1, 0, 0 };
 
     float accept_at(drafter::control const &c, int32_t j)
     {

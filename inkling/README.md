@@ -23,8 +23,8 @@ the long-context rows 2026-11-22):
 | | inkling | Ollama 0.40.17 (same machine) |
 |---|---|---|
 | Generation, short context | about 45 tokens/s | about 32 tokens/s (with its draft model) |
-| Generation with the draft model (`--dspark 7`), writing code | about 66 tokens/s (3 tokens a forward) | |
-| Generation with the draft model, counting to 60 | about 92 tokens/s (6.4 tokens a forward) | |
+| Generation with the draft model (`--dspark 7`), writing code | about 64 tokens/s (3 tokens a forward) | |
+| Generation with the draft model, counting to 60 | about 99 tokens/s (6.9 tokens a forward) | |
 | Generation, rewriting text of the context, drafts from the context | about 80 tokens/s (5.8 tokens a forward) | not measured |
 | Generation at 20,000 tokens of context | about 33 tokens/s | not measured |
 | Prompt processing, 3,400 tokens | 160 tokens/s | about 400 tokens/s |
@@ -136,12 +136,14 @@ time (docs/drafting.md; `native/draft.cpp` is the CPU version, the reference;
 the GPU version is in `native/metal.mm`). The depth of each check is chosen
 from the measured time of each depth and the measured acceptance at each
 place (0, plain steps, when drafting doesn't pay). Greedy, 200 tokens, plain
-against drafted: a Python function 44.0 and 65.9 tokens/s (3.0 tokens a
-forward), counting to 60 44.3 and 92.0 (6.4), a short story 44.5 and 42.1
-(the depth falls to 0; the first checks, which measure each depth, cost a
-little). A draft takes 7.5 ms at one token and 8.6 ms at three; a forward
-over 2 rows costs 6 ms more than over one, over 8 rows 44 ms more, mostly the
-routed experts of the extra tokens.
+against drafted: a Python function 44.0 and 63.2 tokens/s (3.1 tokens a
+forward), a C function 44.5 and 63.8 (3.0), counting to 60 44.4 and 99.0
+(6.9), a short story 44.4 and 43.0 (the depth falls to 0; the first checks,
+which measure depths 3 and 1, cost a little). A draft takes 7.5 ms at one
+token and 8.6 ms at three; a forward over 2 rows costs 6 ms more than over
+one, over 8 rows 44 ms more, mostly the routed experts of the extra tokens.
+`draftcheck` compares the GPU drafter with the CPU version from the same
+hidden states (the same first proposal in 48 of 48, all seven in 47).
 
 The approach follows [oMLX](https://github.com/jundot/omlx)'s for this model:
 drafts copied from the context (#5528), verify rows that are the bits of a
