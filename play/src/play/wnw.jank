@@ -12,6 +12,7 @@
   (:require [clojure.string :as str]
             [cards.core :as c]
             [play.core :as p]
+            [play.decide :as decide]
             [play.wnw-tiles :as tiles]))
 
 (def game (p/vendor "games" "mbh-A53-witchnwiz" "game" "BUILD" "main.nes"))
@@ -71,26 +72,94 @@
                               (contains? objects [x y]) "o"
                               :else (tile-char (nth (:tiles st) (+ (* y width) x))))))))))
 
+(def tile-names
+  {"." "empty" "#" "solid" "H" "a ladder" "w" "a web" "B" "a block" "c" "something to carry" "k" "a key"
+   "m" "a monster" "D" "the closed door" "E" "the open door" "|" "a mirror"})
+
+(defn- around
+  "What is at and next to the player you move, as a sentence."
+  [st]
+  (when-let [pl (first (filter :current (:players st)))]
+    (let [at (fn [dx dy]
+               (let [x (+ (:x pl) dx) y (+ (:y pl) dy)]
+                 (if (and (< -1 x width) (< -1 y height))
+                   (get tile-names (tile-char (nth (:tiles st) (+ (* y width) x))) "something")
+                   "the edge")))]
+      (str "Where " (:who pl) " is: " (at 0 0) (when (= "a ladder" (at 0 0)) " (up and down climb it)")
+           "; left " (at -1 0) ", right " (at 1 0) ", above " (at 0 -1) ", below " (at 0 1) ".\n"))))
+
+(defn- moved
+  "What changed from `before` to `st`: the players' moves, objects gone."
+  [before st]
+  (let [was (into {} (map (fn [pl] [(:who pl) pl]) (:players before)))
+        moves (for [pl (:players st)
+                    :let [b (get was (:who pl))]
+                    :when (and b (or (not= (:x b) (:x pl)) (not= (:y b) (:y pl))))]
+                (str (:who pl) " moved from (" (:x b) ", " (:y b) ") to (" (:x pl) ", " (:y pl) ")"))
+        gone (- (count (:objects before)) (count (:objects st)))
+        monsters (fn [x] (count (filter (fn [ch] (= ch "m")) (map tile-char (:tiles x)))))
+        defeated (- (monsters before) (monsters st))]
+    (str "Since the last action: "
+         (if (seq moves) (str/join "; " moves) "nobody moved")
+         (when (pos? defeated) (str "; " defeated (if (= 1 defeated) " monster" " monsters") " defeated"))
+         (when (pos? gone) (str "; " gone (if (= 1 gone) " object" " objects") " gone"))
+         ".\n")))
+
+(defn runs
+  "The room as runs of the same tile on a row, with their x (empty left out): a line a row."
+  [st]
+  (let [players (into {} (map (fn [pl] [[(:x pl) (:y pl)] (:who pl)]) (:players st)))]
+    (str/join "\n"
+              (for [y (range height)
+                    :let [cells (for [x (range width)]
+                                  [x (or (get players [x y]) (get tile-names (tile-char (nth (:tiles st) (+ (* y width) x))) "something"))])
+                          groups (remove (fn [g] (= "empty" (second (first g)))) (partition-by second cells))]
+                    :when (seq groups)]
+                (str "y " y ": "
+                     (str/join ", " (map (fn [g] (let [[x0 t] (first g) [x1 _] (last g)]
+                                                   (str t (if (= x0 x1) (str " at x " x0) (str " x " x0 " to " x1)))))
+                                         groups)))))))
+
+(defonce telling
+  ;; How the room is told: :grid, a character a tile; :runs, each row's things with their x.
+  (atom {:map :grid}))
+
 (defn told
-  "What a model is told: where it is, the players, the objects, the room."
+  "What a model is told: where it is (and what changed since `before`, the state a step
+  ago), the players, the objects, the room."
   ([] (told (state)))
-  ([st]
-   (str "Screen: " (:state st) ", room " (inc (:room st)) ".\n"
+  ([st] (told st nil))
+  ([st before]
+   (str (when before (moved before st))
+        "Screen: " (:state st) ", room " (inc (:room st)) ".\n"
         (str/join "\n" (map (fn [pl] (str (str/capitalize (:who pl)) " at (" (:x pl) ", " (:y pl) "), facing "
                                           (name (:facing pl)) (when (:current pl) ", the one you move")))
                             (:players st)))
         "\n"
+        (around st)
         (if (seq (:objects st))
           (str "Objects: " (str/join ", " (map (fn [o] (str (:kind o) " at (" (:x o) ", " (:y o) ")")) (:objects st))) ".\n")
           "No objects.\n")
-        "The room (x across, y down; @ a player, o an object, . empty, # solid, H ladder, w web, "
-        "B a block to push, c something to carry, m a monster):\n"
-        (view st))))
+        (let [found (frequencies (map tile-char (:tiles st)))
+              at (fn [ch] (for [i (range (count (:tiles st))) :when (= ch (tile-char (nth (:tiles st) i)))]
+                            (str "(" (mod i width) ", " (quot i width) ")")))]
+          (str (let [n (get found "m" 0)] (str n (if (= 1 n) " monster" " monsters") " left"
+                                               (when (pos? n) (str ", at " (str/join ", " (at "m")))) ". "))
+               (cond (seq (at "E")) (str "The door is open, at " (str/join ", " (at "E")) ": walk into it.\n")
+                     (seq (at "D")) (str "The door is closed, at " (str/join ", " (at "D")) ".\n")
+                     :else "\n")))
+        (if (= :runs (:map @telling))
+          (str "The room by row (x across, y down; empty cells left out):\n" (runs st))
+          (str "The room (x across, y down; @ a player, o an object, . empty, # solid, H ladder, w web, "
+               "B a block to push, c something to carry, k a key, m a monster, D the closed door, E the "
+               "open door, | a mirror):\n"
+               (view st))))))
 
 ;; Actions: buttons held for some frames (a move is a grid cell).
 
 (def actions
-  {:left [:left] :right [:right] :up [:up] :down [:down] :a [:a] :b [:b] :wait []})
+  {:left [:left] :right [:right] :up [:up] :down [:down] :a [:a] :b [:b] :undo [:b] :restart [:select]
+   :wait []})
 
 (def step-frames 16)
 
@@ -123,8 +192,9 @@
 (defonce running (atom false))
 
 (defn play!
-  "`steps` steps of `chooser` (fn [state] action; the scripted player by default) in the
-  background, each shown in the card. (stop!) ends it."
+  "`steps` steps of `chooser` (fn [state] action, or a decision {:action :probs}; the scripted
+  player by default) in the background, each shown in the card: a future, done when they
+  are. (stop!) ends it."
   ([steps] (play! steps scripted))
   ([steps chooser]
    (reset! running true)
@@ -132,18 +202,55 @@
      (try
        (loop [i 0]
          (when (and @running (< i steps))
-           (let [a (chooser (state))]
+           (let [d (chooser (state))
+                 a (if (map? d) (:action d) d)]
              (act! a)
-             (reset! st {:step (inc i) :action a :told (told)})
+             (reset! st (cond-> {:step (inc i) :action a :told (told)}
+                          (map? d) (assoc :decision d :told (:told d))))
              (recur (inc i)))))
        (catch :default _ nil))
-     (reset! running false))
-   :playing))
+     (reset! running false)
+     :done)))
 
 (defn stop! [] (reset! running false))
 
+;; A model playing.
+
+(def rules
+  "What a model playing Witch n' Wiz is told of the game (from its sources, game/PRG0.c)."
+  (str "You play Witch n' Wiz, a puzzle game on the NES. A room is a grid seen from the side, "
+       "16 cells across (x) and 15 down (y). You move one cell an action: left and right walk; "
+       "up and down climb ladders (H); with nothing under you, you fall. Walking into a monster "
+       "(m) defeats it. Walking into a block (B) pushes it, and it falls when nothing is under "
+       "it. Standing on something to carry (c, or a key k), a picks it up, and a again puts it "
+       "down ahead of you; a key put into the closed door (D) opens it. When every monster is "
+       "defeated the door opens (E): walk into it to finish the room. undo takes back your last "
+       "action; "
+       "restart starts the room again; wait does nothing. On the level complete screen, a goes "
+       "on to the next room."))
+
+(def model-actions [:left :right :up :down :a :undo :restart :wait])
+
+(defonce decisions (atom []))
+
+(defn model-player
+  "A player of Witch n' Wiz for model `m` (play.decide); `settings` as decide/player's."
+  ([m] (model-player m {}))
+  ([m settings] (decide/player m (merge {:rules rules :actions model-actions} settings))))
+
+(defn play-model!
+  "`steps` steps chosen by `deciders` (a model-player, or a vector of them: a committee) in
+  the background, each decision kept in `decisions`: a future, done when they are. Each
+  state is told with what changed since the one before."
+  ([deciders steps] (play-model! deciders steps {}))
+  ([deciders steps opts]
+   (reset! decisions [])
+   (let [before (atom nil)
+         telling (fn [s] (let [t (#'told s @before)] (reset! before s) t))]
+     (play! steps (decide/chooser deciders telling decisions opts)))))
+
 (defn watch!
-  "Witch n' Wiz's card at the top of the window: the picture as it is played, and what a
-  model is told."
+  "Witch n' Wiz's card at the top of the window: the picture as it is played and, when a
+  model plays, its side (the probabilities, its thinking, what it was told)."
   []
-  (c/pin! "Witch n' Wiz" st (p/watch-card (p/picture-part :nes 300))))
+  (c/pin! "Witch n' Wiz" st (p/decision-card (p/picture-part :nes 300))))
