@@ -382,6 +382,13 @@ def main():
                 if any(f'{task}-{mode}-{seed}.edn"' in r for r in results):
                     print(f'SKIP {task} {mode} seed {seed}: already in results.edn', flush=True)
                     continue
+                # Between runs, while OUT/pause exists, nothing runs: the GPU and the memory are
+                # free for something else (a second model in memory slows both to a crawl).
+                if os.path.exists(OUT + '/pause'):
+                    print(f'PAUSED before {task} {mode} seed {seed}', flush=True)
+                    while os.path.exists(OUT + '/pause'):
+                        time.sleep(5)
+                    print('RESUMED', flush=True)
                 t0 = time.time()
                 port = proc = None
                 try:
