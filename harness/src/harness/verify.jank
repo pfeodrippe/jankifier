@@ -196,7 +196,14 @@
             (cond
               (threw written) {:threw (str "the file couldn't be copied to be loaded: " (threw written))}
               (threw messages) {:threw (threw messages)}
-              (seq errors) {:threw (str/join "\n" (map (fn [m] (str path ":" (:line m) ": " (:text m))) errors))}
+              ;; Veil's messages name the module as loaded; said with the file's own name
+              ;; (and without the underlining of a hint's suggestion).
+              (seq errors) {:threw (str/join "\n" (map (fn [m]
+                                                         (str path ":" (:line m) ": "
+                                                              (-> (str (:text m))
+                                                                  (str/replace "\u0332" "")
+                                                                  (str/replace as from))))
+                                                       errors))}
               :else (do (swap! loaded assoc-in [:names text] as) as)))))))
 
 (defn- model-checks
