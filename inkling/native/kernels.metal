@@ -705,6 +705,52 @@ kernel void conv_fixed(constant conv_params &P [[buffer(0)]],
   hist[2u * P.ch + c] = h2;
 }
 
+// The same for a prompt's chunk: a thread a (channel, token), each sum in
+// conv_fixed's order (the same bits); the history is left for conv_history.
+kernel void conv_fixed_par(constant conv_params &P [[buffer(0)]],
+                           device const ushort *w [[buffer(1)]],
+                           device const float *in [[buffer(2)]],
+                           device const float *hist [[buffer(3)]],
+                           device float *out [[buffer(4)]],
+                           device float *stream [[buffer(5)]],
+                           device float *kept [[buffer(6)]],
+                           uint2 gid [[thread_position_in_grid]])
+{
+  uint c = gid.x, t = gid.y;
+  if(c >= P.ch || t >= P.nt) return;
+  float x = in[t * P.ch + c];
+  float h0 = t >= 3u ? in[(t - 3u) * P.ch + c] : hist[t * P.ch + c];
+  float h1 = t >= 2u ? in[(t - 2u) * P.ch + c] : hist[(t + 1u) * P.ch + c];
+  float h2 = t >= 1u ? in[(t - 1u) * P.ch + c] : hist[2u * P.ch + c];
+  float w0 = bf16(w[c * 4u]), w1 = bf16(w[c * 4u + 1u]), w2 = bf16(w[c * 4u + 2u]), w3 = bf16(w[c * 4u + 3u]);
+  if(P.keep != 0u) kept[t * P.ch + c] = x;
+  float sum = x;
+  sum += w0 * h0;
+  sum += w1 * h1;
+  sum += w2 * h2;
+  sum += w3 * x;
+  float o = rbf(sum * P.norm);
+  uint at = (P.dst * P.tmax + t) * P.h + c;
+  if(P.mode == 0u) out[t * P.ch + c] = o;
+  else if(P.mode == 1u) stream[at] = o;
+  else if(P.mode == 2u) stream[at] = stream[at] + o;
+  else stream[at] = rbf(stream[at] + o);
+}
+
+// A chunk's convolution history after it: its last three inputs (some from
+// the history before, for a chunk of fewer than three tokens).
+kernel void conv_history(constant conv_params &P [[buffer(0)]],
+                         device const float *in [[buffer(2)]],
+                         device float *hist [[buffer(3)]],
+                         uint c [[thread_position_in_grid]])
+{
+  if(c >= P.ch) return;
+  float h[6] = { hist[c], hist[P.ch + c], hist[2u * P.ch + c], 0.0f, 0.0f, 0.0f };
+  for(uint t = 0; t < min(P.nt, 3u); ++t) h[3u + t] = in[(P.nt - min(P.nt, 3u) + t) * P.ch + c];
+  uint n = min(P.nt, 3u);
+  for(uint i = 0; i < 3u; ++i) hist[i * P.ch + c] = h[n + i];
+}
+
 // Projected taps: static_w [4, ch] plus per-token taps [T, heads * 4],
 // indexed by lag (tap 0 is the current token).
 kernel void conv_dyn(constant conv_params &P [[buffer(0)]],

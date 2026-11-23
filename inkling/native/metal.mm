@@ -188,6 +188,7 @@ namespace inkling
     // The draft model's Markov head's fold of the output head (made once).
     id<MTLBuffer> fold, fold_b;
     // A batch's routes by expert.
+    id<MTLComputePipelineState> conv_fixed_par, conv_history;
     id<MTLComputePipelineState> group_routes, gate_up_grouped, down_grouped, down_combine, gate_up_grouped_mx, down_grouped_mx;
     // The draft model's kernels.
     id<MTLComputePipelineState> draft_fold, draft_mix, draft_norm, draft_block, draft_head, draft_attention, draft_elementwise,
@@ -424,6 +425,8 @@ namespace inkling
       b->dn_nv = pipeline(device, lib, "down_nvfp4", 32);
       b->dn_mx = pipeline(device, lib, "down_mxfp8", 32);
       b->group_routes = pipeline(device, lib, "group_routes", 256);
+      b->conv_fixed_par = pipeline(device, lib, "conv_fixed_par", 32);
+      b->conv_history = pipeline(device, lib, "conv_history", 32);
       b->gate_up_grouped = pipeline(device, lib, "gate_up_grouped", 128);
       b->down_grouped = pipeline(device, lib, "down_grouped", 128);
       b->down_combine = pipeline(device, lib, "down_combine", 32);
@@ -1384,7 +1387,9 @@ namespace inkling
                                  uint32_t mode, uint32_t dst, id<MTLBuffer> kept) {
         conv_params const p{ static_cast<uint32_t>(cv.channels), nt, mode, dst, tmax, h, 1,
                              1.0f / std::sqrt(static_cast<float>(taps + 1)), kept ? 1u : 0u };
-        use(b.conv_fixed, "conv_fixed");
+        // A prompt's chunk: a thread a (channel, token), then the history.
+        bool const par{ nt > 16 && batched };
+        use(par ? b.conv_fixed_par : b.conv_fixed, "conv_fixed");
         [e setBytes:&p length:sizeof(p) atIndex:0];
         bind(1, weight(b, cv.weight, dtype::bf16));
         bind(2, in);
@@ -1392,7 +1397,15 @@ namespace inkling
         bind(4, out);
         bind(5, g.stream);
         bind(6, kept ? kept : b.dummy);
-        threads(p.ch, 1, 1);
+        threads(p.ch, par ? nt : 1, 1);
+        if(par)
+        {
+          use(b.conv_history, "conv_history");
+          [e setBytes:&p length:sizeof(p) atIndex:0];
+          bind(2, in);
+          bind(3, hist);
+          threads(p.ch, 1, 1);
+        }
         if(mode >= 2)
         {
           event(stream_event::kind::read, dst);
