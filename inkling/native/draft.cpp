@@ -218,6 +218,27 @@ namespace inkling
     delete d;
   }
 
+  void forget_context(drafter &d)
+  {
+    d.fed = 0;
+    std::fill(d.ring_pos.begin(), d.ring_pos.end(), -1);
+  }
+
+  void use_draft_model(session &s, int32_t const depth)
+  {
+    if(depth < 0)
+    {
+      free_drafter(s.draft_model);
+      s.draft_model = nullptr;
+      return;
+    }
+    if(!s.draft_model)
+    {
+      s.draft_model = new_drafter(s);
+    }
+    set_draft_depth(*s.draft_model, depth);
+  }
+
   void set_draft_depth(drafter &d, int32_t const depth)
   {
     d.depth = std::clamp(depth, 0, d.block - 1);

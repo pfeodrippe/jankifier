@@ -162,8 +162,10 @@ int main(int argc, char **argv)
         std::printf("row %d (position %zu): %zu of %zu logits differ, worst %.3g\n", r, prompt.size() + r, differ, v,
                     worst);
       }
-      // Rolled back to 3 of the rows, then on one token at a time: the same bits again.
+      // Rolled back to 5 of the rows, then to 3 (twice within the check), then on
+      // one token at a time: the same bits again.
       int const keep{ std::min(3, rows - 1) };
+      inkling::truncate(*batch, static_cast<int32_t>(prompt.size()) + std::min(5, rows - 1));
       inkling::truncate(*batch, static_cast<int32_t>(prompt.size()) + keep);
       batch->all_logits = false;
       bool rolled{ std::memcmp(batch->logits.data(), logits[static_cast<size_t>(keep - 1)].data(), v * sizeof(float)) == 0 };

@@ -166,6 +166,9 @@ namespace inkling
   // The drafter's GPU buffers, and the model's fold of the output head for
   // the Markov head (made once, about 0.3 s).
   void metal_prepare_drafter(drafter &d, session const &s);
+  // The drafter forgets its context (the session was reset or replaced): it is
+  // read again from the session's hidden states at the next draft.
+  void forget_context(drafter &d);
   // The session's ring of taps for a draft model, of n BF16 values, in memory
   // the GPU writes and the CPU reads.
   uint16_t *metal_tap_ring(session &s, size_t n);

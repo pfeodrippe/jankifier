@@ -207,6 +207,15 @@
   (used! s)
   (cpp/inkling.jank_layer.speculate s (double temperature) (double top-p) top-k seed limit least most))
 
+(defn draft-model!
+  "From now on `speculate!` on this session also drafts with the checkpoint's draft model
+  when the context has no match, at most `depth` tokens a check (0 to 7; the depth of
+  each check is chosen from the times and acceptance measured). A negative depth turns
+  it off. The tokens are the same either way."
+  [s depth]
+  (used! s)
+  (cpp/inkling.jank_layer.draft_model s depth))
+
 (defn truncate!
   "The session rolled back to its first `pos` tokens, within the tokens of its last
   `speculate!` (a draft's check): those after are forgotten."

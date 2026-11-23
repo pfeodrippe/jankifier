@@ -181,9 +181,10 @@
                  16384, at most a quarter of it)
     :compact-keep    recent tokens kept as they are beside the summary (15000, at most 30%
                  of the context)
-    :draft       drafting from the context (inkling.core/speculate!): {:least 6 :most 15}
-                 by default, nil off. The tokens are the same either way; text that
-                 repeats the context comes sooner.
+    :draft       drafting (inkling.core/speculate!): from the context, and with the draft
+                 model up to :model tokens a check (inkling.core/draft-model!);
+                 {:least 6 :most 15 :model 7} by default, nil off. The tokens are the same
+                 either way; text that repeats the context or is easy to guess comes sooner.
   The tools and the system text are evaluated now, so the first question starts from them."
   ([m] (agent m {}))
   ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry
@@ -203,7 +204,7 @@
             :obligations obligations
             :max-checks (or max-checks 6)
             :compact (if (contains? opts :compact) (:compact opts) summarize)
-            :draft (if (contains? opts :draft) draft {:least 6 :most 15})
+            :draft (if (contains? opts :draft) draft {:least 6 :most 15 :model 7})
             :compact-reserve (or compact-reserve
                                  (long (min (* 0.25 size) (max 16384.0 (* 0.15 size)))))
             :compact-keep (or compact-keep (long (min 15000.0 (* 0.3 size))))
@@ -219,6 +220,9 @@
                               (frame a :system "tool_declare" :xml (json/write (mapv declared tools))))
                             (when (seq system)
                               (frame a :system nil :text system))))]
+     ;; The draft model reads the hidden states of every token evaluated from now on.
+     (when-let [depth (:model (:draft a))]
+       (ink/draft-model! s depth))
      (when (seq start)
        (ink/eval! s start))
      (atom (assoc a :effort-said false :start start)))))

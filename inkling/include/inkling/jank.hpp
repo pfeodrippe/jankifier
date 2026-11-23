@@ -540,6 +540,15 @@ namespace inkling::jank_layer
     return v;
   }
 
+  // The session's draft model (inkling::use_draft_model).
+  inline object_ref draft_model(object_ref const o, object_ref const depth)
+  {
+    return guarded([&] {
+      inkling::use_draft_model(*session_of(o), static_cast<int32_t>(to_int(depth)));
+      return rt::jank_nil;
+    });
+  }
+
   // The session rolled back to its first `pos` tokens, within its last draft's check.
   inline object_ref truncate(object_ref const o, object_ref const pos)
   {

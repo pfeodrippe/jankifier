@@ -423,6 +423,9 @@ namespace inkling
     std::vector<int32_t> tap_visits;
     uint16_t *tap_ring{};
     std::vector<uint16_t> tap_storage;
+    // The session's draft model (use_draft_model), which speculate uses when
+    // given none; freed with the session.
+    struct drafter *draft_model{};
     // Tracing: evals run on the CPU and record the named values of their
     // last token.
     bool trace{};
@@ -466,7 +469,7 @@ namespace inkling
   // The session rolled back to its first `pos` tokens, which must be within
   // the last eval with all_logits (a draft's check): the tokens after are
   // forgotten, as if never evaluated, and the logits are those of token
-  // pos - 1. Once after a check.
+  // pos - 1. It can go back again, within the same check, until the next eval.
   void truncate(session &s, int32_t pos);
   // The session keeps, from now on, the hidden states a draft model reads
   // (session::tap_visits and tap_ring) for every position it evaluates.
@@ -531,4 +534,7 @@ namespace inkling
   // Up to `count` proposals for the tokens after `anchor`, the token sampled
   // after the session's last one (not yet evaluated), greedy.
   std::vector<int32_t> draft(drafter &d, session const &s, int32_t anchor, int32_t count);
+  // The session's own draft model, at most `depth` drafts a check (made the
+  // first time); a negative depth removes it.
+  void use_draft_model(session &s, int32_t depth);
 }

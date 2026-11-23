@@ -1247,6 +1247,7 @@ namespace inkling
 
   session::~session()
   {
+    free_drafter(draft_model);
     metal_free_session(gpu);
     for(auto const &[p, bytes] : maps)
     {
@@ -1329,6 +1330,10 @@ namespace inkling
         std::memset(c.conv[i], 0, tail * c.conv_width[i] * sizeof(float));
       }
     }
+    if(s.draft_model)
+    {
+      forget_context(*s.draft_model);
+    }
   }
 
   void copy(session &dst, session const &src)
@@ -1353,6 +1358,15 @@ namespace inkling
     dst.tokens = src.tokens;
     dst.logits = src.logits;
     dst.traces = src.traces;
+    if(dst.tap_ring && src.tap_ring && dst.tap_visits == src.tap_visits)
+    {
+      std::memcpy(dst.tap_ring, src.tap_ring,
+                  static_cast<size_t>(tap_slots) * (src.tap_visits.size() + 1) * static_cast<size_t>(src.model->cfg.hidden) * 2);
+    }
+    if(dst.draft_model)
+    {
+      forget_context(*dst.draft_model);
+    }
   }
 
   void eval(session &s, int32_t const *ids, size_t const n)
@@ -1455,8 +1469,9 @@ namespace inkling
 
   std::vector<int32_t> speculate(session &s, float const temperature, float const top_p, int32_t const top_k,
                                  uint64_t const seed, int32_t const limit, int32_t const least, int32_t const most,
-                                 drafter *const d)
+                                 drafter *const given)
   {
+    drafter *const d{ given ? given : s.draft_model };
     if(limit < 1)
     {
       fail("speculate: the limit is at least one token");
@@ -1513,10 +1528,6 @@ namespace inkling
     if(kept < rows.size())
     {
       truncate(s, s.checked_from + static_cast<int32_t>(kept));
-    }
-    else
-    {
-      s.checked_from = -1;
     }
     told(kept);
     rows.resize(kept);
@@ -1586,7 +1597,6 @@ namespace inkling
     s.row_logits.resize(static_cast<size_t>(k) * v);
     s.tokens.resize(static_cast<size_t>(pos));
     s.pos = pos;
-    s.checked_from = -1;
   }
 
   int32_t sample(float const *logits, int32_t const n, float const temperature, float const top_p, int32_t const top_k,
