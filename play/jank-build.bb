@@ -7,6 +7,8 @@
       engine (fs/path (fs/parent here) "inkling")]
   (util/include-dir (str (fs/path here "include")))
   (util/link-library (str (fs/path here "lib" "libplay.dylib")))
-  ;; The engine, for a model choosing the actions (play.decide).
+  ;; The engine, for a model choosing the actions (play.decide), and the harness's native
+  ;; header, for an agent playing (play.agent).
   (util/include-dir (str (fs/path engine "include")))
+  (util/include-dir (str (fs/path (fs/parent here) "harness" "include")))
   (util/link-library (str (fs/path engine "lib" "libinkling.dylib"))))

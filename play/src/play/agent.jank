@@ -1,0 +1,137 @@
+;; SPDX-License-Identifier: MIT
+;; A game played by a harness agent (harness.core): the model's own conversation, thinking as
+;; long as it likes, and tools to look at the game and act in it (one action or several in a
+;; row, stopping at one that changes nothing). The far end of how close a choice is to a real
+;; model step: play.decide scores one action at a time; this is the model working as it does
+;; on any task. Its conversation is in the window as the harness shows any agent's
+;; (harness.cards), above the game's card. Each action is kept with its place in the
+;; conversation, so a replay shows the conversation as it was at each step of the game.
+;;
+;;   (def run (agent/play! :wnw m {:minutes 10}))   ; in the background; a future of the result
+;;   (agent/stop!)                                   ; ends it (the result is kept)
+(ns play.agent
+  (:require [clojure.string :as str]
+            [harness.cards :as hc]
+            [harness.core :as h]
+            [play.core :as p]
+            [play.decide :as decide]
+            [play.nova :as nova]
+            [play.replay :as replay]
+            [play.wnw :as wnw]))
+
+(def games
+  "What the agent plays: the game's state, how it is told (with the state before), an
+  action, the actions, the rules, the card's atom, whether an action changed nothing, and
+  the progress to count."
+  {:wnw {:start! #'wnw/start! :state #'wnw/state :told #'wnw/told :act! #'wnw/act!
+         :actions wnw/model-actions :rules wnw/rules :st #'wnw/st :watch! #'wnw/watch!
+         :same? (fn [a b] (= a b))
+         :progress (fn [s] {:room (inc (:room s)) :screen (:state s)})}
+   :nova {:start! #'nova/start! :state #'nova/state :told #'nova/told :act! #'nova/act!
+          :actions nova/model-actions :rules nova/rules :st #'nova/st :watch! #'nova/watch!
+          :same? (fn [a b] (and (= (:x a) (:x b)) (= (:y a) (:y b))))
+          :progress (fn [s] {:x (/ (long (* 10 (:x s))) 10.0) :health (:health s)})}})
+
+(def guidance
+  (str "\n\nYou play through two tools. look tells you the game as it is now. act does actions "
+       "in order (one, or several you have planned) and tells you what each changed and the "
+       "game after them; it stops at an action that changes nothing. Plan from what you are "
+       "told, act, and read what changed. Keep playing: when a turn ends you are asked to go "
+       "on."))
+
+(defonce running (atom false))
+(defonce current (atom nil))
+(defonce steps (atom []))
+
+(defn- last-of
+  "The text of the agent's last entry of `role` (nil when none)."
+  [a role]
+  (:text (last (filter (fn [e] (= (:role e) role)) (:entries @a)))))
+
+(defn- tools
+  "The game's tools for an agent."
+  [g]
+  (let [{:keys [state told act! actions same? st]} g
+        allowed (set actions)]
+    [{:name "look"
+      :doc "The game as it is now."
+      :params {}
+      :fn (fn [_] (told (state) nil))}
+     {:name "act"
+      :doc (str "Does actions in order and tells what each changed, then the game after them. "
+                "Stops at an action that changes nothing. Actions: " (str/join ", " (map name actions)) ".")
+      :params {:actions {:type "array" :doc "the actions, in order (one or more)"}}
+      :fn (fn [{:keys [actions]}]
+            (let [names (if (string? actions) [actions] (vec actions))
+                  a (:agent (h/me))]
+              (loop [left names said []]
+                (if (or (empty? left) (not @running))
+                  (str (str/join "\n" said) "\n\nThe game now:\n" (told (state) nil))
+                  (let [k (keyword (str/trim (str (first left))))]
+                    (if-not (contains? allowed k)
+                      (str (str/join "\n" (conj said (str (name k) ": not an action (the actions: "
+                                                          (str/join ", " (map name actions)) "); stopped here.")))
+                           "\n\nThe game now:\n" (told (state) nil))
+                      (let [before (state)
+                            seen (told before nil)
+                            _ (act! k)
+                            after (state)
+                            changed (first (str/split-lines (told after before)))
+                            step {:action k :told seen
+                                  :thinking (when a (last-of a :thinking))
+                                  :said (when a (str "act " (pr-str (vec names))))
+                                  :agent-step (when a (:step-count @a))
+                                  ;; Where this call's entry goes in the conversation.
+                                  :entry (when a (count (:entries @a)))}]
+                        (swap! steps conj step)
+                        (reset! @st {:step (count @steps) :action k :decision step :told (told after before)})
+                        (if (same? before after)
+                          (str (str/join "\n" (conj said (str (name k) ": " changed " Stopped here: it changed nothing.")))
+                               "\n\nThe game now:\n" (told after before))
+                          (recur (rest left) (conj said (str (name k) ": " changed)))))))))))}]))
+
+(defn play!
+  "Game `game` (a key of `games`) played from its start by a harness agent on model `m`, for
+  `minutes`, in the background: a future of {:recording :conversation :actions :progress
+  :minutes}. `opts`: :effort (:medium), :context (16384), :max-steps a turn (40),
+  :max-thinking (1200)."
+  [game m {:keys [minutes effort context max-steps max-thinking]
+           :or {minutes 10 effort :medium context 16384 max-steps 40 max-thinking 1200}}]
+  (let [g (get games game)]
+    (when-let [failed ((:start! g))]
+      (throw (ex-info (str "the game didn't start: " failed) {})))
+    ((:watch! g))
+    (reset! steps [])
+    (reset! running true)
+    (let [a (h/agent m {:tools (tools g) :system (str (:rules g) guidance) :effort effort :context context
+                        :max-steps max-steps :max-thinking max-thinking})
+          began (cpp/play_decide.seconds)
+          minutes-of (fn [] (/ (- (cpp/play_decide.seconds) began) 60.0))]
+      (reset! current a)
+      (hc/watch! a (str (name game) " agent"))
+      (future
+        (try
+          (loop [i 0]
+            (when (and @running (< (minutes-of) minutes))
+              (h/ask! a (if (zero? i)
+                          "Play the game. Look first."
+                          "Go on playing."))
+              ;; The turn, cut at the time.
+              (loop []
+                (when-not (realized? (:turn @a))
+                  (if (or (not @running) (>= (minutes-of) minutes))
+                    (h/stop! a)
+                    (cpp/usleep 200000))
+                  (recur)))
+              (h/answer a)
+              (recur (inc i))))
+          (catch :default _ nil))
+        (reset! running false)
+        (let [path (replay/save! game @steps {:agent true :effort effort :minutes minutes})
+              conversation (str/replace path #"\.edn$" ".agent.edn")]
+          (h/save! a conversation)
+          (h/close! a)
+          {:recording path :conversation conversation :actions (count @steps)
+           :progress ((:progress g) ((:state g))) :minutes (/ (long (* 10 (minutes-of))) 10.0)})))))
+
+(defn stop! [] (reset! running false))

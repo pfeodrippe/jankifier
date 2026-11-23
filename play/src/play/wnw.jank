@@ -146,9 +146,11 @@
   ([st before]
    (str (when before (moved before st))
         "Screen: " (:state st) ", room " (inc (:room st)) ".\n"
-        (str/join "\n" (map (fn [pl] (str (str/capitalize (:who pl)) " at (" (:x pl) ", " (:y pl) "), facing "
-                                          (name (:facing pl)) (when (:current pl) ", the one you move")))
-                            (:players st)))
+        (if (seq (:players st))
+          (str/join "\n" (map (fn [pl] (str (str/capitalize (:who pl)) " at (" (:x pl) ", " (:y pl) "), facing "
+                                            (name (:facing pl)) (when (:current pl) ", the one you move")))
+                              (:players st)))
+          "No player is in the room now (gone through the door, or lost): if the room doesn't end, undo or restart.")
         "\n"
         (around st)
         (if (seq (:objects st))
@@ -177,9 +179,18 @@
 
 (def step-frames 16)
 
-(defn act! [action]
+(defn act!
+  "One step: the action's buttons held for step-frames frames, then released for one. When it
+  took the last player through the door, the frames until the room ends (a player told of an
+  empty room that hasn't ended yet doesn't know what to do)."
+  [action]
   (p/nes-run! (get actions action []) step-frames)
-  (p/nes-run! [] 1))
+  (p/nes-run! [] 1)
+  (loop [i 0]
+    (let [s (state)]
+      (when (and (< i 60) (= "game" (:state s)) (empty? (:players s)))
+        (p/nes-run! [] 1)
+        (recur (inc i))))))
 
 ;; Into the game: Start three times, Up to "new game", A twice (the first room).
 (def to-room

@@ -5,8 +5,9 @@
   :plugins [[org.jank-lang/lein-jank "2026.10-1"]]
   :middleware [leiningen.jank/middleware]
   :build-dependencies [[org.jank-lang.commons/jank-build "2026.10-1"]]
-  ;; inkling.core from the engine's own sources (a model choosing the actions: play.decide).
-  :source-paths ["src" "../inkling/src"]
+  ;; inkling.core from the engine's own sources (a model choosing the actions: play.decide),
+  ;; and the harness's (an agent playing: play.agent).
+  :source-paths ["src" "../inkling/src" "../harness/src"]
   :main play.main
   :profiles {:base {:jank {:target-dir "target/debug"
                            :optimization-level 0}}})
