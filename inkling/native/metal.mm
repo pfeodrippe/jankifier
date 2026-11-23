@@ -32,13 +32,14 @@ namespace inkling
 
     struct vec_params
     {
-      uint32_t t0, dst_t0, h, tmax, nsrc, src[6], has_query, query_row, nprev, prev[2], msg_row, tmp_in, tmp_msg;
+      uint32_t t0, dst_t0, h, tmax, nsrc, src[6], has_query, query_row[3], nprev, prev[2], msg_row[3], tmp_in[3], tmp_msg[3],
+        from_tmp;
       float eps;
     };
 
     struct ctl_params
     {
-      uint32_t h, rank, tmax, tmp_in, tmp_msg;
+      uint32_t h, rank, tmax, tmp_in[3], tmp_msg[3];
     };
 
     struct lin_params
@@ -94,6 +95,13 @@ namespace inkling
       uint32_t h, p0, slots, ntaps, tap, src_row;
     };
 
+    // A matrix of linear_multi with its input and output.
+    struct lin_part
+    {
+      tensor const *w;
+      id<MTLBuffer> x, y;
+    };
+
     struct multi_params
     {
       uint32_t in, nt, mode;
@@ -138,10 +146,17 @@ namespace inkling
       float den;
     };
 
-    // Residual stream slots, plus two for a controller's input and message.
+    // Residual stream slots, plus two for each controller's input and message
+    // (up to 3 inputs computed together).
     constexpr uint32_t stream_slots{ 12 };
-    constexpr uint32_t tmp_in_slot{ stream_slots };
-    constexpr uint32_t tmp_msg_slot{ stream_slots + 1 };
+    constexpr uint32_t tmp_in_slot(uint32_t const z)
+    {
+      return stream_slots + 2 * z;
+    }
+    constexpr uint32_t tmp_msg_slot(uint32_t const z)
+    {
+      return stream_slots + 2 * z + 1;
+    }
   }
 
   struct metal_backend
@@ -172,7 +187,9 @@ namespace inkling
     // The taps' ring for a draft model (session::tap_ring), when kept.
     id<MTLBuffer> taps;
     id<MTLBuffer> ids, stream, q, r, gate, sink, kraw, vraw, dynk, dynv, kc, vc, attended, out, ffn_in, xq, xmax, chosen,
-      cw, act, amax, ffn, hidden, logits, pair, cmp, rlogits, qg, bias, scores, inv, part;
+      cw, act, amax, ffn, hidden, logits, rlogits, qg, bias, scores, inv, part;
+    // A controller's normalized pair and its projection, for each of 3 inputs.
+    id<MTLBuffer> pair[3], cmp[3];
     // Bytes of `scores`: the batched attention's scratch.
     size_t scores_bytes{};
     id<MTLBuffer> normed[3];
@@ -479,9 +496,12 @@ namespace inkling
         g->kept.push_back(kept);
       }
       g->ids = scratch_buffer(b, t * sizeof(int32_t));
-      g->stream = scratch_buffer(b, (stream_slots + 2) * t * h * f);
-      g->pair = scratch_buffer(b, t * 2 * h * f);
-      g->cmp = scratch_buffer(b, t * 64 * f);
+      g->stream = scratch_buffer(b, (stream_slots + 6) * t * h * f);
+      for(size_t z{}; z < 3; ++z)
+      {
+        g->pair[z] = scratch_buffer(b, t * 2 * h * f);
+        g->cmp[z] = scratch_buffer(b, t * 64 * f);
+      }
       g->rlogits = scratch_buffer(b, t * c.experts * f);
       // The batched attention: queries by group (with a tile of slack),
       // biases, and scores [8 groups, rows, slots] for as many of the
@@ -754,21 +774,20 @@ namespace inkling
         threads(h, count, 1);
       } };
 
-      // Matrices that read the same input, in one dispatch (linear_multi), each
-      // row as `linear` computes it; a batch of more than 16 tokens takes them
-      // one at a time (the matrix-product kernel).
-      auto const linear_many{ [&](std::vector<std::pair<tensor const *, id<MTLBuffer>>> const &parts, id<MTLBuffer> x,
-                                  uint32_t count, uint32_t mode) {
+      // Matrices of the same width, each with its input and output, in one
+      // dispatch (linear_multi), each row as `linear` computes it; a batch of
+      // more than 16 tokens takes them one at a time (the matrix-product kernel).
+      auto const linear_many{ [&](std::vector<lin_part> const &parts, uint32_t count, uint32_t mode) {
         if((count > 16 && batched) || parts.size() > 6)
         {
-          for(auto const &[w, y] : parts)
+          for(auto const &part : parts)
           {
-            linear(w, x, y, count, mode, 0);
+            linear(part.w, part.x, part.y, count, mode, 0);
           }
           return;
         }
         multi_params p{};
-        p.in = static_cast<uint32_t>(parts[0].first->dim(1));
+        p.in = static_cast<uint32_t>(parts[0].w->dim(1));
         p.nt = count;
         p.mode = mode;
         p.count = static_cast<uint32_t>(parts.size());
@@ -776,34 +795,38 @@ namespace inkling
         std::string name{ "linear" };
         for(size_t i{}; i < parts.size(); ++i)
         {
-          end += static_cast<uint32_t>(parts[i].first->dim(0));
+          end += static_cast<uint32_t>(parts[i].w->dim(0));
           p.ends[i] = end;
-          name += (i == 0 ? " " : "+") + std::to_string(parts[i].first->dim(0));
+          name += (i == 0 ? " " : "+") + std::to_string(parts[i].w->dim(0));
         }
         uint32_t const tb{ count > 1 ? 4u : 1u };
         use(tb == 4 ? b.multi4 : b.multi1, name + "x" + std::to_string(p.in));
         [e setBytes:&p length:sizeof(p) atIndex:0];
         for(size_t i{}; i < 6; ++i)
         {
-          bind(1 + i, i < parts.size() ? weight(b, parts[i].first, dtype::bf16) : b.dummy);
-          bind(8 + i, i < parts.size() ? parts[i].second : b.dummy);
+          auto const &part{ parts[i < parts.size() ? i : 0] };
+          bind(1 + i, weight(b, part.w, dtype::bf16));
+          bind(8 + i, part.y);
+          bind(14 + i, part.x);
         }
-        bind(7, x);
         groups(end, (count + tb - 1) / tb, 1, 32);
       } };
 
-      // A sublayer input: the mix of the sources by `query` (or the last
-      // source as is), through the controller when the visit has messages,
-      // normalized by `norm` and rounded, into dst (see mix_norm).
-      auto const vec{ [&](uint32_t t0,
-                          uint32_t count,
-                          std::vector<uint32_t> const &src,
-                          tensor const *query,
-                          uint32_t query_row,
-                          layer_weights const *messages,
-                          uint32_t message_index,
-                          tensor const *norm,
-                          id<MTLBuffer> dst) {
+      // Sublayer inputs: each the mix of the sources by `query` (row
+      // query_row, or the last source as is when there is no query), through
+      // the controller when the visit has messages, normalized by `norm` and
+      // rounded, into dst (see mix_norm). Up to 3 inputs of the same sources
+      // are computed together, each exactly as alone.
+      struct vec_input
+      {
+        uint32_t query_row;
+        uint32_t message_index;
+        tensor const *norm;
+        id<MTLBuffer> dst;
+      };
+      auto const vec{ [&](uint32_t t0, uint32_t count, std::vector<uint32_t> const &src, tensor const *query,
+                          layer_weights const *messages, std::vector<vec_input> const &ins) {
+        uint32_t const n{ static_cast<uint32_t>(ins.size()) };
         vec_params p{};
         p.t0 = t0;
         p.h = h;
@@ -825,57 +848,78 @@ namespace inkling
           }
         }
         p.has_query = query ? 1 : 0;
-        p.query_row = query_row;
-        p.tmp_in = tmp_in_slot;
-        p.tmp_msg = tmp_msg_slot;
+        for(uint32_t z{}; z < n; ++z)
+        {
+          p.query_row[z] = ins[z].query_row;
+          p.msg_row[z] = ins[z].message_index;
+          p.tmp_in[z] = tmp_in_slot(z);
+          p.tmp_msg[z] = tmp_msg_slot(z);
+        }
         p.eps = c.norm_eps;
         if(messages)
         {
-          auto const &gate{ messages->messages[message_index] };
           p.nprev = static_cast<uint32_t>(previous.size());
           for(size_t i{}; i < previous.size() && i < 2; ++i)
           {
             p.prev[i] = previous[i];
           }
-          p.msg_row = message_index;
           use(b.mix_pair, "mix_pair");
           [e setBytes:&p length:sizeof(p) atIndex:0];
           bind(1, g.stream);
           bind(2, weight(b, query, dtype::f32));
           bind(3, b.message_queries[static_cast<size_t>(messages->index)]);
-          bind(4, g.pair);
-          groups(count, 1, 1, 160);
-          if(stage())
+          for(uint32_t z{}; z < 3; ++z)
           {
-            sync(vm ? &vm->pairs[message_index] : nullptr, vf ? &vf->pairs[message_index] : nullptr, g.pair, 0,
-                 static_cast<size_t>(count) * 2 * h);
+            bind(4 + z, g.pair[z < n ? z : 0]);
           }
-          linear(gate.down, g.pair, g.cmp, count, 1, 0);
-          if(stage())
+          groups(count, n, 1, 160);
+          std::vector<lin_part> downs;
+          for(uint32_t z{}; z < n; ++z)
           {
-            sync(vm ? &vm->compressed[message_index] : nullptr, vf ? &vf->compressed[message_index] : nullptr, g.cmp, 0,
-                 static_cast<size_t>(count) * c.gate_rank);
+            auto const mi{ ins[z].message_index };
+            if(stage())
+            {
+              sync(vm ? &vm->pairs[mi] : nullptr, vf ? &vf->pairs[mi] : nullptr, g.pair[z], 0,
+                   static_cast<size_t>(count) * 2 * h);
+            }
+            downs.push_back({ messages->messages[mi].down, g.pair[z], g.cmp[z] });
           }
-          ctl_params const cp{ h, static_cast<uint32_t>(c.gate_rank), tmax, tmp_in_slot, tmp_msg_slot };
+          linear_many(downs, count, 1);
+          for(uint32_t z{}; z < n && stage(); ++z)
+          {
+            sync(vm ? &vm->compressed[ins[z].message_index] : nullptr, vf ? &vf->compressed[ins[z].message_index] : nullptr,
+                 g.cmp[z], 0, static_cast<size_t>(count) * c.gate_rank);
+          }
+          ctl_params cp{ h, static_cast<uint32_t>(c.gate_rank), tmax, {}, {} };
           use(b.controller, "controller");
+          for(uint32_t z{}; z < 3; ++z)
+          {
+            auto const zz{ z < n ? z : 0 };
+            auto const &gate{ messages->messages[ins[zz].message_index] };
+            cp.tmp_in[z] = tmp_in_slot(z);
+            cp.tmp_msg[z] = tmp_msg_slot(z);
+            uint32_t const at{ z == 0 ? 1u : 2u + 3u * z };
+            bind(at, g.cmp[zz]);
+            bind(at + 1, weight(b, gate.gain, dtype::bf16));
+            bind(at + 2, weight(b, gate.forget, dtype::bf16));
+          }
           [e setBytes:&cp length:sizeof(cp) atIndex:0];
-          bind(1, g.cmp);
-          bind(2, weight(b, gate.gain, dtype::bf16));
-          bind(3, weight(b, gate.forget, dtype::bf16));
           bind(4, g.stream);
-          threads(h, count, 1);
+          threads(h, count, n);
           // Then normalize what the controller left in tmp_in.
-          p.nsrc = 1;
-          p.src[0] = tmp_in_slot;
-          p.has_query = 0;
+          p.from_tmp = 1;
         }
         use(b.mix_norm, "mix_norm");
         [e setBytes:&p length:sizeof(p) atIndex:0];
         bind(1, g.stream);
-        bind(2, p.has_query ? weight(b, query, dtype::f32) : b.dummy);
-        bind(7, weight(b, norm, dtype::bf16));
-        bind(8, dst);
-        groups(count, 1, 1, 160);
+        bind(2, p.has_query && !p.from_tmp ? weight(b, query, dtype::f32) : b.dummy);
+        for(uint32_t z{}; z < 3; ++z)
+        {
+          auto const zz{ z < n ? z : 0 };
+          bind(z == 0 ? 7 : 7 + 2 * z, weight(b, ins[zz].norm, dtype::bf16));
+          bind(z == 0 ? 8 : 8 + 2 * z, ins[zz].dst);
+        }
+        groups(count, n, 1, 160);
       } };
 
       // kept: where a draft's check keeps the inputs (all_logits), or nil.
@@ -997,15 +1041,17 @@ namespace inkling
         bool const same_norm{ lw.attn_norm[0] == lw.attn_norm[1] && lw.attn_norm[1] == lw.attn_norm[2] };
         bool const single{ !messages && !multi_query && same_norm };
         id<MTLBuffer> in[3];
-        for(uint32_t i{}; i < 3; ++i)
         {
-          if(single && i > 0)
+          std::vector<vec_input> ins;
+          for(uint32_t i{}; i < (single ? 1u : 3u); ++i)
           {
-            in[i] = in[0];
-            continue;
+            ins.push_back({ multi_query ? i : 0, i, lw.attn_norm[i], g.normed[i] });
           }
-          vec(0, nt, src, query, multi_query ? i : 0, messages, i, lw.attn_norm[i], g.normed[i]);
-          in[i] = g.normed[i];
+          vec(0, nt, src, query, messages, ins);
+          for(uint32_t i{}; i < 3; ++i)
+          {
+            in[i] = g.normed[single ? 0 : i];
+          }
         }
         if(stage())
         {
@@ -1016,18 +1062,17 @@ namespace inkling
           }
         }
 
-        // Projections: those that read the same input in one dispatch (keys and values
-        // too when all three inputs are the same).
-        bool const kv_too{ single && a.wk->dim(1) == a.wq->dim(1) && a.wv->dim(1) == a.wq->dim(1) };
+        // Projections in one dispatch (keys and values from their own inputs).
+        bool const kv_too{ a.wk->dim(1) == a.wq->dim(1) && a.wv->dim(1) == a.wq->dim(1) };
         {
-          std::vector<std::pair<tensor const *, id<MTLBuffer>>> parts{
-            { a.wq, g.q }, { a.wr, g.r }, { a.gate, g.gate }, { a.sink, g.sink } };
+          std::vector<lin_part> parts{
+            { a.wq, in[0], g.q }, { a.wr, in[0], g.r }, { a.gate, in[0], g.gate }, { a.sink, in[0], g.sink } };
           if(kv_too)
           {
-            parts.push_back({ a.wk, g.kraw });
-            parts.push_back({ a.wv, g.vraw });
+            parts.push_back({ a.wk, in[1], g.kraw });
+            parts.push_back({ a.wv, in[2], g.vraw });
           }
-          linear_many(parts, in[0], nt, 1);
+          linear_many(parts, nt, 1);
         }
         if(stage())
         {
@@ -1254,7 +1299,7 @@ namespace inkling
         // Feed-forward: input, routing, experts.
         src = blocks;
         src.push_back(partial);
-        vec(0, nt, src, lw.mlp_query, 0, messages, 3, lw.mlp_norm, g.ffn_in);
+        vec(0, nt, src, lw.mlp_query, messages, { { 0, 3, lw.mlp_norm, g.ffn_in } });
         if(stage())
         {
           field(&visit_capture::ffn_input, g.ffn_in, 0, static_cast<size_t>(nt) * h);
@@ -1400,7 +1445,7 @@ namespace inkling
       uint32_t const outs{ s.all_logits ? nt : 1u };
       uint32_t const normed{ s.tap_ring ? nt : outs };
       {
-        vec(nt - normed, normed, src, m.out_query, 0, nullptr, 0, m.out_norm, g.hidden);
+        vec(nt - normed, normed, src, m.out_query, nullptr, { { 0, 0, m.out_norm, g.hidden } });
         if(s.tap_ring)
         {
           store_tap(g.hidden, 0, nt, static_cast<uint32_t>(ntaps - 1));

@@ -227,6 +227,9 @@ kernel void embed(constant embed_params &P [[buffer(0)]],
 // tmp_msg) and their normalized pair; `linear` projects the pair down;
 // `controller` gates the two; mix_norm then normalizes tmp_in.
 
+// Up to 3 inputs of the same sources in one dispatch (the third dimension of
+// the grid, z): each has its own query row, message row, scratch slots, norm
+// and destination; each is computed exactly as alone.
 struct vec_params
 {
   uint t0;
@@ -236,12 +239,13 @@ struct vec_params
   uint nsrc;
   uint src[6];
   uint has_query;
-  uint query_row;
+  uint query_row[3];
   uint nprev;
   uint prev[2];
-  uint msg_row;
-  uint tmp_in;
-  uint tmp_msg;
+  uint msg_row[3];
+  uint tmp_in[3];
+  uint tmp_msg[3];
+  uint from_tmp; // mix_norm: the source is tmp_in[z] (the controller's output)
   float eps;
 };
 
@@ -301,14 +305,21 @@ struct vec_params
 kernel void mix_norm(constant vec_params &P [[buffer(0)]],
                      device const float4 *stream [[buffer(1)]],
                      device const float4 *query [[buffer(2)]],
-                     device const ushort4 *norm [[buffer(7)]],
-                     device float4 *dst [[buffer(8)]],
+                     device const ushort4 *norm0 [[buffer(7)]],
+                     device float4 *dst0 [[buffer(8)]],
+                     device const ushort4 *norm1 [[buffer(9)]],
+                     device float4 *dst1 [[buffer(10)]],
+                     device const ushort4 *norm2 [[buffer(11)]],
+                     device float4 *dst2 [[buffer(12)]],
                      uint3 tg [[threadgroup_position_in_grid]],
                      ushort lane [[thread_index_in_simdgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]])
 {
   threadgroup float rs[VSG][12];
   threadgroup float rn[VSG];
+  uint z = tg.y;
+  device const ushort4 *norm = z == 0u ? norm0 : z == 1u ? norm1 : norm2;
+  device float4 *dst = z == 0u ? dst0 : z == 1u ? dst1 : dst2;
   uint tid = uint(sg) * 32u + lane;
   uint hq = P.h / 4u;
   uint q0 = min(tid * 4u, hq - 4u);
@@ -317,9 +328,16 @@ kernel void mix_norm(constant vec_params &P [[buffer(0)]],
   float fh = float(P.h);
   float qscale = 1.0f / sqrt(fh);
   float4 in[4];
-  if(P.has_query != 0u)
+  if(P.from_tmp != 0u)
   {
-    MIX(in, P.nsrc, P.src, query, P.query_row * hq, rs)
+    for(uint c = 0; c < 4; ++c)
+    {
+      in[c] = active ? stream[(P.tmp_in[z] * P.tmax + t) * hq + q0 + c] : float4(0.0f);
+    }
+  }
+  else if(P.has_query != 0u)
+  {
+    MIX(in, P.nsrc, P.src, query, P.query_row[z] * hq, rs)
   }
   else
   {
@@ -347,7 +365,9 @@ kernel void mix_pair(constant vec_params &P [[buffer(0)]],
                      device float4 *stream [[buffer(1)]],
                      device const float4 *query [[buffer(2)]],
                      device const float4 *mquery [[buffer(3)]],
-                     device float4 *pair [[buffer(4)]],
+                     device float4 *pair0 [[buffer(4)]],
+                     device float4 *pair1 [[buffer(5)]],
+                     device float4 *pair2 [[buffer(6)]],
                      uint3 tg [[threadgroup_position_in_grid]],
                      ushort lane [[thread_index_in_simdgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]])
@@ -355,6 +375,8 @@ kernel void mix_pair(constant vec_params &P [[buffer(0)]],
   threadgroup float rs[VSG][12];
   threadgroup float rm[VSG][12];
   threadgroup float rc[VSG][2];
+  uint z = tg.y;
+  device float4 *pair = z == 0u ? pair0 : z == 1u ? pair1 : pair2;
   uint tid = uint(sg) * 32u + lane;
   uint hq = P.h / 4u;
   uint q0 = min(tid * 4u, hq - 4u);
@@ -365,7 +387,7 @@ kernel void mix_pair(constant vec_params &P [[buffer(0)]],
   float4 in[4];
   if(P.has_query != 0u)
   {
-    MIX(in, P.nsrc, P.src, query, P.query_row * hq, rs)
+    MIX(in, P.nsrc, P.src, query, P.query_row[z] * hq, rs)
   }
   else
   {
@@ -375,7 +397,7 @@ kernel void mix_pair(constant vec_params &P [[buffer(0)]],
     }
   }
   float4 msg[4];
-  MIX(msg, P.nprev, P.prev, mquery, P.msg_row * hq, rm)
+  MIX(msg, P.nprev, P.prev, mquery, P.msg_row[z] * hq, rm)
   float si = 0.0f, sm = 0.0f;
   for(uint c = 0; c < 4; ++c)
   {
@@ -403,8 +425,8 @@ kernel void mix_pair(constant vec_params &P [[buffer(0)]],
     uint row = tg.x;
     for(uint c = 0; c < 4; ++c)
     {
-      stream[(P.tmp_in * P.tmax + t) * hq + q0 + c] = in[c];
-      stream[(P.tmp_msg * P.tmax + t) * hq + q0 + c] = msg[c];
+      stream[(P.tmp_in[z] * P.tmax + t) * hq + q0 + c] = in[c];
+      stream[(P.tmp_msg[z] * P.tmax + t) * hq + q0 + c] = msg[c];
       pair[row * 2u * hq + q0 + c] = rbfv(in[c] * ii);
       pair[row * 2u * hq + hq + q0 + c] = rbfv(msg[c] * im);
     }
@@ -419,18 +441,27 @@ struct ctl_params
   uint h;
   uint rank;
   uint tmax;
-  uint tmp_in;
-  uint tmp_msg;
+  uint tmp_in[3];
+  uint tmp_msg[3];
 };
 
 kernel void controller(constant ctl_params &P [[buffer(0)]],
-                       device const float4 *cmp [[buffer(1)]],
-                       device const ushort4 *gain [[buffer(2)]],
-                       device const ushort4 *forget [[buffer(3)]],
+                       device const float4 *cmp0 [[buffer(1)]],
+                       device const ushort4 *gain0 [[buffer(2)]],
+                       device const ushort4 *forget0 [[buffer(3)]],
                        device float *stream [[buffer(4)]],
-                       uint2 gid [[thread_position_in_grid]])
+                       device const float4 *cmp1 [[buffer(5)]],
+                       device const ushort4 *gain1 [[buffer(6)]],
+                       device const ushort4 *forget1 [[buffer(7)]],
+                       device const float4 *cmp2 [[buffer(8)]],
+                       device const ushort4 *gain2 [[buffer(9)]],
+                       device const ushort4 *forget2 [[buffer(10)]],
+                       uint3 gid [[thread_position_in_grid]])
 {
-  uint c = gid.x, t = gid.y;
+  uint c = gid.x, t = gid.y, z = gid.z;
+  device const float4 *cmp = z == 0u ? cmp0 : z == 1u ? cmp1 : cmp2;
+  device const ushort4 *gain = z == 0u ? gain0 : z == 1u ? gain1 : gain2;
+  device const ushort4 *forget = z == 0u ? forget0 : z == 1u ? forget1 : forget2;
   uint n = P.rank / 4u;
   float4 g4 = float4(0.0f), f4 = float4(0.0f);
   for(uint j = 0; j < n; ++j)
@@ -439,8 +470,8 @@ kernel void controller(constant ctl_params &P [[buffer(0)]],
     g4 += bf16v(gain[c * n + j]) * cv;
     f4 += bf16v(forget[c * n + j]) * cv;
   }
-  uint a = (P.tmp_in * P.tmax + t) * P.h + c;
-  uint b = (P.tmp_msg * P.tmax + t) * P.h + c;
+  uint a = (P.tmp_in[z] * P.tmax + t) * P.h + c;
+  uint b = (P.tmp_msg[z] * P.tmax + t) * P.h + c;
   stream[a] = stream[a] * (1.0f - tanh(hsum(f4))) + stream[b] * tanh(hsum(g4));
 }
 
@@ -498,9 +529,10 @@ kernel void linear(constant lin_params &P [[buffer(0)]],
   }
 }
 
-// Several matrices that read the same input, in one dispatch (fewer dispatches,
-// and one larger read): up to 6, their rows one after the other, ends[i] the end
-// of matrix i's. Each row is computed exactly as `linear` computes it.
+// Several matrices of the same width, each with its input and output, in one
+// dispatch (fewer dispatches, and one larger read): up to 6, their rows one
+// after the other, ends[i] the end of matrix i's. Each row is computed exactly
+// as `linear` computes it.
 
 struct multi_params
 {
@@ -519,7 +551,12 @@ kernel void linear_multi(constant multi_params &P [[buffer(0)]],
                          device const uint4 *w3 [[buffer(4)]],
                          device const uint4 *w4 [[buffer(5)]],
                          device const uint4 *w5 [[buffer(6)]],
-                         device const float4 *x [[buffer(7)]],
+                         device const float4 *x0 [[buffer(14)]],
+                         device const float4 *x1 [[buffer(15)]],
+                         device const float4 *x2 [[buffer(16)]],
+                         device const float4 *x3 [[buffer(17)]],
+                         device const float4 *x4 [[buffer(18)]],
+                         device const float4 *x5 [[buffer(19)]],
                          device float *y0 [[buffer(8)]],
                          device float *y1 [[buffer(9)]],
                          device float *y2 [[buffer(10)]],
@@ -537,6 +574,7 @@ kernel void linear_multi(constant multi_params &P [[buffer(0)]],
   uint r = gr - start;
   device const uint4 *w = m == 0u ? w0 : m == 1u ? w1 : m == 2u ? w2 : m == 3u ? w3 : m == 4u ? w4 : w5;
   device float *y = m == 0u ? y0 : m == 1u ? y1 : m == 2u ? y2 : m == 3u ? y3 : m == 4u ? y4 : y5;
+  device const float4 *x = m == 0u ? x0 : m == 1u ? x1 : m == 2u ? x2 : m == 3u ? x3 : m == 4u ? x4 : x5;
   uint t0 = tg.y * TB;
   uint n8 = P.in / 8u;
   float4 acc[TB];
