@@ -51,6 +51,7 @@ namespace inkling
     {
       uint32_t ch, nt, mode, dst, tmax, h, heads;
       float norm;
+      uint32_t keep;
     };
 
     struct kvs_params
@@ -153,6 +154,8 @@ namespace inkling
     uint32_t tmax{};
     std::vector<id<MTLBuffer>> k, v;
     std::vector<std::array<id<MTLBuffer>, 4>> conv;
+    // A draft's check's inputs to each convolution (visit_cache::kept).
+    std::vector<std::array<id<MTLBuffer>, 4>> kept;
     id<MTLBuffer> ids, stream, q, r, gate, sink, kraw, vraw, dynk, dynv, kc, vc, attended, out, ffn_in, xq, xmax, chosen,
       cw, act, amax, ffn, hidden, logits, pair, cmp, rlogits, qg, bias, scores, inv, part;
     // Bytes of `scores`: the batched attention's scratch.
@@ -446,12 +449,16 @@ namespace inkling
         g->k.push_back(kb);
         g->v.push_back(vb);
         std::array<id<MTLBuffer>, 4> hist;
+        std::array<id<MTLBuffer>, 4> kept;
         for(size_t i{}; i < 4; ++i)
         {
           hist[i] = scratch_buffer(b, static_cast<size_t>(c.conv_taps - 1) * vc.conv_width[i] * f);
           vc.conv[i] = static_cast<float *>(hist[i].contents);
+          kept[i] = scratch_buffer(b, static_cast<size_t>(max_rows) * vc.conv_width[i] * f);
+          vc.kept[i] = static_cast<float *>(kept[i].contents);
         }
         g->conv.push_back(hist);
+        g->kept.push_back(kept);
       }
       g->ids = scratch_buffer(b, t * sizeof(int32_t));
       g->stream = scratch_buffer(b, (stream_slots + 2) * t * h * f);
@@ -780,10 +787,11 @@ namespace inkling
         groups(count, 1, 1, 160);
       } };
 
+      // kept: where a draft's check keeps the inputs (all_logits), or nil.
       auto const conv_fixed{ [&](short_conv const &cv, id<MTLBuffer> in, id<MTLBuffer> hist, id<MTLBuffer> out,
-                                 uint32_t mode, uint32_t dst) {
+                                 uint32_t mode, uint32_t dst, id<MTLBuffer> kept) {
         conv_params const p{ static_cast<uint32_t>(cv.channels), nt, mode, dst, tmax, h, 1,
-                             1.0f / std::sqrt(static_cast<float>(taps + 1)) };
+                             1.0f / std::sqrt(static_cast<float>(taps + 1)), kept ? 1u : 0u };
         use(b.conv_fixed, "conv_fixed");
         [e setBytes:&p length:sizeof(p) atIndex:0];
         bind(1, weight(b, cv.weight, dtype::bf16));
@@ -791,6 +799,7 @@ namespace inkling
         bind(3, hist);
         bind(4, out);
         bind(5, g.stream);
+        bind(6, kept ? kept : b.dummy);
         threads(p.ch, 1, 1);
         if(mode >= 2)
         {
@@ -804,7 +813,7 @@ namespace inkling
 
       // Keys or values: projection, short convolution (fixed or projected).
       auto const kv_conv{ [&](short_conv const &cv, tensor const *proj, id<MTLBuffer> x, id<MTLBuffer> raw,
-                              id<MTLBuffer> dyn, id<MTLBuffer> hist, id<MTLBuffer> out,
+                              id<MTLBuffer> dyn, id<MTLBuffer> hist, id<MTLBuffer> kept, id<MTLBuffer> out,
                               std::vector<float> visit_capture::*f_proj, std::vector<float> visit_capture::*f_taps,
                               std::vector<float> visit_capture::*f_conv) {
         size_t const width{ static_cast<size_t>(nt) * cv.channels };
@@ -815,7 +824,7 @@ namespace inkling
         }
         if(!cv.weight_proj)
         {
-          conv_fixed(cv, raw, hist, out, 0, 0);
+          conv_fixed(cv, raw, hist, out, 0, 0, kept);
         }
         else
         {
@@ -825,7 +834,7 @@ namespace inkling
             field(f_taps, dyn, 0, static_cast<size_t>(nt) * cv.heads * taps);
           }
           conv_params const p{ static_cast<uint32_t>(cv.channels), nt, 0, 0, tmax, h, static_cast<uint32_t>(cv.heads),
-                               1.0f / std::sqrt(static_cast<float>(2 * taps + 1)) };
+                               1.0f / std::sqrt(static_cast<float>(2 * taps + 1)), kept ? 1u : 0u };
           use(b.conv_dyn, "conv_dyn");
           [e setBytes:&p length:sizeof(p) atIndex:0];
           bind(1, weight(b, cv.static_w, dtype::bf16));
@@ -833,6 +842,7 @@ namespace inkling
           bind(3, raw);
           bind(4, hist);
           bind(5, out);
+          bind(6, kept ? kept : b.dummy);
           threads(p.ch, 1, 1);
         }
         if(stage())
@@ -913,9 +923,9 @@ namespace inkling
           field(&visit_capture::q_proj, g.q, 0, nt * qw);
           field(&visit_capture::r_proj, g.r, 0, static_cast<size_t>(nt) * c.heads * c.rel_dim);
         }
-        kv_conv(a.k_conv, a.wk, in[1], g.kraw, g.dynk, g.conv[vi][0], g.kc, &visit_capture::k_proj,
+        kv_conv(a.k_conv, a.wk, in[1], g.kraw, g.dynk, g.conv[vi][0], s.all_logits ? g.kept[vi][0] : nil, g.kc, &visit_capture::k_proj,
                 &visit_capture::k_taps, &visit_capture::k_conv);
-        kv_conv(a.v_conv, a.wv, in[2], g.vraw, g.dynv, g.conv[vi][1], g.vc, &visit_capture::v_proj,
+        kv_conv(a.v_conv, a.wv, in[2], g.vraw, g.dynv, g.conv[vi][1], s.all_logits ? g.kept[vi][1] : nil, g.vc, &visit_capture::v_proj,
                 &visit_capture::v_taps, &visit_capture::v_conv);
         {
           kvs_params const p{ p0, static_cast<uint32_t>(vc.slots), static_cast<uint32_t>(a.kv_heads), c.qk_clip,
@@ -1118,11 +1128,11 @@ namespace inkling
           event(stream_event::kind::push, partial);
           blocks.push_back(partial);
           partial = take();
-          conv_fixed(lw.attn_conv, g.out, g.conv[vi][2], b.dummy, 1, partial);
+          conv_fixed(lw.attn_conv, g.out, g.conv[vi][2], b.dummy, 1, partial, s.all_logits ? g.kept[vi][2] : nil);
         }
         else
         {
-          conv_fixed(lw.attn_conv, g.out, g.conv[vi][2], b.dummy, 2, partial);
+          conv_fixed(lw.attn_conv, g.out, g.conv[vi][2], b.dummy, 2, partial, s.all_logits ? g.kept[vi][2] : nil);
         }
         if(stage())
         {
@@ -1256,7 +1266,7 @@ namespace inkling
         {
           field(&visit_capture::ffn, g.ffn, 0, static_cast<size_t>(nt) * h);
         }
-        conv_fixed(lw.mlp_conv, g.ffn, g.conv[vi][3], b.dummy, 3, partial);
+        conv_fixed(lw.mlp_conv, g.ffn, g.conv[vi][3], b.dummy, 3, partial, s.all_logits ? g.kept[vi][3] : nil);
         if(stage())
         {
           field(&visit_capture::partial, g.stream, partial_offset(), static_cast<size_t>(nt) * h);

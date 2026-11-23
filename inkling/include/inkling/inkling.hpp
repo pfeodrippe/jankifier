@@ -304,6 +304,11 @@ namespace inkling
     uint16_t *v{};
     std::array<float *, 4> conv{};
     std::array<int32_t, 4> conv_width{};
+    // A draft's check (an eval with all_logits): each convolution's inputs
+    // [max_rows, width], and its history before the check, to roll back to any
+    // of the check's tokens (`truncate`).
+    std::array<float *, 4> kept{};
+    std::array<std::vector<float>, 4> before{};
 
     // Elements of k (and of v), with the padding rows.
     size_t kv_elements() const { return static_cast<size_t>((slots + 31) / 32 * 32) * kv_heads * head_dim; }
@@ -405,6 +410,10 @@ namespace inkling
     // row (a draft's check), in row_logits; `logits` is still the last one's.
     bool all_logits{};
     std::vector<float> row_logits;
+    // Where the last eval with all_logits started (-1: none since), and the
+    // logits before it: what `truncate` goes back to.
+    int32_t checked_from{ -1 };
+    std::vector<float> logits_before;
     // Tracing: evals run on the CPU and record the named values of their
     // last token.
     bool trace{};
@@ -442,6 +451,11 @@ namespace inkling
   // are then in s.logits.
   void eval(session &s, int32_t const *ids, size_t n);
   void eval(session &s, std::vector<int32_t> const &ids);
+  // The session rolled back to its first `pos` tokens, which must be within
+  // the last eval with all_logits (a draft's check): the tokens after are
+  // forgotten, as if never evaluated, and the logits are those of token
+  // pos - 1. Once after a check.
+  void truncate(session &s, int32_t pos);
 
   // A comparison of two captures, field by field (GPU against CPU).
   struct check_row

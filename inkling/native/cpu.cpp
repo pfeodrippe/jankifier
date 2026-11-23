@@ -430,7 +430,8 @@ namespace inkling
 
     // A short causal convolution over the chunk, updating its history.
     void short_conv_apply(model const &m, short_conv const &c, float *x, int32_t const tokens, float *history,
-                          float const *conditioning, scratch &w, std::vector<float> *const taps_out = nullptr)
+                          float const *conditioning, scratch &w, std::vector<float> *const taps_out = nullptr,
+                          float *const kept = nullptr)
     {
       int32_t const taps{ m.cfg.conv_taps };
       int32_t const tail{ taps - 1 };
@@ -438,6 +439,11 @@ namespace inkling
       std::vector<float> window(static_cast<size_t>((tail + tokens) * ch));
       std::copy(history, history + tail * ch, window.begin());
       std::copy(x, x + tokens * ch, window.begin() + tail * ch);
+      if(kept)
+      {
+        // A draft's check: the inputs, to roll back (truncate).
+        std::copy(x, x + tokens * ch, kept);
+      }
       if(c.weight_proj)
       {
         int32_t const heads{ c.heads };
@@ -563,8 +569,10 @@ namespace inkling
         cap->k_proj = w.kraw;
         cap->v_proj = w.vraw;
       }
-      short_conv_apply(m, a.k_conv, w.kraw.data(), tokens, cache.conv[0], kn, w, cap ? &cap->k_taps : nullptr);
-      short_conv_apply(m, a.v_conv, w.vraw.data(), tokens, cache.conv[1], vn, w, cap ? &cap->v_taps : nullptr);
+      short_conv_apply(m, a.k_conv, w.kraw.data(), tokens, cache.conv[0], kn, w, cap ? &cap->k_taps : nullptr,
+                       s.all_logits ? cache.kept[0] : nullptr);
+      short_conv_apply(m, a.v_conv, w.vraw.data(), tokens, cache.conv[1], vn, w, cap ? &cap->v_taps : nullptr,
+                       s.all_logits ? cache.kept[1] : nullptr);
       if(cap)
       {
         cap->k_conv = w.kraw;
@@ -1070,7 +1078,8 @@ namespace inkling
 
       attention(s, static_cast<int32_t>(vi), lw, pos0, tokens, tr, cap);
       auto &cache{ s.caches[vi] };
-      short_conv_apply(m, lw.attn_conv, w.out.data(), tokens, cache.conv[2], nullptr, w);
+      short_conv_apply(m, lw.attn_conv, w.out.data(), tokens, cache.conv[2], nullptr, w, nullptr,
+                       s.all_logits ? cache.kept[2] : nullptr);
       if(off & no_attention)
       {
         std::fill(w.out.begin(), w.out.end(), 0.0f);
@@ -1113,7 +1122,8 @@ namespace inkling
         cap->ffn_input = w.ffn_in;
       }
       experts(s, lw, w.ffn_in.data(), tokens, w.ffn.data(), tr, cap);
-      short_conv_apply(m, lw.mlp_conv, w.ffn.data(), tokens, cache.conv[3], nullptr, w);
+      short_conv_apply(m, lw.mlp_conv, w.ffn.data(), tokens, cache.conv[3], nullptr, w, nullptr,
+                       s.all_logits ? cache.kept[3] : nullptr);
       if(off & no_feed_forward)
       {
         std::fill(w.ffn.begin(), w.ffn.end(), 0.0f);
@@ -1248,6 +1258,7 @@ namespace inkling
       for(size_t i{}; i < 4; ++i)
       {
         vc.conv[i] = static_cast<float *>(map(static_cast<size_t>(c.conv_taps - 1) * vc.conv_width[i] * sizeof(float)));
+        vc.kept[i] = static_cast<float *>(map(static_cast<size_t>(max_rows) * vc.conv_width[i] * sizeof(float)));
       }
     }
     return s.release();
@@ -1318,6 +1329,21 @@ namespace inkling
     std::lock_guard<std::mutex> const one{ s.model->running };
     bool const gpu{ s.gpu && s.model->use_gpu && !s.trace && !s.model->ablated() };
     s.row_logits.clear();
+    s.checked_from = -1;
+    if(s.all_logits)
+    {
+      // What truncate goes back to: each convolution's history and the logits.
+      size_t const tail{ static_cast<size_t>(s.model->cfg.conv_taps - 1) };
+      for(auto &vc : s.caches)
+      {
+        for(size_t i{}; i < 4; ++i)
+        {
+          vc.before[i].assign(vc.conv[i], vc.conv[i] + tail * static_cast<size_t>(vc.conv_width[i]));
+        }
+      }
+      s.logits_before = s.logits;
+      s.checked_from = s.pos;
+    }
     for(size_t i{}; i < n; i += max_chunk)
     {
       auto const len{ static_cast<int32_t>(std::min<size_t>(max_chunk, n - i)) };
@@ -1335,6 +1361,49 @@ namespace inkling
   void eval(session &s, std::vector<int32_t> const &ids)
   {
     eval(s, ids.data(), ids.size());
+  }
+
+  void truncate(session &s, int32_t const pos)
+  {
+    if(s.checked_from < 0 || pos < s.checked_from || pos > s.pos)
+    {
+      fail("truncate goes back only within the last eval with all_logits (a draft's check)");
+    }
+    std::lock_guard<std::mutex> const one{ s.model->running };
+    int32_t const k{ pos - s.checked_from };
+    int32_t const tail{ s.model->cfg.conv_taps - 1 };
+    // A convolution's history after k of the check's tokens: rows k .. k + tail
+    // of (its history before the check ++ the check's inputs).
+    for(auto &vc : s.caches)
+    {
+      for(size_t i{}; i < 4; ++i)
+      {
+        size_t const width{ static_cast<size_t>(vc.conv_width[i]) };
+        for(int32_t r{}; r < tail; ++r)
+        {
+          int32_t const row{ k + r };
+          float const *src{ row < tail ? vc.before[i].data() + static_cast<size_t>(row) * width
+                                       : vc.kept[i] + static_cast<size_t>(row - tail) * width };
+          std::copy(src, src + width, vc.conv[i] + static_cast<size_t>(r) * width);
+        }
+      }
+    }
+    // The keys and values after pos are left: they are written again before any
+    // token reads them (a window's ring has max_chunk slots more than it reads).
+    size_t const v{ static_cast<size_t>(s.model->cfg.unpadded_vocab) };
+    if(k > 0)
+    {
+      s.logits.assign(s.row_logits.begin() + static_cast<ptrdiff_t>((k - 1) * v),
+                      s.row_logits.begin() + static_cast<ptrdiff_t>(k * v));
+    }
+    else
+    {
+      s.logits = s.logits_before;
+    }
+    s.row_logits.resize(static_cast<size_t>(k) * v);
+    s.tokens.resize(static_cast<size_t>(pos));
+    s.pos = pos;
+    s.checked_from = -1;
   }
 
   int32_t sample(float const *logits, int32_t const n, float const temperature, float const top_p, int32_t const top_k,

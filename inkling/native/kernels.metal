@@ -558,6 +558,7 @@ struct conv_params
   uint h;
   uint heads;
   float norm;
+  uint keep; // 1: each token's input also into `kept` (a draft's check, to roll back)
 };
 
 kernel void conv_fixed(constant conv_params &P [[buffer(0)]],
@@ -566,6 +567,7 @@ kernel void conv_fixed(constant conv_params &P [[buffer(0)]],
                        device float *hist [[buffer(3)]],
                        device float *out [[buffer(4)]],
                        device float *stream [[buffer(5)]],
+                       device float *kept [[buffer(6)]],
                        uint c [[thread_position_in_grid]])
 {
   if(c >= P.ch) return;
@@ -574,6 +576,7 @@ kernel void conv_fixed(constant conv_params &P [[buffer(0)]],
   for(uint t = 0; t < P.nt; ++t)
   {
     float x = in[t * P.ch + c];
+    if(P.keep != 0u) kept[t * P.ch + c] = x;
     float sum = x;
     sum += w0 * h0;
     sum += w1 * h1;
@@ -602,6 +605,7 @@ kernel void conv_dyn(constant conv_params &P [[buffer(0)]],
                      device const float *in [[buffer(3)]],
                      device float *hist [[buffer(4)]],
                      device float *out [[buffer(5)]],
+                     device float *kept [[buffer(6)]],
                      uint c [[thread_position_in_grid]])
 {
   if(c >= P.ch) return;
@@ -611,6 +615,7 @@ kernel void conv_dyn(constant conv_params &P [[buffer(0)]],
   for(uint t = 0; t < P.nt; ++t)
   {
     float x = in[t * P.ch + c];
+    if(P.keep != 0u) kept[t * P.ch + c] = x;
     uint d = (t * P.heads + head) * 4u;
     float sum = x;
     sum += (s0 + dyn[d]) * x;

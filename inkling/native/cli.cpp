@@ -27,7 +27,8 @@ namespace
                  "  inkling rowcheck MODEL.ink PROMPT [ROWS]\n"
                  "                                     evaluates ROWS (8) tokens after the prompt in one\n"
                  "                                     forward, keeping each row's logits, and compares\n"
-                 "                                     them bit by bit with one token at a time\n"
+                 "                                     them bit by bit with one token at a time, then\n"
+                 "                                     rolls back to 3 of them and goes on, compared again\n"
                  "                                     checks every GPU stage of every visit against the CPU\n"
                  "                                     on the CPU's inputs; --all prints every row\n"
                  "    -p TEXT      prompt, used as is (special tokens allowed)\n"
@@ -154,6 +155,20 @@ int main(int argc, char **argv)
         std::printf("row %d (position %zu): %zu of %zu logits differ, worst %.3g\n", r, prompt.size() + r, differ, v,
                     worst);
       }
+      // Rolled back to 3 of the rows, then on one token at a time: the same bits again.
+      int const keep{ std::min(3, rows - 1) };
+      inkling::truncate(*batch, static_cast<int32_t>(prompt.size()) + keep);
+      batch->all_logits = false;
+      bool rolled{ std::memcmp(batch->logits.data(), logits[static_cast<size_t>(keep - 1)].data(), v * sizeof(float)) == 0 };
+      for(int r{ keep }; r < rows; ++r)
+      {
+        inkling::eval(*batch, &next[static_cast<size_t>(r)], 1);
+        rolled = rolled && std::memcmp(batch->logits.data(), logits[static_cast<size_t>(r)].data(), v * sizeof(float)) == 0;
+      }
+      std::printf(rolled ? "OK: rolled back to %d rows and on, the same bits as one token at a time\n"
+                         : "DIFFERENT: rolled back to %d rows and on, not the same as one token at a time\n",
+                  keep);
+      all_same = all_same && rolled;
       std::printf(all_same ? "OK: every row is the same bits as one token at a time\n"
                            : "DIFFERENT: rows of one forward aren't one token at a time\n");
       return all_same ? 0 : 1;
