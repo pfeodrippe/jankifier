@@ -17,11 +17,14 @@ as the reference for the architecture.
 
 ## Status
 
-Measured on an Apple M3 Max (40 GPU cores, 48 GB), 2026-11-22:
+Measured on an Apple M3 Max (40 GPU cores, 48 GB), 2026-11-23 (Ollama's and
+the long-context rows 2026-11-22):
 
 | | inkling | Ollama 0.40.17 (same machine) |
 |---|---|---|
-| Generation, short context | about 41.5 tokens/s | about 32 tokens/s (with its draft model) |
+| Generation, short context | about 45 tokens/s | about 32 tokens/s (with its draft model) |
+| Generation with the draft model (`--dspark 7`), writing code | about 66 tokens/s (3 tokens a forward) | |
+| Generation with the draft model, counting to 60 | about 92 tokens/s (6.4 tokens a forward) | |
 | Generation, rewriting text of the context, drafts from the context | about 80 tokens/s (5.8 tokens a forward) | not measured |
 | Generation at 20,000 tokens of context | about 33 tokens/s | not measured |
 | Prompt processing, 3,400 tokens | 160 tokens/s | about 400 tokens/s |
@@ -29,9 +32,7 @@ Measured on an Apple M3 Max (40 GPU cores, 48 GB), 2026-11-22:
 
 Not done:
 
-- images (the checkpoint's vision encoder), and the draft model used for
-  speculative decoding (its weights are in the model file; docs/drafting.md is
-  how oMLX runs it);
+- images (the checkpoint's vision encoder);
 - a chat template, an HTTP server, samplers beyond temperature, top-p and top-k;
 - prompt processing is 2.5 times slower than Ollama's: three quarters of it
   is the routed experts, which run one route at a time (running the routes by
@@ -97,13 +98,16 @@ bin/inkling tokenize models/inkling-2-mini.ink "Hello <|end_message|>"
 bin/inkling run models/inkling-2-mini.ink -p "The capital of France is" -n 50
 bin/inkling run models/inkling-2-mini.ink -p "..." --cpu            # the reference path
 bin/inkling gpucheck models/inkling-2-mini.ink "The capital of France is"
+bin/inkling rowcheck models/inkling-2-mini.ink "The capital of France is" 16
+bin/inkling tapcheck models/inkling-2-mini.ink "The capital of France is"
+bin/inkling bench models/inkling-2-mini.ink 1 2 4 8 16   # milliseconds of a forward over W rows
 ```
 
 `INK_GPU_PROFILE=1` prints the GPU time of each kernel per forward (every
 dispatch then runs alone, so the total is slower than normal). `INK_SKIP=label,label`
 (labels as that prints them) leaves those dispatches out, for timing what they
 cost in a normal forward (the results are then wrong). `INK_GPU_TIMING=1` prints
-each forward's encoding and GPU time.
+each forward's encoding and GPU time, and each draft's.
 
 ## Drafting
 
@@ -122,9 +126,28 @@ without drafts, 82.4 with (`--draft 3`, 5.8 tokens a forward); sampled at
 temperature 1: 39.3 and 78.7. On text that doesn't repeat the context there is
 rarely a draft, and nothing is lost (41.6 and 41.9).
 
+With the checkpoint's draft model (`use_draft_model`, `run --dspark K`,
+`draft-model!` from jank), when the context has no match, a small model drafts
+up to K tokens from hidden states of the main model (the partial sums entering
+visits 5, 23 and 41 and the final norm's output, which the session keeps for
+every position: `keep_taps`, checked by `tapcheck`): three layers over a
+window of 1,023 positions, then a Markov head that picks the drafts one at a
+time (docs/drafting.md; `native/draft.cpp` is the CPU version, the reference;
+the GPU version is in `native/metal.mm`). The depth of each check is chosen
+from the measured time of each depth and the measured acceptance at each
+place (0, plain steps, when drafting doesn't pay). Greedy, 200 tokens, plain
+against drafted: a Python function 44.0 and 65.9 tokens/s (3.0 tokens a
+forward), counting to 60 44.3 and 92.0 (6.4), a short story 44.5 and 42.1
+(the depth falls to 0; the first checks, which measure each depth, cost a
+little). A draft takes 7.5 ms at one token and 8.6 ms at three; a forward
+over 2 rows costs 6 ms more than over one, over 8 rows 44 ms more, mostly the
+routed experts of the extra tokens.
+
 The approach follows [oMLX](https://github.com/jundot/omlx)'s for this model:
-drafts copied from the context (#5528), and verify rows that are the bits of
-a decode step, so that drafts never change the output (#5531).
+drafts copied from the context (#5528), verify rows that are the bits of a
+decode step, so that drafts never change the output (#5531), its draft model's
+cycle (the context ring, the block of an anchor and masks, the Markov head
+with the output head folded into it) and its adaptive depth.
 
 ## From jank
 
