@@ -1088,12 +1088,15 @@ namespace inkling
         [e dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         dispatched();
       } };
+      // Threads a group for the kernels of a thread an element (none depends on
+      // the group's size): 128 for a prompt's chunk (measured 4% faster), 32 else.
+      NSUInteger const tg_threads{ nt > 16 ? 128u : 32u };
       auto const threads{ [&](NSUInteger x, NSUInteger y, NSUInteger z) {
         if(skipped())
         {
           return;
         }
-        [e dispatchThreads:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(x, 32), 1, 1)];
+        [e dispatchThreads:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(x, tg_threads), 1, 1)];
         dispatched();
       } };
 
