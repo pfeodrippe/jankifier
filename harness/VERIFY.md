@@ -15,7 +15,7 @@ guide to writing Veil, with more examples in `examples/veil/`.
 (def verification
   {:model     "examples/parking.lean"    ; the Veil file: its module's actions are the code's operations
    :instance  {:spot 2}                  ; each `type` of the model and how many values it has
-   :sometimes {:full "∀ s, taken s"}     ; states the code must be able to reach, as Veil terms
+   :sometimes {:full "∀ s, taken s"}     ; states the code must be able to reach, as Veil terms (∀ and ∃ written out: a capital letter there quantifies the whole term)
    :start     (fn [] (new-lot 2))        ; a fresh real system
    :step      {:park (fn [lot {:keys [s]}] (park! lot s))     ; one per action of the model
                :leave (fn [lot {:keys [s]}] (leave! lot s))}
@@ -61,12 +61,13 @@ The model's state is a map of its fields, as jank data:
 |---|---|---|
 | `relation taken : spot → Bool` | the set of what it holds | `#{0 1}` |
 | `relation linked : a → b → Bool` | a set of pairs | `#{[0 1]}` |
-| `function owner : spot → colour` | a map with every argument | `{0 :red 1 :blue}` |
+| `function owner : spot → colour` | a map of the arguments set | `{0 :red 1 :blue}` |
 | `function weight : a → b → Nat` | a map keyed by pairs | `{[0 0] 0 [0 1] 2 ...}` |
 | `individual parked : Nat` | the value | `2` |
 
 A `type`'s values are 0, 1, ... (as many as `:instance` says); an enum's are keywords
-(`enum colour = { red, blue }`: `:red`, `:blue`).
+(`enum colour = { red, blue }`: `:red`, `:blue`). A function holds only the arguments that
+were set: set every one in `after_init` (`owner S := red`) so that the map has them all.
 
 When the check says they part, it shows each field, real and model: fix whichever is
 wrong, the code, the model or the view.
