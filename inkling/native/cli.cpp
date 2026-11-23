@@ -24,6 +24,8 @@ namespace
                  "                                     log-probability of each of the ids (comma separated)\n"
                  "                                     after the prompt: id, logprob, our argmax\n"
                  "  inkling gpucheck MODEL.ink PROMPT [--all]\n"
+                 "  inkling tapcheck MODEL.ink PROMPT  the hidden states kept for a draft model, against\n"
+                 "                                     the captures, and through a check rolled back\n"
                  "  inkling rowcheck MODEL.ink PROMPT [ROWS]\n"
                  "                                     evaluates ROWS (8) tokens after the prompt in one\n"
                  "                                     forward, keeping each row's logits, and compares\n"
@@ -174,6 +176,116 @@ int main(int argc, char **argv)
       std::printf(all_same ? "OK: every row is the same bits as one token at a time\n"
                            : "DIFFERENT: rows of one forward aren't one token at a time\n");
       return all_same ? 0 : 1;
+    }
+
+    if(cmd == "tapcheck" && argc == 4)
+    {
+      // The hidden states kept for a draft model: each path's against its own
+      // captures (the same bits), the GPU's against the CPU's (for information),
+      // and, on the GPU, a check rolled back and continued against one token at
+      // a time (the same bits).
+      if(!m->gpu)
+      {
+        std::fprintf(stderr, "no Metal backend for this model\n");
+        return 1;
+      }
+      std::vector<int32_t> const visits{ 5, 23, 41 };
+      auto const prompt{ inkling::tokenize(*m, argv[3], true) };
+      auto const fresh{ [&](bool gpu) {
+        m->use_gpu = gpu;
+        std::unique_ptr<inkling::session, void (*)(inkling::session *)> s{ inkling::new_session(*m, 4096),
+                                                                            inkling::free_session };
+        inkling::keep_taps(*s, visits);
+        return s;
+      } };
+      size_t const h{ static_cast<size_t>(m->cfg.hidden) };
+      size_t const row{ (visits.size() + 1) * h };
+      auto const bf{ [](uint16_t b) {
+        uint32_t const u{ static_cast<uint32_t>(b) << 16 };
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+      } };
+      // Each path's taps against its own captures: the partial sum after visit
+      // v - 1 is the one entering visit v (5, 23 and 41 restart no loop), and
+      // the last token's final norm output is captured.
+      auto const own{ [&](bool gpu) {
+        auto s{ fresh(gpu) };
+        s->capturing = true;
+        inkling::eval(*s, prompt);
+        auto const &cap{ s->captured };
+        bool same{ cap.tokens == static_cast<int32_t>(prompt.size()) };
+        for(size_t tp{}; same && tp < visits.size(); ++tp)
+        {
+          auto const &partial{ cap.visits[static_cast<size_t>(visits[tp] - 1)].partial };
+          for(size_t p{}; p < prompt.size(); ++p)
+          {
+            for(size_t i{}; i < h; ++i)
+            {
+              uint32_t bits;
+              std::memcpy(&bits, &partial[p * h + i], 4);
+              same = same && s->tap_ring[p * row + tp * h + i] == static_cast<uint16_t>(bits >> 16);
+            }
+          }
+        }
+        for(size_t i{}; same && i < h; ++i)
+        {
+          uint32_t bits;
+          std::memcpy(&bits, &cap.hidden[i], 4);
+          same = s->tap_ring[(prompt.size() - 1) * row + visits.size() * h + i] == static_cast<uint16_t>(bits >> 16);
+        }
+        std::printf("%s: the taps are %s the captured partial sums and final norm output\n", gpu ? "GPU" : "CPU",
+                    same ? "the same bits as" : "NOT");
+        return std::pair{ std::move(s), same };
+      } };
+      auto [cpu, cpu_same] { own(false) };
+      auto [gpu, gpu_same] { own(true) };
+      // GPU against CPU: the forwards differ in rounding, and the differences grow
+      // through the visits, so this is for information.
+      for(size_t tp{}; tp <= visits.size(); ++tp)
+      {
+        double worst{};
+        for(size_t p{}; p < prompt.size(); ++p)
+        {
+          for(size_t i{}; i < h; ++i)
+          {
+            float const a{ bf(cpu->tap_ring[p * row + tp * h + i]) };
+            float const b{ bf(gpu->tap_ring[p * row + tp * h + i]) };
+            worst = std::max(worst, static_cast<double>(std::fabs(a - b)) / std::max(1.0, static_cast<double>(std::fabs(a))));
+          }
+        }
+        std::printf("  GPU against CPU, tap %zu (%s): worst relative difference %.3g\n", tp,
+                    tp < visits.size() ? ("visit " + std::to_string(visits[tp])).c_str() : "final norm", worst);
+      }
+      gpu->capturing = false;
+      // The GPU's continuation: one token at a time, and a check of 8 rolled back to 3.
+      std::vector<int32_t> next;
+      {
+        uint64_t rng{ 1 };
+        for(int i{}; i < 8; ++i)
+        {
+          next.push_back(inkling::sample(gpu->logits.data(), static_cast<int32_t>(gpu->logits.size()), 0, 1, 0, rng));
+          inkling::eval(*gpu, &next.back(), 1);
+        }
+      }
+      auto checked{ fresh(true) };
+      inkling::eval(*checked, prompt);
+      checked->all_logits = true;
+      inkling::eval(*checked, next);
+      checked->all_logits = false;
+      inkling::truncate(*checked, static_cast<int32_t>(prompt.size()) + 3);
+      for(size_t i{ 3 }; i < next.size(); ++i)
+      {
+        inkling::eval(*checked, &next[i], 1);
+      }
+      bool same{ true };
+      for(size_t p{}; p < prompt.size() + next.size(); ++p)
+      {
+        same = same && std::memcmp(gpu->tap_ring + p * row, checked->tap_ring + p * row, row * 2) == 0;
+      }
+      std::printf(same ? "OK: a check rolled back and continued keeps the same taps as one token at a time\n"
+                       : "DIFFERENT: a check rolled back and continued keeps other taps\n");
+      return same && cpu_same && gpu_same ? 0 : 1;
     }
 
     if(cmd == "gpucheck" && (argc == 4 || argc == 5))

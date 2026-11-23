@@ -414,6 +414,15 @@ namespace inkling
     // logits before it: what `truncate` goes back to.
     int32_t checked_from{ -1 };
     std::vector<float> logits_before;
+    // Hidden states kept for a draft model (keep_taps): every evaluated
+    // position keeps, as BF16 bits, the partial sum entering each visit of
+    // tap_visits and then the final norm's output, at row pos % tap_slots of
+    // tap_ring: [tap_slots][tap_visits.size() + 1][hidden]. A position's row
+    // stays until tap_slots positions later (rolled-back positions are written
+    // again).
+    std::vector<int32_t> tap_visits;
+    uint16_t *tap_ring{};
+    std::vector<uint16_t> tap_storage;
     // Tracing: evals run on the CPU and record the named values of their
     // last token.
     bool trace{};
@@ -442,6 +451,9 @@ namespace inkling
   inline constexpr int32_t max_chunk{ 64 };
   // Tokens an eval with all_logits takes at most (one forward on the GPU).
   inline constexpr int32_t max_rows{ 16 };
+  // Positions a session keeps hidden states for a draft model (a window of
+  // 1,024 and room for a check's rows and a chunk).
+  inline constexpr int32_t tap_slots{ 1088 };
 
   session *new_session(model &m, int32_t context);
   void free_session(session *s);
@@ -456,6 +468,9 @@ namespace inkling
   // forgotten, as if never evaluated, and the logits are those of token
   // pos - 1. Once after a check.
   void truncate(session &s, int32_t pos);
+  // The session keeps, from now on, the hidden states a draft model reads
+  // (session::tap_visits and tap_ring) for every position it evaluates.
+  void keep_taps(session &s, std::vector<int32_t> const &visits);
 
   // A comparison of two captures, field by field (GPU against CPU).
   struct check_row

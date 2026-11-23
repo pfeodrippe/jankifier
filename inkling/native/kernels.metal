@@ -702,6 +702,30 @@ kernel void conv_dyn(constant conv_params &P [[buffer(0)]],
   hist[2u * P.ch + c] = h2;
 }
 
+// Hidden states kept for a draft model: rows of `src` (BF16-rounded floats,
+// `stride` apart) into the session's ring, as BF16 bits, at position p0 + t.
+
+struct tap_params
+{
+  uint h;
+  uint p0;
+  uint slots;
+  uint ntaps;
+  uint tap;
+  uint src_row; // first row of src
+};
+
+kernel void tap_store(constant tap_params &P [[buffer(0)]],
+                      device const float *src [[buffer(1)]],
+                      device ushort *ring [[buffer(2)]],
+                      uint2 at [[thread_position_in_grid]])
+{
+  uint c = at.x, t = at.y;
+  if(c >= P.h) return;
+  uint slot = (P.p0 + t) % P.slots;
+  ring[(slot * P.ntaps + P.tap) * P.h + c] = ushort(as_type<uint>(src[(P.src_row + t) * P.h + c]) >> 16);
+}
+
 // Keys (L2-clipped) and values (RMS-normalized) into the visit's cache, as
 // halves holding the BF16-rounded values. A
 // simdgroup per (kv head, token, keys or values); a lane has 4 of the 128.

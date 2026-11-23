@@ -105,6 +105,9 @@ namespace inkling
   metal_backend *metal_open(model &m);
   void metal_close(metal_backend *b);
   metal_session *metal_new_session(session &s);
+  // The session's ring of taps for a draft model, of n BF16 values, in memory
+  // the GPU writes and the CPU reads.
+  uint16_t *metal_tap_ring(session &s, size_t n);
   void metal_free_session(metal_session *g);
   void metal_forward(session &s, int32_t const *ids, int32_t n, capture const *force = nullptr);
 

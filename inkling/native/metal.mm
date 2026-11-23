@@ -89,6 +89,11 @@ namespace inkling
       float scale;
     };
 
+    struct tap_params
+    {
+      uint32_t h, p0, slots, ntaps, tap, src_row;
+    };
+
     struct multi_params
     {
       uint32_t in, nt, mode;
@@ -143,7 +148,7 @@ namespace inkling
   {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
-    id<MTLComputePipelineState> embed, mix_norm, mix_pair, controller, linear1, linear4, linear_mm, multi1, multi4, conv_fixed, conv_dyn, kv_store,
+    id<MTLComputePipelineState> embed, mix_norm, mix_pair, controller, linear1, linear4, linear_mm, multi1, multi4, tap_store, conv_fixed, conv_dyn, kv_store,
       q_prep, att1, att8, att32, att_split, att_merge, att_rows, att_rows_merge, rel_bias, att_scores, att_softmax, att_pv, route, gu_nv, gu_mx, act_quant, dn_nv,
       dn_mx;
     std::unordered_map<void const *, id<MTLBuffer>> weights;
@@ -164,6 +169,8 @@ namespace inkling
     std::vector<std::array<id<MTLBuffer>, 4>> conv;
     // A draft's check's inputs to each convolution (visit_cache::kept).
     std::vector<std::array<id<MTLBuffer>, 4>> kept;
+    // The taps' ring for a draft model (session::tap_ring), when kept.
+    id<MTLBuffer> taps;
     id<MTLBuffer> ids, stream, q, r, gate, sink, kraw, vraw, dynk, dynv, kc, vc, attended, out, ffn_in, xq, xmax, chosen,
       cw, act, amax, ffn, hidden, logits, pair, cmp, rlogits, qg, bias, scores, inv, part;
     // Bytes of `scores`: the batched attention's scratch.
@@ -346,6 +353,7 @@ namespace inkling
       b->linear4 = pipeline(device, lib4, "linear", 32);
       b->multi1 = pipeline(device, lib, "linear_multi", 32);
       b->multi4 = pipeline(device, lib4, "linear_multi", 32);
+      b->tap_store = pipeline(device, lib, "tap_store", 64);
       b->linear_mm = pipeline(device, lib, "linear_mm", 32);
       b->conv_fixed = pipeline(device, lib, "conv_fixed", 32);
       b->conv_dyn = pipeline(device, lib, "conv_dyn", 32);
@@ -514,7 +522,7 @@ namespace inkling
       g->amax = scratch_buffer(b, t * c.top_k * f);
       g->ffn = scratch_buffer(b, t * h * f);
       // Up to max_rows tokens' outputs (all_logits).
-      g->hidden = scratch_buffer(b, static_cast<size_t>(max_rows) * h * f);
+      g->hidden = scratch_buffer(b, std::max<size_t>(t, max_rows) * h * f);
       g->logits = scratch_buffer(b, static_cast<size_t>(max_rows) * (c.unpadded_vocab + 4) * f);
       return g.release();
     }
@@ -523,6 +531,16 @@ namespace inkling
   void metal_free_session(metal_session *g)
   {
     delete g;
+  }
+
+  uint16_t *metal_tap_ring(session &s, size_t const n)
+  {
+    @autoreleasepool
+    {
+      auto &g{ *s.gpu };
+      g.taps = scratch_buffer(*g.backend, n * sizeof(uint16_t));
+      return static_cast<uint16_t *>(g.taps.contents);
+    }
   }
 
   void metal_forward(session &s, int32_t const *ids, int32_t const tokens, capture const *const force)
@@ -722,6 +740,18 @@ namespace inkling
         bind(2, x);
         bind(3, y);
         groups(p.rows, (count + tb - 1) / tb, 1, 32);
+      } };
+
+      // Hidden states for a draft model (session::tap_visits): `count` rows of
+      // `src` from row `src_row`, into the ring at positions p0 .. p0 + count.
+      size_t const ntaps{ s.tap_visits.size() + 1 };
+      auto const store_tap{ [&](id<MTLBuffer> src, uint32_t src_row, uint32_t count, uint32_t index) {
+        tap_params const p{ h, p0, static_cast<uint32_t>(tap_slots), static_cast<uint32_t>(ntaps), index, src_row };
+        use(b.tap_store, "tap_store");
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        bind(1, src);
+        bind(2, g.taps);
+        threads(h, count, 1);
       } };
 
       // Matrices that read the same input, in one dispatch (linear_multi), each
@@ -947,6 +977,15 @@ namespace inkling
           blocks.resize(prelude_blocks);
           partial = prelude_partial;
           event(stream_event::kind::restart, partial);
+        }
+        if(s.tap_ring)
+        {
+          // The partial sum entering this visit, for a draft model.
+          auto const at{ std::find(s.tap_visits.begin(), s.tap_visits.end(), static_cast<int32_t>(vi)) };
+          if(at != s.tap_visits.end())
+          {
+            store_tap(g.stream, partial * tmax, nt, static_cast<uint32_t>(at - s.tap_visits.begin()));
+          }
         }
         layer_weights const *const messages{ visit.pass > 0 ? &lw : nullptr };
 
@@ -1356,16 +1395,22 @@ namespace inkling
       vf = nullptr;
       std::vector<uint32_t> src{ blocks };
       src.push_back(partial);
-      // Every token's (all_logits), or the last one's.
+      // Every token's (all_logits), or the last one's; with taps, every token is
+      // normalized (for a draft model) and the logits' rows are the last `outs`.
       uint32_t const outs{ s.all_logits ? nt : 1u };
+      uint32_t const normed{ s.tap_ring ? nt : outs };
       {
-        vec(nt - outs, outs, src, m.out_query, 0, nullptr, 0, m.out_norm, g.hidden);
+        vec(nt - normed, normed, src, m.out_query, 0, nullptr, 0, m.out_norm, g.hidden);
+        if(s.tap_ring)
+        {
+          store_tap(g.hidden, 0, nt, static_cast<uint32_t>(ntaps - 1));
+        }
         lin_params const p{ static_cast<uint32_t>(c.unpadded_vocab), h, outs, 2, c.logit_cap };
         uint32_t const tb{ outs > 1 ? 4u : 1u };
         use(tb == 4 ? b.linear4 : b.linear1, "unembed");
         [e setBytes:&p length:sizeof(p) atIndex:0];
         bind(1, weight(b, m.unembed, dtype::bf16));
-        bind(2, g.hidden);
+        [e setBuffer:g.hidden offset:static_cast<NSUInteger>(normed - outs) * h * sizeof(float) atIndex:2];
         bind(3, g.logits);
         groups(p.rows, (outs + tb - 1) / tb, 1, 32);
       }
@@ -1405,7 +1450,8 @@ namespace inkling
       s.logits.assign(logits + static_cast<size_t>(outs - 1) * v, logits + static_cast<size_t>(outs) * v);
       if(mine)
       {
-        auto const *const hidden{ static_cast<float const *>(g.hidden.contents) };
+        // The last token's row.
+        auto const *const hidden{ static_cast<float const *>(g.hidden.contents) + static_cast<size_t>(normed - 1) * h };
         mine->hidden.assign(hidden, hidden + h);
         mine->logits = s.logits;
       }

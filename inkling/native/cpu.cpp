@@ -16,6 +16,7 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <cfloat>
 #include <numeric>
 
@@ -991,11 +992,23 @@ namespace inkling
     w.ffn_in.resize(sz);
     w.ffn.resize(sz);
 
+    // A tap's row: BF16 bits of a hidden state, at position pos.
+    size_t const ntaps{ s.tap_visits.size() + 1 };
+    auto const tap{ [&](int32_t pos, size_t index, float const *x) {
+      uint16_t *const out{ s.tap_ring + (static_cast<size_t>(pos % tap_slots) * ntaps + index) * static_cast<size_t>(h) };
+      for(int64_t i{}; i < h; ++i)
+      {
+        uint32_t bits;
+        std::memcpy(&bits, x + i, 4);
+        out[i] = static_cast<uint16_t>(bits >> 16);
+      }
+    } };
     for(size_t vi{}; vi < m.plan.size(); ++vi)
     {
       auto const &visit{ m.plan[vi] };
       auto const &lw{ m.layers[static_cast<size_t>(visit.layer)] };
       tracer tr{ s, "v" + std::to_string(vi) + "." };
+      bool const tapped_here{ s.tap_ring && std::find(s.tap_visits.begin(), s.tap_visits.end(), static_cast<int32_t>(vi)) != s.tap_visits.end() };
       bool const looped{ c.loop && visit.layer == c.loop_start };
       if(looped && visit.pass == 0)
       {
@@ -1011,6 +1024,16 @@ namespace inkling
         w.previous.push_back(w.partial);
         w.blocks.resize(w.prelude_blocks);
         w.partial = w.prelude_partial;
+      }
+      if(tapped_here)
+      {
+        // The partial sum entering this visit, for a draft model.
+        auto const index{ static_cast<size_t>(std::find(s.tap_visits.begin(), s.tap_visits.end(), static_cast<int32_t>(vi))
+                                              - s.tap_visits.begin()) };
+        for(int32_t t{}; t < tokens; ++t)
+        {
+          tap(s.pos + t, index, w.partial.data() + static_cast<size_t>(t) * h);
+        }
       }
       auto const off{ m.ablate[vi] };
       bool const with_messages{ visit.pass > 0 && !(off & no_messages) };
@@ -1147,7 +1170,7 @@ namespace inkling
     // Output: mix, norm, unembed (FP32), softcap; for the last token, or for
     // every token with all_logits.
     w.hidden.resize(static_cast<size_t>(h));
-    auto const output{ [&](int32_t t, float *logits) {
+    auto const normed{ [&](int32_t t) {
       std::vector<float const *> rows;
       for(auto const &b : w.blocks)
       {
@@ -1157,6 +1180,18 @@ namespace inkling
       mix(rows, m.f32(m.out_query), 1, h, w.hidden.data());
       rmsnorm(w.hidden.data(), m.f32(m.out_norm), h, c.norm_eps, w.hidden.data());
       round_all(w.hidden.data(), static_cast<size_t>(h));
+    } };
+    if(s.tap_ring)
+    {
+      // Every token's final norm output, for a draft model.
+      for(int32_t t{}; t < tokens; ++t)
+      {
+        normed(t);
+        tap(s.pos + t, ntaps - 1, w.hidden.data());
+      }
+    }
+    auto const output{ [&](int32_t t, float *logits) {
+      normed(t);
       auto const *un{ static_cast<uint16_t const *>(m.unembed->data) };
       m.workers->run(c.unpadded_vocab, 512, [&](int64_t a, int64_t b) {
         rows_bf16(un, h, w.hidden.data(), 1, logits, c.unpadded_vocab, a, b);
@@ -1453,6 +1488,29 @@ namespace inkling
     }
     rows.resize(kept);
     return rows;
+  }
+
+  void keep_taps(session &s, std::vector<int32_t> const &visits)
+  {
+    for(auto const v : visits)
+    {
+      if(v < 0 || v >= static_cast<int32_t>(s.model->plan.size()))
+      {
+        fail("keep_taps: no visit " + std::to_string(v));
+      }
+    }
+    std::lock_guard<std::mutex> const one{ s.model->running };
+    s.tap_visits = visits;
+    size_t const n{ static_cast<size_t>(tap_slots) * (visits.size() + 1) * static_cast<size_t>(s.model->cfg.hidden) };
+    if(s.gpu)
+    {
+      s.tap_ring = metal_tap_ring(s, n);
+    }
+    else
+    {
+      s.tap_storage.assign(n, 0);
+      s.tap_ring = s.tap_storage.data();
+    }
   }
 
   void truncate(session &s, int32_t const pos)
