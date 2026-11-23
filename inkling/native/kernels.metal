@@ -1709,9 +1709,8 @@ kernel void gate_up_mxfp8(constant gu_params &P [[buffer(0)]],
 
 // A batch's routes by expert (the prompt's chunks): an expert's routes are
 // computed together, with matrix products, so that its weights are read once
-// for all of them. group_routes lists the routes of each expert in route
-// order (order) and cuts them in tiles of up to 32 (tiles: expert, first,
-// count; ntiles).
+// for all of them. The routes of each expert are listed in route order
+// (order) and cut in tiles of up to 32 (tiles: expert, first, count; ntiles).
 // One threadgroup, a thread an expert.
 struct grp_params
 {
@@ -1719,41 +1718,75 @@ struct grp_params
   uint experts;
 };
 
-kernel void group_routes(constant grp_params &P [[buffer(0)]],
-                         device const uint *chosen [[buffer(1)]],
-                         device uint *order [[buffer(2)]],
-                         device uint4 *tiles [[buffer(3)]],
-                         device uint *ntiles [[buffer(4)]],
-                         uint tid [[thread_position_in_threadgroup]])
+// Each expert's routes counted (a threadgroup an expert), then placed in
+// route order and cut in tiles.
+kernel void route_count(constant grp_params &P [[buffer(0)]],
+                        device const uint *chosen [[buffer(1)]],
+                        device uint *counts [[buffer(5)]],
+                        uint e [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]])
 {
-  threadgroup uint count[256];
-  threadgroup uint first[256];
-  for(uint e = tid; e < P.experts; e += 256u)
-  {
-    uint n = 0;
-    for(uint r = 0; r < P.routes; ++r) n += chosen[r] == e ? 1u : 0u;
-    count[e] = n;
-  }
+  threadgroup uint part[8];
+  uint n = 0;
+  for(uint r = tid; r < P.routes; r += 256u) n += chosen[r] == e ? 1u : 0u;
+  n = simd_sum(n);
+  if(lane == 0) part[sg] = n;
   BARRIER;
   if(tid == 0u)
   {
-    uint at = 0, nt = 0;
-    for(uint e = 0; e < P.experts; ++e)
+    uint total = 0;
+    for(uint i = 0; i < 8; ++i) total += part[i];
+    counts[e] = total;
+  }
+}
+
+kernel void route_place(constant grp_params &P [[buffer(0)]],
+                        device const uint *chosen [[buffer(1)]],
+                        device uint *order [[buffer(2)]],
+                        device uint4 *tiles [[buffer(3)]],
+                        device uint *ntiles [[buffer(4)]],
+                        device const uint *counts [[buffer(5)]],
+                        uint e [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup uint part[8];
+  threadgroup uint base[2];
+  if(tid == 0u)
+  {
+    uint first = 0, tile = 0;
+    for(uint i = 0; i < e; ++i)
     {
-      first[e] = at;
-      for(uint s = 0; s < count[e]; s += 32u) tiles[nt++] = uint4(e, at + s, min(32u, count[e] - s), 0u);
-      at += count[e];
+      first += counts[i];
+      tile += (counts[i] + 31u) / 32u;
     }
-    ntiles[0] = nt;
+    uint n = counts[e];
+    for(uint s = 0; s < n; s += 32u) tiles[tile + s / 32u] = uint4(e, first + s, min(32u, n - s), 0u);
+    if(e + 1u == P.experts) ntiles[0] = tile + (n + 31u) / 32u;
+    base[0] = first;
   }
   BARRIER;
-  for(uint e = tid; e < P.experts; e += 256u)
+  uint at = base[0];
+  for(uint r0 = 0; r0 < P.routes; r0 += 256u)
   {
-    uint at = first[e];
-    for(uint r = 0; r < P.routes; ++r)
+    uint r = r0 + tid;
+    uint match = r < P.routes && chosen[r] == e ? 1u : 0u;
+    uint before = simd_prefix_exclusive_sum(match);
+    uint mine = simd_sum(match);
+    if(lane == 0) part[sg] = mine;
+    BARRIER;
+    uint offset = 0, total = 0;
+    for(uint i = 0; i < 8; ++i)
     {
-      if(chosen[r] == e) order[at++] = r;
+      offset += i < uint(sg) ? part[i] : 0u;
+      total += part[i];
     }
+    if(match != 0u) order[at + offset + before] = r;
+    at += total;
+    BARRIER;
   }
 }
 

@@ -189,7 +189,7 @@ namespace inkling
     id<MTLBuffer> fold, fold_b;
     // A batch's routes by expert.
     id<MTLComputePipelineState> conv_fixed_par, conv_history;
-    id<MTLComputePipelineState> group_routes, gate_up_grouped, down_grouped, down_combine, gate_up_grouped_mx, down_grouped_mx;
+    id<MTLComputePipelineState> route_count, route_place, gate_up_grouped, down_grouped, down_combine, gate_up_grouped_mx, down_grouped_mx;
     // The draft model's kernels.
     id<MTLComputePipelineState> draft_fold, draft_mix, draft_norm, draft_block, draft_head, draft_attention, draft_elementwise,
       draft_mk_input, draft_mk_gates, draft_mk_pick, draft_mk_choose;
@@ -219,7 +219,7 @@ namespace inkling
     id<MTLBuffer> pair[3], cmp[3];
     // A batch's routes by expert: their order, tiles and count, and each
     // route's down projection.
-    id<MTLBuffer> order, tiles, ntiles, route_out;
+    id<MTLBuffer> order, tiles, ntiles, route_out, counts;
     uint32_t max_tiles{};
     // Bytes of `scores`: the batched attention's scratch.
     size_t scores_bytes{};
@@ -424,7 +424,8 @@ namespace inkling
       b->act_quant = pipeline(device, lib, "act_quant", 96);
       b->dn_nv = pipeline(device, lib, "down_nvfp4", 32);
       b->dn_mx = pipeline(device, lib, "down_mxfp8", 32);
-      b->group_routes = pipeline(device, lib, "group_routes", 256);
+      b->route_count = pipeline(device, lib, "route_count", 256);
+      b->route_place = pipeline(device, lib, "route_place", 256);
       b->conv_fixed_par = pipeline(device, lib, "conv_fixed_par", 32);
       b->conv_history = pipeline(device, lib, "conv_history", 32);
       b->gate_up_grouped = pipeline(device, lib, "gate_up_grouped", 128);
@@ -595,6 +596,7 @@ namespace inkling
       g->max_tiles = static_cast<uint32_t>((t * c.top_k + 31) / 32 + c.experts);
       g->tiles = scratch_buffer(b, g->max_tiles * 4 * sizeof(uint32_t));
       g->ntiles = scratch_buffer(b, 4 * sizeof(uint32_t));
+      g->counts = scratch_buffer(b, static_cast<size_t>(c.experts) * sizeof(uint32_t));
       g->route_out = scratch_buffer(b, t * c.top_k * h * f);
       // Up to max_rows tokens' outputs (all_logits).
       g->hidden = scratch_buffer(b, std::max<size_t>(t, max_rows) * h * f);
@@ -1824,13 +1826,19 @@ namespace inkling
         {
           {
             grp_params const p{ routes, static_cast<uint32_t>(c.experts) };
-            use(b.group_routes, "group_routes");
+            use(b.route_count, "route_count");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind(1, g.chosen);
+            bind(5, g.counts);
+            groups(p.experts, 1, 1, 256);
+            use(b.route_place, "route_place");
             [e setBytes:&p length:sizeof(p) atIndex:0];
             bind(1, g.chosen);
             bind(2, g.order);
             bind(3, g.tiles);
             bind(4, g.ntiles);
-            groups(1, 1, 1, 256);
+            bind(5, g.counts);
+            groups(p.experts, 1, 1, 256);
           }
           {
             ggu_params const p{ static_cast<uint32_t>(c.top_k), static_cast<uint32_t>(gu.rows), static_cast<uint32_t>(gu.cols),

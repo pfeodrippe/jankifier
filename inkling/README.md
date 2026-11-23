@@ -35,7 +35,7 @@ Not done:
 - images (the checkpoint's vision encoder);
 - a chat template, an HTTP server, samplers beyond temperature, top-p and top-k;
 - a prompt is evaluated in chunks of 512 tokens; a chunk runs the routed
-  experts by expert (`group_routes`, then matrix products over 32 of an
+  experts by expert (`route_count`, `route_place`, then matrix products over 32 of an
   expert's routes and 64 rows, `gate_up_grouped`, `down_grouped` and their
   MXFP8 versions), so that each expert's weights are read once a chunk: a
   3,652-token prompt went from 176 to 547 tokens/s. A chunk's sums are not in
