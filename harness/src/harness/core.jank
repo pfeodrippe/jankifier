@@ -292,6 +292,11 @@
         began (cpp/harness.seconds)
         ;; When the frame being made was opened (seconds since the agent was made).
         opened-at (atom nil)
+        ;; The frame being made as text, for :live: [tokens already in it, the text]. Only
+        ;; the tokens added since are turned into text (tokens are pieces of bytes, so the
+        ;; pieces appended are the whole's text): the whole frame every few tokens would
+        ;; cost the square of its length, which thousands of tokens of thinking make slow.
+        shown (atom [0 ""])
         made (fn [kind header body]
                {:kind kind
                 :name (str/trim (ink/detokenize m header))
@@ -341,6 +346,7 @@
             (contains? content id)
             (let [kind (get content id)]
               (reset! opened-at (clock a))
+              (reset! shown [0 ""])
               (swap! a assoc :state kind :live {:kind kind :name (ink/detokenize m header) :text ""})
               (recur (inc n) :body kind header [] frames))
 
@@ -357,10 +363,13 @@
             (let [kind (or kind :text)
                   body (conj body id)]
               (when (not= where :body)
-                (reset! opened-at (clock a)))
+                (reset! opened-at (clock a))
+                (reset! shown [0 ""]))
               (when (zero? (mod (count body) 4))
-                (swap! a assoc :live {:kind kind :name (ink/detokenize m header)
-                                      :text (ink/detokenize m body)}))
+                (let [[k text] @shown
+                      text (str text (ink/detokenize m (subvec body k)))]
+                  (reset! shown [(count body) text])
+                  (swap! a assoc :live {:kind kind :name (ink/detokenize m header) :text text})))
               (recur (inc n) :body kind header body frames))))))))
 
 ;; A call run.
