@@ -156,6 +156,8 @@ namespace inkling
       int64_t checks{};
       // Checks and drafts kept by depth (stats_of).
       int64_t at_depth[8]{}, kept_at[8]{};
+      // Milliseconds in all, by depth: of the checks, of their drafts.
+      double total_ms[8]{}, draft_ms[8]{};
     } ctl;
     metal_drafter *gpu{};
 
@@ -164,7 +166,7 @@ namespace inkling
   // The drafts for the next check, and what it gave: `drafted` drafts,
   // `accepted` of them, in `ms` milliseconds.
   int32_t choose_depth(drafter &d);
-  void observe_check(drafter &d, int32_t drafted, int32_t accepted, double ms);
+  void observe_check(drafter &d, int32_t drafted, int32_t accepted, double ms, double draft_ms);
   // The draft on the GPU: the context rows [from, s.pos) into the ring (whose
   // positions d.ring_pos already has), then `count` proposals after `anchor`.
   std::vector<int32_t> metal_draft(drafter &d, session const &s, int64_t from, int32_t anchor, int32_t count);

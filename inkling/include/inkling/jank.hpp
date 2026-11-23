@@ -636,6 +636,8 @@ namespace inkling::jank_layer
           row = rt::conj(row, num(st.at_depth[i]));
           row = rt::conj(row, num(st.kept_at[i]));
           row = rt::conj(row, real(st.ms[i]));
+          row = rt::conj(row, real(st.total_ms[i] / st.at_depth[i]));
+          row = rt::conj(row, real(st.draft_ms[i] / st.at_depth[i]));
           depths = rt::conj(depths, row);
         }
         accept = rt::conj(accept, real(st.accept[i]));

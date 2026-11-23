@@ -1487,6 +1487,7 @@ namespace inkling
     std::vector<int32_t> rows{ first };
     // The draft model's checks (not the copies) tell its depth control.
     bool modelled{};
+    double drafting_ms{};
     if(room > 0)
     {
       auto proposed{ context_draft(s, first, least, room) };
@@ -1496,7 +1497,9 @@ namespace inkling
         modelled = true;
         if(depth > 0)
         {
+          auto const t0{ std::chrono::steady_clock::now() };
           proposed = draft(*d, s, first, depth);
+          drafting_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         }
       }
       rows.insert(rows.end(), proposed.begin(), proposed.end());
@@ -1505,7 +1508,7 @@ namespace inkling
       if(modelled)
       {
         double const ms{ std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() };
-        observe_check(*d, static_cast<int32_t>(rows.size()) - 1, static_cast<int32_t>(kept) - 1, ms);
+        observe_check(*d, static_cast<int32_t>(rows.size()) - 1, static_cast<int32_t>(kept) - 1, ms, drafting_ms);
       }
     } };
     if(rows.size() == 1)

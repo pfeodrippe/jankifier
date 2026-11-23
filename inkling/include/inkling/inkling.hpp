@@ -547,6 +547,8 @@ namespace inkling
     int64_t checks{};
     int64_t at_depth[8]{}, kept_at[8]{};
     double ms[8]{};
+    // Milliseconds in all by depth: the checks, and their drafts.
+    double total_ms[8]{}, draft_ms[8]{};
     float accept[8]{};
   };
   draft_stats stats_of(drafter const &d);

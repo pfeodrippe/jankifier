@@ -228,6 +228,8 @@ namespace inkling
       st.at_depth[i] = d.ctl.at_depth[i];
       st.kept_at[i] = d.ctl.kept_at[i];
       st.ms[i] = d.ctl.ms[i];
+      st.total_ms[i] = d.ctl.total_ms[i];
+      st.draft_ms[i] = d.ctl.draft_ms[i];
       st.accept[i] = d.ctl.accept[i];
     }
     return st;
@@ -358,11 +360,13 @@ namespace inkling
     return c.checks % 64 == 0 && rival >= 0 ? rival : best;
   }
 
-  void observe_check(drafter &d, int32_t const drafted, int32_t const accepted, double const ms)
+  void observe_check(drafter &d, int32_t const drafted, int32_t const accepted, double const ms, double const draft_ms)
   {
     auto &c{ d.ctl };
     ++c.checks;
     ++c.at_depth[std::clamp(drafted, 0, 7)];
+    c.total_ms[std::clamp(drafted, 0, 7)] += ms;
+    c.draft_ms[std::clamp(drafted, 0, 7)] += draft_ms;
     c.kept_at[std::clamp(drafted, 0, 7)] += accepted;
     for(int32_t j{}; j < drafted && j < 8; ++j)
     {

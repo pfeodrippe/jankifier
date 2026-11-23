@@ -165,7 +165,8 @@
 (defn info
   "{:position :context :logits :gpu} of a session: where it is, its size, whether it has
   logits, and whether its next eval runs on the GPU; with a draft model, :draft {:checks
-  :depths [[depth checks drafts-kept ms-a-check] ...] :accept [acceptance at each place]}."
+  :depths [[depth checks drafts-kept ms-a-check mean-ms mean-draft-ms] ...] :accept
+  [acceptance at each place]}: ms-a-check as the depth control estimates it."
   [s]
   (cpp/inkling.jank_layer.session_info s))
 
