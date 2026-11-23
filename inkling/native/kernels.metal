@@ -13,10 +13,10 @@ R"MSL(
 using namespace metal;
 
 #ifndef GU_ROWS
-#define GU_ROWS 2u
+#define GU_ROWS 4u
 #endif
 #ifndef DN_ROWS
-#define DN_ROWS 2u
+#define DN_ROWS 4u
 #endif
 #ifndef TB
 #define TB 1

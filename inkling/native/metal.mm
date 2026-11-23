@@ -1326,7 +1326,7 @@ namespace inkling
           bind(7, g.cw);
           bind(8, b.e4m3);
           bind(9, g.act);
-          groups(p.rows / (gu.nvfp4 ? 2 : 4), routes, 1, 32);
+          groups(p.rows / (gu.nvfp4 ? 4 : 4), routes, 1, 32); // GU_ROWS
         }
         if(stage())
         {
@@ -1375,7 +1375,7 @@ namespace inkling
           bind(6, g.chosen);
           bind(8, b.e4m3);
           bind(9, g.ffn);
-          groups(p.rows / (dn.nvfp4 ? 2 : 2), nt, 1, 32);
+          groups(p.rows / (dn.nvfp4 ? 4 : 2), nt, 1, 32); // DN_ROWS
         }
         if(stage())
         {
