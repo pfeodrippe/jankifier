@@ -91,6 +91,9 @@ namespace inkling
     // att_split: at most this many chunks of keys, each at least this many keys.
     constexpr uint32_t split_most{ 64 };
     constexpr uint32_t split_least{ 512 };
+    // Where the split starts (keys): measured faster alone from 2,000 tokens on (34.0
+    // against 35.9 tokens a second), slower under contention at 1,364; four chunks.
+    constexpr uint32_t split_from{ 4 * split_least };
 
     struct route_params
     {
@@ -1009,7 +1012,7 @@ namespace inkling
             groups(a.head_dim / 32, p.rows / 32, p.kvh, 32);
           }
         }
-        else if(m.split_attention && nt == 1 && a.window == 0 && p0 + 1 >= 2 * split_least
+        else if(m.split_attention && nt == 1 && a.window == 0 && p0 + 1 >= split_from
                 && a.heads % a.kv_heads == 0 && a.heads / a.kv_heads <= 4 && a.head_dim == 128)
         {
           // One token over a long context: the keys split in chunks (att_split),

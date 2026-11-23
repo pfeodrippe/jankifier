@@ -224,10 +224,10 @@ namespace inkling
     // Quantize the experts' inputs as the checkpoint's reference does (NVFP4
     // with 4-over-6 block scales, or MXFP8). Off: FP32 inputs.
     bool quantize_expert_inputs{ true };
-    // One token over a long context on the GPU: the global layers' attention
-    // split across the keys and merged (att_split, att_merge) rather than a
-    // threadgroup a head. The same arithmetic in another order.
-    bool split_attention{ false };
+    // One token over a context of 2,048 tokens or more on the GPU: the global
+    // layers' attention split across the keys and merged (att_split, att_merge)
+    // rather than a threadgroup a head. The same arithmetic in another order.
+    bool split_attention{ true };
     // Experiments. ablate has a set of `ablation` bits per visit of the plan,
     // and banned_experts, per layer, experts the router may not choose.
     // While any is set, evals run on the CPU path, which implements them.

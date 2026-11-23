@@ -35,14 +35,14 @@ Not done:
   is the routed experts, which run one route at a time (running the routes by
   expert, to decode an expert's weights once for several tokens, was tried
   and was slower);
-- single-token attention over a very long context: `(ink/set-option! m
-  :split-attention true)` splits the global layers' attention across the keys
-  and merges the chunks (`att_split`, `att_merge`). It passes `check-gpu` (one
-  token at position 1,362: nothing beyond tolerance, as the plain kernel). At
-  19,812 tokens it took 480 us a global visit against 2,709 us for the plain
-  kernel (profiled while another process used the GPU); at 1,364 tokens it is
-  slower (two chunks). Off until it is measured alone at several lengths, to
-  choose where it starts;
+- single-token attention over a long context is split across the keys (the
+  global layers' attention in chunks, then merged: `att_split`, `att_merge`)
+  from 2,048 tokens on, by default (`:split-attention false` turns it off).
+  It passes `check-gpu` (one token at position 1,362: nothing beyond
+  tolerance, as the plain kernel), and is proved to compute the same softmax
+  (specs/models/SoftmaxMerge.lean). Decoding alone, tokens a second, plain
+  against split: 34.0 and 35.9 at 2,000 tokens of context, 26.3 and 35.1 at
+  8,000, 19.3 and 33.1 at 20,000;
 - only Apple Silicon.
 
 ## What was checked

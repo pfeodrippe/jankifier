@@ -438,8 +438,11 @@ kernel void controller(constant ctl_params &P [[buffer(0)]],
   stream[a] = stream[a] * (1.0f - tanh(hsum(f4))) + stream[b] * tanh(hsum(g4));
 }
 
-// y[t, r] = W[r, :] . x[t, :], W BF16 [rows, in], in a multiple of 128. A
-// simdgroup computes one row for TB tokens; each lane sums in / 32 inputs.
+// y[t, r] = W[r, :] . x[t, :], W BF16 [rows, in], in a multiple of 8. A
+// simdgroup computes one row for TB tokens. The lanes read the row interleaved,
+// 8 weights (16 bytes) each at a time, so that a simdgroup's loads are 512
+// contiguous bytes; each lane sums its share in the same order whatever TB is,
+// so a token's result doesn't depend on how many tokens share the dispatch.
 
 struct lin_params
 {
@@ -451,7 +454,7 @@ struct lin_params
 };
 
 kernel void linear(constant lin_params &P [[buffer(0)]],
-                   device const ushort4 *w [[buffer(1)]],
+                   device const uint4 *w [[buffer(1)]],
                    device const float4 *x [[buffer(2)]],
                    device float *y [[buffer(3)]],
                    uint3 tg [[threadgroup_position_in_grid]],
@@ -459,21 +462,23 @@ kernel void linear(constant lin_params &P [[buffer(0)]],
 {
   uint r = tg.x;
   uint t0 = tg.y * TB;
-  uint n = P.in / 4u;
-  uint seg = n / 32u;
-  uint i0 = uint(lane) * seg;
+  uint n8 = P.in / 8u;
   float4 acc[TB];
   uint xo[TB];
   for(uint k = 0; k < TB; ++k)
   {
     acc[k] = float4(0.0f);
-    xo[k] = min(t0 + k, P.nt - 1u) * n + i0;
+    xo[k] = min(t0 + k, P.nt - 1u) * (P.in / 4u);
   }
-  uint wo = r * n + i0;
-  for(uint i = 0; i < seg; ++i)
+  uint wo = r * n8;
+  for(uint i = lane; i < n8; i += 32u)
   {
-    float4 wv = bf16v(w[wo + i]);
-    for(uint k = 0; k < TB; ++k) acc[k] += wv * x[xo[k] + i];
+    uint4 q = w[wo + i];
+    float4 lo = float4(as_type<float>(q.x << 16), as_type<float>(q.x & 0xffff0000u),
+                       as_type<float>(q.y << 16), as_type<float>(q.y & 0xffff0000u));
+    float4 hi = float4(as_type<float>(q.z << 16), as_type<float>(q.z & 0xffff0000u),
+                       as_type<float>(q.w << 16), as_type<float>(q.w & 0xffff0000u));
+    for(uint k = 0; k < TB; ++k) acc[k] += lo * x[xo[k] + 2u * i] + hi * x[xo[k] + 2u * i + 1u];
   }
   for(uint k = 0; k < TB; ++k)
   {
