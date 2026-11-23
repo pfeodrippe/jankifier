@@ -490,10 +490,10 @@
                (str "error: " (:error outcome))
                (str (:note outcome) (result-text (:value outcome) (or (:limit found) 8000))))
         ;; The same call again, with the same result: said, rather than given again (a model
-        ;; going round in a loop re-reads what it already has).
+        ;; going round in a loop re-reads what it already has). Only the result is the same:
+        ;; a call with effects (loading an edited file) may have done something new.
         text (if (and (not (:error outcome)) (same-before? a named args text))
-               (str "(This call gave exactly this result before, and nothing has changed since: "
-                    "the result is earlier in this conversation.)")
+               "(This call gave exactly this result before: the result is earlier in this conversation.)"
                text)]
     ;; :text and :kind are the call as the model wrote it (the session is made again from it).
     [{:role :call :name (str named) :args args :text (str (:text called)) :kind (:kind called)
