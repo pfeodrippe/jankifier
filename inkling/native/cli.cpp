@@ -19,6 +19,7 @@ namespace
                  "  inkling convert SOURCE OUT.ink     checkpoint directory or manifest -> model file\n"
                  "  inkling info MODEL.ink             configuration, plan, tensors\n"
                  "  inkling tokenize MODEL.ink TEXT    token ids and pieces (special tokens allowed)\n"
+                 "  inkling file MODEL.ink NAME        an embedded file (config.json, tokenizer.json, ...)\n"
                  "  inkling run MODEL.ink [options]    generate\n"
                  "  inkling score MODEL.ink PROMPT IDS [--cpu]\n"
                  "                                     log-probability of each of the ids (comma separated)\n"
@@ -185,6 +186,24 @@ int main(int argc, char **argv)
       std::printf(all_same ? "OK: every row is the same bits as one token at a time\n"
                            : "DIFFERENT: rows of one forward aren't one token at a time\n");
       return all_same ? 0 : 1;
+    }
+
+    if(cmd == "file" && argc == 4)
+    {
+      // A file the model file embeds (config.json, tokenizer.json, ...).
+      auto const it{ m->files.find(argv[3]) };
+      if(it == m->files.end())
+      {
+        std::fprintf(stderr, "no embedded file %s; there are:", argv[3]);
+        for(auto const &[name, text] : m->files)
+        {
+          std::fprintf(stderr, " %s", name.c_str());
+        }
+        std::fprintf(stderr, "\n");
+        return 1;
+      }
+      std::fwrite(it->second.data(), 1, it->second.size(), stdout);
+      return 0;
     }
 
     if(cmd == "bench" && argc >= 3)
