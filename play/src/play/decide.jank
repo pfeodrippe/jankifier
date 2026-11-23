@@ -50,16 +50,33 @@ namespace play_decide
 (defn player
   "A player of a game: `rules` (what the game is, what the actions do, what to aim for) and
   `actions` (keywords: each one's name is how the model answers). Its session holds the rules;
-  every choice starts from there. :context is the session's size (8192)."
-  [m {:keys [rules actions context] :or {context 8192}}]
+  every choice starts from there. :context is the session's size (8192). :think is how many
+  tokens the model may think before each choice (0: it answers at once); :effort its
+  thinking effort, as the publisher writes it (\"0.2\")."
+  [m {:keys [rules actions context think effort] :or {context 8192 think 0 effort "0.2"}}]
   (let [base (ink/session m context)]
+    (when (pos? think)
+      (ink/eval! base (frame m :system (str "Thinking effort level: " effort))))
     (ink/eval! base (frame m :system (str rules "\n\nEach turn you are told the game as it is now. "
+                                          (when (pos? think) "Think briefly about what is around, then ")
                                           "Answer with the name of one action only, one of: "
                                           (str/join ", " (map name actions)) ".")))
-    {:model m :actions (vec actions)
+    {:model m :actions (vec actions) :think think
      :answers (into {} (map (fn [a] [a (answer-ids m a)]) actions))
      :base base :work (ink/session m context) :scratch (ink/session m context)
      :history (atom [])}))
+
+(defn- think!
+  "The model's thinking in `s`, up to `n` tokens, its message closed, and its answer begun
+  after it: the thinking's text."
+  [m s n seed]
+  (let [end (id m "<|end_message|>")
+        _ (ink/eval! s [(id m "<|message_model|>") (id m "<|content_thinking|>")])
+        ids (ink/generate! s n {:eos-token end :temperature 0.6 :seed seed})
+        said (vec (remove #{end} ids))]
+    ;; generate! leaves its end token unevaluated (and a cut thinking has none).
+    (ink/eval! s (vec (concat [end] (answer-start m))))
+    (ink/detokenize m said)))
 
 (defn- answer-logprob
   "The log-probability of `ids` as the next tokens of `s` (evaluated in it, but the last)."
@@ -74,7 +91,8 @@ namespace play_decide
 
 (defn choose!
   "The action for the game as `told`, with the last actions said: {:action :probs {action p}
-  :seconds}. Each action's probability is its answer's, over the allowed answers."
+  :seconds}, and :thinking when the player thinks first. Each action's probability is its
+  answer's (after the thinking), over the allowed answers."
   [p told]
   (let [{:keys [model actions answers base work scratch history]} p
         began (cpp/play_decide.seconds)
@@ -83,7 +101,11 @@ namespace play_decide
                   (when (seq recent) (str "\nYour last actions, oldest first: " (str/join ", " (map name recent)) "."))
                   "\nYour action?")
         _ (ink/copy! work base)
-        _ (ink/eval! work (vec (concat (frame model :user text) (answer-start model))))
+        thought (if (pos? (:think p))
+                  (do (ink/eval! work (frame model :user text))
+                      (think! model work (:think p) (inc (count @history))))
+                  (do (ink/eval! work (vec (concat (frame model :user text) (answer-start model))))
+                      nil))
         scores (into {} (map (fn [a]
                                (ink/copy! scratch work)
                                [a (answer-logprob scratch (get answers a))])
@@ -94,7 +116,8 @@ namespace play_decide
         probs (into {} (map (fn [[a w]] [a (/ w total)]) weights))
         action (key (apply max-key val probs))]
     (swap! history conj action)
-    {:action action :probs probs :seconds (- (cpp/play_decide.seconds) began)}))
+    (cond-> {:action action :probs probs :seconds (- (cpp/play_decide.seconds) began)}
+      thought (assoc :thinking thought))))
 
 (defn chooser
   "A game's chooser for its `play!`: from a state, the decision {:action :probs :seconds}, the

@@ -84,21 +84,42 @@
                                (contains? objects [col row]) "e"
                                :else (block-char ((:map st) col row))))))))))
 
+(defn- around
+  "What is next to Nova, from the map: the wall on her right and how high, a gap or spikes
+  ahead on the ground, as sentences."
+  [st]
+  (let [px (long (:x st)) py (long (:y st))
+        at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
+        solid? (fn [ch] (contains? #{"#" "!" "L"} ch))
+        wall (count (take-while (fn [dy] (solid? (at 1 (- dy)))) (range 0 6)))
+        gap (when (:on-ground st)
+              (count (take-while (fn [dx] (= "." (at dx 1))) (range 1 6))))
+        spikes (first (filter (fn [dx] (or (= "^" (at dx 0)) (= "^" (at dx 1)))) (range 1 5)))]
+    (str (cond
+           (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
+                            (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
+           (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide: jump-right to cross it.")
+           :else "On her right the way is clear.")
+         (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right.")))))
+
 (defn told
-  "What a model is told of the game: Nova's state, the objects near, and the level around
-  her."
+  "What a model is told of the game: Nova's state, what is next to her, the objects near, and
+  the level around her (positions relative to her, as the map shows them)."
   ([] (told (state)))
   ([st]
-   (str "Nova is at column " (one-place (:x st)) ", row " (one-place (:y st))
-        " (rows go down), facing " (name (:facing st))
-        (cond (:on-ground st) ", on the ground" (:jumping st) ", jumping" :else ", in the air")
-        ", moving " (one-place (:vx st)) " across (blocks a frame). Health " (:health st) ".\n"
-        (if (seq (:objects st))
-          (str "Objects: " (str/join ", " (map (fn [o] (str (:type o) " at (" (:x o) ", " (:y o) ")")) (:objects st))) ".\n")
-          "No objects near.\n")
-        "The level around her (N Nova, e an object, . empty, # solid, = a ledge, o coin, ^ spikes, "
-        "s spring, ? sign, ! prize block, ~ water):\n"
-        (view st))))
+   (let [px (long (:x st)) py (long (:y st))]
+     (str "Nova is facing " (name (:facing st))
+          (cond (:on-ground st) ", on the ground" (:jumping st) ", jumping" :else ", in the air")
+          ", moving " (one-place (:vx st)) " blocks a frame across. Health " (:health st) ".\n"
+          (around st) "\n"
+          (if (seq (:objects st))
+            (str "Objects (blocks from her: + is right, + is down): "
+                 (str/join ", " (map (fn [o] (str (:type o) " at (" (- (long (:x o)) px) ", " (- (long (:y o)) py) ")")) (:objects st))) ".\n")
+            "No objects near.\n")
+          "The level around her, a character a block (N Nova, e an object, . empty, # solid, = a ledge, "
+          "o coin, ^ spikes, s spring, ? sign, ! prize block, ~ water); rows go down, and it shows a "
+          "few columns behind her and more ahead:\n"
+          (view st)))))
 
 ;; Actions: buttons held for some frames.
 
@@ -196,9 +217,10 @@
 (defonce decisions (atom []))
 
 (defn model-player
-  "A player of Nova for model `m` (play.decide)."
-  [m]
-  (decide/player m {:rules rules :actions model-actions}))
+  "A player of Nova for model `m` (play.decide); `opts` as decide/player's (:think n: it
+  thinks up to n tokens before each choice)."
+  ([m] (model-player m {}))
+  ([m opts] (decide/player m (merge {:rules rules :actions model-actions} opts))))
 
 (defn play-model!
   "`steps` steps chosen by `player` (model-player), in the background, each decision kept in
