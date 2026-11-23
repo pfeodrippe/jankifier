@@ -200,9 +200,17 @@ int main(int argc, char **argv)
       {
         widths = { 1, 2, 4, 8, 16 };
       }
+      for(auto const w : widths)
+      {
+        if(w < 1 || w > 512)
+        {
+          std::fprintf(stderr, "bench: 1 to 512 rows\n");
+          return 2;
+        }
+      }
       auto const piece{ inkling::tokenize(*m, "The quick brown fox jumps over the lazy dog while the cat watches from the window. ", false) };
       std::vector<int32_t> filler;
-      while(filler.size() < 1100)
+      while(filler.size() < 1000 + 512)
       {
         filler.insert(filler.end(), piece.begin(), piece.end());
       }

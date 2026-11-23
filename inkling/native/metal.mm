@@ -90,6 +90,25 @@ namespace inkling
       float scale;
     };
 
+    struct grp_params
+    {
+      uint32_t routes, experts;
+    };
+    struct ggu_params
+    {
+      uint32_t topk, rows, cols;
+      float gate_cap, up_cap, den;
+    };
+    struct gdn_params
+    {
+      uint32_t rows, cols;
+      float den;
+    };
+    struct gcomb_params
+    {
+      uint32_t topk, rows;
+    };
+
     struct tap_params
     {
       uint32_t h, p0, slots, ntaps, tap, src_row;
@@ -168,6 +187,8 @@ namespace inkling
       dn_mx;
     // The draft model's Markov head's fold of the output head (made once).
     id<MTLBuffer> fold, fold_b;
+    // A batch's routes by expert.
+    id<MTLComputePipelineState> group_routes, gate_up_grouped, down_grouped, down_combine;
     // The draft model's kernels.
     id<MTLComputePipelineState> draft_fold, draft_mix, draft_norm, draft_block, draft_head, draft_attention, draft_elementwise,
       draft_mk_input, draft_mk_gates, draft_mk_pick, draft_mk_choose;
@@ -195,6 +216,10 @@ namespace inkling
       cw, act, amax, ffn, hidden, logits, rlogits, qg, bias, scores, inv, part;
     // A controller's normalized pair and its projection, for each of 3 inputs.
     id<MTLBuffer> pair[3], cmp[3];
+    // A batch's routes by expert: their order, tiles and count, and each
+    // route's down projection.
+    id<MTLBuffer> order, tiles, ntiles, route_out;
+    uint32_t max_tiles{};
     // Bytes of `scores`: the batched attention's scratch.
     size_t scores_bytes{};
     id<MTLBuffer> normed[3];
@@ -398,6 +423,10 @@ namespace inkling
       b->act_quant = pipeline(device, lib, "act_quant", 96);
       b->dn_nv = pipeline(device, lib, "down_nvfp4", 32);
       b->dn_mx = pipeline(device, lib, "down_mxfp8", 32);
+      b->group_routes = pipeline(device, lib, "group_routes", 256);
+      b->gate_up_grouped = pipeline(device, lib, "gate_up_grouped", 128);
+      b->down_grouped = pipeline(device, lib, "down_grouped", 128);
+      b->down_combine = pipeline(device, lib, "down_combine", 32);
       b->dummy = scratch_buffer(*b, 16384);
       b->draft_fold = pipeline(device, lib, "draft_fold", 256);
       b->draft_mix = pipeline(device, lib, "draft_mix", 256);
@@ -557,6 +586,11 @@ namespace inkling
       g->act = scratch_buffer(b, t * c.top_k * c.expert_width * f);
       g->amax = scratch_buffer(b, t * c.top_k * f);
       g->ffn = scratch_buffer(b, t * h * f);
+      g->order = scratch_buffer(b, t * c.top_k * sizeof(uint32_t));
+      g->max_tiles = static_cast<uint32_t>((t * c.top_k + 31) / 32 + c.experts);
+      g->tiles = scratch_buffer(b, g->max_tiles * 4 * sizeof(uint32_t));
+      g->ntiles = scratch_buffer(b, 4 * sizeof(uint32_t));
+      g->route_out = scratch_buffer(b, t * c.top_k * h * f);
       // Up to max_rows tokens' outputs (all_logits).
       g->hidden = scratch_buffer(b, std::max<size_t>(t, max_rows) * h * f);
       g->logits = scratch_buffer(b, static_cast<size_t>(max_rows) * (c.unpadded_vocab + 4) * f);
@@ -1767,6 +1801,42 @@ namespace inkling
             std::memcpy(g.xmax.contents, vf->expert_input_max.data(), nt * fl);
           }
         }
+        // A prompt's chunk: the routes by expert, each expert's weights read once
+        // for all its routes (matrix products; the sums' order is not one
+        // token's, as the batch's other kernels' isn't).
+        bool const grouped{ nt > 16 && batched && quant && gu.nvfp4 && dn.nvfp4 && !std::getenv("INK_NO_GROUPED") };
+        if(grouped)
+        {
+          {
+            grp_params const p{ routes, static_cast<uint32_t>(c.experts) };
+            use(b.group_routes, "group_routes");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind(1, g.chosen);
+            bind(2, g.order);
+            bind(3, g.tiles);
+            bind(4, g.ntiles);
+            groups(1, 1, 1, 256);
+          }
+          {
+            ggu_params const p{ static_cast<uint32_t>(c.top_k), static_cast<uint32_t>(gu.rows), static_cast<uint32_t>(gu.cols),
+                                c.gate_cap, c.up_cap, m.f32(gu.denominator)[0] };
+            use(b.gate_up_grouped, "gate_up grouped");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind(1, weight(b, gu.weight, dtype::u32));
+            bind(2, weight(b, gu.scales, dtype::u8));
+            bind(3, weight(b, gu.amax, dtype::f32));
+            bind(4, g.xq);
+            bind(5, g.xmax);
+            bind(6, g.order);
+            bind(7, g.cw);
+            bind(8, b.e4m3);
+            bind(9, g.act);
+            bind(10, g.tiles);
+            bind(11, g.ntiles);
+            groups(p.rows / 64, std::min<uint32_t>(g.max_tiles, routes / 32 + static_cast<uint32_t>(c.experts)), 1, 128);
+          }
+        }
+        else
         {
           gu_params const p{ static_cast<uint32_t>(c.top_k), static_cast<uint32_t>(gu.rows),
                              static_cast<uint32_t>(gu.cols), quant ? 1u : 0u, c.gate_cap, c.up_cap,
@@ -1824,6 +1894,34 @@ namespace inkling
             std::memcpy(g.amax.contents, vf->activation_max.data(), routes * fl);
           }
         }
+        if(grouped)
+        {
+          {
+            gdn_params const p{ static_cast<uint32_t>(dn.rows), static_cast<uint32_t>(dn.cols), m.f32(dn.denominator)[0] };
+            use(b.down_grouped, "down grouped");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind(1, weight(b, dn.weight, dtype::u32));
+            bind(2, weight(b, dn.scales, dtype::u8));
+            bind(3, weight(b, dn.amax, dtype::f32));
+            bind(4, g.act);
+            bind(5, g.amax);
+            bind(6, g.order);
+            bind(8, b.e4m3);
+            bind(9, g.route_out);
+            bind(10, g.tiles);
+            bind(11, g.ntiles);
+            groups(p.rows / 64, std::min<uint32_t>(g.max_tiles, routes / 32 + static_cast<uint32_t>(c.experts)), 1, 128);
+          }
+          {
+            gcomb_params const p{ static_cast<uint32_t>(c.top_k), static_cast<uint32_t>(dn.rows) };
+            use(b.down_combine, "down combine");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind(1, g.route_out);
+            bind(2, g.ffn);
+            threads(static_cast<NSUInteger>(dn.rows), nt, 1);
+          }
+        }
+        else
         {
           dn_params const p{ static_cast<uint32_t>(c.top_k), static_cast<uint32_t>(dn.rows),
                              static_cast<uint32_t>(dn.cols), quant ? 1u : 0u,

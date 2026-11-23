@@ -1661,6 +1661,217 @@ kernel void gate_up_mxfp8(constant gu_params &P [[buffer(0)]],
   }
 }
 
+// A batch's routes by expert (the prompt's chunks): an expert's routes are
+// computed together, with matrix products, so that its weights are read once
+// for all of them. group_routes lists the routes of each expert in route
+// order (order) and cuts them in tiles of up to 32 (tiles: expert, first,
+// count; ntiles).
+// One threadgroup, a thread an expert.
+struct grp_params
+{
+  uint routes;
+  uint experts;
+};
+
+kernel void group_routes(constant grp_params &P [[buffer(0)]],
+                         device const uint *chosen [[buffer(1)]],
+                         device uint *order [[buffer(2)]],
+                         device uint4 *tiles [[buffer(3)]],
+                         device uint *ntiles [[buffer(4)]],
+                         uint tid [[thread_position_in_threadgroup]])
+{
+  threadgroup uint count[256];
+  threadgroup uint first[256];
+  for(uint e = tid; e < P.experts; e += 256u)
+  {
+    uint n = 0;
+    for(uint r = 0; r < P.routes; ++r) n += chosen[r] == e ? 1u : 0u;
+    count[e] = n;
+  }
+  BARRIER;
+  if(tid == 0u)
+  {
+    uint at = 0, nt = 0;
+    for(uint e = 0; e < P.experts; ++e)
+    {
+      first[e] = at;
+      for(uint s = 0; s < count[e]; s += 32u) tiles[nt++] = uint4(e, at + s, min(32u, count[e] - s), 0u);
+      at += count[e];
+    }
+    ntiles[0] = nt;
+  }
+  BARRIER;
+  for(uint e = tid; e < P.experts; e += 256u)
+  {
+    uint at = first[e];
+    for(uint r = 0; r < P.routes; ++r)
+    {
+      if(chosen[r] == e) order[at++] = r;
+    }
+  }
+}
+
+// The tile's matrix product, for 64 rows of the expert's NVFP4 matrix
+// [rows, cols] and up to 32 routes, whose inputs (NVFP4 values, exact as
+// halves) row `xrow(j)` of x holds: acc[route][row] in out. 4 simdgroups,
+// 32 columns (two NVFP4 blocks) at a time.
+#define GROUPED_PRODUCT(XROW)                                                                                 \
+  threadgroup half ws[64 * 32];                                                                               \
+  threadgroup half xs[32 * 32];                                                                               \
+  simdgroup_float8x8 mc[4][2];                                                                                \
+  for(uint a = 0; a < 4; ++a)                                                                                 \
+    for(uint b = 0; b < 2; ++b) mc[a][b] = make_filled_simdgroup_matrix<float, 8>(0.0f);                      \
+  uint nb = P.cols / 16u;                                                                                     \
+  for(uint k0 = 0; k0 < P.cols; k0 += 32u)                                                                    \
+  {                                                                                                           \
+    if(tid < 64u)                                                                                             \
+    {                                                                                                         \
+      uint off = e * P.rows + row0 + tid;                                                                     \
+      uint4 q = ((device const uint4 *)w)[(off * nb + k0 / 16u) / 2u];                                        \
+      float s0 = e4m3[sc[off * nb + k0 / 16u]], s1 = e4m3[sc[off * nb + k0 / 16u + 1u]];                      \
+      uint parts[4] = { q.x, q.y, q.z, q.w };                                                                 \
+      for(uint i = 0; i < 4; ++i)                                                                             \
+      {                                                                                                       \
+        float sc_ = i < 2u ? s0 : s1;                                                                         \
+        float4 lo = e2m1v(parts[i]) * sc_, hi = e2m1v(parts[i] >> 16) * sc_;                                  \
+        for(uint c = 0; c < 4; ++c)                                                                           \
+        {                                                                                                     \
+          ws[tid * 32u + 8u * i + c] = half(lo[c]);                                                           \
+          ws[tid * 32u + 8u * i + 4u + c] = half(hi[c]);                                                      \
+        }                                                                                                     \
+      }                                                                                                       \
+    }                                                                                                         \
+    else                                                                                                      \
+    {                                                                                                         \
+      uint j = (tid - 64u) / 2u, part = (tid - 64u) % 2u;                                                     \
+      bool live = j < n;                                                                                      \
+      device const float4 *xr = x + (XROW) * (P.cols / 4u) + (k0 + 16u * part) / 4u;                         \
+      for(uint c = 0; c < 4; ++c)                                                                             \
+      {                                                                                                       \
+        float4 v = live ? xr[c] : float4(0.0f);                                                               \
+        for(uint i = 0; i < 4; ++i) xs[j * 32u + 16u * part + 4u * c + i] = half(v[i]);                      \
+      }                                                                                                       \
+    }                                                                                                         \
+    BARRIER;                                                                                                  \
+    for(uint kk = 0; kk < 32u; kk += 8u)                                                                      \
+    {                                                                                                         \
+      simdgroup_half8x8 mx[4], mw[2];                                                                         \
+      for(uint a = 0; a < 4; ++a) simdgroup_load(mx[a], xs + (8u * a) * 32u + kk, 32);                       \
+      for(uint b = 0; b < 2; ++b) simdgroup_load(mw[b], ws + (16u * sg + 8u * b) * 32u + kk, 32, 0, true);    \
+      for(uint a = 0; a < 4; ++a)                                                                             \
+        for(uint b = 0; b < 2; ++b) simdgroup_multiply_accumulate(mc[a][b], mx[a], mw[b], mc[a][b]);          \
+    }                                                                                                         \
+    BARRIER;                                                                                                  \
+  }                                                                                                           \
+  threadgroup float out[32 * 64];                                                                             \
+  for(uint a = 0; a < 4; ++a)                                                                                 \
+    for(uint b = 0; b < 2; ++b) simdgroup_store(mc[a][b], out + (8u * a) * 64u + 16u * sg + 8u * b, 64);     \
+  BARRIER;
+
+struct ggu_params
+{
+  uint topk;
+  uint rows;
+  uint cols;
+  float gate_cap;
+  float up_cap;
+  float den;
+};
+
+kernel void gate_up_grouped(constant ggu_params &P [[buffer(0)]],
+                            device const uint *w [[buffer(1)]],
+                            device const uchar *sc [[buffer(2)]],
+                            device const float *wmax [[buffer(3)]],
+                            device const float4 *x [[buffer(4)]],
+                            device const float *xmax [[buffer(5)]],
+                            device const uint *order [[buffer(6)]],
+                            device const float *cw [[buffer(7)]],
+                            device const float *e4m3 [[buffer(8)]],
+                            device float *act [[buffer(9)]],
+                            device const uint4 *tiles [[buffer(10)]],
+                            device const uint *ntiles [[buffer(11)]],
+                            uint3 tg [[threadgroup_position_in_grid]],
+                            uint3 tp [[thread_position_in_threadgroup]],
+                            ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  uint tid = tp.x;
+  if(tg.y >= ntiles[0]) return;
+  uint4 tile = tiles[tg.y];
+  uint e = tile.x, start = tile.y, n = tile.z;
+  uint row0 = tg.x * 64u;
+  GROUPED_PRODUCT(order[start + min(j, n - 1u)] / P.topk)
+  // Gate and up pairs: rows 2 i and 2 i + 1.
+  for(uint i = tid; i < 32u * 32u; i += 128u)
+  {
+    uint j = i / 32u, pr = i % 32u;
+    if(j >= n) continue;
+    uint route = order[start + j];
+    uint t = route / P.topk;
+    float outer = (xmax[t] * wmax[e]) / (P.den * 1536.0f);
+    float gate = rbf(out[j * 64u + 2u * pr] * outer);
+    float up = rbf(out[j * 64u + 2u * pr + 1u] * outer);
+    act[route * (P.rows / 2u) + row0 / 2u + pr]
+      = rbf(softcap(gate, P.gate_cap) * sigmoidf(gate) * softcap(up, P.up_cap) * cw[route]);
+  }
+}
+
+struct gdn_params
+{
+  uint rows;
+  uint cols;
+  float den;
+};
+
+kernel void down_grouped(constant gdn_params &P [[buffer(0)]],
+                         device const uint *w [[buffer(1)]],
+                         device const uchar *sc [[buffer(2)]],
+                         device const float *wmax [[buffer(3)]],
+                         device const float4 *x [[buffer(4)]],
+                         device const float *amax [[buffer(5)]],
+                         device const uint *order [[buffer(6)]],
+                         device const float *e4m3 [[buffer(8)]],
+                         device float *route_out [[buffer(9)]],
+                         device const uint4 *tiles [[buffer(10)]],
+                         device const uint *ntiles [[buffer(11)]],
+                         uint3 tg [[threadgroup_position_in_grid]],
+                         uint3 tp [[thread_position_in_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  uint tid = tp.x;
+  if(tg.y >= ntiles[0]) return;
+  uint4 tile = tiles[tg.y];
+  uint e = tile.x, start = tile.y, n = tile.z;
+  uint row0 = tg.x * 64u;
+  GROUPED_PRODUCT(order[start + min(j, n - 1u)])
+  for(uint i = tid; i < 32u * 64u; i += 128u)
+  {
+    uint j = i / 64u, r = i % 64u;
+    if(j >= n) continue;
+    uint route = order[start + j];
+    float outer = (amax[route] * wmax[e]) / (P.den * 1536.0f);
+    route_out[route * P.rows + row0 + r] = rbf(out[j * 64u + r] * outer);
+  }
+}
+
+// Each token's routes, rounded, summed in order: the feed-forward's output.
+struct gcomb_params
+{
+  uint topk;
+  uint rows;
+};
+
+kernel void down_combine(constant gcomb_params &P [[buffer(0)]],
+                         device const float *route_out [[buffer(1)]],
+                         device float *ffn [[buffer(2)]],
+                         uint2 gid [[thread_position_in_grid]])
+{
+  uint r = gid.x, t = gid.y;
+  if(r >= P.rows) return;
+  float total = 0.0f;
+  for(uint j = 0; j < P.topk; ++j) total += route_out[(t * P.topk + j) * P.rows + r];
+  ffn[t * P.rows + r] = rbf(total);
+}
+
 // Quantizes each route's activations, in place: the down projection's input.
 
 struct aq_params
