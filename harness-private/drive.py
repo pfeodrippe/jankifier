@@ -337,6 +337,15 @@ def grade(port, task):
 
 
 def main():
+    # One driver at a time: two would share the run's directory. (Stop one with SIGTERM: a
+    # background job ignores SIGINT.)
+    import fcntl
+    os.makedirs(OUT, exist_ok=True)
+    lock = open(OUT + '/driver.lock', 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit('another driver is running')
     tasks = sys.argv[1].split(',')
     seeds = [int(x) for x in sys.argv[2].split(',')]
     modes = sys.argv[3].split(',')
