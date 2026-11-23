@@ -30,7 +30,10 @@
 
 - [ ] split attention measured alone (2k, 4k, 8k, 20k, 49k tokens of context), a threshold chosen, on by default, tokens/s of a real turn
 - [ ] a full agent turn profiled
-- [ ] other exact speedups: experts grouped for prefill, speculative decoding, batching
+- [x] experts grouped for prefill (a prompt 176 -> 587 tokens/s), speculative decoding (copies from the context; the checkpoint's draft model with adaptive depth: code about 64 tokens/s, counting 99, prose unchanged)
+- [ ] batching several sessions
+- [ ] the grouped expert kernels are bound by decoding and staging the weights (6 TFLOPS of the GPU's ~14): double buffering, or decoding straight into registers
+- [ ] specs/models/SplitAttention.lean models the old chunking; att_rows changed it
 - [ ] context trimming, only if the trials show it does no harm
 - [ ] proofs of the engine (inkling/specs): split attention, pool and stream for any size, the router, the session API (in progress)
 - [ ] engine bugs the proofs found (fix after the trials: the trials load the engine):
