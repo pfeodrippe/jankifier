@@ -498,6 +498,76 @@ kernel void linear(constant lin_params &P [[buffer(0)]],
   }
 }
 
+// Several matrices that read the same input, in one dispatch (fewer dispatches,
+// and one larger read): up to 6, their rows one after the other, ends[i] the end
+// of matrix i's. Each row is computed exactly as `linear` computes it.
+
+struct multi_params
+{
+  uint in;
+  uint nt;
+  uint mode;
+  float cap;
+  uint count;
+  uint ends[6];
+};
+
+kernel void linear_multi(constant multi_params &P [[buffer(0)]],
+                         device const uint4 *w0 [[buffer(1)]],
+                         device const uint4 *w1 [[buffer(2)]],
+                         device const uint4 *w2 [[buffer(3)]],
+                         device const uint4 *w3 [[buffer(4)]],
+                         device const uint4 *w4 [[buffer(5)]],
+                         device const uint4 *w5 [[buffer(6)]],
+                         device const float4 *x [[buffer(7)]],
+                         device float *y0 [[buffer(8)]],
+                         device float *y1 [[buffer(9)]],
+                         device float *y2 [[buffer(10)]],
+                         device float *y3 [[buffer(11)]],
+                         device float *y4 [[buffer(12)]],
+                         device float *y5 [[buffer(13)]],
+                         uint3 tg [[threadgroup_position_in_grid]],
+                         ushort lane [[thread_index_in_simdgroup]])
+{
+  uint gr = tg.x;
+  uint m = 0;
+  while(m + 1u < P.count && gr >= P.ends[m]) ++m;
+  uint start = m == 0u ? 0u : P.ends[m - 1u];
+  uint rows = P.ends[m] - start;
+  uint r = gr - start;
+  device const uint4 *w = m == 0u ? w0 : m == 1u ? w1 : m == 2u ? w2 : m == 3u ? w3 : m == 4u ? w4 : w5;
+  device float *y = m == 0u ? y0 : m == 1u ? y1 : m == 2u ? y2 : m == 3u ? y3 : m == 4u ? y4 : y5;
+  uint t0 = tg.y * TB;
+  uint n8 = P.in / 8u;
+  float4 acc[TB];
+  uint xo[TB];
+  for(uint k = 0; k < TB; ++k)
+  {
+    acc[k] = float4(0.0f);
+    xo[k] = min(t0 + k, P.nt - 1u) * (P.in / 4u);
+  }
+  uint wo = r * n8;
+  for(uint i = lane; i < n8; i += 32u)
+  {
+    uint4 q = w[wo + i];
+    float4 lo = float4(as_type<float>(q.x << 16), as_type<float>(q.x & 0xffff0000u),
+                       as_type<float>(q.y << 16), as_type<float>(q.y & 0xffff0000u));
+    float4 hi = float4(as_type<float>(q.z << 16), as_type<float>(q.z & 0xffff0000u),
+                       as_type<float>(q.w << 16), as_type<float>(q.w & 0xffff0000u));
+    for(uint k = 0; k < TB; ++k) acc[k] += lo * x[xo[k] + 2u * i] + hi * x[xo[k] + 2u * i + 1u];
+  }
+  for(uint k = 0; k < TB; ++k)
+  {
+    float s = simd_sum(hsum(acc[k]));
+    if(lane == 0 && t0 + k < P.nt)
+    {
+      if(P.mode == 1u) s = rbf(s);
+      if(P.mode == 2u) s = softcap(s, P.cap);
+      y[(t0 + k) * rows + r] = s;
+    }
+  }
+}
+
 // The same for a batch, as a matrix product: a simdgroup computes 32 tokens
 // by 32 rows with 8x8 matrices loaded straight from memory, which needs the
 // weights as IEEE halves (`w`: a copy of the BF16 weights, rows padded to a

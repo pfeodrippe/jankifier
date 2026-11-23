@@ -89,6 +89,14 @@ namespace inkling
       float scale;
     };
 
+    struct multi_params
+    {
+      uint32_t in, nt, mode;
+      float cap;
+      uint32_t count;
+      uint32_t ends[6];
+    };
+
     struct split_params
     {
       uint32_t p0, heads, kvh, slots, extent, chunk, splits;
@@ -135,7 +143,7 @@ namespace inkling
   {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
-    id<MTLComputePipelineState> embed, mix_norm, mix_pair, controller, linear1, linear4, linear_mm, conv_fixed, conv_dyn, kv_store,
+    id<MTLComputePipelineState> embed, mix_norm, mix_pair, controller, linear1, linear4, linear_mm, multi1, multi4, conv_fixed, conv_dyn, kv_store,
       q_prep, att1, att8, att32, att_split, att_merge, att_rows, att_rows_merge, rel_bias, att_scores, att_softmax, att_pv, route, gu_nv, gu_mx, act_quant, dn_nv,
       dn_mx;
     std::unordered_map<void const *, id<MTLBuffer>> weights;
@@ -336,6 +344,8 @@ namespace inkling
       b->controller = pipeline(device, lib, "controller", 32);
       b->linear1 = pipeline(device, lib, "linear", 32);
       b->linear4 = pipeline(device, lib4, "linear", 32);
+      b->multi1 = pipeline(device, lib, "linear_multi", 32);
+      b->multi4 = pipeline(device, lib4, "linear_multi", 32);
       b->linear_mm = pipeline(device, lib, "linear_mm", 32);
       b->conv_fixed = pipeline(device, lib, "conv_fixed", 32);
       b->conv_dyn = pipeline(device, lib, "conv_dyn", 32);
@@ -714,6 +724,44 @@ namespace inkling
         groups(p.rows, (count + tb - 1) / tb, 1, 32);
       } };
 
+      // Matrices that read the same input, in one dispatch (linear_multi), each
+      // row as `linear` computes it; a batch of more than 16 tokens takes them
+      // one at a time (the matrix-product kernel).
+      auto const linear_many{ [&](std::vector<std::pair<tensor const *, id<MTLBuffer>>> const &parts, id<MTLBuffer> x,
+                                  uint32_t count, uint32_t mode) {
+        if((count > 16 && batched) || parts.size() > 6)
+        {
+          for(auto const &[w, y] : parts)
+          {
+            linear(w, x, y, count, mode, 0);
+          }
+          return;
+        }
+        multi_params p{};
+        p.in = static_cast<uint32_t>(parts[0].first->dim(1));
+        p.nt = count;
+        p.mode = mode;
+        p.count = static_cast<uint32_t>(parts.size());
+        uint32_t end{};
+        std::string name{ "linear" };
+        for(size_t i{}; i < parts.size(); ++i)
+        {
+          end += static_cast<uint32_t>(parts[i].first->dim(0));
+          p.ends[i] = end;
+          name += (i == 0 ? " " : "+") + std::to_string(parts[i].first->dim(0));
+        }
+        uint32_t const tb{ count > 1 ? 4u : 1u };
+        use(tb == 4 ? b.multi4 : b.multi1, name + "x" + std::to_string(p.in));
+        [e setBytes:&p length:sizeof(p) atIndex:0];
+        for(size_t i{}; i < 6; ++i)
+        {
+          bind(1 + i, i < parts.size() ? weight(b, parts[i].first, dtype::bf16) : b.dummy);
+          bind(8 + i, i < parts.size() ? parts[i].second : b.dummy);
+        }
+        bind(7, x);
+        groups(end, (count + tb - 1) / tb, 1, 32);
+      } };
+
       // A sublayer input: the mix of the sources by `query` (or the last
       // source as is), through the controller when the visit has messages,
       // normalized by `norm` and rounded, into dst (see mix_norm).
@@ -830,7 +878,10 @@ namespace inkling
                               std::vector<float> visit_capture::*f_proj, std::vector<float> visit_capture::*f_taps,
                               std::vector<float> visit_capture::*f_conv) {
         size_t const width{ static_cast<size_t>(nt) * cv.channels };
-        linear(proj, x, raw, nt, 1, 0);
+        if(proj)
+        {
+          linear(proj, x, raw, nt, 1, 0);
+        }
         if(stage())
         {
           field(f_proj, raw, 0, width);
@@ -926,19 +977,27 @@ namespace inkling
           }
         }
 
-        // Projections.
-        linear(a.wq, in[0], g.q, nt, 1, 0);
-        linear(a.wr, in[0], g.r, nt, 1, 0);
-        linear(a.gate, in[0], g.gate, nt, 1, 0);
-        linear(a.sink, in[0], g.sink, nt, 1, 0);
+        // Projections: those that read the same input in one dispatch (keys and values
+        // too when all three inputs are the same).
+        bool const kv_too{ single && a.wk->dim(1) == a.wq->dim(1) && a.wv->dim(1) == a.wq->dim(1) };
+        {
+          std::vector<std::pair<tensor const *, id<MTLBuffer>>> parts{
+            { a.wq, g.q }, { a.wr, g.r }, { a.gate, g.gate }, { a.sink, g.sink } };
+          if(kv_too)
+          {
+            parts.push_back({ a.wk, g.kraw });
+            parts.push_back({ a.wv, g.vraw });
+          }
+          linear_many(parts, in[0], nt, 1);
+        }
         if(stage())
         {
           field(&visit_capture::q_proj, g.q, 0, nt * qw);
           field(&visit_capture::r_proj, g.r, 0, static_cast<size_t>(nt) * c.heads * c.rel_dim);
         }
-        kv_conv(a.k_conv, a.wk, in[1], g.kraw, g.dynk, g.conv[vi][0], s.all_logits ? g.kept[vi][0] : nil, g.kc, &visit_capture::k_proj,
+        kv_conv(a.k_conv, kv_too ? nullptr : a.wk, in[1], g.kraw, g.dynk, g.conv[vi][0], s.all_logits ? g.kept[vi][0] : nil, g.kc, &visit_capture::k_proj,
                 &visit_capture::k_taps, &visit_capture::k_conv);
-        kv_conv(a.v_conv, a.wv, in[2], g.vraw, g.dynv, g.conv[vi][1], s.all_logits ? g.kept[vi][1] : nil, g.vc, &visit_capture::v_proj,
+        kv_conv(a.v_conv, kv_too ? nullptr : a.wv, in[2], g.vraw, g.dynv, g.conv[vi][1], s.all_logits ? g.kept[vi][1] : nil, g.vc, &visit_capture::v_proj,
                 &visit_capture::v_taps, &visit_capture::v_conv);
         {
           kvs_params const p{ p0, static_cast<uint32_t>(vc.slots), static_cast<uint32_t>(a.kv_heads), c.qk_clip,
