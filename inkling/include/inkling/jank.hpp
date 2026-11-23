@@ -521,6 +521,32 @@ namespace inkling::jank_layer
                                rng));
   }
 
+  // Drafting: up to `limit` tokens sampled and evaluated, drafted from the
+  // context and checked in one forward (inkling::speculate): a vector of ids.
+  inline object_ref speculate(object_ref const o, object_ref const temperature, object_ref const top_p,
+                              object_ref const top_k, object_ref const seed, object_ref const limit,
+                              object_ref const least, object_ref const most)
+  {
+    auto const s{ session_of(o) };
+    auto const ids{ inkling::speculate(*s, static_cast<float>(to_real(temperature)), static_cast<float>(to_real(top_p)),
+                                       static_cast<int32_t>(to_int(top_k)), static_cast<uint64_t>(to_int(seed)),
+                                       static_cast<int32_t>(to_int(limit)), static_cast<int32_t>(to_int(least)),
+                                       static_cast<int32_t>(to_int(most))) };
+    object_ref v{ rt::obj::persistent_vector::empty() };
+    for(auto const id : ids)
+    {
+      v = rt::conj(v, num(id));
+    }
+    return v;
+  }
+
+  // The session rolled back to its first `pos` tokens, within its last draft's check.
+  inline object_ref truncate(object_ref const o, object_ref const pos)
+  {
+    inkling::truncate(*session_of(o), static_cast<int32_t>(to_int(pos)));
+    return rt::jank_nil;
+  }
+
   // Tracing.
 
   inline object_ref set_trace(object_ref const o, object_ref const on)

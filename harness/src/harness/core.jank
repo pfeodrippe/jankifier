@@ -181,10 +181,13 @@
                  16384, at most a quarter of it)
     :compact-keep    recent tokens kept as they are beside the summary (15000, at most 30%
                  of the context)
+    :draft       drafting from the context (inkling.core/speculate!): {:least 6 :most 15}
+                 by default, nil off. The tokens are the same either way; text that
+                 repeats the context comes sooner.
   The tools and the system text are evaluated now, so the first question starts from them."
   ([m] (agent m {}))
   ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry
-              obligations max-checks compact-reserve compact-keep] :as opts}]
+              obligations max-checks compact-reserve compact-keep draft] :as opts}]
    (let [tools (mapv tool tools)
          ids (into {} (map (fn [[k piece]] [k (ink/token-id m piece)]) pieces))
          size (or context 16384)
@@ -200,6 +203,7 @@
             :obligations obligations
             :max-checks (or max-checks 6)
             :compact (if (contains? opts :compact) (:compact opts) summarize)
+            :draft (if (contains? opts :draft) draft {:least 6 :most 15})
             :compact-reserve (or compact-reserve
                                  (long (min (* 0.25 size) (max 16384.0 (* 0.15 size)))))
             :compact-keep (or compact-keep (long (min 15000.0 (* 0.3 size))))
@@ -278,7 +282,7 @@
   :end-turn, :limit (the step's tokens ran out), :context (the session is full) or
   :stopped."
   [a]
-  (let [{:keys [model session ids sampling max-tokens max-thinking]} @a
+  (let [{:keys [model session ids sampling max-tokens max-thinking draft]} @a
         m model
         s session
         max-thinking (or max-thinking 1536)
@@ -311,7 +315,29 @@
         ;; Cut short: the frame being made is kept as far as it got (:partial), and the
         ;; session is left well formed, the frame and the turn closed, so that the
         ;; conversation can go on.
+        ;; Tokens drafted, checked and evaluated, not yet taken by the loop: dropped from
+        ;; the session (rolled back) before the loop stops or puts a token of its own.
+        queue (atom [])
+        unqueue! (fn []
+                   (when (seq @queue)
+                     (ink/truncate! s (- (ink/position s) (count @queue)))
+                     (reset! queue [])))
+        next-id (fn [n]
+                  (if (seq @queue)
+                    (let [id (first @queue)]
+                      (swap! queue (fn [q] (vec (rest q))))
+                      id)
+                    (let [ids (if draft
+                                (ink/speculate! s (merge sampling draft
+                                                         {:seed (+ seed n)
+                                                          :limit (max 1 (min 16 (- max-tokens n)))}))
+                                (let [id (ink/sample s (assoc sampling :seed (+ seed n)))]
+                                  (ink/eval! s [id])
+                                  [id]))]
+                      (reset! queue (vec (rest ids)))
+                      (first ids))))
         cut (fn [frames why n where kind header body]
+              (unqueue!)
               (when (< (+ (ink/position s) 2) (:context (ink/info s)))
                 (ink/eval! s (if (= where :between) [ends] [closes ends])))
               (done (if (and (= where :body) (seq body))
@@ -323,22 +349,23 @@
       (cond
         (:stop @a) (cut frames :stopped n where kind header body)
         (>= n max-tokens) (cut frames :limit n where kind header body)
-        (>= (ink/position s) room) (cut frames :context n where kind header body)
+        (>= (- (ink/position s) (count @queue)) room) (cut frames :context n where kind header body)
 
         ;; Thinking that goes on and on (the model can circle around a detail for a whole
         ;; step and never act): closed here, as the model would close it, so that what comes
         ;; next is from what it has thought so far.
         (and (= where :body) (= kind :thinking) (>= (count body) max-thinking))
-        (do (ink/eval! s [closes])
+        (do (unqueue!)
+            (ink/eval! s [closes])
             (recur (inc n) :between nil [] []
                    (conj frames (wrote! a (assoc (made :thinking [] body) :cut true)))))
 
         :else
-        (let [id (ink/sample s (assoc sampling :seed (+ seed n)))]
-          (ink/eval! s [id])
+        (let [id (next-id n)]
           (cond
             (= id ends)
-            (done frames :end-turn (inc n))
+            (do (unqueue!)
+                (done frames :end-turn (inc n)))
 
             (= id opens)
             (recur (inc n) :header nil [] [] frames)

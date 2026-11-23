@@ -196,6 +196,24 @@
   ([s {:keys [temperature top-p top-k seed] :or {temperature 0 top-p 1.0 top-k 0 seed 1}}]
    (cpp/inkling.jank_layer.sample s (double temperature) (double top-p) top-k seed)))
 
+(defn speculate!
+  "Up to :limit tokens (1 by default), as many turns of `sample` then `eval!` would give
+  (token i sampled with :seed + i), but drafted from the context and the drafts checked
+  in one forward: the tokens are the same, sooner when the text repeats the context.
+  :least is the shortest match of the context that drafts (6), :most the longest draft
+  (15). Returns the ids evaluated (at least one)."
+  [s {:keys [temperature top-p top-k seed limit least most]
+      :or {temperature 0 top-p 1.0 top-k 0 seed 1 limit 1 least 6 most 15}}]
+  (used! s)
+  (cpp/inkling.jank_layer.speculate s (double temperature) (double top-p) top-k seed limit least most))
+
+(defn truncate!
+  "The session rolled back to its first `pos` tokens, within the tokens of its last
+  `speculate!` (a draft's check): those after are forgotten."
+  [s pos]
+  (used! s)
+  (cpp/inkling.jank_layer.truncate s pos))
+
 (defn trace!
   "Turns tracing on or off."
   [s on?]
