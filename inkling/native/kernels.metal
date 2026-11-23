@@ -12,6 +12,12 @@ R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef GU_ROWS
+#define GU_ROWS 2u
+#endif
+#ifndef DN_ROWS
+#define DN_ROWS 2u
+#endif
 #ifndef TB
 #define TB 1
 #endif
@@ -964,6 +970,163 @@ kernel void att_merge(constant split_params &P [[buffer(0)]],
   out[o] = rbfv(a / den / (1.0f + exp(-gate[o])));
 }
 
+// Attention for a few tokens (up to 16: one decoded, or a draft's check), the
+// keys split in chunks as att_split does, for any layer (global or with a
+// window). A token's chunks depend only on how many keys it sees (rows_chunk),
+// so a token's result is the same bits whether it is alone or among others.
+// Grid: (key-value head, chunk, token); a chunk past a token's last does
+// nothing. att_rows_merge then combines a token's chunks, a simdgroup a head.
+
+struct rows_params
+{
+  uint p0;
+  uint heads;
+  uint kvh;
+  uint slots;
+  uint window;
+  uint extent;
+  uint most; // chunks a token at most (the scratch's stride)
+  float scale;
+};
+
+// Keys a chunk, by the keys a token sees: 256, or more past 16,384 keys, so
+// that there are never more than 64 chunks.
+inline uint rows_chunk(uint keys)
+{
+  uint c = (keys + 63u) / 64u;
+  return max(256u, (c + 63u) / 64u * 64u);
+}
+
+inline uint rows_first(uint p, uint window)
+{
+  return (window > 0u && p + 1u > window) ? p + 1u - window : 0u;
+}
+
+kernel void att_rows(constant rows_params &P [[buffer(0)]],
+                     device const float4 *q [[buffer(1)]],
+                     device const float4 *r [[buffer(2)]],
+                     device const float4 *rel [[buffer(3)]],
+                     device const half4 *K [[buffer(4)]],
+                     device const half4 *V [[buffer(5)]],
+                     device float4 *part [[buffer(6)]],
+                     uint3 tg [[threadgroup_position_in_grid]],
+                     ushort lane [[thread_index_in_simdgroup]],
+                     ushort sg [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup float tm[NSG][SPLIT_HEADS];
+  threadgroup float tl[NSG][SPLIT_HEADS];
+  threadgroup float4 tacc[NSG][SPLIT_HEADS][32];
+  uint g = tg.x, split = tg.y, t = tg.z;
+  uint per = P.heads / P.kvh;
+  uint p = P.p0 + t;
+  uint first = rows_first(p, P.window);
+  uint keys = p + 1u - first;
+  uint chunk = rows_chunk(keys);
+  if(split * chunk >= keys) return;
+  uint begin = first + split * chunk;
+  uint end = min(begin + chunk, p + 1u);
+
+  float4 qv[SPLIT_HEADS];
+  float4 rv[SPLIT_HEADS];
+  float m[SPLIT_HEADS], l[SPLIT_HEADS];
+  float4 acc[SPLIT_HEADS];
+  for(uint h = 0; h < per; ++h)
+  {
+    uint head = g * per + h;
+    qv[h] = q[(t * P.heads + head) * 32u + lane];
+    rv[h] = lane < 4 ? r[(t * P.heads + head) * 4u + lane] : float4(0.0f);
+    m[h] = -1e30f;
+    l[h] = 0.0f;
+    acc[h] = float4(0.0f);
+  }
+
+  for(uint j = begin + sg; j < end; j += NSG)
+  {
+    uint at = ((j % P.slots) * P.kvh + g) * 32u;
+    float4 k = float4(K[at + lane]);
+    float4 v = float4(V[at + lane]);
+    uint dist = p - j;
+    bool near = dist < P.extent;
+    float4 rl = (near && lane < 4) ? rel[dist * 4u + lane] : float4(0.0f);
+    for(uint h = 0; h < per; ++h)
+    {
+      float s = simd_sum(dot(qv[h], k)) * P.scale;
+      if(near) s += rbf(simd_sum(dot(rv[h], rl)));
+      if(s > m[h])
+      {
+        float f = exp(m[h] - s);
+        l[h] *= f;
+        acc[h] *= f;
+        m[h] = s;
+      }
+      float pr = exp(s - m[h]);
+      l[h] += pr;
+      acc[h] += pr * v;
+    }
+  }
+
+  for(uint h = 0; h < per; ++h)
+  {
+    if(lane == 0)
+    {
+      tm[sg][h] = m[h];
+      tl[sg][h] = l[h];
+    }
+    tacc[sg][h][lane] = acc[h];
+  }
+  BARRIER;
+  if(sg == 0)
+  {
+    for(uint h = 0; h < per; ++h)
+    {
+      float best = -1e30f;
+      for(uint i = 0; i < NSG; ++i) best = max(best, tm[i][h]);
+      float sum = 0.0f;
+      float4 a = float4(0.0f);
+      for(uint i = 0; i < NSG; ++i)
+      {
+        float f = exp(tm[i][h] - best);
+        sum += tl[i][h] * f;
+        a += tacc[i][h][lane] * f;
+      }
+      uint base = ((t * P.most + split) * P.heads + g * per + h) * 33u;
+      part[base + lane] = a;
+      if(lane == 0) part[base + 32u] = float4(best, sum, 0.0f, 0.0f);
+    }
+  }
+}
+
+kernel void att_rows_merge(constant rows_params &P [[buffer(0)]],
+                           device const float4 *part [[buffer(1)]],
+                           device const float *sink [[buffer(2)]],
+                           device const float4 *gate [[buffer(3)]],
+                           device float4 *out [[buffer(4)]],
+                           uint3 tg [[threadgroup_position_in_grid]],
+                           ushort lane [[thread_index_in_simdgroup]])
+{
+  uint head = tg.x, t = tg.y;
+  uint p = P.p0 + t;
+  uint first = rows_first(p, P.window);
+  uint keys = p + 1u - first;
+  uint chunk = rows_chunk(keys);
+  uint splits = (keys + chunk - 1u) / chunk;
+  float sk = sink[t * P.heads + head];
+  float best = sk;
+  for(uint s = 0; s < splits; ++s) best = max(best, part[((t * P.most + s) * P.heads + head) * 33u + 32u].x);
+  float den = exp(sk - best);
+  float4 a = float4(0.0f);
+  for(uint s = 0; s < splits; ++s)
+  {
+    uint base = ((t * P.most + s) * P.heads + head) * 33u;
+    float4 ml = part[base + 32u];
+    float f = exp(ml.x - best);
+    den += ml.y * f;
+    a += part[base + lane] * f;
+  }
+  uint o = (t * P.heads + head) * 32u + lane;
+  out[o] = rbfv(a / den / (1.0f + exp(-gate[o])));
+}
+
 // Attention for a batch, as matrix products. Per key-value group g, with
 // rows = (token, head of g):
 //   att_scores:  scores[row, slot] = q[row] . k[slot] / sqrt(128) + bias, for
@@ -1280,35 +1443,37 @@ kernel void gate_up_nvfp4(constant gu_params &P [[buffer(0)]],
                           uint3 tg [[threadgroup_position_in_grid]],
                           ushort lane [[thread_index_in_simdgroup]])
 {
+  // GU_ROWS rows a simdgroup (gate and up pairs). A row's sum is the same
+  // whatever GU_ROWS is: more rows only put more loads in flight at once.
   uint route = tg.y;
   uint t = route / P.topk;
   uint e = chosen[route];
-  uint row0 = tg.x * 4u;
+  uint row0 = tg.x * GU_ROWS;
   uint nb = P.cols / 16u;
-  float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+  float acc[GU_ROWS];
+  for(uint r = 0; r < GU_ROWS; ++r) acc[r] = 0.0f;
   for(uint b = lane; b < nb; b += 32u)
   {
     float4 xb[4];
     for(uint i = 0; i < 4; ++i) xb[i] = xq[t * (P.cols / 4u) + b * 4u + i];
-    for(uint r = 0; r < 4; ++r)
+    for(uint r = 0; r < GU_ROWS; ++r)
     {
       uint off = e * P.rows + row0 + r;
-      uint lo = w[off * (P.cols / 8u) + b * 2u];
-      uint hi = w[off * (P.cols / 8u) + b * 2u + 1u];
-      float4 d = e2m1v(lo) * xb[0] + e2m1v(lo >> 16) * xb[1] + e2m1v(hi) * xb[2] + e2m1v(hi >> 16) * xb[3];
+      uint2 q = ((device const uint2 *)w)[off * (P.cols / 16u) + b];
+      float4 d = e2m1v(q.x) * xb[0] + e2m1v(q.x >> 16) * xb[1] + e2m1v(q.y) * xb[2] + e2m1v(q.y >> 16) * xb[3];
       acc[r] += hsum(d) * e4m3[sc[off * nb + b]];
     }
   }
-  float a[4];
-  for(uint r = 0; r < 4; ++r) a[r] = simd_sum(acc[r]);
+  float a[GU_ROWS];
+  for(uint r = 0; r < GU_ROWS; ++r) a[r] = simd_sum(acc[r]);
   if(lane == 0)
   {
     float outer = P.quant != 0u ? (xmax[t] * wmax[e]) / (P.den * 1536.0f) : wmax[e] / P.den;
-    for(uint pr = 0; pr < 2; ++pr)
+    for(uint pr = 0; pr < GU_ROWS / 2u; ++pr)
     {
       float gate = rbf(a[2u * pr] * outer);
       float up = rbf(a[2u * pr + 1u] * outer);
-      act[route * (P.rows / 2u) + tg.x * 2u + pr]
+      act[route * (P.rows / 2u) + tg.x * (GU_ROWS / 2u) + pr]
         = rbf(softcap(gate, P.gate_cap) * sigmoidf(gate) * softcap(up, P.up_cap) * cw[route]);
     }
   }
@@ -1434,34 +1599,36 @@ kernel void down_nvfp4(constant dn_params &P [[buffer(0)]],
                        uint3 tg [[threadgroup_position_in_grid]],
                        ushort lane [[thread_index_in_simdgroup]])
 {
+  // DN_ROWS rows a simdgroup; a row's sum is the same whatever DN_ROWS is.
   uint t = tg.y;
-  uint row0 = tg.x * 2u;
+  uint row0 = tg.x * DN_ROWS;
   uint nb = P.cols / 16u;
-  float total[2] = { 0.0f, 0.0f };
+  float total[DN_ROWS];
+  for(uint r = 0; r < DN_ROWS; ++r) total[r] = 0.0f;
   for(uint j = 0; j < P.topk; ++j)
   {
     uint route = t * P.topk + j;
     uint e = chosen[route];
-    float acc[2] = { 0.0f, 0.0f };
+    float acc[DN_ROWS];
+    for(uint r = 0; r < DN_ROWS; ++r) acc[r] = 0.0f;
     for(uint b = lane; b < nb; b += 32u)
     {
       float4 xb[4];
       for(uint i = 0; i < 4; ++i) xb[i] = act[route * (P.cols / 4u) + b * 4u + i];
-      for(uint r = 0; r < 2; ++r)
+      for(uint r = 0; r < DN_ROWS; ++r)
       {
         uint off = e * P.rows + row0 + r;
-        uint lo = w[off * (P.cols / 8u) + b * 2u];
-        uint hi = w[off * (P.cols / 8u) + b * 2u + 1u];
-        float4 d = e2m1v(lo) * xb[0] + e2m1v(lo >> 16) * xb[1] + e2m1v(hi) * xb[2] + e2m1v(hi >> 16) * xb[3];
+        uint2 q = ((device const uint2 *)w)[off * (P.cols / 16u) + b];
+        float4 d = e2m1v(q.x) * xb[0] + e2m1v(q.x >> 16) * xb[1] + e2m1v(q.y) * xb[2] + e2m1v(q.y >> 16) * xb[3];
         acc[r] += hsum(d) * e4m3[sc[off * nb + b]];
       }
     }
     float outer = P.quant != 0u ? (amax[route] * wmax[e]) / (P.den * 1536.0f) : wmax[e] / P.den;
-    for(uint r = 0; r < 2; ++r) total[r] += rbf(simd_sum(acc[r]) * outer);
+    for(uint r = 0; r < DN_ROWS; ++r) total[r] += rbf(simd_sum(acc[r]) * outer);
   }
   if(lane == 0)
   {
-    for(uint r = 0; r < 2; ++r) ffn[t * P.rows + row0 + r] = rbf(total[r]);
+    for(uint r = 0; r < DN_ROWS; ++r) ffn[t * P.rows + row0 + r] = rbf(total[r]);
   }
 }
 

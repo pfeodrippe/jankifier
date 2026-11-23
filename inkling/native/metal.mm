@@ -82,6 +82,12 @@ namespace inkling
       float scale;
     };
 
+    struct rows_params
+    {
+      uint32_t p0, heads, kvh, slots, window, extent, most;
+      float scale;
+    };
+
     struct split_params
     {
       uint32_t p0, heads, kvh, slots, extent, chunk, splits;
@@ -129,7 +135,7 @@ namespace inkling
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> embed, mix_norm, mix_pair, controller, linear1, linear4, linear_mm, conv_fixed, conv_dyn, kv_store,
-      q_prep, att1, att8, att32, att_split, att_merge, rel_bias, att_scores, att_softmax, att_pv, route, gu_nv, gu_mx, act_quant, dn_nv,
+      q_prep, att1, att8, att32, att_split, att_merge, att_rows, att_rows_merge, rel_bias, att_scores, att_softmax, att_pv, route, gu_nv, gu_mx, act_quant, dn_nv,
       dn_mx;
     std::unordered_map<void const *, id<MTLBuffer>> weights;
     // Half-float copies of projection weights, for the batched kernels.
@@ -337,6 +343,8 @@ namespace inkling
       b->att32 = pipeline(device, lib32, "attention", 1024);
       b->att_split = pipeline(device, lib8, "att_split", 256);
       b->att_merge = pipeline(device, lib, "att_merge", 32);
+      b->att_rows = pipeline(device, lib8, "att_rows", 256);
+      b->att_rows_merge = pipeline(device, lib, "att_rows_merge", 32);
       b->rel_bias = pipeline(device, lib, "rel_bias", 32);
       b->att_scores = pipeline(device, lib, "att_scores", 32);
       b->att_softmax = pipeline(device, lib, "att_softmax", 128);
@@ -462,7 +470,8 @@ namespace inkling
       g->scores_bytes = std::min(full, std::max<size_t>(512u << 20, c.kv_heads * 32 * slots * f));
       g->scores = scratch_buffer(b, g->scores_bytes);
       // att_split's records: a head a chunk, 33 float4s.
-      g->part = scratch_buffer(b, static_cast<size_t>(split_most) * c.heads * 33 * 4 * f);
+      // att_rows' chunks: up to 16 tokens, 64 chunks each.
+      g->part = scratch_buffer(b, static_cast<size_t>(16) * split_most * c.heads * 33 * 4 * f);
       for(auto &n : g->normed)
       {
         n = scratch_buffer(b, t * h * f);
@@ -662,7 +671,7 @@ namespace inkling
       auto const linear{ [&](tensor const *w, id<MTLBuffer> x, id<MTLBuffer> y, uint32_t count, uint32_t mode, float cap) {
         lin_params const p{ static_cast<uint32_t>(w->dim(0)), static_cast<uint32_t>(w->dim(1)), count, mode, cap };
         auto const name{ "linear " + std::to_string(p.rows) + "x" + std::to_string(p.in) };
-        if(count >= 16 && p.rows >= 512 && w->type == dtype::bf16 && batched)
+        if(count > 16 && p.rows >= 512 && w->type == dtype::bf16 && batched)
         {
           // A batch and a big matrix: the matrix-product kernel.
           use(b.linear_mm, name + " (mm)");
@@ -673,8 +682,10 @@ namespace inkling
           groups((p.rows + 31) / 32, (count + 31) / 32, 1, 32);
           return;
         }
+        // Tokens a simdgroup: 4 for several (8 or 16 rows in one tile, tried, were slower
+        // than passes of 4). A token's sum is the same whatever this is (see `linear`).
         uint32_t const tb{ count > 1 ? 4u : 1u };
-        use(count > 1 ? b.linear4 : b.linear1, name);
+        use(tb == 4 ? b.linear4 : b.linear1, name);
         [e setBytes:&p length:sizeof(p) atIndex:0];
         bind(1, weight(b, w, dtype::bf16));
         bind(2, x);
@@ -957,7 +968,7 @@ namespace inkling
             }
           }
         }
-        if(nt >= 16 && batched)
+        if(nt > 16 && batched)
         {
           // A batch: attention as matrix products (see att_scores).
           char const *const kind{ a.window == 0 ? " (global)" : " (local)" };
@@ -1011,6 +1022,38 @@ namespace inkling
             bind(5, g.attended);
             groups(a.head_dim / 32, p.rows / 32, p.kvh, 32);
           }
+        }
+        else if(nt <= 16 && a.heads % a.kv_heads == 0 && a.heads / a.kv_heads <= 4 && a.head_dim == 128)
+        {
+          // A few tokens (one decoded, or a draft's check): att_rows, a token's keys in
+          // chunks that depend on its own position only, then att_rows_merge.
+          uint32_t const last{ p0 + nt - 1 };
+          uint32_t const first_last{ a.window > 0 && last + 1 > static_cast<uint32_t>(a.window) ? last + 1 - static_cast<uint32_t>(a.window) : 0 };
+          uint32_t const keys_last{ last + 1 - first_last };
+          uint32_t const c64{ (keys_last + 63) / 64 };
+          uint32_t const chunk_last{ std::max(256u, (c64 + 63) / 64 * 64) };
+          uint32_t const most{ (keys_last + chunk_last - 1) / chunk_last };
+          rows_params const p{ p0, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads),
+                               static_cast<uint32_t>(vc.slots), static_cast<uint32_t>(a.window),
+                               static_cast<uint32_t>(a.rel_extent), split_most,
+                               1.0f / std::sqrt(static_cast<float>(a.head_dim)) };
+          std::string const kind{ a.window == 0 ? "global" : "local" };
+          use(b.att_rows, "attention (" + kind + ", rows)");
+          [e setBytes:&p length:sizeof(p) atIndex:0];
+          bind(1, g.q);
+          bind(2, g.r);
+          bind(3, b.rel[static_cast<size_t>(visit.layer)]);
+          bind(4, g.k[vi]);
+          bind(5, g.v[vi]);
+          bind(6, g.part);
+          groups(p.kvh, most, nt, 32 * 8);
+          use(b.att_rows_merge, "attention (" + kind + ", merge)");
+          [e setBytes:&p length:sizeof(p) atIndex:0];
+          bind(1, g.part);
+          bind(2, g.sink);
+          bind(3, g.gate);
+          bind(4, g.attended);
+          groups(p.heads, nt, 1, 32);
         }
         else if(m.split_attention && nt == 1 && a.window == 0 && p0 + 1 >= split_from
                 && a.heads % a.kv_heads == 0 && a.heads / a.kv_heads <= 4 && a.head_dim == 128)
@@ -1157,7 +1200,7 @@ namespace inkling
           bind(7, g.cw);
           bind(8, b.e4m3);
           bind(9, g.act);
-          groups(p.rows / 4, routes, 1, 32);
+          groups(p.rows / (gu.nvfp4 ? 2 : 4), routes, 1, 32);
         }
         if(stage())
         {
@@ -1206,7 +1249,7 @@ namespace inkling
           bind(6, g.chosen);
           bind(8, b.e4m3);
           bind(9, g.ffn);
-          groups(p.rows / 2, nt, 1, 32);
+          groups(p.rows / (dn.nvfp4 ? 2 : 2), nt, 1, 32);
         }
         if(stage())
         {
