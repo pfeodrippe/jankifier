@@ -37,7 +37,9 @@ namespace
                  "    --threads N  CPU threads\n"
                  "    --cpu        run on the CPU (the reference path)\n"
                  "    --ctx N      context (default 8192)\n"
-                 "    --top N      print the top N logits after the prompt\n");
+                 "    --top N      print the top N logits after the prompt\n"
+                 "    --draft N    draft from the context (matches of at least N tokens) and check\n"
+                 "                 the drafts in one forward: the same tokens, sooner\n");
   }
 
   double now()
@@ -255,6 +257,7 @@ int main(int argc, char **argv)
       float temp{ 0 };
       int32_t ctx{ 8192 };
       int32_t top{ 0 };
+      int32_t draft{ 0 };
       for(int i{ 3 }; i < argc; ++i)
       {
         std::string const a{ argv[i] };
@@ -294,6 +297,10 @@ int main(int argc, char **argv)
         {
           top = std::stoi(next());
         }
+        else if(a == "--draft")
+        {
+          draft = std::stoi(next());
+        }
         else
         {
           usage();
@@ -323,22 +330,46 @@ int main(int argc, char **argv)
           std::printf("%d\t%.4f\t%s\n", id, s->logits[static_cast<size_t>(id)], inkling::detokenize(*m, &id, 1).c_str());
         }
       }
-      uint64_t rng{ 0x9e3779b97f4a7c15ull };
+      // Token i sampled with the generator seeded (seed + i) | 1, with or without drafts,
+      // so that the two give the same tokens.
+      uint64_t const seed{ 0x9e3779b97f4a7c15ull };
       double const g0{ now() };
       int32_t produced{};
-      for(; produced < n; ++produced)
+      int32_t checks{};
+      bool ended{};
+      while(produced < n && !ended)
       {
-        auto const id{ inkling::sample(s->logits.data(), static_cast<int32_t>(s->logits.size()), temp, 0.95f, 0, rng) };
-        std::fputs(inkling::detokenize(*m, &id, 1).c_str(), stdout);
-        std::fflush(stdout);
-        if(id == c.eos_token)
+        std::vector<int32_t> ids;
+        if(draft > 0)
         {
-          break;
+          ids = inkling::speculate(*s, temp, 0.95f, 0, seed + static_cast<uint64_t>(produced), n - produced, draft, 15);
+          ++checks;
         }
-        inkling::eval(*s, &id, 1);
+        else
+        {
+          uint64_t rng{ (seed + static_cast<uint64_t>(produced)) | 1u };
+          ids = { inkling::sample(s->logits.data(), static_cast<int32_t>(s->logits.size()), temp, 0.95f, 0, rng) };
+          inkling::eval(*s, ids);
+        }
+        for(auto const id : ids)
+        {
+          std::fputs(inkling::detokenize(*m, &id, 1).c_str(), stdout);
+          ++produced;
+          if(id == c.eos_token)
+          {
+            ended = true;
+            break;
+          }
+        }
+        std::fflush(stdout);
       }
       double const g1{ now() };
-      std::fprintf(stderr, "\ngenerated %d tokens in %.2f s (%.2f tok/s)\n", produced, g1 - g0, produced / (g1 - g0));
+      std::fprintf(stderr, "\ngenerated %d tokens in %.2f s (%.2f tok/s)", produced, g1 - g0, produced / (g1 - g0));
+      if(draft > 0)
+      {
+        std::fprintf(stderr, ", %d forwards (%.2f tokens each)", checks, static_cast<double>(produced) / checks);
+      }
+      std::fprintf(stderr, "\n");
       return 0;
     }
     usage();

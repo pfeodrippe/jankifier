@@ -484,4 +484,20 @@ namespace inkling
 
   // Samples from logits. temperature <= 0 is greedy (argmax).
   int32_t sample(float const *logits, int32_t n, float temperature, float top_p, int32_t top_k, uint64_t &rng);
+
+  // Speculative decoding's draft from the context: after the sequence's
+  // tokens and `next`, the tokens that followed the longest earlier match of
+  // its end, when that match has at least `least` tokens; at most `most` of
+  // them. Empty when there is no such match.
+  std::vector<int32_t> context_draft(session const &s, int32_t next, int32_t least, int32_t most);
+
+  // Up to `limit` tokens, the same as `limit` turns of sampling from the
+  // session's logits (token i with the generator seeded `(seed + i) | 1`, as
+  // inkling.core/sample is) and evaluating the token, but drafted from the
+  // context (context_draft with `least` and `most`) and the drafts checked in
+  // one forward: drafts are kept while each equals the token sampled at its
+  // place. Returns the tokens evaluated (at least one); the session ends as
+  // after evaluating them one at a time, the same bits.
+  std::vector<int32_t> speculate(session &s, float temperature, float top_p, int32_t top_k, uint64_t seed,
+                                 int32_t limit, int32_t least, int32_t most);
 }

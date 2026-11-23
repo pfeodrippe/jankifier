@@ -21,15 +21,17 @@ Measured on an Apple M3 Max (40 GPU cores, 48 GB), 2026-11-22:
 
 | | inkling | Ollama 0.40.17 (same machine) |
 |---|---|---|
-| Generation, short context | 38 to 40 tokens/s | about 32 tokens/s (with its draft model) |
-| Generation at 3,400 tokens of context | about 29 tokens/s | not measured |
+| Generation, short context | about 41.5 tokens/s | about 32 tokens/s (with its draft model) |
+| Generation, rewriting text of the context, drafts from the context | about 80 tokens/s (5.8 tokens a forward) | not measured |
+| Generation at 20,000 tokens of context | about 33 tokens/s | not measured |
 | Prompt processing, 3,400 tokens | 160 tokens/s | about 400 tokens/s |
 | CPU reference path | about 8 tokens/s | |
 
 Not done:
 
 - images (the checkpoint's vision encoder), and the draft model used for
-  speculative decoding;
+  speculative decoding (its weights are in the model file; docs/drafting.md is
+  how oMLX runs it);
 - a chat template, an HTTP server, samplers beyond temperature, top-p and top-k;
 - prompt processing is 2.5 times slower than Ollama's: three quarters of it
   is the routed experts, which run one route at a time (running the routes by
@@ -99,6 +101,27 @@ bin/inkling gpucheck models/inkling-2-mini.ink "The capital of France is"
 
 `INK_GPU_PROFILE=1` prints the GPU time of each kernel per forward (every
 dispatch then runs alone, so the total is slower than normal).
+
+## Drafting
+
+`speculate` (and `bin/inkling run --draft N`) samples the next token, then
+looks for the end of the sequence earlier in it (at least N tokens matching):
+the tokens that followed there are a draft, checked with the next token in one
+forward over up to 16 rows (`all_logits`), and kept while each equals the
+token sampled at its place; the session is rolled back past the first that
+doesn't (`truncate`). Each place is sampled with the seed it would have had
+one token at a time, so the tokens are the same as without drafts, sampled or
+greedy: `rowcheck` checks that each row of one forward is the same bits as a
+token evaluated alone, and that rolling back and going on is too.
+
+Rewriting a short piece of code from the context, greedy: 40.0 tokens/s
+without drafts, 82.4 with (`--draft 3`, 5.8 tokens a forward); sampled at
+temperature 1: 39.3 and 78.7. On text that doesn't repeat the context there is
+rarely a draft, and nothing is lost (41.6 and 41.9).
+
+The approach follows [oMLX](https://github.com/jundot/omlx)'s for this model:
+drafts copied from the context (#5528), and verify rows that are the bits of
+a decode step, so that drafts never change the output (#5531).
 
 ## From jank
 

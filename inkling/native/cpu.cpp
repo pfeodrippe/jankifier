@@ -1363,6 +1363,98 @@ namespace inkling
     eval(s, ids.data(), ids.size());
   }
 
+  std::vector<int32_t> context_draft(session const &s, int32_t const next, int32_t const least, int32_t const most)
+  {
+    // The sequence with `next`; its end matched against every earlier place, the
+    // longest match (up to 64 tokens) kept, the latest among equals.
+    std::vector<int32_t> const &t{ s.tokens };
+    int64_t const n{ static_cast<int64_t>(t.size()) + 1 };
+    auto const at{ [&](int64_t i) { return i == n - 1 ? next : t[static_cast<size_t>(i)]; } };
+    if(least < 1 || most < 1 || n < least + 1)
+    {
+      return {};
+    }
+    int64_t best_end{ -1 };
+    int64_t best_len{};
+    // An earlier place `e` (the last token of a match) is a candidate when its
+    // token equals the end's; the match is measured backwards from there.
+    for(int64_t e{ n - 2 }; e >= least - 1 && best_len < 64; --e)
+    {
+      if(at(e) != next)
+      {
+        continue;
+      }
+      int64_t len{};
+      while(len < 64 && e - len >= 0 && at(e - len) == at(n - 1 - len))
+      {
+        ++len;
+      }
+      if(len > best_len)
+      {
+        best_len = len;
+        best_end = e;
+      }
+    }
+    if(best_len < least)
+    {
+      return {};
+    }
+    std::vector<int32_t> draft;
+    for(int64_t i{ best_end + 1 }; i < n - 1 && static_cast<int32_t>(draft.size()) < most; ++i)
+    {
+      draft.push_back(at(i));
+    }
+    return draft;
+  }
+
+  std::vector<int32_t> speculate(session &s, float const temperature, float const top_p, int32_t const top_k,
+                                 uint64_t const seed, int32_t const limit, int32_t const least, int32_t const most)
+  {
+    if(limit < 1)
+    {
+      fail("speculate: the limit is at least one token");
+    }
+    auto const v{ static_cast<int32_t>(s.model->cfg.unpadded_vocab) };
+    auto const sampled{ [&](float const *logits, int32_t i) {
+      uint64_t rng{ (seed + static_cast<uint64_t>(i)) | 1u };
+      return sample(logits, v, temperature, top_p, top_k, rng);
+    } };
+    int32_t const first{ sampled(s.logits.data(), 0) };
+    int32_t const room{ std::min({ limit - 1, most, max_rows - 1, s.context - s.pos - 1 }) };
+    std::vector<int32_t> rows{ first };
+    if(room > 0)
+    {
+      auto const draft{ context_draft(s, first, least, room) };
+      rows.insert(rows.end(), draft.begin(), draft.end());
+    }
+    if(rows.size() == 1)
+    {
+      eval(s, rows);
+      return rows;
+    }
+    bool const was{ s.all_logits };
+    s.all_logits = true;
+    eval(s, rows);
+    s.all_logits = was;
+    // Drafts kept while each equals what is sampled at its place.
+    size_t kept{ 1 };
+    while(kept < rows.size()
+          && sampled(s.row_logits.data() + (kept - 1) * static_cast<size_t>(v), static_cast<int32_t>(kept)) == rows[kept])
+    {
+      ++kept;
+    }
+    if(kept < rows.size())
+    {
+      truncate(s, s.checked_from + static_cast<int32_t>(kept));
+    }
+    else
+    {
+      s.checked_from = -1;
+    }
+    rows.resize(kept);
+    return rows;
+  }
+
   void truncate(session &s, int32_t const pos)
   {
     if(s.checked_from < 0 || pos < s.checked_from || pos > s.pos)
@@ -1417,46 +1509,93 @@ namespace inkling
     {
       return static_cast<int32_t>(std::max_element(logits, logits + n) - logits);
     }
-    std::vector<int32_t> idx(static_cast<size_t>(n));
-    std::iota(idx.begin(), idx.end(), 0);
-    int32_t const k{ top_k > 0 ? std::min(top_k, n) : n };
-    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
-    std::vector<double> p(static_cast<size_t>(k));
-    double const best{ logits[idx[0]] };
-    double sum{};
-    for(int32_t i{}; i < k; ++i)
-    {
-      p[static_cast<size_t>(i)] = std::exp((logits[idx[static_cast<size_t>(i)]] - best) / temperature);
-      sum += p[static_cast<size_t>(i)];
-    }
-    int32_t keep{ k };
-    if(top_p > 0 && top_p < 1)
-    {
-      double acc{};
-      for(int32_t i{}; i < k; ++i)
-      {
-        acc += p[static_cast<size_t>(i)] / sum;
-        if(acc >= top_p)
-        {
-          keep = i + 1;
-          break;
-        }
-      }
-    }
-    double total{};
-    for(int32_t i{}; i < keep; ++i)
-    {
-      total += p[static_cast<size_t>(i)];
-    }
-    // xorshift64*
+    // xorshift64*: one number in [0, 1).
     rng ^= rng >> 12;
     rng ^= rng << 25;
     rng ^= rng >> 27;
-    double const u{ static_cast<double>((rng * 2685821657736338717ull) >> 11) / 9007199254740992.0 * total };
+    double const r{ static_cast<double>((rng * 2685821657736338717ull) >> 11) / 9007199254740992.0 };
+    double const best{ *std::max_element(logits, logits + n) };
+    auto const weight{ [&](int32_t i) { return std::exp((logits[i] - best) / temperature); } };
+    bool const nucleus{ top_p > 0 && top_p < 1 };
+    int32_t const k{ top_k > 0 ? std::min(top_k, n) : n };
+    if(k == n && !nucleus)
+    {
+      // Every token: no order needed, the tokens in their own order.
+      double total{};
+      for(int32_t i{}; i < n; ++i)
+      {
+        total += weight(i);
+      }
+      double const u{ r * total };
+      double acc{};
+      for(int32_t i{}; i < n; ++i)
+      {
+        acc += weight(i);
+        if(u < acc)
+        {
+          return i;
+        }
+      }
+      return n - 1;
+    }
+    // The k most likely (ties by index), sorted only as far as needed: the top-p
+    // cut is found among the first m, m growing until it is or m reaches k.
+    std::vector<int32_t> idx(static_cast<size_t>(n));
+    std::iota(idx.begin(), idx.end(), 0);
+    auto const before{ [&](int32_t a, int32_t b) { return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); } };
+    if(k < n)
+    {
+      std::nth_element(idx.begin(), idx.begin() + k, idx.end(), before);
+      idx.resize(static_cast<size_t>(k));
+    }
+    double sum{};
+    for(auto const i : idx)
+    {
+      sum += weight(i);
+    }
+    int32_t keep{ k };
+    double kept{ sum };
+    int32_t m{ std::min(k, 64) };
+    while(true)
+    {
+      std::partial_sort(idx.begin(), idx.begin() + m, idx.end(), before);
+      if(!nucleus)
+      {
+        if(m == k)
+        {
+          break;
+        }
+        m = k;
+        continue;
+      }
+      double acc{};
+      int32_t found{ -1 };
+      for(int32_t i{}; i < m; ++i)
+      {
+        acc += weight(idx[static_cast<size_t>(i)]);
+        if(acc / sum >= top_p)
+        {
+          found = i;
+          break;
+        }
+      }
+      if(found >= 0)
+      {
+        keep = found + 1;
+        kept = acc;
+        break;
+      }
+      if(m == k)
+      {
+        break;
+      }
+      m = std::min(k, m * 4);
+    }
+    double const u{ r * kept };
     double acc{};
     for(int32_t i{}; i < keep; ++i)
     {
-      acc += p[static_cast<size_t>(i)];
+      acc += weight(idx[static_cast<size_t>(i)]);
       if(u < acc)
       {
         return idx[static_cast<size_t>(i)];
