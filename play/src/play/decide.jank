@@ -121,7 +121,7 @@ namespace play_decide
 
 (defn- think!
   "The model's thinking in `s`, up to `n` tokens, its message closed, and its answer begun
-  after it: the thinking's text."
+  after it: {:text :tokens :cut} (cut: it reached `n` before it ended)."
   [m s n temperature seed]
   (let [end (id m "<|end_message|>")
         _ (ink/eval! s [(id m "<|message_model|>") (id m "<|content_thinking|>")])
@@ -129,7 +129,7 @@ namespace play_decide
         said (vec (remove #{end} ids))]
     ;; generate! leaves its end token unevaluated (and a cut thinking has none).
     (ink/eval! s (vec (concat [end] (answer-start m))))
-    (ink/detokenize m said)))
+    {:text (ink/detokenize m said) :tokens (count said) :cut (= (count said) (count ids))}))
 
 (defn- normalized
   "Probabilities from log-probabilities: {k lp} to {k p}, over the keys."
@@ -141,8 +141,9 @@ namespace play_decide
 
 (defn choose!
   "The action for the game as `told`, with its last actions said: {:action :probs {action p}
-  :seconds}, and :thinking when it thinks first. Each action's probability is its answer's
-  (after the thinking), over the allowed answers."
+  :seconds}, and :thinking, :thought-tokens and :cut (the thinking reached its budget) when it
+  thinks first. Each action's probability is its answer's (after the thinking), over the
+  allowed answers."
   [p told]
   (let [{:keys [model work scratch history]} p
         config @(:config p)
@@ -168,7 +169,7 @@ namespace play_decide
         action (key (apply max-key val probs))]
     (swap! history conj action)
     (cond-> {:action action :probs probs :seconds (- (cpp/play_decide.seconds) began)}
-      thought (assoc :thinking thought))))
+      thought (assoc :thinking (:text thought) :thought-tokens (:tokens thought) :cut (:cut thought)))))
 
 (defn committee!
   "Several players' choices for the game as `told`, combined: :combine :mean (the mean of

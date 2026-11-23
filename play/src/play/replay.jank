@@ -3,7 +3,8 @@
 ;; each step, its probabilities, thinking and committee votes, and the action taken; the
 ;; NES is deterministic, so playing the game again from power-on with the same actions
 ;; shows the same pictures. A replay keeps a save of the console at every step: any step
-;; can be gone to at once.
+;; can be gone to at once. A game that can't be saved (NetHack: :saves false) is played again
+;; from its start to go back.
 ;;
 ;;   (replay/save! :nova @nova/decisions {:player-settings ...})   ; the file's path
 ;;   (replay/open! "path.edn")      ; the game again, in a card: the picture and the model's side
@@ -55,7 +56,7 @@ namespace play_replay
   {:nova {:title "Nova the Squirrel" :start! #'nova/start! :act! #'nova/act!
           :play-model! #'nova/play-model! :decisions #'nova/decisions}
    :nethack {:title "NetHack" :start! #'nethack/start! :act! #'nethack/act! :picture #'nethack/picture
-             :play-model! #'nethack/play-model! :decisions #'nethack/decisions :restore? false}
+             :play-model! #'nethack/play-model! :decisions #'nethack/decisions :saves false}
    :wnw {:title "Witch n' Wiz" :start! #'wnw/start! :act! #'wnw/act!}})
 
 (defn save!
@@ -97,15 +98,23 @@ namespace play_replay
                 :result (str "replay, step " i " of " (count steps))})))
 
 (defn go!
-  "To step `i`: the console as it was when the model decided step `i` (from the save kept
+  "To step `i`: the game as it was when the model decided step `i` (from the save kept
   there, or played up to it)."
   [i]
-  (let [{:keys [game steps saves]} @replaying
-        act! (get-in games [game :act!])
+  (let [{:keys [game steps saves at]} @replaying
+        {:keys [act! start!]} (get games game)
         i (max 0 (min i (dec (count steps))))
         known (dec (count @saves))]
-    (if (<= i known)
+    (cond
+      (false? (get-in games [game :saves]))
+      (let [from (if (< i at) (do (start!) 0) at)]
+        (doseq [k (range from i)]
+          (act! (:action (get steps k)))))
+
+      (<= i known)
       (p/nes-restore! (get @saves i))
+
+      :else
       (do (p/nes-restore! (get @saves known))
           (doseq [k (range known i)]
             (act! (:action (get steps k)))
@@ -123,7 +132,8 @@ namespace play_replay
         {:keys [start! title]} (get games (:game r))]
     (when-let [failed (start!)]
       (throw (ex-info (str "the game didn't start: " failed) {})))
-    (reset! replaying (assoc r :at 0 :path path :saves (atom [(p/nes-save!)])))
+    (reset! replaying (assoc r :at 0 :path path
+                             :saves (atom (if (false? (get-in games [(:game r) :saves])) [] [(p/nes-save!)]))))
     ;; In the game's own card's place: there is one console.
     (c/pin! title st (p/decision-card ((or (:picture (get games (:game r))) (fn [] (p/picture-part :nes 300))))))
     (show! 0)

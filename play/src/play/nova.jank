@@ -101,8 +101,12 @@
         gap (when (:on-ground st)
               (count (take-while (fn [dx] (= "." (at dx 1))) (range 1 6))))
         spikes (first (filter (fn [dx] (or (= "^" (at dx 0)) (= "^" (at dx 1)))) (range 1 5)))
-        ledge (and (:on-ground st) (= "=" (at 0 1)))]
-    (str (when ledge "She stands on a ledge (=): down drops her through it. ")
+        ledge (and (:on-ground st) (= "=" (at 0 1)))
+        ladder (or (= "H" (at 0 0)) (= "H" (at 0 -1)))
+        door (= "D" (at 0 0))]
+    (str (when ladder "She is at a ladder (H): up climbs it. ")
+         (when door "She is at a door (D): up goes through it. ")
+         (when ledge "She stands on a ledge (=): down drops her through it. ")
          (cond
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
                             (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
@@ -125,8 +129,9 @@
                  (str/join ", " (map (fn [o] (str (:type o) " at (" (- (long (:x o)) px) ", " (- (long (:y o)) py) ")")) (:objects st))) ".\n")
             "No objects near.\n")
           "The level around her, a character a block (N Nova, e an object, . empty, # solid, = a ledge, "
-          "o coin, ^ spikes, s spring, ? sign, ! prize block, ~ water); rows go down, and it shows a "
-          "few columns behind her and more ahead:\n"
+          "H a ladder, D a door, o coin, ^ spikes, s spring, ? sign, ! prize block, ~ water or lava, "
+          "L a lock, k a key, + a heart, E the exit); rows go down, and it shows a few columns behind "
+          "her and more ahead:\n"
           (view st)))))
 
 ;; Actions: buttons held for some frames.
@@ -134,7 +139,7 @@
 (def actions
   "What a player can do in a step: a name and the buttons held, for `step-frames` frames."
   {:right [:right] :left [:left] :jump [:a] :jump-right [:a :right] :jump-left [:a :left]
-   :down [:down] :attack [:b] :wait []})
+   :down [:down] :up [:up] :attack [:b] :wait []})
 
 (def step-frames 8)
 
@@ -224,11 +229,12 @@
        "her, and so do enemies she touches. Coins are worth taking. Each action holds the "
        "controller's buttons for a moment (8 frames): right and left walk; jump jumps straight "
        "up; jump-right and jump-left jump forward; down, standing on a ledge (=), drops her "
-       "through it; attack uses Nova's ability (the B button); wait does nothing. Holding a "
+       "through it; up climbs a ladder (H) she is at, or goes through a door (D); attack uses "
+       "Nova's ability (the B button); wait does nothing. Holding a "
        "direction while in the air steers her. When a wall is too high, look for another way: "
        "under a ledge, or back."))
 
-(def model-actions [:right :jump-right :jump :left :jump-left :down :attack :wait])
+(def model-actions [:right :jump-right :jump :left :jump-left :up :down :attack :wait])
 
 (defonce decisions (atom []))
 
