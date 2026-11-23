@@ -1423,6 +1423,63 @@ namespace inkling
     eval(s, ids.data(), ids.size());
   }
 
+  void eval_batch(std::vector<session *> const &sessions, std::vector<int32_t> const &ids)
+  {
+    if(sessions.empty() || sessions.size() != ids.size())
+    {
+      fail("eval_batch takes a token for each session");
+    }
+    if(sessions.size() > static_cast<size_t>(max_chunk))
+    {
+      fail("eval_batch takes at most " + std::to_string(max_chunk) + " sessions");
+    }
+    model *const m{ sessions.front()->model };
+    bool together{ m->use_gpu && !m->ablated() };
+    for(size_t i{}; i < sessions.size(); ++i)
+    {
+      auto const &s{ *sessions[i] };
+      if(s.model != m)
+      {
+        fail("eval_batch's sessions are of one model");
+      }
+      if(std::find(sessions.begin(), sessions.begin() + static_cast<ptrdiff_t>(i), &s)
+         != sessions.begin() + static_cast<ptrdiff_t>(i))
+      {
+        fail("eval_batch has a session twice");
+      }
+      together = together && s.gpu && !s.trace && !s.all_logits && !s.capturing && !s.record && !s.tap_ring
+                 && !s.draft_model;
+    }
+    if(!together)
+    {
+      // One at a time: the same as a batch, without its speed.
+      for(size_t i{}; i < sessions.size(); ++i)
+      {
+        eval(*sessions[i], &ids[i], 1);
+      }
+      return;
+    }
+    for(size_t i{}; i < sessions.size(); ++i)
+    {
+      auto const &s{ *sessions[i] };
+      if(s.pos + 1 > s.context)
+      {
+        fail("the session's context (" + std::to_string(s.context) + " tokens) is full");
+      }
+      if(ids[i] < 0 || ids[i] >= m->cfg.vocab)
+      {
+        fail("token id " + std::to_string(ids[i]) + " is outside the vocabulary");
+      }
+    }
+    std::lock_guard<std::mutex> const one{ m->running };
+    for(auto *const s : sessions)
+    {
+      s->row_logits.clear();
+      s->checked_from = -1;
+    }
+    metal_forward_batch(sessions, ids.data());
+  }
+
   std::vector<int32_t> context_draft(session const &s, int32_t const next, int32_t const least, int32_t const most)
   {
     // The sequence with `next`; its end matched against every earlier place, the

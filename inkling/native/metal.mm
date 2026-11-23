@@ -1025,13 +1025,42 @@ namespace inkling
     }
   }
 
-  void metal_forward(session &s, int32_t const *ids, int32_t const tokens, capture const *const force)
+  // A forward's rows by session: `n` rows from `row` on are `s`'s next tokens, the first at
+  // position p0.
+  struct segment
+  {
+    session *s;
+    uint32_t row, n, p0;
+  };
+
+  // One forward of `tokens` rows, in segments of their sessions (one segment: a session's
+  // chunk; several: a batch, each session's tokens at its own position, its own cache and
+  // histories). Everything but the caches, the convolutions' histories and attention is
+  // done for all the rows at once, in the first session's scratch buffers.
+  void forward_rows(std::vector<segment> const &segs, int32_t const *ids, int32_t const tokens,
+                    capture const *const force)
   {
     @autoreleasepool
     {
+      session &s{ *segs.front().s };
       auto &g{ *s.gpu };
       auto &b{ *g.backend };
       auto &m{ *s.model };
+      bool const several{ segs.size() > 1 };
+      for(auto const &seg : segs)
+      {
+        if(several
+           && (seg.s->model != s.model || !seg.s->gpu || seg.s->gpu->tmax != g.tmax || seg.s->capturing
+               || seg.s->record || seg.s->all_logits || seg.s->tap_ring || seg.s->draft_model || seg.n > 16))
+        {
+          fail("a batch's sessions are of one model, on the GPU, and don't capture, record, keep every "
+               "row's logits, keep taps or draft; each evaluates at most 16 tokens");
+        }
+      }
+      if(several && force)
+      {
+        fail("a batch can't be forced");
+      }
       auto const &c{ m.cfg };
       uint32_t const h{ static_cast<uint32_t>(c.hidden) };
       uint32_t const tmax{ g.tmax };
@@ -1075,6 +1104,10 @@ namespace inkling
         label = std::move(name);
       } };
       auto const bind{ [&](NSUInteger index, id<MTLBuffer> buf) { [e setBuffer:buf offset:0 atIndex:index]; } };
+      // A buffer from its float `at` on (a segment's first row).
+      auto const bind_at{ [&](NSUInteger index, id<MTLBuffer> buf, size_t at) {
+        [e setBuffer:buf offset:at * sizeof(float) atIndex:index];
+      } };
       // INK_SKIP=label,label (labels as INK_GPU_PROFILE prints them) leaves those
       // dispatches out: the results are wrong, the time is what's left without them.
       static std::string const skip_list{ std::getenv("INK_SKIP") ? "," + std::string{ std::getenv("INK_SKIP") } + ","
@@ -1389,28 +1422,44 @@ namespace inkling
       } };
 
       // kept: where a draft's check keeps the inputs (all_logits), or nil.
-      auto const conv_fixed{ [&](short_conv const &cv, id<MTLBuffer> in, id<MTLBuffer> hist, id<MTLBuffer> out,
-                                 uint32_t mode, uint32_t dst, id<MTLBuffer> kept) {
-        conv_params const p{ static_cast<uint32_t>(cv.channels), nt, mode, dst, tmax, h, 1,
-                             1.0f / std::sqrt(static_cast<float>(taps + 1)), kept ? 1u : 0u };
-        // A prompt's chunk: a thread a (channel, token), then the history.
-        bool const par{ nt > 16 && batched };
-        use(par ? b.conv_fixed_par : b.conv_fixed, "conv_fixed");
-        [e setBytes:&p length:sizeof(p) atIndex:0];
-        bind(1, weight(b, cv.weight, dtype::bf16));
-        bind(2, in);
-        bind(3, hist);
-        bind(4, out);
-        bind(5, g.stream);
-        bind(6, kept ? kept : b.dummy);
-        threads(p.ch, par ? nt : 1, 1);
-        if(par)
+      // Visit vi's convolution `which` (0 keys, 1 values, 2 attention, 3 feed-forward) of
+      // each segment, with its session's history (and inputs kept for a draft's check).
+      auto const conv_fixed{ [&](short_conv const &cv, id<MTLBuffer> in, size_t vi, size_t which, id<MTLBuffer> out,
+                                 uint32_t mode, uint32_t dst) {
+        size_t const ch{ static_cast<size_t>(cv.channels) };
+        for(auto const &seg : segs)
         {
-          use(b.conv_history, "conv_history");
+          auto &gs{ *seg.s->gpu };
+          id<MTLBuffer> const hist{ gs.conv[vi][which] };
+          id<MTLBuffer> const kept{ seg.s->all_logits ? gs.kept[vi][which] : nil };
+          conv_params const p{ static_cast<uint32_t>(ch), seg.n, mode, dst, tmax, h, 1,
+                               1.0f / std::sqrt(static_cast<float>(taps + 1)), kept ? 1u : 0u };
+          // A prompt's chunk: a thread a (channel, token), then the history.
+          bool const par{ seg.n > 16 && batched };
+          use(par ? b.conv_fixed_par : b.conv_fixed, "conv_fixed");
           [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(2, in);
+          bind(1, weight(b, cv.weight, dtype::bf16));
+          bind_at(2, in, seg.row * ch);
           bind(3, hist);
-          threads(p.ch, 1, 1);
+          if(out == b.dummy)
+          {
+            bind(4, out);
+          }
+          else
+          {
+            bind_at(4, out, seg.row * ch);
+          }
+          bind_at(5, g.stream, static_cast<size_t>(seg.row) * h);
+          bind(6, kept ? kept : b.dummy);
+          threads(p.ch, par ? seg.n : 1, 1);
+          if(par)
+          {
+            use(b.conv_history, "conv_history");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind_at(2, in, seg.row * ch);
+            bind(3, hist);
+            threads(p.ch, 1, 1);
+          }
         }
         if(mode >= 2)
         {
@@ -1424,7 +1473,7 @@ namespace inkling
 
       // Keys or values: projection, short convolution (fixed or projected).
       auto const kv_conv{ [&](short_conv const &cv, tensor const *proj, id<MTLBuffer> x, id<MTLBuffer> raw,
-                              id<MTLBuffer> dyn, id<MTLBuffer> hist, id<MTLBuffer> kept, id<MTLBuffer> out,
+                              id<MTLBuffer> dyn, size_t vi, size_t which, id<MTLBuffer> out,
                               std::vector<float> visit_capture::*f_proj, std::vector<float> visit_capture::*f_taps,
                               std::vector<float> visit_capture::*f_conv) {
         size_t const width{ static_cast<size_t>(nt) * cv.channels };
@@ -1438,7 +1487,7 @@ namespace inkling
         }
         if(!cv.weight_proj)
         {
-          conv_fixed(cv, raw, hist, out, 0, 0, kept);
+          conv_fixed(cv, raw, vi, which, out, 0, 0);
         }
         else
         {
@@ -1447,17 +1496,23 @@ namespace inkling
           {
             field(f_taps, dyn, 0, static_cast<size_t>(nt) * cv.heads * taps);
           }
-          conv_params const p{ static_cast<uint32_t>(cv.channels), nt, 0, 0, tmax, h, static_cast<uint32_t>(cv.heads),
-                               1.0f / std::sqrt(static_cast<float>(2 * taps + 1)), kept ? 1u : 0u };
-          use(b.conv_dyn, "conv_dyn");
-          [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(1, weight(b, cv.static_w, dtype::bf16));
-          bind(2, dyn);
-          bind(3, raw);
-          bind(4, hist);
-          bind(5, out);
-          bind(6, kept ? kept : b.dummy);
-          threads(p.ch, 1, 1);
+          size_t const ch{ static_cast<size_t>(cv.channels) };
+          for(auto const &seg : segs)
+          {
+            auto &gs{ *seg.s->gpu };
+            id<MTLBuffer> const kept{ seg.s->all_logits ? gs.kept[vi][which] : nil };
+            conv_params const p{ static_cast<uint32_t>(ch), seg.n, 0, 0, tmax, h, static_cast<uint32_t>(cv.heads),
+                                 1.0f / std::sqrt(static_cast<float>(2 * taps + 1)), kept ? 1u : 0u };
+            use(b.conv_dyn, "conv_dyn");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind(1, weight(b, cv.static_w, dtype::bf16));
+            bind_at(2, dyn, static_cast<size_t>(seg.row) * cv.heads * 4);
+            bind_at(3, raw, seg.row * ch);
+            bind(4, gs.conv[vi][which]);
+            bind_at(5, out, seg.row * ch);
+            bind(6, kept ? kept : b.dummy);
+            threads(p.ch, 1, 1);
+          }
         }
         if(stage())
         {
@@ -1555,32 +1610,43 @@ namespace inkling
           field(&visit_capture::q_proj, g.q, 0, nt * qw);
           field(&visit_capture::r_proj, g.r, 0, static_cast<size_t>(nt) * c.heads * c.rel_dim);
         }
-        kv_conv(a.k_conv, kv_too ? nullptr : a.wk, in[1], g.kraw, g.dynk, g.conv[vi][0], s.all_logits ? g.kept[vi][0] : nil, g.kc, &visit_capture::k_proj,
+        kv_conv(a.k_conv, kv_too ? nullptr : a.wk, in[1], g.kraw, g.dynk, vi, 0, g.kc, &visit_capture::k_proj,
                 &visit_capture::k_taps, &visit_capture::k_conv);
-        kv_conv(a.v_conv, kv_too ? nullptr : a.wv, in[2], g.vraw, g.dynv, g.conv[vi][1], s.all_logits ? g.kept[vi][1] : nil, g.vc, &visit_capture::v_proj,
+        kv_conv(a.v_conv, kv_too ? nullptr : a.wv, in[2], g.vraw, g.dynv, vi, 1, g.vc, &visit_capture::v_proj,
                 &visit_capture::v_taps, &visit_capture::v_conv);
+        // A row's keys or values (kv_store's simdgroups: 32 float4s a kv head), queries and
+        // relative features, and attention's per-head values (32 float4s a head).
+        size_t const kv_row{ static_cast<size_t>(a.kv_heads) * 128 };
+        size_t const q_row{ static_cast<size_t>(a.heads) * 128 };
+        size_t const r_row{ static_cast<size_t>(a.heads) * 16 };
+        size_t const per_group{ static_cast<size_t>(a.heads / a.kv_heads) };
+        for(auto const &seg : segs)
         {
-          kvs_params const p{ p0, static_cast<uint32_t>(vc.slots), static_cast<uint32_t>(a.kv_heads), c.qk_clip,
-                              c.norm_eps };
-          use(b.kv_store, "kv_store");
-          [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(1, g.kc);
-          bind(2, g.vc);
-          bind(3, g.k[vi]);
-          bind(4, g.v[vi]);
-          groups(p.kvh, nt, 2, 32);
-        }
-        {
-          qp_params const p{ p0, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads), tmax,
-                             a.window == 0 ? 1u : 0u, c.qk_clip, c.rel_clip, c.log_floor, c.log_alpha };
-          use(b.q_prep, "q_prep");
-          [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(1, g.q);
-          bind(2, g.r);
-          bind(3, weight(b, a.q_scale, dtype::bf16));
-          bind(4, weight(b, a.r_scale, dtype::bf16));
-          bind(5, g.qg);
-          groups(p.heads, nt, 1, 32);
+          auto &gs{ *seg.s->gpu };
+          auto const &svc{ seg.s->caches[vi] };
+          {
+            kvs_params const p{ seg.p0, static_cast<uint32_t>(svc.slots), static_cast<uint32_t>(a.kv_heads), c.qk_clip,
+                                c.norm_eps };
+            use(b.kv_store, "kv_store");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind_at(1, g.kc, seg.row * kv_row);
+            bind_at(2, g.vc, seg.row * kv_row);
+            bind(3, gs.k[vi]);
+            bind(4, gs.v[vi]);
+            groups(p.kvh, seg.n, 2, 32);
+          }
+          {
+            qp_params const p{ seg.p0, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads), tmax,
+                               a.window == 0 ? 1u : 0u, c.qk_clip, c.rel_clip, c.log_floor, c.log_alpha };
+            use(b.q_prep, "q_prep");
+            [e setBytes:&p length:sizeof(p) atIndex:0];
+            bind_at(1, g.q, seg.row * q_row);
+            bind_at(2, g.r, seg.row * r_row);
+            bind(3, weight(b, a.q_scale, dtype::bf16));
+            bind(4, weight(b, a.r_scale, dtype::bf16));
+            bind_at(5, g.qg, seg.row * per_group * 128);
+            groups(p.heads, seg.n, 1, 32);
+          }
         }
         if(stage())
         {
@@ -1611,7 +1677,7 @@ namespace inkling
             }
           }
         }
-        if(nt > 16 && batched)
+        if(!several && nt > 16 && batched)
         {
           // A batch: attention as matrix products (see att_scores).
           char const *const kind{ a.window == 0 ? " (global)" : " (local)" };
@@ -1666,85 +1732,98 @@ namespace inkling
             groups(a.head_dim / 32, p.rows / 32, p.kvh, 32);
           }
         }
-        else if(nt <= 16 && a.heads % a.kv_heads == 0 && a.heads / a.kv_heads <= 4 && a.head_dim == 128)
-        {
-          // A few tokens (one decoded, or a draft's check): att_rows, a token's keys in
-          // chunks that depend on its own position only, then att_rows_merge.
-          uint32_t const last{ p0 + nt - 1 };
-          uint32_t const first_last{ a.window > 0 && last + 1 > static_cast<uint32_t>(a.window) ? last + 1 - static_cast<uint32_t>(a.window) : 0 };
-          uint32_t const keys_last{ last + 1 - first_last };
-          uint32_t const c64{ (keys_last + 63) / 64 };
-          uint32_t const chunk_last{ std::max(256u, (c64 + 63) / 64 * 64) };
-          uint32_t const most{ (keys_last + chunk_last - 1) / chunk_last };
-          rows_params const p{ p0, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads),
-                               static_cast<uint32_t>(vc.slots), static_cast<uint32_t>(a.window),
-                               static_cast<uint32_t>(a.rel_extent), split_most,
-                               1.0f / std::sqrt(static_cast<float>(a.head_dim)) };
-          std::string const kind{ a.window == 0 ? "global" : "local" };
-          use(b.att_rows, "attention (" + kind + ", rows)");
-          [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(1, g.q);
-          bind(2, g.r);
-          bind(3, b.rel[static_cast<size_t>(visit.layer)]);
-          bind(4, g.k[vi]);
-          bind(5, g.v[vi]);
-          bind(6, g.part);
-          groups(p.kvh, most, nt, 32 * 8);
-          use(b.att_rows_merge, "attention (" + kind + ", merge)");
-          [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(1, g.part);
-          bind(2, g.sink);
-          bind(3, g.gate);
-          bind(4, g.attended);
-          groups(p.heads, nt, 1, 32);
-        }
-        else if(m.split_attention && nt == 1 && a.window == 0 && p0 + 1 >= split_from
-                && a.heads % a.kv_heads == 0 && a.heads / a.kv_heads <= 4 && a.head_dim == 128)
-        {
-          // One token over a long context: the keys split in chunks (att_split),
-          // then the chunks merged (att_merge).
-          uint32_t const keys{ p0 + 1 };
-          uint32_t const splits{ std::min(split_most, keys / split_least) };
-          uint32_t const chunk{ (keys + splits - 1) / splits };
-          split_params const p{ p0, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads),
-                                static_cast<uint32_t>(vc.slots), static_cast<uint32_t>(a.rel_extent), chunk, splits,
-                                1.0f / std::sqrt(static_cast<float>(a.head_dim)) };
-          use(b.att_split, "attention (global, split)");
-          [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(1, g.q);
-          bind(2, g.r);
-          bind(3, b.rel[static_cast<size_t>(visit.layer)]);
-          bind(4, g.k[vi]);
-          bind(5, g.v[vi]);
-          bind(6, g.part);
-          groups(p.kvh, splits, 1, 32 * 8);
-          use(b.att_merge, "attention (global, merge)");
-          [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(1, g.part);
-          bind(2, g.sink);
-          bind(3, g.gate);
-          bind(4, g.attended);
-          groups(p.heads, 1, 1, 32);
-        }
         else
         {
-          att_params const p{ p0, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads),
-                              static_cast<uint32_t>(vc.slots), static_cast<uint32_t>(a.window),
-                              static_cast<uint32_t>(a.rel_extent), 1.0f / std::sqrt(static_cast<float>(a.head_dim)) };
-          // Lanes per head, by how many keys the chunk's last token sees.
-          uint32_t const keys{ a.window > 0 ? std::min(p0 + nt, static_cast<uint32_t>(a.window)) : p0 + nt };
-          uint32_t const nsg{ keys <= 64 ? 1u : keys <= 2048 ? 8u : 32u };
-          use(nsg == 1 ? b.att1 : nsg == 8 ? b.att8 : b.att32, a.window == 0 ? "attention (global)" : "attention (local)");
-          [e setBytes:&p length:sizeof(p) atIndex:0];
-          bind(1, g.q);
-          bind(2, g.r);
-          bind(3, g.sink);
-          bind(4, g.gate);
-          bind(5, b.rel[static_cast<size_t>(visit.layer)]);
-          bind(6, g.k[vi]);
-          bind(7, g.v[vi]);
-          bind(8, g.attended);
-          groups(p.heads, nt, 1, 32 * nsg);
+          for(auto const &seg : segs)
+          {
+            auto &gs{ *seg.s->gpu };
+            auto const &svc{ seg.s->caches[vi] };
+            uint32_t const at{ seg.p0 };
+            uint32_t const n{ seg.n };
+            size_t const row{ seg.row };
+            if(n <= 16 && a.heads % a.kv_heads == 0 && a.heads / a.kv_heads <= 4 && a.head_dim == 128)
+            {
+              // A few tokens (one decoded, or a draft's check): att_rows, a token's keys in
+              // chunks that depend on its own position only, then att_rows_merge. (The
+              // chunks' scratch is the segment's alone: its merge runs before the next
+              // segment's att_rows.)
+              uint32_t const last{ at + n - 1 };
+              uint32_t const first_last{ a.window > 0 && last + 1 > static_cast<uint32_t>(a.window) ? last + 1 - static_cast<uint32_t>(a.window) : 0 };
+              uint32_t const keys_last{ last + 1 - first_last };
+              uint32_t const c64{ (keys_last + 63) / 64 };
+              uint32_t const chunk_last{ std::max(256u, (c64 + 63) / 64 * 64) };
+              uint32_t const most{ (keys_last + chunk_last - 1) / chunk_last };
+              rows_params const p{ at, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads),
+                                   static_cast<uint32_t>(svc.slots), static_cast<uint32_t>(a.window),
+                                   static_cast<uint32_t>(a.rel_extent), split_most,
+                                   1.0f / std::sqrt(static_cast<float>(a.head_dim)) };
+              std::string const kind{ a.window == 0 ? "global" : "local" };
+              use(b.att_rows, "attention (" + kind + ", rows)");
+              [e setBytes:&p length:sizeof(p) atIndex:0];
+              bind_at(1, g.q, row * q_row);
+              bind_at(2, g.r, row * r_row);
+              bind(3, b.rel[static_cast<size_t>(visit.layer)]);
+              bind(4, gs.k[vi]);
+              bind(5, gs.v[vi]);
+              bind(6, g.part);
+              groups(p.kvh, most, n, 32 * 8);
+              use(b.att_rows_merge, "attention (" + kind + ", merge)");
+              [e setBytes:&p length:sizeof(p) atIndex:0];
+              bind(1, g.part);
+              bind_at(2, g.sink, row * a.heads);
+              bind_at(3, g.gate, row * q_row);
+              bind_at(4, g.attended, row * q_row);
+              groups(p.heads, n, 1, 32);
+            }
+            else if(m.split_attention && n == 1 && a.window == 0 && at + 1 >= split_from
+                    && a.heads % a.kv_heads == 0 && a.heads / a.kv_heads <= 4 && a.head_dim == 128)
+            {
+              // One token over a long context: the keys split in chunks (att_split),
+              // then the chunks merged (att_merge).
+              uint32_t const keys{ at + 1 };
+              uint32_t const splits{ std::min(split_most, keys / split_least) };
+              uint32_t const chunk{ (keys + splits - 1) / splits };
+              split_params const p{ at, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads),
+                                    static_cast<uint32_t>(svc.slots), static_cast<uint32_t>(a.rel_extent), chunk, splits,
+                                    1.0f / std::sqrt(static_cast<float>(a.head_dim)) };
+              use(b.att_split, "attention (global, split)");
+              [e setBytes:&p length:sizeof(p) atIndex:0];
+              bind_at(1, g.q, row * q_row);
+              bind_at(2, g.r, row * r_row);
+              bind(3, b.rel[static_cast<size_t>(visit.layer)]);
+              bind(4, gs.k[vi]);
+              bind(5, gs.v[vi]);
+              bind(6, g.part);
+              groups(p.kvh, splits, 1, 32 * 8);
+              use(b.att_merge, "attention (global, merge)");
+              [e setBytes:&p length:sizeof(p) atIndex:0];
+              bind(1, g.part);
+              bind_at(2, g.sink, row * a.heads);
+              bind_at(3, g.gate, row * q_row);
+              bind_at(4, g.attended, row * q_row);
+              groups(p.heads, 1, 1, 32);
+            }
+            else
+            {
+              att_params const p{ at, static_cast<uint32_t>(a.heads), static_cast<uint32_t>(a.kv_heads),
+                                  static_cast<uint32_t>(svc.slots), static_cast<uint32_t>(a.window),
+                                  static_cast<uint32_t>(a.rel_extent), 1.0f / std::sqrt(static_cast<float>(a.head_dim)) };
+              // Lanes per head, by how many keys the chunk's last token sees.
+              uint32_t const keys{ a.window > 0 ? std::min(at + n, static_cast<uint32_t>(a.window)) : at + n };
+              uint32_t const nsg{ keys <= 64 ? 1u : keys <= 2048 ? 8u : 32u };
+              use(nsg == 1 ? b.att1 : nsg == 8 ? b.att8 : b.att32, a.window == 0 ? "attention (global)" : "attention (local)");
+              [e setBytes:&p length:sizeof(p) atIndex:0];
+              bind_at(1, g.q, row * q_row);
+              bind_at(2, g.r, row * r_row);
+              bind_at(3, g.sink, row * a.heads);
+              bind_at(4, g.gate, row * q_row);
+              bind(5, b.rel[static_cast<size_t>(visit.layer)]);
+              bind(6, gs.k[vi]);
+              bind(7, gs.v[vi]);
+              bind_at(8, g.attended, row * q_row);
+              groups(p.heads, n, 1, 32 * nsg);
+            }
+          }
         }
         if(stage())
         {
@@ -1760,11 +1839,11 @@ namespace inkling
           event(stream_event::kind::push, partial);
           blocks.push_back(partial);
           partial = take();
-          conv_fixed(lw.attn_conv, g.out, g.conv[vi][2], b.dummy, 1, partial, s.all_logits ? g.kept[vi][2] : nil);
+          conv_fixed(lw.attn_conv, g.out, vi, 2, b.dummy, 1, partial);
         }
         else
         {
-          conv_fixed(lw.attn_conv, g.out, g.conv[vi][2], b.dummy, 2, partial, s.all_logits ? g.kept[vi][2] : nil);
+          conv_fixed(lw.attn_conv, g.out, vi, 2, b.dummy, 2, partial);
         }
         if(stage())
         {
@@ -1979,7 +2058,7 @@ namespace inkling
         {
           field(&visit_capture::ffn, g.ffn, 0, static_cast<size_t>(nt) * h);
         }
-        conv_fixed(lw.mlp_conv, g.ffn, g.conv[vi][3], b.dummy, 3, partial, s.all_logits ? g.kept[vi][3] : nil);
+        conv_fixed(lw.mlp_conv, g.ffn, vi, 3, b.dummy, 3, partial);
         if(stage())
         {
           field(&visit_capture::partial, g.stream, partial_offset(), static_cast<size_t>(nt) * h);
@@ -1995,7 +2074,7 @@ namespace inkling
       src.push_back(partial);
       // Every token's (all_logits), or the last one's; with taps, every token is
       // normalized (for a draft model) and the logits' rows are the last `outs`.
-      uint32_t const outs{ s.all_logits ? nt : 1u };
+      uint32_t const outs{ s.all_logits || several ? nt : 1u };
       uint32_t const normed{ s.tap_ring ? nt : outs };
       {
         vec(nt - normed, normed, src, m.out_query, nullptr, { { 0, 0, m.out_norm, g.hidden } });
@@ -2052,6 +2131,18 @@ namespace inkling
 
       auto const *const logits{ static_cast<float const *>(g.logits.contents) };
       size_t const v{ static_cast<size_t>(c.unpadded_vocab) };
+      if(several)
+      {
+        // Each session's last row.
+        for(auto const &seg : segs)
+        {
+          size_t const last{ seg.row + seg.n - 1 };
+          seg.s->logits.assign(logits + last * v, logits + (last + 1) * v);
+          seg.s->tokens.insert(seg.s->tokens.end(), ids + seg.row, ids + seg.row + seg.n);
+          seg.s->pos += seg.n;
+        }
+        return;
+      }
       if(s.all_logits)
       {
         s.row_logits.insert(s.row_logits.end(), logits, logits + static_cast<size_t>(nt) * v);
@@ -2067,5 +2158,20 @@ namespace inkling
       s.tokens.insert(s.tokens.end(), ids, ids + tokens);
       s.pos += tokens;
     }
+  }
+
+  void metal_forward(session &s, int32_t const *ids, int32_t const tokens, capture const *const force)
+  {
+    forward_rows({ segment{ &s, 0, static_cast<uint32_t>(tokens), static_cast<uint32_t>(s.pos) } }, ids, tokens, force);
+  }
+
+  void metal_forward_batch(std::vector<session *> const &sessions, int32_t const *ids)
+  {
+    std::vector<segment> segs;
+    for(size_t i{}; i < sessions.size(); ++i)
+    {
+      segs.push_back({ sessions[i], static_cast<uint32_t>(i), 1, static_cast<uint32_t>(sessions[i]->pos) });
+    }
+    forward_rows(segs, ids, static_cast<int32_t>(sessions.size()), nullptr);
   }
 }

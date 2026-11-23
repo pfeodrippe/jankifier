@@ -33,6 +33,11 @@ namespace
                  "  inkling draftcheck MODEL.ink PROMPT\n"
                  "                                     the draft model on the GPU against its CPU version,\n"
                  "                                     from the same hidden states\n"
+                 "  inkling batchcheck MODEL.ink [N] [STEPS] [CTX]\n"
+                 "                                     N sessions (8), each after a prompt of its own length,\n"
+                 "                                     decode STEPS (32) greedy tokens one session at a time\n"
+                 "                                     and all in one forward (eval_batch): each step's logits\n"
+                 "                                     compared bit by bit, and the time of a step each way\n"
                  "  inkling rowcheck MODEL.ink PROMPT [ROWS]\n"
                  "                                     evaluates ROWS (8) tokens after the prompt in one\n"
                  "                                     forward, keeping each row's logits, and compares\n"
@@ -122,6 +127,92 @@ int main(int argc, char **argv)
       }
       return 0;
     }
+    if(cmd == "batchcheck" && argc >= 3 && argc <= 6)
+    {
+      // Sessions decoded together must give each one the bits it gets alone.
+      int const n{ argc > 3 ? std::atoi(argv[3]) : 8 };
+      int const steps{ argc > 4 ? std::atoi(argv[4]) : 32 };
+      int const ctx{ argc > 5 ? std::atoi(argv[5]) : 2048 };
+      using owned = std::unique_ptr<inkling::session, void (*)(inkling::session *)>;
+      std::vector<owned> alone, together;
+      std::vector<inkling::session *> batch;
+      for(int i{}; i < n; ++i)
+      {
+        std::string text{ "<|message_user|><|content_text|>Tell me something about the number "
+                          + std::to_string(i * 7 + 3) + "." };
+        for(int k{}; k < i; ++k)
+        {
+          text += " Please.";
+        }
+        text += "<|end_message|><|message_model|><|content_text|>";
+        auto const prompt{ inkling::tokenize(*m, text, true) };
+        alone.emplace_back(inkling::new_session(*m, ctx), inkling::free_session);
+        together.emplace_back(inkling::new_session(*m, ctx), inkling::free_session);
+        inkling::eval(*alone.back(), prompt);
+        inkling::eval(*together.back(), prompt);
+        batch.push_back(together.back().get());
+      }
+      size_t const v{ alone[0]->logits.size() };
+      double t_alone{}, t_batch{};
+      bool same{ true };
+      for(int step{}; step < steps; ++step)
+      {
+        std::vector<int32_t> next(static_cast<size_t>(n));
+        for(int i{}; i < n; ++i)
+        {
+          uint64_t rng{ 1 };
+          next[static_cast<size_t>(i)] = inkling::sample(alone[static_cast<size_t>(i)]->logits.data(),
+                                                         static_cast<int32_t>(v), 0.0f, 1.0f, 0, rng);
+        }
+        double const a0{ now() };
+        for(int i{}; i < n; ++i)
+        {
+          inkling::eval(*alone[static_cast<size_t>(i)], &next[static_cast<size_t>(i)], 1);
+        }
+        double const a1{ now() };
+        inkling::eval_batch(batch, next);
+        double const a2{ now() };
+        // The first step of each way is left out of the times (buffers touched first).
+        if(step > 0)
+        {
+          t_alone += a1 - a0;
+          t_batch += a2 - a1;
+        }
+        for(int i{}; i < n; ++i)
+        {
+          auto const &x{ alone[static_cast<size_t>(i)]->logits };
+          auto const &y{ together[static_cast<size_t>(i)]->logits };
+          if(x.size() != y.size() || std::memcmp(x.data(), y.data(), v * sizeof(float)) != 0)
+          {
+            size_t differ{};
+            double worst{};
+            for(size_t k{}; k < v; ++k)
+            {
+              if(std::memcmp(&x[k], &y[k], sizeof(float)) != 0)
+              {
+                ++differ;
+                worst = std::max(worst, static_cast<double>(std::fabs(x[k] - y[k])));
+              }
+            }
+            if(same)
+            {
+              std::printf("step %d, session %d (position %d): %zu of %zu logits differ, worst %.3g\n", step, i,
+                          static_cast<int>(alone[static_cast<size_t>(i)]->pos), differ, v, worst);
+            }
+            same = false;
+          }
+        }
+      }
+      int const timed{ std::max(1, steps - 1) };
+      std::printf("%d sessions at positions %d to %d, %d steps\n", n, static_cast<int>(alone.front()->pos),
+                  static_cast<int>(alone.back()->pos), steps);
+      std::printf("one at a time: %.1f ms a step (%.1f tokens/s)\n", 1e3 * t_alone / timed, n * timed / t_alone);
+      std::printf("in one forward: %.1f ms a step (%.1f tokens/s)\n", 1e3 * t_batch / timed, n * timed / t_batch);
+      std::printf(same ? "OK: every session's logits are the same bits as alone, at every step\n"
+                       : "DIFFERENT: a batch isn't each session alone\n");
+      return same ? 0 : 1;
+    }
+
     if(cmd == "rowcheck" && (argc == 4 || argc == 5))
     {
       // A draft's check must give each row the bits a decode step gives it: the

@@ -466,6 +466,10 @@ namespace inkling
   // are then in s.logits.
   void eval(session &s, int32_t const *ids, size_t n);
   void eval(session &s, std::vector<int32_t> const &ids);
+  // One token for each session (ids[i] is sessions[i]'s), in one forward when they can
+  // share it (the GPU; none keeping every row's logits, capturing, recording, keeping taps
+  // or drafting), else one at a time: each session ends as after eval of its token.
+  void eval_batch(std::vector<session *> const &sessions, std::vector<int32_t> const &ids);
   // The session rolled back to its first `pos` tokens, which must be within
   // the last eval with all_logits (a draft's check): the tokens after are
   // forgotten, as if never evaluated, and the logits are those of token

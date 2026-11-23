@@ -105,6 +105,7 @@ bin/inkling gpucheck models/inkling-2-mini.ink "The capital of France is"
 bin/inkling rowcheck models/inkling-2-mini.ink "The capital of France is" 16
 bin/inkling tapcheck models/inkling-2-mini.ink "The capital of France is"
 bin/inkling bench models/inkling-2-mini.ink 1 2 4 8 16   # milliseconds of a forward over W rows
+bin/inkling batchcheck models/inkling-2-mini.ink 8 32    # sessions decoded together, against alone
 ```
 
 `INK_GPU_PROFILE=1` prints the GPU time of each kernel per forward (every
@@ -209,6 +210,21 @@ Checking and experiments:
 (ink/ban-experts! m 20 [3 17])              ; experts the router may not choose
 (ink/copy! s2 s)                            ; fork a session
 ```
+
+Several sessions, a token each, in one forward:
+
+```clojure
+(ink/eval-batch! [s1 s2 s3] [id1 id2 id3])  ; each as after (ink/eval! s [id]), sooner
+```
+
+Each session's rows go through the projections, norms and experts together;
+its own cache, convolution histories and attention are its own (the forward
+runs in segments of rows by session). `batchcheck` decodes N sessions, at
+different positions, one at a time and together, and compares every logit of
+every step: the same bits. Decoding 8 sessions together gives 112 tokens/s in
+all (one session alone: 46), 16 sessions 108 (each row reads its own experts,
+so 16 rows cost twice 8). Sessions that can't share a forward (on the CPU,
+keeping every row's logits, capturing, drafting) are evaluated one at a time.
 
 `ink/model-ptr` and `ink/session-ptr` give the C++ objects for direct
 interop:

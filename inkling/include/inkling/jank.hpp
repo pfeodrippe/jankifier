@@ -418,6 +418,19 @@ namespace inkling::jank_layer
     });
   }
 
+  inline object_ref eval_batch(object_ref const sessions, object_ref const ids)
+  {
+    return guarded([&] {
+      std::vector<session *> all;
+      for(auto s{ rt::seq(sessions) }; s != rt::jank_nil; s = rt::next(s))
+      {
+        all.push_back(session_of(rt::first(s)));
+      }
+      inkling::eval_batch(all, ids_of(ids));
+      return object_ref{ rt::jank_nil };
+    });
+  }
+
   inline object_ref tokenize_for(object_ref const o, object_ref const text)
   {
     auto const ids{ inkling::tokenize(*session_of(o)->model, to_std(text), true) };

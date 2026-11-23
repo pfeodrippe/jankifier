@@ -153,6 +153,16 @@
     (cpp/inkling.jank_layer.eval_text s ids-or-text)
     (cpp/inkling.jank_layer.eval s (vec ids-or-text))))
 
+(defn eval-batch!
+  "One token for each session (`ids` in the sessions' order), in one forward: each
+  session ends as after (eval! s [id]), sooner than one after the other. Sessions that
+  can't share a forward (on the CPU, keeping every row's logits, drafting...) are
+  evaluated one at a time."
+  [sessions ids]
+  (when (seq sessions)
+    (used! (first sessions)))
+  (cpp/inkling.jank_layer.eval_batch (vec sessions) (vec ids)))
+
 (defn reset! [s]
   (used! s)
   (cpp/inkling.jank_layer.reset s))

@@ -182,6 +182,9 @@ namespace inkling
   uint16_t *metal_tap_ring(session &s, size_t n);
   void metal_free_session(metal_session *g);
   void metal_forward(session &s, int32_t const *ids, int32_t n, capture const *force = nullptr);
+  // One token for each of `sessions` (ids[i] is sessions[i]'s), in one forward: each
+  // session ends as after its own metal_forward of that token.
+  void metal_forward_batch(std::vector<session *> const &sessions, int32_t const *ids);
 
   // NVFP4 decoding tables.
   inline constexpr float e2m1_values[16]{ 0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
