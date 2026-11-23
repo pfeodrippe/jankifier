@@ -472,6 +472,29 @@ namespace inkling::jank_layer
   }
 
   // The n most likely next tokens: id, piece, logit and log-probability.
+  // The log-probability of token `id` next, from the session's logits (log-softmax).
+  inline object_ref logprob(object_ref const o, object_ref const id)
+  {
+    auto const s{ session_of(o) };
+    auto const &lg{ s->logits };
+    auto const i{ to_int(id) };
+    if(lg.empty() || i < 0 || i >= static_cast<int64_t>(lg.size()))
+    {
+      throw std::runtime_error{ "inkling: no logits for that id" };
+    }
+    double best{ lg[0] };
+    for(auto const l : lg)
+    {
+      best = std::max(best, static_cast<double>(l));
+    }
+    double sum{};
+    for(auto const l : lg)
+    {
+      sum += std::exp(l - best);
+    }
+    return real(lg[static_cast<size_t>(i)] - (best + std::log(sum)));
+  }
+
   inline object_ref top(object_ref const o, object_ref const count)
   {
     auto const s{ session_of(o) };

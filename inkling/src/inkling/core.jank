@@ -192,6 +192,11 @@
   ([s] (top s 10))
   ([s n] (cpp/inkling.jank_layer.top s n)))
 
+(defn logprob
+  "The log-probability of token `id` coming next (from the session's logits)."
+  [s id]
+  (cpp/inkling.jank_layer.logprob s id))
+
 (defn sample
   "A next token: greedy when :temperature is 0 (the default)."
   ([s] (sample s {}))
