@@ -100,7 +100,10 @@ bin/inkling gpucheck models/inkling-2-mini.ink "The capital of France is"
 ```
 
 `INK_GPU_PROFILE=1` prints the GPU time of each kernel per forward (every
-dispatch then runs alone, so the total is slower than normal).
+dispatch then runs alone, so the total is slower than normal). `INK_SKIP=label,label`
+(labels as that prints them) leaves those dispatches out, for timing what they
+cost in a normal forward (the results are then wrong). `INK_GPU_TIMING=1` prints
+each forward's encoding and GPU time.
 
 ## Drafting
 

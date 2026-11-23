@@ -565,11 +565,24 @@ namespace inkling
         label = std::move(name);
       } };
       auto const bind{ [&](NSUInteger index, id<MTLBuffer> buf) { [e setBuffer:buf offset:0 atIndex:index]; } };
+      // INK_SKIP=label,label (labels as INK_GPU_PROFILE prints them) leaves those
+      // dispatches out: the results are wrong, the time is what's left without them.
+      static std::string const skip_list{ std::getenv("INK_SKIP") ? "," + std::string{ std::getenv("INK_SKIP") } + ","
+                                                                   : std::string{} };
+      auto const skipped{ [&] { return !skip_list.empty() && skip_list.find("," + label + ",") != std::string::npos; } };
       auto const groups{ [&](NSUInteger x, NSUInteger y, NSUInteger z, NSUInteger threads) {
+        if(skipped())
+        {
+          return;
+        }
         [e dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         dispatched();
       } };
       auto const threads{ [&](NSUInteger x, NSUInteger y, NSUInteger z) {
+        if(skipped())
+        {
+          return;
+        }
         [e dispatchThreads:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(x, 32), 1, 1)];
         dispatched();
       } };
@@ -1196,7 +1209,11 @@ namespace inkling
                              gu.nvfp4 ? m.f32(gu.denominator)[0] : 1.0f };
           // One route at a time, also for a batch: running the routes by
           // expert, so that an expert's rows are decoded once for several
-          // tokens, measured slower (3.7 against 3.2 ms for 64 tokens).
+          // tokens, measured slower (3.7 against 3.2 ms for 64 tokens). For a
+          // draft's check (8 tokens, about 30 experts for 64 routes) too, in
+          // three versions (an 8-row forward 74 -> 88, 95, 102 ms): the routes
+          // of one expert read its weights at about the same time, from the
+          // cache, so grouping saves little memory traffic and costs parallelism.
           use(gu.nvfp4 ? b.gu_nv : b.gu_mx, gu.nvfp4 ? "gate_up nvfp4" : "gate_up mxfp8");
           [e setBytes:&p length:sizeof(p) atIndex:0];
           bind(1, weight(b, gu.weight, dtype::u32));
