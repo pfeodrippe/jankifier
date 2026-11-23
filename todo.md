@@ -6,6 +6,7 @@
   - [ ] Super Mario Bros. through it (the ROM from the user): the state decoded from RAM every few frames, the action chosen by the decision API; compare with Jev's World 1-1 in 356 decisions
   - [ ] a turn-based puzzle too, where each move takes reasoning
 - [ ] play doom: ViZDoom (a Doom engine made for programs to play it: the player's state, the objects in view with their positions, the map) with Freedoom's free game data, in the process through its C++ API; a level's state as text every few tics, the action chosen by the decision API
+- [ ] the games seen in the window: a card for each (the NES picture as a texture, Doom's screen, NetHack's 24x80 text screen in colour), live as the model plays, beside its decisions and their probabilities; and replayed from a recording (seed and actions) on the same timeline as the agents' replays
 - [ ] play nethack: the NetHack Learning Environment's C core (the 24x80 screen, the messages, the player's stats, the inventory), in the process; turn-based, so each move can take a real decision
 - [ ] autocompletion and stuff
   - I start a nrepl from core-test, but unable to run tests or check autocompletion
