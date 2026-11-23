@@ -166,6 +166,8 @@ namespace inkling
     id<MTLComputePipelineState> embed, mix_norm, mix_pair, controller, linear1, linear4, linear_mm, multi1, multi4, tap_store, conv_fixed, conv_dyn, kv_store,
       q_prep, att1, att8, att32, att_split, att_merge, att_rows, att_rows_merge, rel_bias, att_scores, att_softmax, att_pv, route, gu_nv, gu_mx, act_quant, dn_nv,
       dn_mx;
+    // The draft model's Markov head's fold of the output head (made once).
+    id<MTLBuffer> fold, fold_b;
     // The draft model's kernels.
     id<MTLComputePipelineState> draft_fold, draft_mix, draft_norm, draft_block, draft_head, draft_attention, draft_elementwise,
       draft_mk_input, draft_mk_gates, draft_mk_pick, draft_mk_choose;
@@ -571,7 +573,7 @@ namespace inkling
   struct metal_drafter
   {
     std::vector<id<MTLBuffer>> ring_k, ring_v;
-    id<MTLBuffer> ring_pos, fold, fold_b, mix, kc, vc, hs, x, q, kb, vb, att, o, gate, up, dh, base, f, state, in, proj, z, fz,
+    id<MTLBuffer> ring_pos, mix, kc, vc, hs, x, q, kb, vb, att, o, gate, up, dh, base, f, state, in, proj, z, fz,
       part, tokens;
     uint32_t mix_rows{};
   };
@@ -626,6 +628,74 @@ namespace inkling
     };
   }
 
+  void metal_prepare_drafter(drafter &d, session const &s)
+  {
+    @autoreleasepool
+    {
+      auto &m{ *d.m };
+      auto &b{ *s.gpu->backend };
+      auto const &c{ m.cfg };
+      uint32_t const h{ static_cast<uint32_t>(c.hidden) };
+      uint32_t const rows{ static_cast<uint32_t>(d.block) };
+      uint32_t const kvw{ static_cast<uint32_t>(d.kv_heads * d.head_dim) };
+      uint32_t const qw{ static_cast<uint32_t>(d.heads * d.head_dim) };
+      uint32_t const width{ static_cast<uint32_t>(d.lw[0].gate->dim(0)) };
+      uint32_t const vocab{ static_cast<uint32_t>(c.unpadded_vocab) };
+      size_t const f{ sizeof(float) };
+      std::lock_guard<std::mutex> const one{ m.running };
+      auto g{ std::make_unique<metal_drafter>() };
+      size_t const ring{ static_cast<size_t>(kvw) * d.slots * f };
+      for(int32_t l{}; l < d.layers; ++l)
+      {
+        g->ring_k.push_back(scratch_buffer(b, ring));
+        g->ring_v.push_back(scratch_buffer(b, ring));
+      }
+      g->ring_pos = scratch_buffer(b, static_cast<size_t>(d.slots) * sizeof(int32_t));
+      g->hs = scratch_buffer(b, rows * h * f);
+      g->x = scratch_buffer(b, rows * h * f);
+      g->q = scratch_buffer(b, rows * qw * f);
+      g->kb = scratch_buffer(b, rows * kvw * f);
+      g->vb = scratch_buffer(b, rows * kvw * f);
+      g->att = scratch_buffer(b, rows * qw * f);
+      g->o = scratch_buffer(b, rows * h * f);
+      g->gate = scratch_buffer(b, rows * width * f);
+      g->up = scratch_buffer(b, rows * width * f);
+      g->dh = scratch_buffer(b, rows * h * f);
+      g->base = scratch_buffer(b, static_cast<size_t>(rows) * vocab * f);
+      g->f = scratch_buffer(b, h * f);
+      g->state = scratch_buffer(b, static_cast<size_t>(d.rank) * f);
+      g->in = scratch_buffer(b, static_cast<size_t>(d.rnn->dim(1)) * f);
+      g->proj = scratch_buffer(b, static_cast<size_t>(d.rnn->dim(0)) * f);
+      g->z = scratch_buffer(b, static_cast<size_t>(d.rank) * f);
+      g->fz = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * f);
+      g->part = scratch_buffer(b, 1024 * 2 * f);
+      g->tokens = scratch_buffer(b, 16 * sizeof(uint32_t));
+      if(!b.fold)
+      {
+        // fold[v, t] = unembed[v] . hidden_out[:, t]: a step of the Markov head
+        // reads it rather than the output head.
+        b.fold = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * d.rank * sizeof(uint16_t));
+        b.fold_b = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * f);
+        id<MTLCommandBuffer> const cmd{ [b.queue commandBuffer] };
+        id<MTLComputeCommandEncoder> const e{ [cmd computeCommandEncoder] };
+        fold_params const fp{ h, static_cast<uint32_t>(d.rank) };
+        [e setComputePipelineState:b.draft_fold];
+        [e setBytes:&fp length:sizeof(fp) atIndex:0];
+        [e setBuffer:weight(b, m.unembed, dtype::bf16) offset:0 atIndex:1];
+        [e setBuffer:weight(b, d.hidden_out, dtype::bf16) offset:0 atIndex:2];
+        [e setBuffer:weight(b, d.hidden_bias, dtype::bf16) offset:0 atIndex:3];
+        [e setBuffer:b.fold offset:0 atIndex:4];
+        [e setBuffer:b.fold_b offset:0 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(m.unembed->dim(0)), 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(d.rank), 1, 1)];
+        [e endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+      }
+      d.gpu = g.release();
+    }
+  }
+
   std::vector<int32_t> metal_draft(drafter &d, session const &s, int64_t const from, int32_t const anchor, int32_t const count)
   {
     @autoreleasepool
@@ -672,46 +742,7 @@ namespace inkling
 
       if(!d.gpu)
       {
-        // The buffers, and the Markov head's fold of the output head (once).
-        auto g{ std::make_unique<metal_drafter>() };
-        size_t const ring{ static_cast<size_t>(kvw) * d.slots * f };
-        for(int32_t l{}; l < d.layers; ++l)
-        {
-          g->ring_k.push_back(scratch_buffer(b, ring));
-          g->ring_v.push_back(scratch_buffer(b, ring));
-        }
-        g->ring_pos = scratch_buffer(b, static_cast<size_t>(d.slots) * sizeof(int32_t));
-        g->fold = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * d.rank * sizeof(uint16_t));
-        g->fold_b = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * f);
-        g->hs = scratch_buffer(b, rows * h * f);
-        g->x = scratch_buffer(b, rows * h * f);
-        g->q = scratch_buffer(b, rows * qw * f);
-        g->kb = scratch_buffer(b, rows * kvw * f);
-        g->vb = scratch_buffer(b, rows * kvw * f);
-        g->att = scratch_buffer(b, rows * qw * f);
-        g->o = scratch_buffer(b, rows * h * f);
-        g->gate = scratch_buffer(b, rows * width * f);
-        g->up = scratch_buffer(b, rows * width * f);
-        g->dh = scratch_buffer(b, rows * h * f);
-        g->base = scratch_buffer(b, static_cast<size_t>(rows) * vocab * f);
-        g->f = scratch_buffer(b, h * f);
-        g->state = scratch_buffer(b, static_cast<size_t>(d.rank) * f);
-        g->in = scratch_buffer(b, static_cast<size_t>(d.rnn->dim(1)) * f);
-        g->proj = scratch_buffer(b, static_cast<size_t>(d.rnn->dim(0)) * f);
-        g->z = scratch_buffer(b, static_cast<size_t>(d.rank) * f);
-        g->fz = scratch_buffer(b, static_cast<size_t>(m.unembed->dim(0)) * f);
-        g->part = scratch_buffer(b, 1024 * 2 * f);
-        g->tokens = scratch_buffer(b, 16 * sizeof(uint32_t));
-        fold_params const fp{ h, static_cast<uint32_t>(d.rank) };
-        [e setComputePipelineState:b.draft_fold];
-        [e setBytes:&fp length:sizeof(fp) atIndex:0];
-        bind(1, weight(b, m.unembed, dtype::bf16));
-        bind(2, weight(b, d.hidden_out, dtype::bf16));
-        bind(3, weight(b, d.hidden_bias, dtype::bf16));
-        bind(4, g->fold);
-        bind(5, g->fold_b);
-        groups(static_cast<NSUInteger>(m.unembed->dim(0)), 1, static_cast<NSUInteger>(d.rank));
-        d.gpu = g.release();
+        fail("draft: the drafter has no GPU buffers");
       }
       auto &g{ *d.gpu };
       if(g.mix_rows < n_new)
@@ -860,12 +891,12 @@ namespace inkling
         bind(3, g.state);
         bind(4, g.z);
         threads(static_cast<NSUInteger>(d.rank));
-        lin(g.fold, vocab, static_cast<uint32_t>(d.rank), g.z, g.fz, 1, 1);
+        lin(b.fold, vocab, static_cast<uint32_t>(d.rank), g.z, g.fz, 1, 1);
         [e setComputePipelineState:b.draft_mk_pick];
         [e setBytes:&p length:sizeof(p) atIndex:0];
         bind(1, g.base);
         bind(2, g.fz);
-        bind(3, g.fold_b);
+        bind(3, b.fold_b);
         bind(4, g.part);
         groups(nparts, 1, 256);
         [e setComputePipelineState:b.draft_mk_choose];

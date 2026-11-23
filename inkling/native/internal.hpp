@@ -136,16 +136,36 @@ namespace inkling
     std::vector<std::vector<float>> ring_k, ring_v;
     std::vector<int64_t> ring_pos;
     int64_t fed{};
+    // The most drafts a check takes (set_draft_depth), and the depth chosen for
+    // the next check (choose_depth): oMLX's adaptive depth, from each depth's
+    // measured time and the acceptance at each position.
     int32_t depth{ 7 };
+    struct control
+    {
+      // Acceptance of draft j + 1 when the drafts before it were accepted (-1:
+      // not measured yet, the one before is used).
+      float accept[8]{ 0.6f, -1, -1, -1, -1, -1, -1, -1 };
+      // Milliseconds of a check with d drafts (0: not measured yet).
+      double ms[8]{};
+      int32_t cur{};
+      // Checks so far; the first ones measure each depth once.
+      int64_t checks{};
+    } ctl;
     metal_drafter *gpu{};
 
     ~drafter();
   };
-  int32_t draft_depth(drafter const &d);
+  // The drafts for the next check, and what it gave: `drafted` drafts,
+  // `accepted` of them, in `ms` milliseconds.
+  int32_t choose_depth(drafter &d);
+  void observe_check(drafter &d, int32_t drafted, int32_t accepted, double ms);
   // The draft on the GPU: the context rows [from, s.pos) into the ring (whose
   // positions d.ring_pos already has), then `count` proposals after `anchor`.
   std::vector<int32_t> metal_draft(drafter &d, session const &s, int64_t from, int32_t anchor, int32_t count);
   void metal_free_drafter(metal_drafter *g);
+  // The drafter's GPU buffers, and the model's fold of the output head for
+  // the Markov head (made once, about 0.3 s).
+  void metal_prepare_drafter(drafter &d, session const &s);
   // The session's ring of taps for a draft model, of n BF16 values, in memory
   // the GPU writes and the CPU reads.
   uint16_t *metal_tap_ring(session &s, size_t n);

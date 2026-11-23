@@ -198,6 +198,10 @@ namespace inkling
     }
     d->ring_pos.assign(static_cast<size_t>(d->slots), -1);
     keep_taps(s, d->visits);
+    if(s.gpu)
+    {
+      metal_prepare_drafter(*d, s);
+    }
     return d.release();
   }
 
@@ -219,9 +223,129 @@ namespace inkling
     d.depth = std::clamp(depth, 0, d.block - 1);
   }
 
-  int32_t draft_depth(drafter const &d)
+  namespace
   {
-    return d.depth;
+    // The first checks: each depth once, from the deepest, then plain steps.
+    int32_t const warmup[]{ 7, 7, 6, 5, 4, 3, 2, 1, 0, 0 };
+
+    float accept_at(drafter::control const &c, int32_t j)
+    {
+      while(j > 0 && c.accept[j] < 0)
+      {
+        --j;
+      }
+      return c.accept[j];
+    }
+
+    // A depth's time: measured, or from the measured ones (the nearest below
+    // plus the slope between the cheapest and the dearest measured).
+    double ms_at(drafter::control const &c, int32_t d)
+    {
+      if(c.ms[d] > 0)
+      {
+        return c.ms[d];
+      }
+      int32_t lo{ -1 }, hi{ -1 };
+      for(int32_t i{}; i < 8; ++i)
+      {
+        if(c.ms[i] > 0)
+        {
+          lo = lo < 0 ? i : lo;
+          hi = i;
+        }
+      }
+      if(lo < 0)
+      {
+        return 1.0;
+      }
+      double const slope{ hi > lo ? (c.ms[hi] - c.ms[lo]) / (hi - lo) : 7.0 };
+      int32_t below{ lo };
+      for(int32_t i{ lo }; i < d; ++i)
+      {
+        if(c.ms[i] > 0)
+        {
+          below = i;
+        }
+      }
+      return c.ms[below] + slope * (d - below);
+    }
+
+    // Expected tokens a millisecond with d drafts.
+    double score(drafter::control const &c, int32_t d)
+    {
+      double expected{ 1 }, run{ 1 };
+      for(int32_t j{}; j < d; ++j)
+      {
+        run *= accept_at(c, j);
+        expected += run;
+      }
+      return expected / ms_at(c, d);
+    }
+  }
+
+  int32_t choose_depth(drafter &d)
+  {
+    auto &c{ d.ctl };
+    int32_t const top{ d.depth };
+    auto const n{ static_cast<int64_t>(std::size(warmup)) };
+    if(c.checks < n)
+    {
+      c.cur = std::min(warmup[c.checks], top);
+      return c.cur;
+    }
+    // The best, kept unless another is 3% better; every 64 checks, the best
+    // rival is measured again (times change with the context's length).
+    int32_t best{ std::min(c.cur, top) };
+    int32_t rival{ -1 };
+    for(int32_t i{}; i <= top; ++i)
+    {
+      if(score(c, i) > score(c, best) * 1.03)
+      {
+        best = i;
+      }
+    }
+    for(int32_t i{}; i <= top; ++i)
+    {
+      if(i != best && (rival < 0 || score(c, i) > score(c, rival)))
+      {
+        rival = i;
+      }
+    }
+    c.cur = best;
+    return c.checks % 64 == 0 && rival >= 0 ? rival : best;
+  }
+
+  void observe_check(drafter &d, int32_t const drafted, int32_t const accepted, double const ms)
+  {
+    auto &c{ d.ctl };
+    ++c.checks;
+    for(int32_t j{}; j < drafted && j < 8; ++j)
+    {
+      bool const yes{ j < accepted };
+      c.accept[j] = c.accept[j] < 0 ? (yes ? 1.0f : 0.0f) : 0.92f * c.accept[j] + 0.08f * (yes ? 1.0f : 0.0f);
+      if(!yes)
+      {
+        break;
+      }
+    }
+    if(c.checks == 1)
+    {
+      // The first check also brings the prompt's rows into the ring: its time
+      // says little.
+      return;
+    }
+    auto &t{ c.ms[std::clamp(drafted, 0, 7)] };
+    if(t <= 0)
+    {
+      t = ms;
+    }
+    else
+    {
+      // A check far slower than usual (the first draft folds the output head)
+      // counts little.
+      double const w{ ms > 2 * t ? 0.05 : 0.2 };
+      t += w * (ms - t);
+    }
   }
 
   std::vector<int32_t> draft(drafter &d, session const &s, int32_t const anchor, int32_t const count)

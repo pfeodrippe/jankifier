@@ -524,7 +524,9 @@ namespace inkling
   // session, which keeps from now on the hidden states it reads (keep_taps).
   drafter *new_drafter(session &s);
   void free_drafter(drafter *d);
-  // Tokens speculate drafts with it at most (0 to block size - 1; 7 at first).
+  // Tokens speculate drafts with it at most (0 to block size - 1; 7 at first);
+  // each check takes the depth with the most tokens a millisecond expected,
+  // from the times and acceptance measured (as oMLX does).
   void set_draft_depth(drafter &d, int32_t depth);
   // Up to `count` proposals for the tokens after `anchor`, the token sampled
   // after the session's last one (not yet evaluated), greedy.

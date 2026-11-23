@@ -16,6 +16,7 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cfloat>
 #include <numeric>
@@ -1465,21 +1466,37 @@ namespace inkling
       uint64_t rng{ (seed + static_cast<uint64_t>(i)) | 1u };
       return sample(logits, v, temperature, top_p, top_k, rng);
     } };
+    auto const started{ std::chrono::steady_clock::now() };
     int32_t const first{ sampled(s.logits.data(), 0) };
     int32_t const room{ std::min({ limit - 1, most, max_rows - 1, s.context - s.pos - 1 }) };
     std::vector<int32_t> rows{ first };
+    // The draft model's checks (not the copies) tell its depth control.
+    bool modelled{};
     if(room > 0)
     {
       auto proposed{ context_draft(s, first, least, room) };
       if(proposed.empty() && d)
       {
-        proposed = draft(*d, s, first, std::min(room, draft_depth(*d)));
+        int32_t const depth{ std::min(room, choose_depth(*d)) };
+        modelled = true;
+        if(depth > 0)
+        {
+          proposed = draft(*d, s, first, depth);
+        }
       }
       rows.insert(rows.end(), proposed.begin(), proposed.end());
     }
+    auto const told{ [&](size_t kept) {
+      if(modelled)
+      {
+        double const ms{ std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() };
+        observe_check(*d, static_cast<int32_t>(rows.size()) - 1, static_cast<int32_t>(kept) - 1, ms);
+      }
+    } };
     if(rows.size() == 1)
     {
       eval(s, rows);
+      told(1);
       return rows;
     }
     bool const was{ s.all_logits };
@@ -1501,6 +1518,7 @@ namespace inkling
     {
       s.checked_from = -1;
     }
+    told(kept);
     rows.resize(kept);
     return rows;
   }
