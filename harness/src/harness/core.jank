@@ -546,8 +546,11 @@
         left (- max-steps used)]
     (when (and (>= max-steps 12)
                (contains? #{(dec max-steps) (quot max-steps 2) (quot max-steps 4) 8 4 2} left))
-      (str "\n\n[the harness] Step " used " of " max-steps " (" left " left). A step is your message "
-           "with its calls; the turn ends when the steps run out, finished or not."))))
+      ;; Said outright that a call's contents don't count: a game agent took each of its
+      ;; actions for a step and rationed them.
+      (str "\n\n[the harness] Step " used " of " max-steps " (" left " left). A step is one message of "
+           "yours with its calls, however much each call holds (a tool taking a list counts once); the turn "
+           "ends when the steps run out, finished or not."))))
 
 (defn- turn!
   "The model's turn: it speaks, its calls are run and their results given to it, and it
