@@ -48,7 +48,10 @@
     :fn        (fn [args]): args is the call's arguments, a map with keyword keys. What it
                returns is the result the model reads: a string as it is, anything else as it
                prints. Throwing is an error the model is told of.
-    :limit     characters of a result the model is given (8000 when not said)"
+    :limit     characters of a result the model is given (8000 when not said)
+    :reads-only  true when the tool only reads (no effects): a result the same as an earlier
+               call's (the same arguments) is then said to be in the conversation already,
+               not given again. A tool with effects always gives its result."
   [t]
   (when-not (and (string? (:name t)) (seq (:name t)))
     (throw (ex-info "a tool needs a :name" {:tool t})))
@@ -76,7 +79,7 @@
   ^double, ^boolean). `opts` may give :name, :doc, :limit, :params (per parameter, a
   description, or {:type \"integer\" :doc \"...\"} to say its type without a tag) and
   :optional [names] (parameters a call may leave out: the function gets nil for them, so
-  they can't be tagged)."
+  they can't be tagged), and :reads-only (see `tool`)."
   ([v] (wrap v {}))
   ([v opts]
    (let [said (meta v)
@@ -89,6 +92,7 @@
      (tool {:name (or (:name opts) (subs full (inc (str/index-of full "/"))))
             :doc (or (:doc opts) (:doc said))
             :limit (:limit opts)
+            :reads-only (boolean (:reads-only opts))
             :params (into {} (map (fn [p]
                                     (let [k (keyword (str p))
                                           about (get (:params opts) k)]
@@ -499,12 +503,19 @@
         text (if (:error outcome)
                (str "error: " (:error outcome))
                (str (:note outcome) (result-text (:value outcome) (or (:limit found) 8000))))
-        ;; The same call again, with the same result: said, rather than given again (a model
-        ;; going round in a loop re-reads what it already has). Only the result is the same:
-        ;; a call with effects (loading an edited file) may have done something new.
-        text (if (and (not (:error outcome)) (same-before? a named args text))
+        ;; The same call again, with the same result: a tool that only reads says so rather
+        ;; than give it again (a model going round in a loop re-reads what it already has). A
+        ;; tool with effects gives it, and says it ran again: its effects may be new (loading
+        ;; an edited file gives the same text, and loads the edit).
+        same (and (not (:error outcome)) (same-before? a named args text))
+        text (cond
+               (and same (:reads-only found))
                "(This call gave exactly this result before: the result is earlier in this conversation.)"
-               text)]
+
+               same
+               (str text "\n(It ran again and gave the same result as the last time it was called so.)")
+
+               :else text)]
     ;; :text and :kind are the call as the model wrote it (the session is made again from it).
     [{:role :call :name (str named) :args args :text (str (:text called)) :kind (:kind called)
       :began (:began called) :ended (:ended called)}

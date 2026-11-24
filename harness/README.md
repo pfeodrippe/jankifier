@@ -95,6 +95,12 @@ what differs from the Clojure it knows (32-bit integers, no JVM, `format`)
 and on calling C++, each line tried in this process. The model reads the file
 when a task needs it.
 
+A call made again with the same arguments and the same result: a tool that
+only reads (`functions`, `describe`, `read_file`, `list_dir`: `:reads-only`)
+says the result is earlier in the conversation rather than give it again; a
+tool with effects gives it, and says it ran again (loading an edited file
+gives the same text, and loads the edit).
+
 `shell` gives a command 120 seconds (its `timeout`), then kills it with what
 it started. A command that leaves something running in the background ends
 when the shell does, so a server can be started and then checked.

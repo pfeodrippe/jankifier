@@ -325,10 +325,10 @@
    (h/wrap #'load-file {:name "load_file"
                         :params {:path "the file's path, like work/x.jank"}
                         :limit 12000})
-   (h/wrap #'functions {:params {:namespace "the namespace's name, like inkling.core"}
+   (h/wrap #'functions {:reads-only true :params {:namespace "the namespace's name, like inkling.core"}
                         :limit 12000})
-   (h/wrap #'describe {:params {:name "the full name, like inkling.core/routing"}})
-   (h/wrap #'read-file {:name "read_file"
+   (h/wrap #'describe {:reads-only true :params {:name "the full name, like inkling.core/routing"}})
+   (h/wrap #'read-file {:name "read_file" :reads-only true
                         :params {:path "the file's path"
                                  :from {:type "integer" :doc "the first line wanted (optional)"}
                                  :lines {:type "integer"
@@ -341,7 +341,7 @@
                         :params {:path "the file's path"
                                  :old "the text to replace, exactly as in the file"
                                  :new "the text to put in its place"}})
-   (h/wrap #'list-dir {:name "list_dir" :params {:path "the directory's path"}})
+   (h/wrap #'list-dir {:name "list_dir" :reads-only true :params {:path "the directory's path"}})
    (h/wrap #'shell {:name "shell"
                     :params {:command "the command line"
                              :timeout {:type "number"

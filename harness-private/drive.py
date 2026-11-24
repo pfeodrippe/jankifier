@@ -330,11 +330,13 @@ def run_form(task, mode, seed):
                                     (doseq [k [:coder :modeler]]
                                       (h/save! (get t k) (clojure.string/replace live #"\\.edn$" (str "-" (name k) ".edn")))))
                                   ;; Going round in a loop: the last six results all the
-                                  ;; harness's "the same result as before". Ended, as the step
-                                  ;; limit would end it later.
+                                  ;; harness's "the same result as before" (a tool that reads)
+                                  ;; or "ran again and gave the same result" (one with effects).
+                                  ;; Ended, as the step limit would end it later.
                                   (let [rs (take-last 6 (filter (fn [e] (= :result (:role e))) (h/entries x)))]
                                     (when (and (= 6 (count rs))
-                                               (every? (fn [e] (clojure.string/starts-with? (str (:text e)) "(This call gave exactly this result before")) rs))
+                                               (every? (fn [e] (or (clojure.string/starts-with? (str (:text e)) "(This call gave exactly this result before")
+                                                                   (clojure.string/ends-with? (str (:text e)) "(It ran again and gave the same result as the last time it was called so.)"))) rs))
                                       (reset! looped true)
                                       ;; (Not h/stop!, which waits for the turn: this runs inside it.)
                                       (swap! x assoc :stop true)))))}}
