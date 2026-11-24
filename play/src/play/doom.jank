@@ -25,7 +25,12 @@
   "What a player can do in a step: a name and the buttons held."
   {:forward [:forward] :back [:back] :turn-left [:turn-left] :turn-right [:turn-right]
    :attack [:attack] :use [:use] :strafe-left [:strafe-left] :strafe-right [:strafe-right]
-   :forward-left [:forward :turn-left] :forward-right [:forward :turn-right] :wait []})
+   :forward-left [:forward :strafe-left] :forward-right [:forward :strafe-right] :wait []})
+
+(def ^:private arcs
+  ;; Versions 1 to 3: forward-left and forward-right walked while turning (an arc; the agent
+  ;; took them for steps to the side and walked in circles).
+  (assoc actions :forward-left [:forward :turn-left] :forward-right [:forward :turn-right]))
 
 (def step-tics 4)
 
@@ -192,9 +197,10 @@
 
 (def version
   "How act! plays an action, for replays (each recording, and each agent's step, says the
-  version it was played with): 1 the first (attack held 8 tics, turns 10), 2 with aim, 3 now.
-  Raised whenever act! changes."
-  3)
+  version it was played with): 1 the first (attack held 8 tics, turns 10), 2 with aim, 3
+  with turns of a fixed angle, 4 with forward-left and forward-right stepping to the side
+  instead of turning. Raised whenever act! changes."
+  4)
 
 (def ^:private v1-tics
   {:forward 12 :back 12 :strafe-left 12 :strafe-right 12 :forward-left 12 :forward-right 12
@@ -203,24 +209,34 @@
 (defn act-v1!
   "An action as version 1 played it: its buttons held for its tics."
   [action]
-  (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) (get v1-tics action step-tics)))
+  (cpp/play.doom_act (reduce + 0 (map buttons (get arcs action []))) (get v1-tics action step-tics)))
 
 (defn act-v2!
   "An action as version 2 played it: version 1, and aim (turned to the nearest monster)."
   [action]
   (if (= action :aim) (aim!) (act-v1! action)))
 
-(defn act!
-  "One step: the action's buttons held for its tics; turn-left and turn-right turn
-  turn-degrees, attack turns to the nearest monster in view first (if there is one), use
-  says what opened; the reward."
-  [action]
+(defn- acted!
+  "An action, its buttons as `moves` has them, as act! plays it: the reward."
+  [moves action]
   (case action
     :turn-left (turn! turn-degrees)
     :turn-right (turn! (- turn-degrees))
     :use (use!)
     (let [aimed (if (= action :attack) (aim!) 0.0)]
-      (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) (get action-tics action step-tics))))))
+      (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics))))))
+
+(defn act-v3!
+  "An action as version 3 played it: forward-left and forward-right walked while turning."
+  [action]
+  (acted! arcs action))
+
+(defn act!
+  "One step: the action's buttons held for its tics; turn-left and turn-right turn
+  turn-degrees, attack turns to the nearest monster in view first (if there is one), use
+  says what opened; the reward."
+  [action]
+  (acted! actions action))
 
 ;; A scripted player.
 
@@ -276,7 +292,7 @@
   (str "You play Doom (Freedoom's first map), seen from the player's eyes. Find the way to the "
        "exit, and shoot the monsters that attack you. Each action holds the keys for a moment: "
        "forward and back walk (about 50 units), turn-left and turn-right turn 30 degrees, forward-left and "
-       "forward-right walk while turning, strafe-left and strafe-right step sideways, attack "
+       "forward-right walk ahead and to the side at once, without turning, strafe-left and strafe-right step sideways, attack "
        "turns to the nearest monster in view and shoots it (with none in view, it shoots "
        "straight ahead), use opens a door within 64 units straight ahead or "
        "presses a switch right in front of you, wait does nothing. Distances are in map units: "
