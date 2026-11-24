@@ -42,6 +42,11 @@
    :nethack {:start! #'nethack/start! :state #'nethack/state :told #'nethack/told :act! #'nethack/act!
              ;; The game ends when the character dies (or the game is quit).
              :over (fn [] (when (:done (nethack/state)) "the game ended (the character died)."))
+             ;; A step onto a trap seen before is not done (an agent stepped back into a bear
+             ;; trap again and again).
+             :caution #'nethack/caution
+             ;; Answers to the game's messages and menus don't move the @.
+             :still #{:more :enter :escape :yes :no :select-all}
              :actions nethack/model-actions :rules nethack/rules :st #'nethack/st :watch! #'nethack/watch!
              ;; Walking into a wall takes no turn: the screen stays the same.
              :same? (fn [a b] (and (= (:screen a) (:screen b)) (= (:message a) (:message b))))

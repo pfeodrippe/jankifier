@@ -69,6 +69,38 @@
                             (str label " " (char-name (at dr dc)))))
            ".\n"))))
 
+(defonce ^{:doc "Traps seen on the map: #{[dungeon-level x y]}. Once the @ stands on one the map
+  shows the @, not the ^: an agent stepped back into the bear trap it had left, again and again."}
+  traps (atom #{}))
+
+(defn- note-traps!
+  "Adds the traps (^) on the screen's map (rows 1 to 21; a map row is the screen row less one),
+  and the @'s square when the game's message speaks of a trap."
+  [s]
+  (let [depth (:depth (:stats s))]
+    ;; A trap under an item shows the item, not the ^ (an agent's bear trap had a corpse on
+    ;; it): the square the @ is on when the game speaks of a trap is one too.
+    (when (re-find #"trap|shoots out at you" (str/lower-case (str (:message s))))
+      (swap! traps conj [depth (:x (:stats s)) (:y (:stats s))]))
+    (doseq [r (range 1 22)
+            :let [line (get (:screen s) r "")]
+            c (range (count line))
+            :when (= \^ (nth line c))]
+      (swap! traps conj [depth c (dec r)]))))
+
+(def ^:private steps-by-direction
+  {:north [0 -1] :south [0 1] :east [1 0] :west [-1 0]
+   :north-east [1 -1] :north-west [-1 -1] :south-east [1 1] :south-west [-1 1]})
+
+(defn caution
+  "Why `action` should not be done now (nil: it may be): a step onto a trap seen before."
+  [s action]
+  (when-let [[dx dy] (get steps-by-direction action)]
+    (let [{:keys [depth x y]} (:stats s)]
+      (when (contains? @traps [depth (+ x dx) (+ y dy)])
+        (str "a trap (^) you have seen is " (name action) " of you: stepping onto it springs it again "
+             "(a bear trap holds you for turns, an arrow or dart trap hurts). Go around it.")))))
+
 (def ^:private direction-names
   {[0 -1] "north" [0 1] "south" [1 0] "east" [-1 0] "west"
    [1 -1] "north-east" [-1 -1] "north-west" [1 1] "south-east" [-1 1] "south-west"})
@@ -101,12 +133,25 @@
                        "The game waits for you to read its message (--More--): answer more.\n"
                        (re-find #"\[[yn]+[^\]]*\]" top)
                        "The game asks a question: answer yes or no (or escape).\n")]
+     (note-traps! s)
      (str waiting
           (str/join "\n" (map str/trimr (:screen s))) "\n"
           "HP " (:hp st) "/" (:hp-max st) ", armor class " (:armor-class st) ", experience level "
           (:xp-level st) ", dungeon level " (:depth st) ", gold " (:gold st) ", turn " (:turn st)
           ", " (get hunger-names (:hunger st) "hunger unknown") ".\n"
           (around s)
+          (let [{:keys [depth x y]} (:stats s)]
+            (when (contains? @traps [depth x y])
+              "You stand on a trap you saw before (the map shows you, not the ^): moving off it may take some tries if it holds you.\n"))
+          (let [near (filter (fn [[d tx ty]] (and (= d (:depth (:stats s)))
+                                                   (<= (max (- tx (:x (:stats s))) (- (:x (:stats s)) tx)) 1)
+                                                   (<= (max (- ty (:y (:stats s))) (- (:y (:stats s)) ty)) 1)
+                                                   (not (and (= tx (:x (:stats s))) (= ty (:y (:stats s)))))))
+                             @traps)]
+            (when (seq near)
+              (str "Traps you have seen next to you: "
+                   (str/join ", " (for [[_ tx ty] near] (get direction-names [(- tx (:x (:stats s))) (- ty (:y (:stats s)))])))
+                   " (don't step there).\n")))
           (when (seq (str/trim (:message s))) (str "Message: " (str/trim (:message s)) "\n"))
           (when-not (:normal s) "A menu or a question is open.\n")
           "Inventory:\n" (:inventory s)))))
@@ -118,6 +163,7 @@
   story and welcome passed (Enter), until the map is there. nil, or what went wrong."
   ([] (start! 1))
   ([seed]
+   (reset! traps #{})
    (let [dir (cpp/play.nethack_prepare run-dir nhdat)]
      (or (cpp/play.nethack_open library dir options seed)
          (do
@@ -134,14 +180,22 @@
   {:north (int \k) :south (int \j) :east (int \l) :west (int \h)
    :north-east (int \u) :north-west (int \y) :south-east (int \n) :south-west (int \b)
    :down (int \>) :up (int \<) :search (int \s) :pick-up (int \,) :eat (int \e) :wait (int \.)
-   :open (int \o) :kick 4 :enter 13 :escape 27 :yes (int \y) :no (int \n) :more 13})
+   :open (int \o) :kick 4 :enter 13 :escape 27 :yes (int \y) :no (int \n) :more 13
+   ;; In a menu, , selects every item on its page (Enter then takes them).
+   :select-all (int \,)})
+
+;; Keys sent for one action: rest searches 20 turns (a count, then s), stopped by the game when
+;; something comes into view. An agent waited a turn at a time, hundreds of times, to heal.
+(def key-runs {:rest [(int \2) (int \0) (int \s)]})
 
 (defn act!
   "One key (a name of keys-by-name, a character or a number): whether the game ended."
   [k]
-  (cpp/play.nethack_step (cond (keyword? k) (get keys-by-name k 27)
-                               (char? k) (int k)
-                               :else k)))
+  (if-let [run (get key-runs k)]
+    (last (mapv (fn [key] (cpp/play.nethack_step key)) run))
+    (cpp/play.nethack_step (cond (keyword? k) (get keys-by-name k 27)
+                                 (char? k) (int k)
+                                 :else k))))
 
 ;; A scripted player: answers what it is asked, goes down stairs it stands on, else walks in
 ;; a random direction (and searches now and then).
@@ -196,12 +250,17 @@
        "weapon, [ armor, % food, ! a potion, ? a scroll. When a message ends with --More--, "
        "answer more; when you are asked a question or a menu is open, answer it (yes, no, "
        "escape, or enter). Eat when you are hungry. down goes down stairs you stand on, search "
-       "looks for hidden doors, pick-up picks up what is here, open opens a door next to you "
-       "(a direction follows), kick kicks (a direction follows), wait waits a turn."))
+       "looks for hidden doors, pick-up picks up what is here (in its menu, select-all then enter "
+       "takes everything), open opens a door next to you (a direction follows), kick kicks (a "
+       "direction follows), wait waits a turn, rest rests up to 20 turns (it stops when "
+       "something comes into view): HP comes back slowly, so rest when it is low and nothing is "
+       "near. ^ is a trap: don't step on one you have seen (a bear trap holds you for turns). "
+       "Your pet (a little dog d, a kitten f or a pony u, by your role) starts next to you and "
+       "follows you; it fights for you: don't attack it (walking into it swaps places with it)."))
 
 (def model-actions
   [:north :south :east :west :north-east :north-west :south-east :south-west :down :up :search
-   :pick-up :eat :open :kick :wait :more :enter :escape :yes :no])
+   :pick-up :eat :open :kick :wait :rest :select-all :more :enter :escape :yes :no])
 
 (defonce decisions (atom []))
 
