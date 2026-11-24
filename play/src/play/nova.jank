@@ -197,7 +197,11 @@
                                       (cond (zero? dy) " (her row)"
                                             (neg? dy) (str ", " (- dy) " above")
                                             :else (str ", " dy " below")))))
-                ": jump over it, wait for it to pass, or attack it. "))
+                ": jump over it, wait for it to pass, or attack it"
+                ;; A shot starts about 2 blocks ahead of her: one closer is passed over.
+                (when (some (fn [[_ dx dy]] (and (<= 1 (max dx (- dx)) 2) (zero? dy))) ds)
+                  " (one 1 or 2 blocks from her on her row is too close to shoot: her shot starts past it; step back first, or jump over it)")
+                ". "))
          (cond
            ended "On her right the level ends: nothing is past it, and walking right is blocked. The way on is elsewhere: a door (D) or a ladder (H). "
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
