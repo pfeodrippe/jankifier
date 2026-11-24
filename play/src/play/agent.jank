@@ -44,6 +44,9 @@
           ;; Not moving her is what these do: they don't stop the actions after them (an
           ;; attack stopped an agent's list as if it had changed nothing).
           :still #{:attack :wait}
+          ;; A planned list stops when she is hurt or dies (an agent's 25 waits went on while a
+          ;; GOOMBA touched her).
+          :stop-when #'nova/stop-when
           :actions nova/model-actions :rules nova/rules :st #'nova/st :watch! #'nova/watch!
           :same? (fn [a b] (and (= (:x a) (:x b)) (= (:y a) (:y b))))
           :progress (fn [s] {:x (/ (long (* 10 (:x s))) 10.0) :health (:health s)})}})
@@ -120,6 +123,10 @@
                           (and (:over g) ((:over g)))
                           (str (str/join "\n" (conj said (str (name k) ": " changed)))
                                "\n\nThe game is over: " ((:over g)) " Stopped here.")
+
+                          (and (:stop-when g) (seq (rest left)) ((:stop-when g) before after))
+                          (str (str/join "\n" (conj said (str (name k) ": " changed " Stopped here: " ((:stop-when g) before after))))
+                               "\n\nThe game now:\n" (told after before))
 
                           (and (same? before after) (not (contains? (:still g) k)))
                           (str (str/join "\n" (conj said (str (name k) ": " changed " Stopped here: it changed nothing.")))

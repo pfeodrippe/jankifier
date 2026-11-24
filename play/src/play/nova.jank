@@ -320,6 +320,20 @@
                    "Jump over it, or wait for it to pass."
                    (str "Jump over it, or attack it (a shot stuns it" (when (<= n 2) "; this near, step back first: her shot starts past it") ")."))))))))
 
+(defn- died?
+  "Whether Nova died between `before` and `st`: her health back up while she went far back
+  (the game starts that part of the level again)."
+  [before st]
+  (and (> (:health st) (:health before)) (< (- (:x st) (:x before)) -8.0)))
+
+(defn stop-when
+  "Why the actions planned after one that went from `before` to `st` should not be done (nil:
+  they may be): she was hurt, or died (planned before, they no longer fit)."
+  [before st]
+  (cond
+    (died? before st) "she died and starts this part again."
+    (< (:health st) (:health before)) (str "she was hurt (health " (:health before) " to " (:health st) ").")))
+
 (defn- moved
   "How far Nova went from `before` to `st`, as a sentence (or that she died and starts again)."
   [before st]
@@ -332,7 +346,7 @@
     (cond
       ;; Health back up while she jumped far back in the same area (or another): the game
       ;; started this part again after she died.
-      (and (> (:health st) (:health before)) (< dx -8.0))
+      (died? before st)
       (str "Nova died (her health ran out, or she fell) and starts this part of the level again, "
            "her health back to " (:health st) ".\n")
 
