@@ -30,6 +30,8 @@
          :same? (fn [a b] (= a b))
          :progress (fn [s] {:room (inc (:room s)) :screen (:state s)})}
    :doom {:start! #'doom/start! :state #'doom/state :told #'doom/told :act! #'doom/act! :version #'doom/version
+          ;; Why the game is over, or nil: the agent's run ends there.
+          :over #'doom/over
           :actions doom/model-actions :rules doom/rules :st #'doom/st :watch! #'doom/watch!
           ;; A shot changes the ammo: only a step that changes none of these changed nothing.
           :same? (fn [a b] (= (select-keys a [:x :y :angle :health :ammo :kills :changes])
@@ -98,9 +100,15 @@
                                   :entry (when a (count (:entries @a)))}]
                         (swap! steps conj step)
                         (reset! @st {:step (count @steps) :action k :decision step :told (told after before)})
-                        (if (same? before after)
+                        (cond
+                          (and (:over g) ((:over g)))
+                          (str (str/join "\n" (conj said (str (name k) ": " changed)))
+                               "\n\nThe game is over: " ((:over g)) " Stopped here.")
+
+                          (same? before after)
                           (str (str/join "\n" (conj said (str (name k) ": " changed " Stopped here: it changed nothing.")))
                                "\n\nThe game now:\n" (told after before))
+                          :else
                           (recur (rest left) (conj said (str (name k) ": " changed)))))))))))}
      (harness-tools/notes)]))
 
@@ -117,15 +125,19 @@
     (future
       (try
         (loop [i 0]
-          (when (and @running (< (minutes-of) minutes))
+          (when (and @running (< (minutes-of) minutes) (not (and (:over g) ((:over g)))))
             (h/ask! a (if (zero? i) first-ask "Go on playing."))
-            ;; The turn, cut at the time.
-            (loop []
+            ;; The turn, cut at the time, or once the game is over (a few seconds on, for the
+            ;; model to read it).
+            (loop [over-since nil]
               (when-not (realized? (:turn @a))
-                (if (or (not @running) (>= (minutes-of) minutes))
-                  (h/stop! a)
-                  (cpp/usleep 200000))
-                (recur)))
+                (let [over (and (:over g) ((:over g)))
+                      since (when over (or over-since (cpp/play_decide.seconds)))]
+                  (if (or (not @running) (>= (minutes-of) minutes)
+                          (and since (> (- (cpp/play_decide.seconds) since) 20.0)))
+                    (h/stop! a)
+                    (cpp/usleep 200000))
+                  (recur since))))
             (h/answer a)
             (recur (inc i))))
         (catch :default _ nil))

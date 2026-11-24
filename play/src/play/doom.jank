@@ -208,6 +208,15 @@
          (when-let [said @note] (reset! note nil) (str " " said))
          "\n")))
 
+(defn over
+  "Why the game is over (the player died, or reached the exit: Doom's episode ends there), or
+  nil while it goes on."
+  []
+  (when (cpp/play.doom_finished)
+    (if (pos? (:dead (state) 0))
+      "You died."
+      "You finished the level: you reached the exit.")))
+
 (defn told
   "What a model is told: the player's numbers (and how it moved since `before`, the state a
   step ago), how far it can walk each way, and each object in view with its distance (map
@@ -217,7 +226,8 @@
   ([s before]
    (if-not s
      "No game."
-     (str (when before (moved before s))
+     (str (when-let [why (over)] (str "The game is over. " why "\n"))
+          (when before (moved before s))
           "Health " (long (:health s)) ", armor " (long (:armor s)) ", ammo " (long (:ammo s))
           ", kills " (long (:kills s)) ", items " (long (:items s)) (when (pos? (:dead s 0)) ", dead") ".\n"
           "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees.\n"
