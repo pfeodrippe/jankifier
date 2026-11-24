@@ -128,7 +128,12 @@
     (or (and (= "|" c) (not= "|" (map-cell s x (dec y))) (not= "|" (map-cell s x (inc y)))
              (wall? (map-cell s (dec x) y)) (wall? (map-cell s (inc x) y)))
         (and (= "-" c) (not= "-" (map-cell s (dec x) y)) (not= "-" (map-cell s (inc x) y))
-             (wall? (map-cell s x (dec y))) (wall? (map-cell s x (inc y)))))))
+             (wall? (map-cell s x (dec y))) (wall? (map-cell s x (inc y))))
+        ;; In a dark room's wall not seen yet: a | with somewhere to walk above and below it
+        ;; (or a - with it left and right) is a door.
+        (let [open? (fn [cc] (not (contains? #{" " "|" "-"} cc)))]
+          (or (and (= "|" c) (open? (map-cell s x (dec y))) (open? (map-cell s x (inc y))))
+              (and (= "-" c) (open? (map-cell s (dec x) y)) (open? (map-cell s (inc x) y))))))))
 
 (defn- passable-at? [s x y]
   (let [c (map-cell s x y)]
