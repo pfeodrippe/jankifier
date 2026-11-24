@@ -43,7 +43,7 @@
           :caution #'nova/caution
           ;; Not moving her is what these do: they don't stop the actions after them (an
           ;; attack stopped an agent's list as if it had changed nothing).
-          :still #{:attack :wait}
+          :still #{:attack :wait :face-right :face-left}
           ;; A planned list stops when she is hurt or dies (an agent's 25 waits went on while a
           ;; GOOMBA touched her).
           :stop-when #'nova/stop-when

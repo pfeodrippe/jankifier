@@ -295,8 +295,8 @@
                 (let [[t dx dy] (first ds)]
                   (when (and (<= -1 dy 0) (not (zero? dx)) (not (contains? unshootable t))
                              (not= (:facing st) (if (pos? dx) :right :left)))
-                    (str " (her shot goes the way she faces, " (name (:facing st)) " now: a step "
-                         (if (pos? dx) "right" "left") " turns her toward it)")))
+                    (str " (her shot goes the way she faces, " (name (:facing st)) " now: face-"
+                         (if (pos? dx) "right" "left") " turns her toward it where she stands)")))
                 ;; A shot starts about 2 blocks ahead of her: one closer is passed over.
                 (when (some (fn [[_ dx dy]] (and (<= 1 (max dx (- dx)) 2) (<= -1 dy 0))) ds)
                   " (one 1 or 2 blocks from her on her row is too close to shoot: her shot starts past it; step back first, or jump over it)")
@@ -428,7 +428,7 @@
 (def actions
   "What a player can do in a step: a name and the buttons held, for `step-frames` frames."
   {:right [:right] :left [:left] :jump [:a] :jump-right [:a :right] :jump-left [:a :left]
-   :down [:down] :up [:up] :attack [:b] :wait []})
+   :down [:down] :up [:up] :attack [:b] :wait [] :face-right [:right] :face-left [:left]})
 
 (def step-frames 8)
 
@@ -448,8 +448,8 @@
   "How act! plays an action, for replays (each agent's step says the version it was played
   with): 1 the first, 2 with up stepping to a door or ladder near her first, 3 with a door's
   new area waited for, 4 waited for until it is done changing, 5 with up at a door stopping
-  her in its column first. Raised whenever act! changes."
-  5)
+  her in its column first, 6 with face-right and face-left. Raised whenever act! changes."
+  6)
 
 (defn- step-to!
   "Nova walked a frame at a time to the middle of column `col` (at most 40 frames)."
@@ -539,15 +539,8 @@
           (act-v1! :up))
       (act-v2-up!))))
 
-(defn act!
-  "One step: the action's buttons held for its frames, then released for one (so a jump can
-  be pressed again); up at a door in her column or within 2 blocks stops her and walks her to
-  its middle first (door-up!), and up with a ladder within 2 blocks on her row steps to it
-  first (a step walks 1 to 3 blocks: the agent walked past the door it meant to take);
-  through a door, frames run until the new area hasn't changed for 20 frames (at most 240).
-  The area is drawn and its objects set over about 10 frames, and she can't move for about
-  20: version 3 stopped at the first thing drawn, and the agent saw half an area, the last
-  area's owl, and a right that didn't move her."
+(defn act-v5!
+  "One step as version 5 played it: no turning in place."
   [action]
   (if (= action :up)
     (let [level (:level (state))]
@@ -559,6 +552,31 @@
             (let [now (area-now (state))]
               (recur (inc i) (if (= now seen) (inc still) 0) now))))))
     (act-v1! action)))
+
+(defn- face!
+  "Nova turned to face `dir` (:right or :left) where she stands: stopped, then the direction
+  pressed for one frame (it turns her and moves her 0.008 blocks; a step to turn walked her
+  into the too-close range of an owl she meant to shoot)."
+  [dir]
+  (settle!)
+  (p/nes-run! [dir] 1)
+  (p/nes-run! [] 1))
+
+(defn act!
+  "One step: the action's buttons held for its frames, then released for one (so a jump can
+  be pressed again); face-right and face-left turn her where she stands (face!); up at a door
+  in her column or within 2 blocks stops her and walks her to its middle first (door-up!),
+  and up with a ladder within 2 blocks on her row steps to it first (a step walks 1 to 3
+  blocks: the agent walked past the door it meant to take); through a door, frames run until
+  the new area hasn't changed for 20 frames (at most 240). The area is drawn and its objects
+  set over about 10 frames, and she can't move for about 20: version 3 stopped at the first
+  thing drawn, and the agent saw half an area, the last area's owl, and a right that didn't
+  move her."
+  [action]
+  (case action
+    :face-right (face! :right)
+    :face-left (face! :left)
+    (act-v5! action)))
 
 ;; Into the game: the menus, then level 1-1.
 
@@ -637,11 +655,12 @@
        "controller's buttons for a moment (8 frames): right and left walk; jump jumps straight "
        "up; jump-right and jump-left jump forward; down, standing on a ledge (=), drops her "
        "through it (not through a platform, -); up climbs a ladder (H) she is at, or goes through a door (D); attack uses "
-       "Nova's ability (the B button); wait does nothing. Holding a "
+       "Nova's ability (the B button), shooting the way she faces; face-right and face-left turn her "
+       "where she stands (to shoot without stepping closer); wait does nothing. Holding a "
        "direction while in the air steers her. When a wall is too high, look for another way: "
        "under a ledge, or back."))
 
-(def model-actions [:right :jump-right :jump :left :jump-left :up :down :attack :wait])
+(def model-actions [:right :jump-right :jump :left :jump-left :up :down :attack :wait :face-right :face-left])
 
 (defonce decisions (atom []))
 
