@@ -41,6 +41,11 @@ extern "C"
   int play_doom_finished(void);
   int play_doom_state(double *variables, int max, int *tic, char *objects, int size);
   int play_doom_rays(double *out, int max);
+  // The sectors' floor and ceiling heights kept now, for play_doom_moved.
+  void play_doom_mark();
+  // The sectors whose floor or ceiling moved since play_doom_mark: each one's middle x, y and
+  // its floor's and ceiling's change, four numbers a sector; the count.
+  int play_doom_moved(double *out, int max);
   /* The NES's last frame run (not the one shown: frames are shown at the game's own speed,
      queued), and a picture shown at once in place of the queued ones (a restored state's). */
   int play_nes_latest(uint32_t *out, int max, int *width, int *height);

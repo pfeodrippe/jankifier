@@ -32,8 +32,8 @@
    :doom {:start! #'doom/start! :state #'doom/state :told #'doom/told :act! #'doom/act! :version #'doom/version
           :actions doom/model-actions :rules doom/rules :st #'doom/st :watch! #'doom/watch!
           ;; A shot changes the ammo: only a step that changes none of these changed nothing.
-          :same? (fn [a b] (= (select-keys a [:x :y :angle :health :ammo :kills])
-                              (select-keys b [:x :y :angle :health :ammo :kills])))
+          :same? (fn [a b] (= (select-keys a [:x :y :angle :health :ammo :kills :changes])
+                              (select-keys b [:x :y :angle :health :ammo :kills :changes])))
           :progress (fn [s] {:kills (long (:kills s)) :health (long (:health s)) :items (long (:items s))
                              :x (long (:x s)) :y (long (:y s))})}
    :nova {:start! #'nova/start! :state #'nova/state :told #'nova/told :act! #'nova/act!

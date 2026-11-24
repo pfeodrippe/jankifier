@@ -132,8 +132,7 @@ namespace
   // Multiples of a turn (30 degrees: play.doom's turn-left and turn-right), and behind.
   std::array<double, 8> const doom_ray_angles{ 90, 60, 30, 0, -30, -60, -90, 180 };
   // Each direction's distance and whether a closed door ends it.
-  // Each ray's distance and what ends it: 0 a wall, 1 a door, 2 the exit, 3 something else
-  // a player uses (a switch).
+  // Each ray's distance and what ends it: the use special of the line (0 a wall).
   std::vector<std::pair<double, int>> doom_rays;
 
   // What a line's use special (patches/vizdoom-use-specials.patch) makes it: doom_rays' kinds.
@@ -166,7 +165,7 @@ namespace
       double x1, y1, x2, y2;
       bool blocking;
       double ceiling, floor;
-      int kind;
+      int special;
     };
     // A line is in each of its sectors' lists: keyed by its ends, either way round.
     std::map<std::array<long long, 4>, wall> walls;
@@ -179,11 +178,11 @@ namespace
         {
           key = { key[2], key[3], key[0], key[1] };
         }
-        int const kind{ use_kind(l.useSpecial) };
         auto const at(walls.find(key));
         if(at == walls.end())
         {
-          walls.emplace(key, wall{ l.x1, l.y1, l.x2, l.y2, l.isBlocking, sector.ceilingHeight, sector.floorHeight, kind });
+          walls.emplace(key, wall{ l.x1, l.y1, l.x2, l.y2, l.isBlocking, sector.ceilingHeight, sector.floorHeight,
+                                   l.useSpecial });
         }
         else
         {
@@ -191,7 +190,7 @@ namespace
           w.blocking = w.blocking || l.isBlocking;
           w.ceiling = std::min(w.ceiling, sector.ceilingHeight);
           w.floor = std::max(w.floor, sector.floorHeight);
-          w.kind = std::max(w.kind, kind);
+          w.special = std::max(w.special, l.useSpecial);
         }
       }
     }
@@ -201,7 +200,7 @@ namespace
       double const th{ (angle + a) * M_PI / 180.0 };
       double const dx{ std::cos(th) }, dy{ std::sin(th) };
       double best{ 2048.0 };
-      int kind{};
+      int special{};
       for(auto const &[_, w] : walls)
       {
         // Open: not blocking, room for the player (56 high), and a floor it can step up to (24).
@@ -222,12 +221,20 @@ namespace
         if(t > 0.0 && u >= 0.0 && u <= 1.0 && t < best)
         {
           best = t;
-          kind = w.kind;
+          special = w.special;
         }
       }
-      doom_rays.emplace_back(best, kind);
+      doom_rays.emplace_back(best, special);
     }
   }
+
+  // Each sector's floor and ceiling and its middle (the mean of its lines' ends), as Doom
+  // showed it last, and as play_doom_mark kept it.
+  struct sector_seen
+  {
+    double floor, ceiling, x, y;
+  };
+  std::vector<sector_seen> doom_sectors, doom_marked;
 
   // What the last state of Doom shows: its picture (queued), variables and objects in view,
   // and with `rays`, how far the player can walk each way.
@@ -240,6 +247,18 @@ namespace
     }
     doom_tic = state->number;
     doom_vars = state->gameVariables;
+    doom_sectors.clear();
+    for(auto const &sector : state->sectors)
+    {
+      double sx{}, sy{};
+      for(auto const &l : sector.lines)
+      {
+        sx += l.x1 + l.x2;
+        sy += l.y1 + l.y2;
+      }
+      double const n(2.0 * static_cast<double>(std::max<size_t>(1, sector.lines.size())));
+      doom_sectors.push_back({ sector.floorHeight, sector.ceilingHeight, sx / n, sy / n });
+    }
     if(rays && doom_vars.size() > 5)
     {
       doom_cast(*state, doom_vars[3], doom_vars[4], doom_vars.size() > 9 ? doom_vars[9] : 0.0, doom_vars[5]);
@@ -721,16 +740,42 @@ extern "C"
     return static_cast<int>(n);
   }
 
-  // How far the player can walk in each of doom_ray_angles' directions: angle, distance and
-  // what ends it (doom_rays' kinds), three numbers a direction; the count of directions.
+  // How far the player can walk in each of doom_ray_angles' directions: angle, distance, what
+  // ends it (use_kind's kinds) and its line's use special, four numbers a direction; the count
+  // of directions.
+  void play_doom_mark()
+  {
+    doom_marked = doom_sectors;
+  }
+
+  int play_doom_moved(double *out, int max)
+  {
+    int n{};
+    for(size_t i{}; i < doom_sectors.size() && i < doom_marked.size() && 4 * (n + 1) <= max; ++i)
+    {
+      auto const &a(doom_marked[i]);
+      auto const &b(doom_sectors[i]);
+      if(std::abs(b.floor - a.floor) >= 1.0 || std::abs(b.ceiling - a.ceiling) >= 1.0)
+      {
+        out[4 * n] = b.x;
+        out[4 * n + 1] = b.y;
+        out[4 * n + 2] = b.floor - a.floor;
+        out[4 * n + 3] = b.ceiling - a.ceiling;
+        ++n;
+      }
+    }
+    return n;
+  }
+
   int play_doom_rays(double *out, int max)
   {
     int n{};
-    for(size_t i{}; i < doom_rays.size() && 3 * (n + 1) <= max; ++i, ++n)
+    for(size_t i{}; i < doom_rays.size() && 4 * (n + 1) <= max; ++i, ++n)
     {
-      out[3 * n] = doom_ray_angles[i];
-      out[3 * n + 1] = doom_rays[i].first;
-      out[3 * n + 2] = doom_rays[i].second;
+      out[4 * n] = doom_ray_angles[i];
+      out[4 * n + 1] = doom_rays[i].first;
+      out[4 * n + 2] = use_kind(doom_rays[i].second);
+      out[4 * n + 3] = doom_rays[i].second;
     }
     return n;
   }

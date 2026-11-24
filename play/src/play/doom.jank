@@ -48,7 +48,14 @@
 
 (defonce st (atom {}))
 
-(defn state [] (cpp/play.doom_state))
+(defonce changes
+  ;; How many uses moved something: a use can move things elsewhere while the player's own
+  ;; numbers stay the same (the state says it, and play.agent's :same? reads it).
+  (atom 0))
+
+(defn state []
+  (when-let [s (cpp/play.doom_state)]
+    (assoc s :changes @changes)))
 
 (def pi 3.141592653589793)
 
@@ -117,6 +124,21 @@
           (>= (max a (- a)) 179.0) "(6 turns)"
           :else (str "(" n (if (pos? a) " turn-left" " turn-right") ")"))))
 
+(def lifts
+  "ZDoom's lift specials (Plat_...)."
+  #{60 62 63 64 65 206})
+
+(defn- ends-text
+  "What ends a way, said after its distance: a door, the exit, a lift or a switch."
+  [r]
+  (case (:ends r)
+    :door " (a closed door: use opens it within 64 units)"
+    :exit " (the exit switch: use it within 64 units to finish the level)"
+    :switch (if (contains? lifts (:special r))
+              " (a lift's edge: use it on or beside the lift within 64 units; it goes down, waits about 3 seconds, then comes up)"
+              " (a switch: use presses it within 64 units)")
+    nil))
+
 (defn- walls
   "How far the player can walk in each direction a whole number of turns away and behind
   (cpp/play.doom_rays), and whether that way is new ground, as lines."
@@ -127,11 +149,7 @@
                                           (when-let [t (turns a)] (str " " t)) ": " (long (:distance r))
                                           (when (>= (:distance r) 64.0)
                                             (if (new-ground? s a (:distance r)) ", new ground" ", been there"))
-                                          (case (:ends r)
-                                            :door " (a closed door: use opens it within 64 units)"
-                                            :exit " (the exit switch: use it within 64 units to finish the level)"
-                                            :switch " (a switch: use presses it within 64 units)"
-                                            nil))))
+                                          (ends-text r))))
                            (cpp/play.doom_rays)))
        "\n"))
 
@@ -241,25 +259,61 @@
           (recur (inc i) (+ reward (cpp/play.doom_act (get buttons (if (pos? left) :turn-left :turn-right)) 1)))
           reward)))))
 
+(defn- what-moved
+  "What a sector's change `m` ({:floor :ceiling}) looks like."
+  [m]
+  (cond (pos? (:ceiling m)) "a ceiling rose (a door opening)"
+        (neg? (:ceiling m)) "a ceiling came down (a door closing)"
+        (neg? (:floor m)) "a floor went down (a lift or a way opening)"
+        :else "a floor rose"))
+
 (defn- use!
-  "Use pressed, then a moment for a door to move: what opened ahead said in the next turn."
-  []
-  (let [ahead (fn [] (:distance (first (filter (fn [r] (zero? (long (:angle r)))) (cpp/play.doom_rays)))))
+  "Use pressed, then a moment for what it sets off to move (with `lift-wait`, a lift's start
+  waited for: about 3 seconds): what moved (any sector of the map whose floor or ceiling
+  moved: a door, a lift), where, said in the next turn."
+  [lift-wait]
+  (let [ahead (fn [] (first (filter (fn [r] (zero? (long (:angle r)))) (cpp/play.doom_rays))))
         before (ahead)
+        _ (cpp/play.doom_mark)
         reward (+ (cpp/play.doom_act (get buttons :use) 4) (cpp/play.doom_act 0 30))
-        after (ahead)]
-    (reset! note (if (and before after (> after (+ before 32.0)))
-                   (str "The way ahead opened (" (long before) " to " (long after) ").")
-                   (str "Nothing opened ahead: use works on a door within 64 units straight ahead.")))
+        ;; A lift waits about 3 seconds before it moves: waited for, at most 4 seconds more.
+        lift (and lift-wait before (contains? lifts (:special before)) (< (:distance before) 64.0))
+        reward (+ reward (loop [i 0 r 0.0]
+                           (if (or (not lift) (seq (cpp/play.doom_moved)) (>= i 14))
+                             r
+                             (recur (inc i) (+ r (cpp/play.doom_act 0 10))))))
+        s (state)
+        moved (sort-by first (for [m (cpp/play.doom_moved)
+                                   :let [[d a] (bearing s m)]]
+                               [d a m]))
+        door-ahead (and before (= :door (:ends before)) (< (:distance before) 64.0)
+                        (some (fn [[d _ m]] (and (< d 192.0) (pos? (:ceiling m)))) moved))]
+    (when (seq moved)
+      (swap! changes inc))
+    (reset! note
+            (cond
+              door-ahead
+              "The door ahead opened."
+
+              (seq moved)
+              (str "Something moved: "
+                   (str/join "; " (for [[d a m] (take 3 moved)]
+                                    (str (what-moved m) ", " (long d) " away, " (direction a)
+                                         (when-let [t (turns a)] (str " " t)))))
+                   ".")
+              (and before (:ends before) (< (:distance before) 64.0))
+              (str "You pressed it, but nothing moved yet.")
+              :else
+              (str "Nothing happened: use works on a door, a switch or a lift edge within 64 units straight ahead.")))
     reward))
 
 (def version
   "How act! plays an action, for replays (each recording, and each agent's step, says the
   version it was played with): 1 the first (attack held 8 tics, turns 10), 2 with aim, 3
   with turns of a fixed angle, 4 with forward-left and forward-right stepping to the side
-  instead of turning, 5 with each move waited out until the player stops. Raised whenever
-  act! changes."
-  5)
+  instead of turning, 5 with each move waited out until the player stops, 6 with use waiting
+  for a lift to start. Raised whenever act! changes."
+  6)
 
 (def ^:private v1-tics
   {:forward 12 :back 12 :strafe-left 12 :strafe-right 12 :forward-left 12 :forward-right 12
@@ -291,11 +345,11 @@
 (defn- acted!
   "An action, its buttons as `moves` has them, as act! plays it (a move waited out until the
   player stops when `settle`): the reward."
-  [moves settle action]
+  [moves settle lift-wait action]
   (case action
     :turn-left (turn! turn-degrees)
     :turn-right (turn! (- turn-degrees))
-    :use (use!)
+    :use (use! lift-wait)
     (let [before (state)
           aimed (if (= action :attack) (aim!) 0.0)
           reward (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics)))
@@ -306,20 +360,25 @@
 (defn act-v3!
   "An action as version 3 played it: forward-left and forward-right walked while turning."
   [action]
-  (acted! arcs false action))
+  (acted! arcs false false action))
 
 (defn act-v4!
   "An action as version 4 played it: a move not waited out (the player slid on into the next
   action)."
   [action]
-  (acted! actions false action))
+  (acted! actions false false action))
+
+(defn act-v5!
+  "An action as version 5 played it: use not waiting for a lift to start."
+  [action]
+  (acted! actions true false action))
 
 (defn act!
   "One step: the action's buttons held for its tics, then a move waited out until the player
   stops; turn-left and turn-right turn turn-degrees, attack turns to the nearest monster in
   view first (if there is one), use says what opened; the reward."
   [action]
-  (acted! actions true action))
+  (acted! actions true true action))
 
 ;; A scripted player.
 

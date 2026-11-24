@@ -71,7 +71,7 @@ namespace play_replay_native
    :nethack {:title "NetHack" :start! #'nethack/start! :act! #'nethack/act! :stop! #'nethack/stop! :picture #'nethack/picture
              :play-model! #'nethack/play-model! :decisions #'nethack/decisions :saves false}
    :doom {:title "Doom" :start! #'doom/start! :act! #'doom/act! :stop! #'doom/stop! :picture #'doom/picture
-          :version #'doom/version :acts {1 #'doom/act-v1! 2 #'doom/act-v2! 3 #'doom/act-v3! 4 #'doom/act-v4! 5 #'doom/act!}
+          :version #'doom/version :acts {1 #'doom/act-v1! 2 #'doom/act-v2! 3 #'doom/act-v3! 4 #'doom/act-v4! 5 #'doom/act-v5! 6 #'doom/act!}
           :play-model! #'doom/play-model! :decisions #'doom/decisions :conversation #'doom/conversation
           :saves false}
    :wnw {:title "Witch n' Wiz" :start! #'wnw/start! :act! #'wnw/act! :stop! #'wnw/stop!

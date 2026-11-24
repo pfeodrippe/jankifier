@@ -361,21 +361,48 @@ namespace play
 
   // How far the player can walk: [{:angle :distance :door} ...], angles to the left of
   // where it faces.
-  inline object_ref doom_rays()
+  inline object_ref doom_mark()
   {
-    double v[64]{};
-    int const n(play_doom_rays(v, 64));
+    play_doom_mark();
+    return rt::jank_nil;
+  }
+
+  // [{:x :y :floor :ceiling}]: the sectors that moved since doom_mark, with their changes.
+  inline object_ref doom_moved()
+  {
+    std::vector<double> v(4 * 256);
+    int const n(play_doom_moved(v.data(), static_cast<int>(v.size())));
     object_ref list{ rt::obj::persistent_vector::empty() };
     for(int i{}; i < n; ++i)
     {
       object_ref r{ rt::obj::persistent_array_map::empty() };
-      r = rt::assoc(r, kw("angle"), num(v[3 * i]));
-      r = rt::assoc(r, kw("distance"), num(v[3 * i + 1]));
-      // What ends the way: a door, the exit, or something else to use (a switch).
-      int const kind{ static_cast<int>(v[3 * i + 2]) };
+      r = rt::assoc(r, kw("x"), num(v[4 * i]));
+      r = rt::assoc(r, kw("y"), num(v[4 * i + 1]));
+      r = rt::assoc(r, kw("floor"), num(v[4 * i + 2]));
+      r = rt::assoc(r, kw("ceiling"), num(v[4 * i + 3]));
+      list = rt::conj(list, r);
+    }
+    return list;
+  }
+
+  inline object_ref doom_rays()
+  {
+    double v[64]{};
+    int const n(play_doom_rays(v, 64));
+    // Four numbers a ray: angle, distance, kind and the line's use special.
+    object_ref list{ rt::obj::persistent_vector::empty() };
+    for(int i{}; i < n; ++i)
+    {
+      object_ref r{ rt::obj::persistent_array_map::empty() };
+      r = rt::assoc(r, kw("angle"), num(v[4 * i]));
+      r = rt::assoc(r, kw("distance"), num(v[4 * i + 1]));
+      // What ends the way: a door, the exit, or something else to use (a switch), and the
+      // line's special (ZDoom's numbers).
+      int const kind{ static_cast<int>(v[4 * i + 2]) };
       if(kind > 0)
       {
         r = rt::assoc(r, kw("ends"), kw(kind == 1 ? "door" : kind == 2 ? "exit" : "switch"));
+        r = rt::assoc(r, kw("special"), integer(static_cast<int64_t>(v[4 * i + 3])));
       }
       list = rt::conj(list, r);
     }
