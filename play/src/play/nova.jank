@@ -426,7 +426,7 @@
                          (not (contains? unshootable t)))
                     (str ": it is on top of the wall ahead (her shot from down here passes under it): "
                          (when (= 1 (first wall-near)) "step left 1 block first (at the wall's foot it touches her as it comes to the edge); then, ")
-                         "when it walks toward her (a shot doesn't catch one walking away), facing it, high-jump (straight up) and attack right after it, with no wait between: the high-jump ends at the jump's top, where her shot is on its row. Again until it is stunned, then high-jump-right onto the wall")
+                         "when it walks toward her (a shot doesn't catch one walking away), facing it, high-jump (straight up), then attack as the very next action: the high-jump action ends with her still in the air at the jump's top, so the attack fires from up there, on its row (no wait between them; after landing is too late). Again until it is stunned, then high-jump-right onto the wall")
                     ;; One walking on the wall ahead: up there it is on her row (an owl pacing a
                     ;; 2-high wall held agents for minutes; this play got past it in replay).
                     (and (<= dy -2) wall-near (pos? dx) (>= dx (first wall-near)))
@@ -457,7 +457,7 @@
                   (when (seq makers)
                     (str " (" (str/join " and " makers) " " (if (= 1 (count makers)) "makes" "make")
                          " the FLAMES while not stunned"
-                         (when (some #{"FIRE_JUMP"} makers) ", a FIRE_JUMP bouncing in place: don't stand beside it")
+                         (when (some #{"FIRE_JUMP"} makers) ", a FIRE_JUMP hopping along toward her: don't jump toward it")
                          ": stun it with a shot from 3 blocks or more on its row and the flames stop; FLAMES burn out in a moment)")))
                 ;; Only a GOOMBA is flattened by landing on it (src/enemy.s, GoombaSmoosh).
                 (when (= "GOOMBA" (first (first ds))) " (landing on a GOOMBA from above flattens it)")
@@ -560,13 +560,35 @@
                                 (= "GOOMBA" t)
                                 (str " (a GOOMBA walks on top of it" way ": waiting below the wall's edge, it walks off onto her; from 1 to 3 blocks before the wall, high-jump-right onto it, then right in the air: landing on the GOOMBA flattens it).")
                                 (and (= 2 h) (not (contains? unshootable t)))
-                                (str " (" t " walks on top of it" way ": don't jump up into it. From 1 or 2 blocks back from the wall, when it walks toward her, facing it, high-jump (straight up) and attack right after it, with no wait between: the high-jump ends at the jump's top, where her shot is on its row. Once it is stunned, high-jump-right onto the wall).")
+                                (str " (" t " walks on top of it" way ": don't jump up into it. From 1 or 2 blocks back from the wall, when it walks toward her, facing it, high-jump (straight up), then attack as the very next action: the high-jump action ends with her still in the air at the jump's top, so the attack fires from up there, on its row (no wait between them; after landing is too late). Once it is stunned, high-jump-right onto the wall).")
                                 :else (str " (" (if (= h 1) "jump-right" "high-jump-right") " gets over it; " t " is on top of it" way ").")))
                             :else (case top 1 " (jump-right gets over it)." 2 " (high-jump-right gets over it)." " (too high to jump: look for another way).")))))
                    "On her right the way is clear."))
          ;; A jump-right alone from beside spikes came down on them (right is held 8 frames,
          ;; while she still pushes against them): nearly every agent was hurt there. In replay,
          ;; two rights after it, or a lone high-jump-right, cleared them.
+         ;; A fire-maker further on than the dangers' 3 blocks: agents met them up close and
+         ;; were hurt in nearly every run. In replay, against a FIRE_JUMP hopping toward her,
+         ;; standing back on higher ground and shooting again and again was never hurt (30
+         ;; tries) and stunned it each time; jumping toward it was hurt 10 times in 16. Into a
+         ;; FIRE_WALK's pen, a step down when it was 3 or more blocks off and a shot at once
+         ;; was unhurt 7 times in 8; landing in the pen near it was hurt every time.
+         (when-let [o (when-not (some (fn [[t]] (#{"FIRE_WALK" "FIRE_JUMP"} t)) (dangers st))
+                        (first (sort-by (fn [o] (max (- (:x o) (:x st)) (- (:x st) (:x o))))
+                                        (filter (fn [o] (and (#{"FIRE_WALK" "FIRE_JUMP"} (:type o)) (not (:stunned o))
+                                                             (<= 4 (max (- (long (:x o)) px) (- px (long (:x o)))) 9)
+                                                             (<= -4 (- (long (:y o)) py) 3)))
+                                                (:objects st)))))]
+           (let [dx (- (long (:x o)) px) dy (- (long (:y o)) py)
+                 way (if (pos? dx) "right" "left")
+                 toward (= (:facing o) (if (pos? dx) :left :right))]
+             (str " A " (:type o) " " (max dx (- dx)) " blocks " way
+                  (cond (zero? dy) " (her row)" (neg? dy) (str ", " (- dy) " above") :else (str ", " dy " below"))
+                  (if toward ", coming toward her" ", going away from her")
+                  (if (= "FIRE_JUMP" (:type o))
+                    (str " (it hops along, making FLAMES where it lands): stay where she is, face it (face-" way
+                         "), and shoot again and again (attack, wait, wait, attack, ...): a shot stuns it when a hop brings it onto her row, and the flames stop. Don't jump toward it.")
+                    (str " (it throws FLAMES around it): keep 3 or more blocks from it. Go onto its row only when it is 3 or more blocks from her, face it, and attack at once: a shot stuns it and the flames stop. Landing near it hurts.")))))
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right: to clear them, jump-right then right twice while in the air, or a high-jump-right on its own (a jump-right alone from beside them comes down on them)."))
          (when fall-left (str " On her left "
                               (if (= 1 fall-left)
