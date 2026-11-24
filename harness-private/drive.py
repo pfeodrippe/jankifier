@@ -32,7 +32,8 @@ import json, os, shutil, signal, socket, subprocess, sys, time
 PROJECT = '/Users/pfeodrippe/dev/jankifier'
 HARNESS = PROJECT + '/harness'
 PRIVATE = PROJECT + '/harness-private'
-OUT = PROJECT + '/trials-out'
+# TRIALS_OUT: another directory for the runs (an experiment kept apart from the trials).
+OUT = os.environ.get('TRIALS_OUT', PROJECT + '/trials-out')
 HOME = '/private/tmp/jank-agent/home'
 TMP = '/private/tmp/jank-agent/tmp'   # the process's TMPDIR: the shared one holds other programs' files
 USER_HOME = os.path.expanduser('~')
@@ -79,6 +80,13 @@ TASKS = {
 }
 
 PLAIN_TAIL = "\n\nTest it with the eval tool until you are sure it is right, then say what you did."
+
+# The terse mode (an experiment): plain, and the model told to write its messages tersely,
+# in our words after the caveman skill's rules (github.com/JuliusBrussee/caveman).
+TERSE = ("\n\nWrite tersely: the answer first, then nothing more. No greetings, hedging, recaps, "
+         "closers or narration between tool calls. Short plain words, one idea a sentence. Keep "
+         "code, commands, paths, names and errors exactly as they are, and every number and "
+         "negation.")
 
 
 def verified_tail(file):
@@ -298,6 +306,7 @@ def setup(port):
 def run_form(task, mode, seed):
     t = TASKS[task]
     verified = mode == 'verified'
+    terse = mode == 'terse'
     ask = t['ask'] + (verified_tail(t['file']) if verified else PLAIN_TAIL)
     recording = f'{OUT}/{task}-{mode}-{seed}.edn'
     return f'''
@@ -306,7 +315,7 @@ def run_form(task, mode, seed):
       live (str {jstr(OUT + '/live.edn')})
       current (atom nil)
       looped (atom false)
-      system (str tools/situation (when verified (str "\\n\\n" (slurp "VERIFY.md"))))
+      system (str tools/situation (when verified (str "\\n\\n" (slurp "VERIFY.md"))) {jstr(TERSE) if terse else '""'})
       a (h/agent m {{:tools (vec (concat (tools/defaults) (when verified [(verify/tool)])))
                     :system system
                     ;; 128k tokens: about 4.3 GB of the engine's caches. There is no compaction,
