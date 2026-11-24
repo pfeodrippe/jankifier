@@ -1,0 +1,170 @@
+;; SPDX-License-Identifier: MIT
+(ns play.population
+  "Several harness agents on one model playing one game from the same start, each in its own
+  copy of the game. There is one game in the process: it is switched to an agent's copy while
+  that agent's tool call runs (one call at a time), and the engine makes the agents' tokens
+  one forward when they meet (inkling's :auto-batch). Every few minutes the agents furthest on
+  are kept and the others replaced by copies of them: their conversation and their game. What
+  the best of them reaches is what the search reaches, not one agent alone.
+
+    (def pop (population/start! :nethack m {:agents 4 :every 5 :minutes 30}))
+    (population/report)   ; each agent's progress
+    (population/stop!)"
+  (:require [clojure.string :as str]
+            [harness.core :as h]
+            [harness.cards :as hc]
+            [play.agent :as agent]
+            [play.core :as p]
+            [play.nethack :as nethack]
+            [play.nova :as nova]
+            [play.replay :as replay]))
+
+;; A game's copy: what is kept of it while another agent plays, and how it is put back.
+;; NetHack has no snapshot, but with the same seed it plays the same way: its copy is the
+;; actions from its start (replayed in well under a second) and the traps the agent's text
+;; has noted. Nova's is the emulator's saved state.
+(def copies
+  {:nethack {:take (fn [c] (assoc c :traps @nethack/traps))
+             :put! (fn [c]
+                     (nethack/start! (:seed c 1))
+                     (doseq [k (:actions c)] (nethack/act! k))
+                     (reset! nethack/traps (:traps c #{})))
+             :fresh (fn [seed] {:seed seed :actions [] :traps #{}})
+             ;; Further on: deeper, then more of the level seen, then more experience.
+             :score (fn [s] (let [st (:stats s)
+                                  seen (count (filter (fn [ch] (not= \space ch))
+                                                      (apply str (subvec (:screen s) 1 22))))]
+                              (+ (* 100000 (:depth st)) (* 10 seen) (:xp-level st))))}
+   :nova {:take (fn [c] (assoc c :save (p/nes-save!)))
+          :put! (fn [c] (p/nes-restore! (:save c)))
+          :fresh (fn [_] {:save (p/nes-save!)})
+          ;; The areas in the level's order, then how far right, then health.
+          :score (fn [s] (+ (* 1000 (get {0 0 49 1 45 2} (:level s) 0)) (long (:x s)) (* 0.01 (:health s))))}})
+
+(defonce ^{:doc "The agents: [{:id :agent :copy (atom) :steps (atom) :score}]."} members (atom []))
+(defonce running (atom false))
+(defonce ^:private owner (atom nil))
+(defonce ^:private holding (atom nil))
+
+(defn- with-game
+  "f run with the game switched to member `m`'s copy, one member at a time."
+  [game m f]
+  (let [{:keys [take put!]} (get copies game)
+        id (:id m)]
+    (loop []
+      (when-not (compare-and-set! owner nil id)
+        (cpp/usleep 2000)
+        (recur)))
+    (try
+      (when-not (= @holding id)
+        (put! @(:copy m))
+        (reset! holding id))
+      (let [r (f)]
+        (swap! (:copy m) take)
+        r)
+      (finally (reset! owner nil)))))
+
+(defn- member
+  "Member `id` of game `game`: an agent on `m` whose tools play its own copy (`copy`) and keep
+  its own steps."
+  [game m opts id copy steps]
+  (let [g (get agent/games game)
+        mem {:id id :copy (atom copy) :steps (atom (vec steps))}
+        ;; The game's act! also kept in the copy: NetHack's copy is its actions.
+        g (assoc g :act! (fn [k] (swap! (:copy mem) update :actions (fnil conj []) k) ((:act! g) k)))
+        a (agent/agent-of g m opts {:steps (:steps mem) :running running :guard (fn [f] (with-game game mem f))})]
+    (assoc mem :agent a)))
+
+(defn- turns!
+  "Member `mem`'s agent asked to play, turn after turn, until `running` is off or its :retired
+  is set: a future."
+  [mem first-ask]
+  (future
+    (try
+      (loop [i 0]
+        (when (and @running (not (:retired @(:copy mem))))
+          (h/ask! (:agent mem) (if (zero? i) first-ask "Go on playing: a new turn, with its own steps (the game is as you left it)."))
+          (h/answer (:agent mem))
+          (recur (inc i))))
+      (catch :default _ nil))
+    :done))
+
+(defn score-of
+  "Member `mem`'s progress, read from its copy of the game."
+  [game mem]
+  (with-game game mem (fn [] ((:score (get copies game)) ((:state (get agent/games game)))))))
+
+(defn report
+  "Each member's id, score, actions and progress."
+  ([] (report (:game (meta @members))))
+  ([game]
+   (vec (for [mem @members]
+          {:id (:id mem) :score (score-of game mem) :actions (count @(:steps mem))
+           :progress (with-game game mem (fn [] ((:progress (get agent/games game)) ((:state (get agent/games game))))))}))))
+
+(defn- fork!
+  "A new member from member `best`: its conversation saved and made again in a new agent, its
+  game copy and steps copied. Returns the new member, started."
+  [game m opts best id]
+  (let [path (str "/tmp/population-" id ".agent.edn")]
+    (h/save! (:agent best) path)
+    (let [mem (member game m opts id (dissoc @(:copy best) :retired) @(:steps best))]
+      (h/resume! (:agent mem) path)
+      (hc/watch! (:agent mem) (str (name game) " agent " id))
+      (assoc mem :future (turns! mem "You were stopped and are going on where you were: look, and go on playing.")))))
+
+(defn start!
+  "`agents` agents on model `m` playing `game` from its start for `minutes`; every `every`
+  minutes the better half kept and the rest replaced by forks of it. `opts` also as
+  agent/play!'s. A future of each member's result at the end."
+  [game m opts]
+  (let [opts (merge agent/defaults {:agents 4 :every 5 :minutes 30} opts)
+        g (get agent/games game)
+        {:keys [fresh]} (get copies game)]
+    (reset! running true)
+    (reset! owner nil)
+    (reset! holding nil)
+    (when-let [failed ((:start! g))]
+      (throw (ex-info (str "the game didn't start: " failed) {})))
+    ((:watch! g))
+    (let [first-copy (fresh (:seed opts 1))
+          began (cpp/play_decide.seconds)
+          minutes-of (fn [] (/ (- (cpp/play_decide.seconds) began) 60.0))
+          started (vec (for [i (range (:agents opts))]
+                         (let [mem (member game m (assoc opts :seed (+ (:seed opts 1) i)) i first-copy [])]
+                           (hc/watch! (:agent mem) (str (name game) " agent " i))
+                           (assoc mem :future (turns! mem "Play the game. Look first.")))))]
+      (reset! members (with-meta started {:game game}))
+      (future
+        (try
+          (loop [next-id (:agents opts) last-cut 0.0]
+            (when (and @running (< (minutes-of) (:minutes opts)))
+              (cpp/usleep 5000000)
+              (if (< (- (minutes-of) last-cut) (:every opts))
+                (recur next-id last-cut)
+                ;; The cut: the better half kept, each of the rest replaced by a fork of one of
+                ;; them (the best first).
+                (let [ranked (sort-by (fn [mem] (- (score-of game mem))) @members)
+                      kept (vec (take (quot (count ranked) 2) ranked))
+                      dropped (vec (drop (count kept) ranked))]
+                  (doseq [mem dropped]
+                    (swap! (:copy mem) assoc :retired true)
+                    (h/stop! (:agent mem))
+                    (h/close! (:agent mem)))
+                  (let [forks (vec (map-indexed (fn [i _] (fork! game m (assoc opts :seed (+ next-id i)) (nth kept (mod i (count kept))) (+ next-id i)))
+                                                dropped))]
+                    (reset! members (with-meta (into kept forks) {:game game}))
+                    (recur (+ next-id (count dropped)) (minutes-of)))))))
+          (catch :default _ nil))
+        (reset! running false)
+        (doseq [mem @members] (h/stop! (:agent mem)))
+        (let [ranked (sort-by (fn [mem] (- (score-of game mem))) @members)]
+          (vec (for [mem ranked]
+                 (let [path (replay/save! game @(:steps mem) (assoc (select-keys opts [:effort :minutes :temperature :context]) :agent true :population (:id mem)))
+                       conversation (str/replace path #"\.edn$" ".agent.edn")]
+                   (h/save! (:agent mem) conversation)
+                   (h/close! (:agent mem))
+                   {:id (:id mem) :recording path :conversation conversation :score (score-of game mem)
+                    :actions (count @(:steps mem))}))))))))
+
+(defn stop! [] (reset! running false))

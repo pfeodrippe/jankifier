@@ -89,6 +89,22 @@ walks). Its conversation is shown above the game as the harness shows any agent
 (def run (agent/play! :wnw m {:minutes 10}))   ; a future of the result
 ```
 
+`play.population` runs several such agents at once on the one model, each in its own copy of
+the game, and keeps the ones furthest on. There is one game in the process: it is switched to
+an agent's copy while that agent's tool call runs (NetHack's copy is its seed and the keys
+pressed, replayed in a few milliseconds; Nova's is the emulator's saved state), and the
+engine makes the agents' tokens one forward when they meet (inkling's `:auto-batch`). Every
+`:every` minutes the better half is kept and each of the rest replaced by a copy of one of
+them (its conversation, its game and its steps), with a sampling seed of its own. What the
+best of them reaches is what this search reaches, not one agent alone.
+
+```clojure
+(require '[play.population :as population])
+(def pop (population/start! :nethack m {:agents 4 :every 5 :minutes 30}))
+(population/report)        ; each agent's score, actions and progress
+(population/stop!)
+```
+
 On Witch n' Wiz from power-on (23 Nov 2026): the agent finished 4 rooms in 10 minutes, a
 committee of three thinking players and one thinking player 2 rooms each, and the player
 without thinking none in 3 minutes. The decision players start every choice afresh and in

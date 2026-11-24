@@ -83,19 +83,27 @@
   (:text (last (filter (fn [e] (= (:role e) role)) (:entries @a)))))
 
 (defn- tools
-  "The game's tools for an agent."
-  [g]
+  "The game's tools for an agent. `ctx`: :steps (the atom its actions are kept in; the run's
+  own by default), :guard (a function a tool's work is done through, given a function of
+  none: a population's agents share one game, switched to an agent's copy for its calls),
+  :running (whether to go on; the run's own atom by default)."
+  ([g] (tools g {}))
+  ([g ctx]
   (let [{:keys [state told act! actions same? st]} g
+        steps (or (:steps ctx) steps)
+        running (or (:running ctx) running)
+        guard (or (:guard ctx) (fn [f] (f)))
         allowed (set actions)]
     [{:name "look"
       :doc "The game as it is now."
       :params {}
-      :fn (fn [_] (told (state) nil))}
+      :fn (fn [_] (guard (fn [] (told (state) nil))))}
      {:name "act"
       :doc (str "Does actions in order and tells what each changed, then the game after them. "
                 "Stops at an action that changes nothing. Actions: " (str/join ", " (map name actions)) ".")
       :params {:actions {:type "array" :doc "the actions, in order (one or more)"}}
       :fn (fn [{:keys [actions]}]
+            (guard (fn []
             (let [names (if (string? actions) [actions] (vec actions))
                   a (:agent (h/me))]
               (loop [left names said []]
@@ -145,8 +153,8 @@
                           (str (str/join "\n" (conj said (str (name k) ": " changed " Stopped here: it changed nothing.")))
                                "\n\nThe game now:\n" (told after before))
                           :else
-                          (recur (rest left) (conj said (str (name k) ": " changed)))))))))))}
-     (harness-tools/notes)]))
+                          (recur (rest left) (conj said (str (name k) ": " changed)))))))))))))}
+     (harness-tools/notes)])))
 
 (defn- playing!
   "Agent `a` playing game `game` (already where it should start) for `minutes`, in the
@@ -185,10 +193,11 @@
         {:recording path :conversation conversation :actions (count @steps)
          :progress ((:progress g) ((:state g))) :minutes (/ (long (* 10 (minutes-of))) 10.0)}))))
 
-(defn- agent-of
-  "A game agent on model `m` with `opts` (play!'s)."
-  [g m {:keys [effort context max-steps max-thinking temperature seed]}]
-  (h/agent m {:tools (tools g)
+(defn agent-of
+  "A game agent on model `m` with `opts` (play!'s); `ctx` as `tools`'s."
+  ([g m opts] (agent-of g m opts {}))
+  ([g m {:keys [effort context max-steps max-thinking temperature seed]} ctx]
+  (h/agent m {:tools (tools g ctx)
               ;; Rules as text, or a function of none (a game whose rules depend on where it is
               ;; played: Doom's scenario).
               :system (str (let [r (:rules g)] (if (string? r) r (r))) guidance)
@@ -200,9 +209,9 @@
               :summary-result-chars 400 :summary-thinking-chars 400
               ;; The recent part kept beside a summary: a few steps (the default, 20% of 64k, kept
               ;; so much that a compaction left the session nearly as full).
-              :compact-keep 6000}))
+              :compact-keep 6000})))
 
-(def ^:private defaults
+(def defaults
   ;; 64k of context: a game agent adds about 6000 tokens a minute (its thinking mostly), and
   ;; in 32k its compactions, 80 seconds each, came one after another.
   {:minutes 10 :effort :medium :context 65536 :max-steps 40 :max-thinking 1200 :temperature 1.0 :seed 1})
