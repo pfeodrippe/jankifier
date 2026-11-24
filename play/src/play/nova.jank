@@ -206,12 +206,14 @@
            ended "On her right the level ends: nothing is past it, and walking right is blocked. The way on is elsewhere: a door (D) or a ladder (H). "
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
                             (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
-           (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide: jump-right to cross it.")
+           (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide: jump-right to cross it"
+                                     (when (> gap 1) ", then right while in the air (a jump alone is short: wait in the air and she falls in)")
+                                     ".")
            gap-ahead (let [[from width floor] gap-ahead]
                        (str "On her right the ground goes on " (dec from) (if (= 2 from) " block" " blocks")
                             ", then stops: a gap " width (if (= 1 width) " block" " blocks") " wide"
                             (if floor "" ", with no floor below (a fall)")
-                            ": walk to its edge, then jump-right to cross it."))
+                            ": walk to its edge, then jump-right, then right while in the air to carry over it."))
            (some (fn [[_ dx dy]] (and (< 0 dx 3) (<= (max dy (- dy)) 1))) (dangers st))
            "On her right the ground goes on, but something that hurts is in the way."
            :else "On her right the way is clear.")
