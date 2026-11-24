@@ -69,9 +69,30 @@
                             (str label " " (char-name (at dr dc)))))
            ".\n"))))
 
+(def ^:private direction-names
+  {[0 -1] "north" [0 1] "south" [1 0] "east" [-1 0] "west"
+   [1 -1] "north-east" [-1 -1] "north-west" [1 1] "south-east" [-1 1] "south-west"})
+
+(defn- changed
+  "A line for what changed from `before` to `s`: the game's message, where the @ went, the HP."
+  [s before]
+  (let [a (:stats before) b (:stats s)
+        msg (str/trim (str (:message s)))
+        dx (- (:x b) (:x a)) dy (- (:y b) (:y a))
+        moved (cond (and (zero? dx) (zero? dy)) nil
+                    (contains? direction-names [dx dy]) (str "You moved " (get direction-names [dx dy]) ".")
+                    :else "You moved.")
+        hp (when (not= (:hp a) (:hp b)) (str " HP " (:hp a) " to " (:hp b) "."))
+        depth (when (not= (:depth a) (:depth b)) (str " Dungeon level " (:depth a) " to " (:depth b) "."))]
+    (str (or moved (if (= (:screen s) (:screen before)) "Nothing changed." "You stayed where you were."))
+         hp depth
+         (when (seq msg) (str " The game says: " msg)))))
+
 (defn told
-  "What a model is told: the terminal, then the numbers and the inventory in words."
+  "What a model is told: the terminal, then the numbers and the inventory in words; with the
+  state a step before, first a line of what changed."
   ([] (told (state)))
+  ([s before] (if before (str (changed s before) "\n" (told s)) (told s)))
   ([s]
    (let [st (:stats s)
          ;; The top lines joined (a long message wraps, --More-- with it).

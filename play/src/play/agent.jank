@@ -17,6 +17,7 @@
             [play.core :as p]
             [play.decide :as decide]
             [play.doom :as doom]
+            [play.nethack :as nethack]
             [play.nova :as nova]
             [play.replay :as replay]
             [play.wnw :as wnw]))
@@ -38,6 +39,13 @@
                               (select-keys b [:x :y :angle :health :ammo :kills :changes])))
           :progress (fn [s] {:kills (long (:kills s)) :health (long (:health s)) :items (long (:items s))
                              :x (long (:x s)) :y (long (:y s))})}
+   :nethack {:start! #'nethack/start! :state #'nethack/state :told #'nethack/told :act! #'nethack/act!
+             ;; The game ends when the character dies (or the game is quit).
+             :over (fn [] (when (:done (nethack/state)) "the game ended (the character died)."))
+             :actions nethack/model-actions :rules nethack/rules :st #'nethack/st :watch! #'nethack/watch!
+             ;; Walking into a wall takes no turn: the screen stays the same.
+             :same? (fn [a b] (and (= (:screen a) (:screen b)) (= (:message a) (:message b))))
+             :progress (fn [s] (select-keys (:stats s) [:depth :hp :hp-max :xp-level :turn :score]))}
    :nova {:start! #'nova/start! :state #'nova/state :told #'nova/told :act! #'nova/act! :version #'nova/version
           ;; A walk into a pit is not done (agents walked off into the same one, four times).
           :caution #'nova/caution

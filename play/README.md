@@ -94,6 +94,17 @@ committee of three thinking players and one thinking player 2 rooms each, and th
 without thinking none in 3 minutes. The decision players start every choice afresh and in
 room 3 fell into the same pocket again and again; the agent remembered it.
 
+On Nova the Squirrel's first level (24 Nov 2026, inkling-2-mini, 30 minutes a run, seeds 83
+to 102): the level is three areas (the game's intro_a, garden and intro_b; RAM 0xA7 reads 0,
+49 and 45), the exit door at x 219 of the third. Every run since seed 98 reached the third
+area, the fastest in 9.5 minutes without a death (seed 100); the furthest was x 123.5 there
+(seed 86). None reached the exit. What was left: a FIRE_WALK pacing a pen in the first area
+(about a hit a run), enemies met in the air after a spring, and a wall at x 113 of the third
+area whose way on goes left, down a ladder and under it (the text now gives that way, from a
+search of the map; no run has reached it since). The text's advice for each spot came from
+playing the recorded runs again from that spot with many plans of actions, and keeping the
+plan that worked across them.
+
 How a game is told matters more than how the model is asked: a map of characters makes it
 count them, so the levels can also be told as runs of things with their positions
 (`(reset! wnw/telling {:map :runs})`, the same for Nova), with what each move from where the
