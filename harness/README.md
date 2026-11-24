@@ -360,6 +360,26 @@ ended after it, driven from outside over its REPL:
 The run in progress is kept in `../trials-out/live.edn` as it goes; another
 window follows it: `(hc/follow-file! "../trials-out/live.edn" "live")`.
 
+## A team
+
+`harness.team` puts three agents on one model for verified work: a coordinator, who has
+the task and the verify tool and can only end its turn once the check passes, and two
+workers it asks (`ask_coder`, `ask_modeler`, or `ask_both` for both at once): the coder writes
+the jank code, the modeler the Veil model. Each worker is an agent of its own, with the
+default tools and verify. Asked together, they work at the same time on their own threads,
+and the engine makes their tokens one forward when they meet (inkling's `:auto-batch`).
+
+```clojure
+(def t (team/team m {:file "work/lru.jank" :system tools/situation}))
+(h/ask! (:coordinator t) "the task")
+```
+
+The coordinator thinks at `:medium` (at the workers' effort it designed the whole work in
+its own thinking and never handed it out), and a worker's step may take 24,576 tokens. The
+trials' driver runs a team as the mode `team`; its workers' conversations are kept beside
+the coordinator's (`live-coder.edn`, `live-modeler.edn`). On lru, a team passed the check
+and the grader in 45 minutes and 93,000 tokens (23 Nov 2026, before the last two fixes).
+
 ## What went wrong, across runs
 
 `harness.review` reads a folder of recordings (from outside the sandbox: the
