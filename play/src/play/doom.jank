@@ -236,8 +236,9 @@
        (str/join "\n" (map (fn [r] (let [a (:angle r)]
                                      (str "- " (if (>= (max a (- a)) 179.0) "behind" (direction a))
                                           (when-let [t (turns a)] (str " " t)) ": " (long (:distance r))
-                                          (when (>= (:distance r) 64.0)
-                                            (if (new-ground? s a (:distance r)) ", new ground" ", been there"))
+                                          (cond (< (:distance r) 64.0) ", a wall close by"
+                                                (new-ground? s a (:distance r)) ", new ground"
+                                                :else ", been there")
                                           (ends-text r))))
                            (cpp/play.doom_rays)))
        "\n"))
