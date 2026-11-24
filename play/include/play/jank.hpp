@@ -111,6 +111,12 @@ namespace play
     return integer(play_nes_run(static_cast<unsigned>(to_int(buttons)), static_cast<unsigned>(to_int(frames))));
   }
 
+  inline object_ref nes_run2(object_ref const buttons, object_ref const buttons2, object_ref const frames)
+  {
+    return integer(play_nes_run2(static_cast<unsigned>(to_int(buttons)), static_cast<unsigned>(to_int(buttons2)),
+                                 static_cast<unsigned>(to_int(frames))));
+  }
+
   inline object_ref nes_frames()
   {
     return integer(play_nes_frames());

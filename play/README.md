@@ -177,6 +177,19 @@ from their sources in `vendor/games/`:
   AUDIO=0 MAPS=0 ./compile_master.sh      # BUILD/main.nes
   ```
 
+- Squirrel Domino, a falling-pill puzzle game for one or two (code zlib; its README asks
+  that its background graphics not be reused in other projects), by Nova the Squirrel's
+  author. Two models play it against each other (`play.domino`), on the NES's two
+  controllers.
+
+  ```sh
+  git clone --depth 1 https://github.com/NovaSquirrel/SquirrelDomino.git && cd SquirrelDomino
+  ca65 squirrel_domino.s -o squirrel_domino.o -l squirrel_domino.lst -g
+  ld65 -C nrom128.x squirrel_domino.o -o squirrel_domino.nes --dbgfile squirrel_domino.dbg
+  ```
+
+  Built from commit 96557700ffe3009f7800da3e76abd95af375bb74.
+
 - Super Tilt Bro. (WTFPL), a fighting game for two: not built yet. Its C sources need a 6502
   GCC built from source (gcc-6502-bits) and a fork of the xa assembler; it has no releases
   on GitHub.

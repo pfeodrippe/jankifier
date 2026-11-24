@@ -14,6 +14,8 @@ extern "C"
    * joypad ids: B 0, Select 2, Start 3, Up 4, Down 5, Left 6, Right 7, A 8). */
   int play_nes_open(char const *core, char const *game, char *error, int size);
   int play_nes_run(unsigned buttons, unsigned frames);
+  /* The same with the second controller's buttons too (two players). */
+  int play_nes_run2(unsigned buttons, unsigned buttons2, unsigned frames);
   long long play_nes_frames(void);
   int play_nes_ram(unsigned char *out, int max);
   int play_nes_cartridge_ram(unsigned char *out, int max);

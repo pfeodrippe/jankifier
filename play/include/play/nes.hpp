@@ -44,7 +44,8 @@ namespace play
     // What the core's callbacks see: the one emulator of the process.
     struct frontend
     {
-      unsigned buttons{};
+      // The two controllers' buttons (port 0 and port 1).
+      unsigned buttons{}, buttons2{};
       std::vector<uint32_t> picture; // XRGB8888
       unsigned width{}, height{};
       std::string directory{ "." };
@@ -142,15 +143,16 @@ namespace play
 
     inline int16_t input_state(unsigned port, unsigned device, unsigned, unsigned id)
     {
-      if(port != 0 || device != RETRO_DEVICE_JOYPAD)
+      if(port > 1 || device != RETRO_DEVICE_JOYPAD)
       {
         return 0;
       }
+      unsigned const held{ port == 0 ? the().buttons : the().buttons2 };
       if(id == RETRO_DEVICE_ID_JOYPAD_MASK)
       {
-        return static_cast<int16_t>(the().buttons);
+        return static_cast<int16_t>(held);
       }
-      return (the().buttons >> id) & 1u;
+      return (held >> id) & 1u;
     }
   }
 
@@ -255,14 +257,17 @@ namespace play
         throw std::runtime_error("the core didn't take the game at " + path);
       }
       set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
+      set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
       loaded = true;
       frames = 0;
     }
 
-    // `n` frames with `buttons` held.
-    void run(unsigned buttons, unsigned n = 1)
+    // `n` frames with `buttons` held on the first controller (and `buttons2` on the
+    // second).
+    void run(unsigned buttons, unsigned n = 1, unsigned buttons2 = 0)
     {
       detail::the().buttons = buttons;
+      detail::the().buttons2 = buttons2;
       for(unsigned i{}; i < n; ++i)
       {
         run_frame();

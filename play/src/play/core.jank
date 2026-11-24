@@ -38,6 +38,12 @@
   ([ks] (nes-run! ks 1))
   ([ks frames] (cpp/play.nes_run (held ks) frames)))
 
+(defn nes-run2!
+  "`frames` frames with the first controller's buttons `ks` held and the second's `ks2` (two
+  players)."
+  [ks ks2 frames]
+  (cpp/play.nes_run2 (held ks) (held ks2) frames))
+
 (defn nes-frames [] (cpp/play.nes_frames))
 (defn nes-queued "Frames run and not yet shown (the window shows them at the game's speed)." [] (cpp/play.nes_queued))
 (defn nes-flush! "The frames not yet shown dropped: the last one run shown now (after a jump)." [] (cpp/play.nes_flush))

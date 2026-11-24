@@ -1,0 +1,192 @@
+;; SPDX-License-Identifier: MIT
+;; Squirrel Domino (NovaSquirrel's, built from its sources in vendor/games/: zlib), a
+;; falling-pill puzzle game for two: each player clears the viruses in its own field, and the
+;; first to clear all of them wins. Both players' state read from RAM (the build's
+;; squirrel_domino.dbg names the addresses), each told its own field, and a step is both
+;; players' buttons at once (the NES's two controllers). Two model players choose at the same
+;; time, each on its own thread: the engine makes their tokens one forward.
+;;
+;;   (domino/watch!)                       ; its card, at the top of the window
+;;   (domino/start!)                       ; power-on to a versus game
+;;   (domino/play-models! [p1 p2] 300)     ; two model players, 300 steps, in the background
+(ns play.domino
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [play.core :as p]
+            [play.decide :as decide]))
+
+(def game (p/vendor "games" "SquirrelDomino" "squirrel_domino.nes"))
+
+;; RAM (squirrel_domino.dbg): two bytes each, player 1's then player 2's; the fields at $700,
+;; 128 bytes a player, a column of 16 rows after another.
+(def addr {:state 0x26 :x 0x47 :y 0x49 :dir 0x4D :color1 0x4F :color2 0x51 :next1 0x53 :next2 0x55
+           :viruses 0x5B :field 0x700})
+(def width 8)
+(def height 16)
+;; The game's states (squirrel_domino.s PuzzleStates) and colours (the order its pieces use).
+(def states ["starting" "new pill" "pill falling" "matching" "falling" "won" "lost"])
+(def colors ["red" "green" "blue"])
+;; A field's byte: 0 empty, else $80, the colour times 8 and the kind (PuzzleTiles).
+(def kinds ["virus" "pill" "pill" "pill" "pill" "pill" "clearing"])
+
+(defn- cell [ram player col row]
+  (nth ram (+ (get addr :field) (* player 128) (* col height) row)))
+
+(defn state
+  "Both players: [{:state :x :y :vertical :colors [c1 c2] :next [c1 c2] :field [[cell ...] ...]
+  :viruses} ...]; a field is rows of cells, nil or {:kind :color}."
+  []
+  (let [ram (p/nes-ram)
+        at (fn [k player] (nth ram (+ (get addr k) player)))]
+    (vec (for [player [0 1]]
+           (let [field (vec (for [row (range height)]
+                              (vec (for [col (range width)]
+                                     (let [v (cell ram player col row)]
+                                       (when (pos? v)
+                                         {:kind (get kinds (bit-and v 7) "pill")
+                                          :color (get colors (bit-and (bit-shift-right v 3) 3) "grey")}))))))]
+             {:state (get states (at :state player) "unknown")
+              :x (at :x player) :y (at :y player) :vertical (pos? (at :dir player))
+              :colors [(get colors (at :color1 player)) (get colors (at :color2 player))]
+              :next [(get colors (at :next1 player)) (get colors (at :next2 player))]
+              :field field
+              :viruses (count (filter (fn [c] (= "virus" (:kind c))) (apply concat field)))})))))
+
+(defn- pill-cells
+  "The cells of a pill at x, y: [x y] then its second half (to the right, or above when it
+  stands)."
+  [x y vertical]
+  (if vertical [[x y] [x (dec y)]] [[x y] [(inc x) y]]))
+
+(defn- landing
+  "The row a pill would land at if dropped now (its first half's)."
+  [pl]
+  (let [free? (fn [[c r]] (or (< r 0) (and (< -1 c width) (< r height) (nil? (get-in (:field pl) [r c])))))]
+    (loop [y (:y pl)]
+      (if (every? free? (pill-cells (:x pl) (inc y) (:vertical pl)))
+        (recur (inc y))
+        y))))
+
+(defn- runs
+  "A field as runs of the same thing on a row, with their x: a line a row that has something."
+  [pl]
+  (str/join "\n"
+            (for [row (range height)
+                  :let [cells (map-indexed vector (get (:field pl) row))
+                        groups (remove (fn [g] (nil? (second (first g))))
+                                       (partition-by (fn [[_ c]] (when c [(:color c) (:kind c)])) cells))]
+                  :when (seq groups)]
+              (str "y " row ": "
+                   (str/join ", " (map (fn [g] (let [[x0 c] (first g) [x1 _] (last g)]
+                                                 (str (:color c) " " (:kind c) (when (> (count g) 1) "s")
+                                                      (if (= x0 x1) (str " at x " x0) (str " x " x0 " to " x1)))))
+                                       groups))))))
+
+(defn told
+  "What player `player` (0 or 1) is told: its pill and where it would land, its field, the
+  other's viruses left."
+  ([player] (told player (state)))
+  ([player st]
+   (let [pl (get st player)
+         other (get st (- 1 player))
+         [c1 c2] (:colors pl)]
+     (str "You are player " (inc player) ". " (:state pl) ". Your viruses left: " (:viruses pl)
+          "; the other player's: " (:viruses other) ".\n"
+          (when (= "pill falling" (:state pl))
+            (str "Your pill: " c1 " at (" (:x pl) ", " (:y pl) ") and " c2 " "
+                 (if (:vertical pl) "above it" "to its right")
+                 (if (:vertical pl) " (standing)" " (lying)") ". Dropped now, it would land at row "
+                 (landing pl) ". Next pill: " (str/join " and " (:next pl)) ".\n"))
+          "Your field, 8 wide (x 0 to 7) and 16 high (y 0 at the top, 15 at the bottom), by row "
+          "(empty cells left out):\n"
+          (let [r (runs pl)] (if (seq r) r "(empty)"))))))
+
+;; Actions: buttons held for a moment, for both players at once.
+
+(def actions
+  {:left [:left] :right [:right] :rotate [:b] :drop [:up] :down [:down] :wait []})
+
+(def press-frames 4)
+(def step-frames 8)
+
+(defn act!
+  "One step: player 1's action and player 2's, their buttons pressed together, then released."
+  [a1 a2]
+  (p/nes-run2! (get actions a1 []) (get actions a2 []) press-frames)
+  (p/nes-run2! [] [] (- step-frames press-frames)))
+
+(defonce st (atom {}))
+
+(defn start!
+  "Power-on to a versus game, 4 viruses each (worked out by hand, with snapshots: the title,
+  down to \"Versus mode\", A, Start for player 1, then for player 2 on its own controller): nil,
+  or what went wrong."
+  []
+  (or (p/nes-open! game)
+      (do
+        (p/nes-run! [] 180)
+        (doseq [[ks ks2 frames] [[[:down] [] 4] [[] [] 10] [[:a] [] 4] [[] [] 90] [[:start] [] 4] [[] [] 120]
+                                 [[] [:start] 4] [[] [] 150]]]
+          (p/nes-run2! ks ks2 frames))
+        (p/nes-flush!)
+        (reset! st {:step 0 :told (told 0)})
+        nil)))
+
+;; Model players.
+
+(def rules
+  "What a model playing Squirrel Domino is told of the game (its own help, and its sources)."
+  (str "You play Squirrel Domino, a falling-pill puzzle game on the NES, against another player, "
+       "each in a field of its own. Viruses sit in your field, each red, green or blue. Pills of "
+       "two halves fall from the top, one at a time; each half is red, green or blue. Make a line "
+       "of 4 or more of the same colour, across or down (viruses and pill halves together), to "
+       "clear it. Clear all your viruses before the other player clears theirs to win. Actions: "
+       "left and right move the falling pill a column; rotate turns it (lying or standing; turning "
+       "it twice swaps its halves); drop puts it down at once where it would land; down makes it "
+       "fall faster; wait does nothing (it falls by itself, slowly). Put a pill's halves on or "
+       "beside viruses of their colour."))
+
+(def model-actions [:left :right :rotate :drop :down :wait])
+
+(defonce decisions (atom [[] []]))
+(defonce running (atom false))
+
+(defn model-player
+  "A player of Squirrel Domino for model `m` (play.decide); `settings` as decide/player's."
+  ([m] (model-player m {}))
+  ([m settings] (decide/player m (merge {:rules rules :actions model-actions} settings))))
+
+(defn play-models!
+  "`steps` steps of two model players against each other, in the background: at each, both
+  choose at the same time on their own threads (the engine makes their tokens one forward),
+  then both actions are done together. Each decision kept in `decisions` (player 1's, player
+  2's). A future, done when the steps are or a player has won or lost; (stop!) ends it."
+  [[p1 p2] steps]
+  (reset! decisions [[] []])
+  (reset! running true)
+  (future
+    (try
+      (loop [i 0]
+        (let [s (state)]
+          (when (and @running (< i steps) (not (some (fn [pl] (contains? #{"won" "lost"} (:state pl))) s)))
+            (let [t1 (told 0 s)
+                  t2 (told 1 s)
+                  f1 (future (decide/choose! p1 t1))
+                  f2 (future (decide/choose! p2 t2))
+                  d1 (assoc @f1 :told t1)
+                  d2 (assoc @f2 :told t2)]
+              (act! (:action d1) (:action d2))
+              (swap! decisions (fn [[a b]] [(conj a d1) (conj b d2)]))
+              (reset! st {:step (inc i) :action (:action d1) :decision d1 :told t1
+                          :result (str "player 2: " (name (:action d2)))})
+              (recur (inc i))))))
+      (catch :default _ nil))
+    (reset! running false)
+    :done))
+
+(defn stop! [] (reset! running false))
+
+(defn watch!
+  "Squirrel Domino's card at the top of the window: both fields, and player 1's side."
+  []
+  (c/pin! "Squirrel Domino" st (p/decision-card (p/picture-part :nes 360))))

@@ -273,13 +273,18 @@ extern "C"
 
   int play_nes_run(unsigned buttons, unsigned frames)
   {
+    return play_nes_run2(buttons, 0, frames);
+  }
+
+  int play_nes_run2(unsigned buttons, unsigned buttons2, unsigned frames)
+  {
     if(!nes_now)
     {
       return -1;
     }
     for(unsigned i{}; i < frames; ++i)
     {
-      nes_now->run(buttons, 1);
+      nes_now->run(buttons, 1, buttons2);
       std::lock_guard<std::mutex> hold{ nes_lock };
       nes_latest = nes_now->picture();
       nes_queued.push_back(nes_latest);
