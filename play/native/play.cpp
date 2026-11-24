@@ -126,7 +126,8 @@ namespace
                                                            vizdoom::POSITION_Z };
   std::vector<vizdoom::Button> const doom_buttons{ vizdoom::MOVE_FORWARD, vizdoom::MOVE_BACKWARD, vizdoom::TURN_LEFT,
                                                    vizdoom::TURN_RIGHT,   vizdoom::ATTACK,        vizdoom::USE,
-                                                   vizdoom::MOVE_LEFT,    vizdoom::MOVE_RIGHT };
+                                                   vizdoom::MOVE_LEFT,    vizdoom::MOVE_RIGHT,
+                                                   vizdoom::SPEED };
 
   // How far the player can walk in some directions (degrees to the left of where it faces),
   // from the map's lines: a line stops it when it is one-sided or impassable, or when the

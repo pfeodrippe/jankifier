@@ -19,13 +19,16 @@
 (def wad (p/vendor "ViZDoom" "src" "freedoom2.wad"))
 
 ;; The buttons, as play.h orders them.
-(def buttons {:forward 1 :back 2 :turn-left 4 :turn-right 8 :attack 16 :use 32 :strafe-left 64 :strafe-right 128})
+(def buttons {:forward 1 :back 2 :turn-left 4 :turn-right 8 :attack 16 :use 32 :strafe-left 64 :strafe-right 128
+              :speed 256})
 
 (def actions
   "What a player can do in a step: a name and the buttons held."
   {:forward [:forward] :back [:back] :turn-left [:turn-left] :turn-right [:turn-right]
    :attack [:attack] :use [:use] :strafe-left [:strafe-left] :strafe-right [:strafe-right]
-   :forward-left [:forward :strafe-left] :forward-right [:forward :strafe-right] :wait []})
+   :forward-left [:forward :strafe-left] :forward-right [:forward :strafe-right] :wait []
+   ;; Forward with the run key held, not waited out: the player keeps its speed.
+   :run [:forward :speed]})
 
 (def ^:private arcs
   ;; Versions 1 to 3: forward-left and forward-right walked while turning (an arc; the agent
@@ -44,7 +47,7 @@
   units and 8 about 34; turning too, 8 tics turn 16 degrees and 12 about 33; the pistol fires
   once in 14 tics every time, in 8 half the time, in 16 sometimes twice)."
   {:forward 12 :back 12 :strafe-left 12 :strafe-right 12 :forward-left 12 :forward-right 12
-   :turn-left 10 :turn-right 10 :attack 14})
+   :turn-left 10 :turn-right 10 :attack 14 :run 12})
 
 (defonce st (atom {}))
 
@@ -489,7 +492,7 @@
           _ (cpp/play.doom_mark)
           aimed (if (= action :attack) (aim! around) 0.0)
           reward (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics)))
-          reward (+ reward (if settle (settled!) 0.0))
+          reward (+ reward (if (and settle (not= action :run)) (settled!) 0.0))
           moved (moved-near (state))]
       ;; A line walked over, a shot switch: what it set off, said.
       (when (seq moved)
@@ -587,18 +590,22 @@
        "exit, and shoot the monsters that attack you. Each action holds the keys for a moment: "
        "forward and back walk (about 100 units: each move is waited out until you stop), turn-left and "
        "turn-right turn 30 degrees, forward-left and "
-       "forward-right walk ahead and to the side at once, without turning, strafe-left and strafe-right step sideways, attack "
+       "forward-right walk ahead and to the side at once, without turning, run runs ahead (about "
+       "twice as far as forward, and not waited out: you keep your speed into the next action; for "
+       "when time matters), strafe-left and strafe-right step sideways, attack "
        "turns to the nearest monster that can see you, in view or not, and shoots it (with none, it "
        "doesn't fire), use opens a door within 64 units straight ahead or "
        "presses a switch right in front of you, wait does nothing. Distances are in map units: "
        "the player is 32 wide, a corridor about 128. Directions: your facing is in degrees "
        "counterclockwise, 0 east (x grows) and 90 north (y grows); turn-left adds 30 to it, "
        "turn-right takes 30 away. Each direction you are told says how many turns face it. Armor "
-       "takes part of each hit until it runs out; health items heal, and at 0 health you die."))
+       "takes part of each hit until it runs out; health items heal, and at 0 health you die. "
+       "Game time passes only while you act. A door opened from afar (by a line walked over or a "
+       "switch) closes again after about 4 seconds of game time: run to it."))
 
 (def model-actions
-  [:forward :turn-left :turn-right :forward-left :forward-right :back :strafe-left :strafe-right :attack :use
-   :wait])
+  [:forward :run :turn-left :turn-right :forward-left :forward-right :back :strafe-left :strafe-right :attack
+   :use :wait])
 
 (defonce decisions (atom []))
 ;; The last model game's conversation (play.decide/conversation), shown above the game.
