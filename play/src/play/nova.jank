@@ -151,10 +151,11 @@
         ledge (and (:on-ground st) (= "=" (at 0 1)))
         ladder (or (= "H" (at 0 0)) (= "H" (at 0 -1)))
         door (= "D" (at 0 0))
-        ;; The level's end on her right: nothing at all in the columns 2 to 12 past her (the
-        ;; level's data holds nothing there: walking right is blocked by the level's edge).
-        ended (every? (fn [dx] (every? (fn [row] (zero? ((:map st) (+ px dx) row))) (range rows)))
-                      (range 2 13))
+        ;; The level's end on her right: within 3 columns of the first column after which the
+        ;; level's data holds nothing for 12 (walking right is blocked by the level's edge).
+        empty-col? (fn [c] (every? (fn [row] (zero? ((:map st) c row))) (range rows)))
+        end-col (first (filter (fn [c] (every? empty-col? (range c (+ c 12)))) (range px (+ px 40))))
+        ended (and end-col (<= (- end-col px) 3))
         ;; The nearest ladder or door on her row within 4 blocks, when she isn't at one.
         near (first (for [dx [1 -1 2 -2 3 -3 4 -4]
                           :let [ch (at dx 0)]
