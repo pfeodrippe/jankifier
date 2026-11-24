@@ -39,8 +39,11 @@
           :progress (fn [s] {:kills (long (:kills s)) :health (long (:health s)) :items (long (:items s))
                              :x (long (:x s)) :y (long (:y s))})}
    :nova {:start! #'nova/start! :state #'nova/state :told #'nova/told :act! #'nova/act! :version #'nova/version
-          ;; A walk right into a pit is not done (agents walked off into the same one, four times).
+          ;; A walk into a pit is not done (agents walked off into the same one, four times).
           :caution #'nova/caution
+          ;; Not moving her is what these do: they don't stop the actions after them (an
+          ;; attack stopped an agent's list as if it had changed nothing).
+          :still #{:attack :wait}
           :actions nova/model-actions :rules nova/rules :st #'nova/st :watch! #'nova/watch!
           :same? (fn [a b] (and (= (:x a) (:x b)) (= (:y a) (:y b))))
           :progress (fn [s] {:x (/ (long (* 10 (:x s))) 10.0) :health (:health s)})}})
@@ -118,7 +121,7 @@
                           (str (str/join "\n" (conj said (str (name k) ": " changed)))
                                "\n\nThe game is over: " ((:over g)) " Stopped here.")
 
-                          (same? before after)
+                          (and (same? before after) (not (contains? (:still g) k)))
                           (str (str/join "\n" (conj said (str (name k) ": " changed " Stopped here: it changed nothing.")))
                                "\n\nThe game now:\n" (told after before))
                           :else
