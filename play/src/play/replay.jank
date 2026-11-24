@@ -73,7 +73,7 @@ namespace play_replay_native
    :doom {:title "Doom" :start! #'doom/start! :act! #'doom/act! :stop! #'doom/stop! :picture #'doom/picture
           ;; Where it was played (the scenario), kept and started from.
           :setting #'doom/setting :start-with #'doom/start-with!
-          :version #'doom/version :acts {1 #'doom/act-v1! 2 #'doom/act-v2! 3 #'doom/act-v3! 4 #'doom/act-v4! 5 #'doom/act-v5! 6 #'doom/act-v6! 7 #'doom/act-v7! 8 #'doom/act!}
+          :version #'doom/version :acts {1 #'doom/act-v1! 2 #'doom/act-v2! 3 #'doom/act-v3! 4 #'doom/act-v4! 5 #'doom/act-v5! 6 #'doom/act-v6! 7 #'doom/act-v7! 8 #'doom/act-v8! 9 #'doom/act!}
           :play-model! #'doom/play-model! :decisions #'doom/decisions :conversation #'doom/conversation
           :saves false}
    :wnw {:title "Witch n' Wiz" :start! #'wnw/start! :act! #'wnw/act! :stop! #'wnw/stop!

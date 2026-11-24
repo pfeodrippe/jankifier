@@ -311,11 +311,12 @@
 
 (defn- threats
   "The monsters alive that can see the player, the nearest first: [object distance degrees].
-  Those on the screen (ViZDoom's labels: in view, so seen), and those anywhere around within
-  1500 that the line of sight reaches (to their middle, their feet and 28: one on a ledge is
-  seen over it)."
-  [s]
-  (let [shown (for [o (:objects s) :when (alive? o) :let [[d a] (bearing s o)]] [o d a])
+  Those on the screen (ViZDoom's labels: in view, so seen; not with `sight-only`, as version
+  8 played), and those anywhere around within 1500 that the line of sight reaches (to their
+  middle, their feet and 28: one on a ledge is seen over it)."
+  ([s] (threats s false))
+  ([s sight-only]
+  (let [shown (if sight-only [] (for [o (:objects s) :when (alive? o) :let [[d a] (bearing s o)]] [o d a]))
         apart (fn [a b] (let [d (- a b)] (max d (- d))))
         near (fn [o p] (< (+ (apart (:x o) (:x p)) (apart (:y o) (:y p))) 48.0))
         sighted (for [o (cpp/play.doom_monsters)
@@ -323,7 +324,7 @@
                       :let [[d a] (bearing s o)]
                       :when (and (< d 1500.0) (cpp/play.doom_sees_at (:x o) (:y o) (+ (:z o) 28.0)))]
                   [o d a])]
-    (vec (sort-by second (concat shown sighted)))))
+    (vec (sort-by second (concat shown sighted))))))
 
 (defn- moved
   "How the player moved from `before` to `s`, as a sentence (and what the last action did:
@@ -450,7 +451,7 @@
   [around]
   (loop [i 0 reward 0.0]
     (let [s (state)
-          [_ _ a] (if around (first (seq (threats s))) (nearest-enemy s))]
+          [_ _ a] (if around (first (seq (threats s (= around :sight)))) (nearest-enemy s))]
       (if (and a (>= (max a (- a)) aimed-within) (< i 60) (not (cpp/play.doom_finished)))
         (recur (inc i) (+ reward (cpp/play.doom_act (get buttons (if (pos? a) :turn-left :turn-right)) 1)))
         reward))))
@@ -538,9 +539,9 @@
   with turns of a fixed angle, 4 with forward-left and forward-right stepping to the side
   instead of turning, 5 with each move waited out until the player stops, 6 with use waiting
   for a lift to start, 7 with attack not fired with no monster in view, 8 with attack turning
-  to the nearest monster that can see the player, in view or not. Raised whenever act!
-  changes."
-  8)
+  to the nearest monster that can see the player, in view or not, 9 with every monster on the
+  screen counting as one that can see the player. Raised whenever act! changes."
+  9)
 
 (def ^:private v1-tics
   {:forward 12 :back 12 :strafe-left 12 :strafe-right 12 :forward-left 12 :forward-right 12
@@ -580,7 +581,7 @@
     :turn-right (turn! (- turn-degrees))
     :use (use! lift-wait)
     (if (and hold-fire (= action :attack)
-             (not (if around (seq (threats (state))) (nearest-enemy (state)))))
+             (not (if around (seq (threats (state) (= around :sight))) (nearest-enemy (state)))))
       (do (reset! note (if around "No monster can see you: not fired." "No monster in view: not fired."))
           0.0)
     (let [before (state)
@@ -621,6 +622,12 @@
   "An action as version 7 played it: attack turning only to a monster in view."
   [action]
   (acted! {:moves actions :settle true :lift-wait true :hold-fire true} action))
+
+(defn act-v8!
+  "An action as version 8 played it: the monsters that can see the player only by the line of
+  sight."
+  [action]
+  (acted! {:moves actions :settle true :lift-wait true :hold-fire true :around :sight} action))
 
 (defn act!
   "One step: the action's buttons held for its tics, then a move waited out until the player
