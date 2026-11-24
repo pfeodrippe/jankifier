@@ -813,8 +813,15 @@
                    (catch cpp/jank.error_ref e {:failed (str (cpp/.-message (cpp/* e)))})
                    (catch cpp/std.exception e {:failed (str (cpp/.what e))})
                    (catch :default _ {:failed "the compaction threw something jank does not say"}))]
-        (if-not (and (string? said) (seq (str/trim said)))
+        (cond
+          ;; Stopped while the summary was being made (a run's time ran out): nothing to put in
+          ;; place, and not a failure (it was shown as "couldn't compact").
+          (:stop @a) nil
+
+          (not (and (string? said) (seq (str/trim said))))
           {:failed (if (map? said) (:failed said) "the compaction gave no summary") :began began :reason reason}
+
+          :else
           (let [e {:role :compacted :text (str/trim said) :reason reason
                    :summarized (count summarized) :kept (count kept) :tokens-before tokens-before
                    :began began}
