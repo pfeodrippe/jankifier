@@ -211,6 +211,30 @@
             nearest nearest
             :else [nil nil]))))
 
+(defn- stairs
+  "Steps up on Nova's right starting at column offset `d` (her row's solid there): the walls
+  of the columns from d rise a block or two each, for 3 columns or more: [first-height
+  top-height columns fall-behind?], else nil. Each is climbed with a jump onto it; a jump
+  steered right in the air carried an agent past their top into the pit behind."
+  [st d]
+  (let [px (long (:x st)) py (feet-row st)
+        at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
+        solid? (fn [ch] (contains? #{"#" "!" "L"} ch))
+        height (fn [col] (count (take-while (fn [dy] (solid? (at col (- dy)))) (range 0 10))))
+        hs (mapv height (range d (+ d 8)))
+        n (inc (count (take-while (fn [i] (< (nth hs i) (nth hs (inc i)) (+ (nth hs i) 3))) (range 0 7))))]
+    (when (and (pos? (first hs)) (>= n 3))
+      [(first hs) (nth hs (dec n)) n (fall? st (+ px d n))])))
+
+(defn- stairs-text
+  "The sentence for steps up from column offset `d`."
+  [[h0 top n fall-behind] d]
+  (str "On her right are steps up, a column each from x " d " to x " (+ d n -1) " (" h0 " to " top
+       " blocks high): jump-right onto the first, then each next with another jump-right, stopping on each"
+       " (steering right in the air carries her past the top)"
+       (when fall-behind ", and behind the top is a fall: from the top, jump-right over it, then right in the air")
+       ". "))
+
 (defn- around
   "What is next to Nova, from the map and the objects: the dangers near her, the wall on her
   right and how high, a gap or spikes ahead on the ground, as sentences."
@@ -229,9 +253,12 @@
         ;; and whether it has a floor below (else a fall).
         gap-ahead (when (and (:on-ground st) (not (pos? (or gap 0))))
                     (when-let [from (first (filter (fn [dx] (= "." (at dx 1))) (range 2 9)))]
+                      ;; Only when no wall stands on her row before it (stairs before a pit read
+                      ;; as "the ground goes on 7 blocks, then stops").
+                      (when-not (some (fn [dx] (contains? #{"#" "!" "L"} (at dx 0))) (range 1 from))
                       (let [width (count (take-while (fn [dx] (= "." (at dx 1))) (range from (+ from 8))))
                             floor (not (fall? st (+ px from)))]
-                        [from width floor])))
+                        [from width floor]))))
         spikes (first (filter (fn [dx] (or (= "^" (at dx 0)) (= "^" (at dx 1)))) (range 1 5)))
         ledge (and (:on-ground st) (= "=" (at 0 1)))
         ladder (or (= "H" (at 0 0)) (= "H" (at 0 -1)))
@@ -306,6 +333,7 @@
                 ". "))
          (cond
            ended "On her right the level ends: nothing is past it, and walking right is blocked. The way on is elsewhere: a door (D) or a ladder (H). "
+           (and (pos? wall) (stairs st 1)) (stairs-text (stairs st 1) 1)
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
                             (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
            ;; Ground below the gap: a drop onto it, not a jump across (from a high platform an
@@ -335,6 +363,8 @@
            ;; How far clear, and the wall after it: "clear" with a wall 5 blocks on read as a
            ;; contradiction to an agent.
            :else (if-let [d (first (filter (fn [dx] (solid? (at dx 0))) (range 2 13)))]
+                   (if-let [up (stairs st d)]
+                     (str "On her right the way is clear for " (dec d) (if (= 2 d) " block" " blocks") ". " (stairs-text up d))
                    (let [height (fn [col] (count (take-while (fn [dy] (solid? (at col (- dy)))) (range 0 8))))
                          h (height d)
                          ;; A taller wall just behind a step decides the advice (an agent read
@@ -347,7 +377,7 @@
                           ;; the wall to the map's lock).
                           (let [c (at d 0)] (when (not= "#" c) (str " (the " (get char-names c c) " at x " d ")")))
                           (when taller (str ", and behind it at x " taller " one " top " high"))
-                          (if (<= top 2) " (jump-right gets over it)." " (too high to jump: look for another way).")))
+                          (if (<= top 2) " (jump-right gets over it)." " (too high to jump: look for another way)."))))
                    "On her right the way is clear."))
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right."))
          (when fall-left (str " On her left "
