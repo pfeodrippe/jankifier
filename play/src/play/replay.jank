@@ -94,7 +94,9 @@ namespace play_replay_native
   ([game decisions] (save! game decisions {}))
   ([game decisions about]
    (cpp/play_replay_native.make_dirs folder)
-   (let [path (str folder "/" (name game) "-" (cpp/play_replay_native.stamp) ".edn")]
+   ;; A population's agents are kept in the same second: each with its id in the name.
+   (let [path (str folder "/" (name game) "-" (cpp/play_replay_native.stamp)
+                   (when-let [id (:population about)] (str "-agent" id)) ".edn")]
      (spit path (pr-str {:game game
                          :about (merge (when-let [f (get-in games [game :setting])] (f))
                                        (assoc about :version (deref-version game)))

@@ -12,7 +12,9 @@
     (population/stop!)"
   (:require [clojure.string :as str]
             [harness.core :as h]
+            [cards.core :as c]
             [harness.cards :as hc]
+            [inkling.core :as ink]
             [play.agent :as agent]
             [play.core :as p]
             [play.nethack :as nethack]
@@ -23,26 +25,46 @@
 ;; NetHack has no snapshot, but with the same seed it plays the same way: its copy is the
 ;; actions from its start (replayed in well under a second) and the traps the agent's text
 ;; has noted. Nova's is the emulator's saved state.
+(defonce ^{:doc "The traps any agent's copy has noted (NetHack): #{[level x y]}."} shared-traps (atom #{}))
+
 (def copies
-  {:nethack {:take (fn [c] (assoc c :traps @nethack/traps))
+  {:nethack {:take (fn [c]
+                    (swap! shared-traps into @nethack/traps)
+                    ;; The squares shown so far, by level (the screen alone counts less when a
+                    ;; menu covers the map: a score from it went down and up).
+                    (let [s (nethack/state)
+                          depth (:depth (:stats s))
+                          shown (when (:normal s)
+                                  (for [r (range 1 22)
+                                        :let [line (get (:screen s) r "")]
+                                        x (range (count line))
+                                        :when (not= \space (nth line x))]
+                                    [depth x r]))]
+                      (-> c
+                          (assoc :traps @nethack/traps)
+                          (update :seen (fnil into #{}) shown))))
              :put! (fn [c]
                      (nethack/start! (:seed c 1))
                      (doseq [k (:actions c)] (nethack/act! k))
-                     (reset! nethack/traps (:traps c #{})))
+                     ;; Its traps, and the traps any agent found on the first level: with the
+                     ;; same seed that level is the same in every copy (deeper ones are made
+                     ;; when first reached, from the game's random state then, so they differ).
+                     (reset! nethack/traps (into (:traps c #{}) (filter (fn [[d]] (= 1 d)) @shared-traps))))
              :fresh (fn [seed] {:seed seed :actions [] :traps #{}})
-             ;; Further on: deeper, then more of the level seen, then more experience.
-             :score (fn [s] (let [st (:stats s)
-                                  seen (count (filter (fn [ch] (not= \space ch))
-                                                      (apply str (subvec (:screen s) 1 22))))]
-                              (+ (* 100000 (:depth st)) (* 10 seen) (:xp-level st))))}
+             ;; Further on: deeper, then more of the dungeon seen, then more experience.
+             ;; A game that has ended (the character died) is last.
+             :score (fn [s c] (if (:done s)
+                                -1
+                                (+ (* 100000 (:depth (:stats s))) (* 10 (count (:seen c))) (:xp-level (:stats s)))))}
    :nova {:take (fn [c] (assoc c :save (p/nes-save!)))
           :put! (fn [c] (p/nes-restore! (:save c)))
           :fresh (fn [_] {:save (p/nes-save!)})
           ;; The areas in the level's order, then how far right, then health.
-          :score (fn [s] (+ (* 1000 (get {0 0 49 1 45 2} (:level s) 0)) (long (:x s)) (* 0.01 (:health s))))}})
+          :score (fn [s _] (+ (* 1000 (get {0 0 49 1 45 2} (:level s) 0)) (long (:x s)) (* 0.01 (:health s))))}})
 
 (defonce ^{:doc "The agents: [{:id :agent :copy (atom) :steps (atom) :score}]."} members (atom []))
 (defonce running (atom false))
+(defonce ^{:doc "What the agents told each other: [{:from id :text}]."} board (atom []))
 (defonce ^:private owner (atom nil))
 (defonce ^:private holding (atom nil))
 
@@ -69,11 +91,23 @@
   its own steps."
   [game m opts id copy steps]
   (let [g (get agent/games game)
-        mem {:id id :copy (atom copy) :steps (atom (vec steps))}
+        mem {:id id :copy (atom copy) :steps (atom (vec steps))
+             ;; Set to hold its turns (for a copy to be made of it); :paused once they are held.
+             :hold (atom false) :paused (atom false)}
         ;; The game's act! also kept in the copy: NetHack's copy is its actions.
         g (assoc g :act! (fn [k] (swap! (:copy mem) update :actions (fnil conj []) k) ((:act! g) k)))
-        a (agent/agent-of g m opts {:steps (:steps mem) :running running :guard (fn [f] (with-game game mem f))})]
-    (assoc mem :agent a)))
+        tell {:name "tell_others"
+              :doc (str "Tells the other agents playing this same game (the same dungeon, each in its own copy) "
+                        "something you found that helps them: where the stairs are, a trap, a dead end, what "
+                        "worked. Short and plain; they read it at their next turn.")
+              :params {:text {:type "string" :doc "what to tell them"}}
+              :fn (fn [{:keys [text]}]
+                    (swap! board conj {:from id :text (str text)})
+                    ;; A string made at the call (a bare literal here broke jank's C++).
+                    (str "Told: the others read it at their next turn."))}
+        a (agent/agent-of g m opts {:steps (:steps mem) :running running :guard (fn [f] (with-game game mem f))
+                                    :extra-tools [tell]})]
+    (assoc mem :agent a :read (atom (count @board)))))
 
 (defn- turns!
   "Member `mem`'s agent asked to play, turn after turn, until `running` is off or its :retired
@@ -83,7 +117,16 @@
     (try
       (loop [i 0]
         (when (and @running (not (:retired @(:copy mem))))
-          (h/ask! (:agent mem) (if (zero? i) first-ask "Go on playing: a new turn, with its own steps (the game is as you left it)."))
+          (when @(:hold mem)
+            (reset! (:paused mem) true)
+            (loop [] (when (and @(:hold mem) @running) (cpp/usleep 100000) (recur)))
+            (reset! (:paused mem) false))
+          (let [new (filter (fn [e] (not= (:from e) (:id mem))) (subvec @board (min @(:read mem) (count @board))))
+                heard (when (seq new)
+                        (str "\n\nThe other agents told you:\n"
+                             (str/join "\n" (for [e new] (str "- agent " (:from e) ": " (:text e))))))]
+            (reset! (:read mem) (count @board))
+            (h/ask! (:agent mem) (str (if (zero? i) first-ask "Go on playing: a new turn, with its own steps (the game is as you left it).") heard)))
           (h/answer (:agent mem))
           (recur (inc i))))
       (catch :default _ nil))
@@ -92,7 +135,7 @@
 (defn score-of
   "Member `mem`'s progress, read from its copy of the game."
   [game mem]
-  (with-game game mem (fn [] ((:score (get copies game)) ((:state (get agent/games game)))))))
+  (with-game game mem (fn [] ((:score (get copies game)) ((:state (get agent/games game))) @(:copy mem)))))
 
 (defn report
   "Each member's id, score, actions and progress."
@@ -103,15 +146,25 @@
            :progress (with-game game mem (fn [] ((:progress (get agent/games game)) ((:state (get agent/games game))))))}))))
 
 (defn- fork!
-  "A new member from member `best`: its conversation saved and made again in a new agent, its
-  game copy and steps copied. Returns the new member, started."
+  "A new member from member `best`: best's turns held and its turn stopped, then its
+  conversation and its session's state copied into a new agent (ink/copy!: no tokens made
+  again; saving and making the conversation again took a minute), its game copy and steps
+  copied; then both go on. Returns the new member, started."
   [game m opts best id]
-  (let [path (str "/tmp/population-" id ".agent.edn")]
-    (h/save! (:agent best) path)
-    (let [mem (member game m opts id (dissoc @(:copy best) :retired) @(:steps best))]
-      (h/resume! (:agent mem) path)
-      (hc/watch! (:agent mem) (str (name game) " agent " id))
-      (assoc mem :future (turns! mem "You were stopped and are going on where you were: look, and go on playing.")))))
+  (let [a (:agent best)]
+    (reset! (:hold best) true)
+    ;; Its turn stopped, until its loop holds (a turn may have begun as the hold was set).
+    (loop [] (h/stop! a) (when-not @(:paused best) (cpp/usleep 50000) (recur)))
+    (try
+      (let [mem (member game m opts id (dissoc @(:copy best) :retired) @(:steps best))
+            b (:agent mem)
+            v @a]
+        (swap! b assoc :entries (:entries v) :view (:view v) :notes (:notes v) :effort-said (:effort-said v)
+               :generated (:generated v) :seconds (:seconds v) :step-count (:step-count v))
+        (ink/copy! (:session @b) (:session v))
+        (hc/watch! b (str (name game) " agent " id))
+        (assoc mem :future (turns! mem "You were stopped and are going on where you were: look, and go on playing.")))
+      (finally (reset! (:hold best) false)))))
 
 (defn start!
   "`agents` agents on model `m` playing `game` from its start for `minutes`; every `every`
@@ -122,10 +175,14 @@
         g (get agent/games game)
         {:keys [fresh]} (get copies game)]
     (reset! running true)
+    (reset! board [])
+    (reset! shared-traps #{})
     (reset! owner nil)
     (reset! holding nil)
     (when-let [failed ((:start! g))]
       (throw (ex-info (str "the game didn't start: " failed) {})))
+    ;; Only this game's card at the top (Nova's stayed above NetHack's and hid it).
+    (c/unpin!)
     ((:watch! g))
     (let [first-copy (fresh (:seed opts 1))
           began (cpp/play_decide.seconds)

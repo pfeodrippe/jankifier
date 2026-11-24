@@ -11,6 +11,7 @@
 ;;   (agent/stop!)                                   ; ends it (the result is kept)
 (ns play.agent
   (:require [clojure.string :as str]
+            [cards.core :as c]
             [harness.cards :as hc]
             [harness.core :as h]
             [harness.tools :as harness-tools]
@@ -86,7 +87,7 @@
   "The game's tools for an agent. `ctx`: :steps (the atom its actions are kept in; the run's
   own by default), :guard (a function a tool's work is done through, given a function of
   none: a population's agents share one game, switched to an agent's copy for its calls),
-  :running (whether to go on; the run's own atom by default)."
+  :running (whether to go on; the run's own atom by default), :extra-tools (more tools)."
   ([g] (tools g {}))
   ([g ctx]
   (let [{:keys [state told act! actions same? st]} g
@@ -94,6 +95,7 @@
         running (or (:running ctx) running)
         guard (or (:guard ctx) (fn [f] (f)))
         allowed (set actions)]
+    (into
     [{:name "look"
       :doc "The game as it is now."
       :params {}
@@ -154,7 +156,9 @@
                                "\n\nThe game now:\n" (told after before))
                           :else
                           (recur (rest left) (conj said (str (name k) ": " changed)))))))))))))}
-     (harness-tools/notes)])))
+     (harness-tools/notes)]
+    ;; A population's own tools (telling the other agents).
+    (vec (:extra-tools ctx))))))
 
 (defn- playing!
   "Agent `a` playing game `game` (already where it should start) for `minutes`, in the
@@ -227,6 +231,8 @@
         g (get games game)]
     (when-let [failed ((:start! g))]
       (throw (ex-info (str "the game didn't start: " failed) {})))
+    ;; Only this game's card at the top (Nova's stayed above NetHack's and hid it).
+    (c/unpin!)
     ((:watch! g))
     (reset! steps [])
     (playing! game (agent-of g m opts) (:minutes opts) "Play the game. Look first."
