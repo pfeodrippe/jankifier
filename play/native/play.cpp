@@ -15,6 +15,8 @@ extern "C"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <deque>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -40,6 +42,14 @@ namespace
   std::vector<uint32_t> nes_picture;
   unsigned nes_width{}, nes_height{};
   uint64_t nes_shown{}; // how many pictures there were: the window uploads a new one
+  // The frames run and not yet shown: the window shows one each 1/60 s, so that a game is
+  // seen at its own speed while it runs as fast as it goes (at most nes_queued_most kept:
+  // the oldest are dropped when the game runs far ahead of what is seen).
+  std::deque<std::vector<uint32_t>> nes_queued;
+  size_t const nes_queued_most{ 120 };
+  std::chrono::steady_clock::time_point nes_popped{};
+  // The last frame run (what the console shows now, whatever is still queued).
+  std::vector<uint32_t> nes_latest;
 
   // NetHack.
 
@@ -248,6 +258,8 @@ extern "C"
       nes_now = std::make_unique<play::nes>(core);
       nes_now->load(game);
       nes_picture.clear();
+      nes_queued.clear();
+      nes_latest.clear();
       nes_shown = 0;
       return 0;
     }
@@ -265,12 +277,19 @@ extern "C"
     {
       return -1;
     }
-    nes_now->run(buttons, frames);
-    std::lock_guard<std::mutex> hold{ nes_lock };
-    nes_picture = nes_now->picture();
-    nes_width = nes_now->width();
-    nes_height = nes_now->height();
-    ++nes_shown;
+    for(unsigned i{}; i < frames; ++i)
+    {
+      nes_now->run(buttons, 1);
+      std::lock_guard<std::mutex> hold{ nes_lock };
+      nes_latest = nes_now->picture();
+      nes_queued.push_back(nes_latest);
+      while(nes_queued.size() > nes_queued_most)
+      {
+        nes_queued.pop_front();
+      }
+      nes_width = nes_now->width();
+      nes_height = nes_now->height();
+    }
     return 0;
   }
 
@@ -310,7 +329,50 @@ extern "C"
 
   int play_nes_picture(uint32_t *out, int max, int *width, int *height, uint64_t *version)
   {
+    {
+      // The next frame queued, when a 60th of a second has gone by since the last one.
+      std::lock_guard<std::mutex> hold{ nes_lock };
+      auto const now(std::chrono::steady_clock::now());
+      if(!nes_queued.empty() && now - nes_popped >= std::chrono::microseconds{ 16667 })
+      {
+        nes_picture = std::move(nes_queued.front());
+        nes_queued.pop_front();
+        ++nes_shown;
+        nes_popped = now;
+      }
+    }
     return copy_picture(nes_lock, nes_picture, nes_width, nes_height, nes_shown, out, max, width, height, version);
+  }
+
+  void play_nes_flush()
+  {
+    std::lock_guard<std::mutex> hold{ nes_lock };
+    nes_queued.clear();
+    nes_picture = nes_latest;
+    ++nes_shown;
+  }
+
+  int play_nes_queued()
+  {
+    std::lock_guard<std::mutex> hold{ nes_lock };
+    return static_cast<int>(nes_queued.size());
+  }
+
+  int play_nes_latest(uint32_t *out, int max, int *width, int *height)
+  {
+    uint64_t version{};
+    return copy_picture(nes_lock, nes_latest, nes_width, nes_height, 0, out, max, width, height, &version);
+  }
+
+  void play_nes_show(uint32_t const *picture, int n, int width, int height)
+  {
+    std::lock_guard<std::mutex> hold{ nes_lock };
+    nes_queued.clear();
+    nes_latest.assign(picture, picture + std::max(n, 0));
+    nes_picture = nes_latest;
+    nes_width = static_cast<unsigned>(width);
+    nes_height = static_cast<unsigned>(height);
+    ++nes_shown;
   }
 
   int play_nes_save(unsigned char *out, int max)

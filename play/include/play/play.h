@@ -39,6 +39,13 @@ extern "C"
   int play_doom_finished(void);
   int play_doom_state(double *variables, int max, int *tic, char *objects, int size);
   int play_doom_rays(double *out, int max);
+  /* The NES's last frame run (not the one shown: frames are shown at the game's own speed,
+     queued), and a picture shown at once in place of the queued ones (a restored state's). */
+  int play_nes_latest(uint32_t *out, int max, int *width, int *height);
+  void play_nes_show(uint32_t const *picture, int n, int width, int height);
+  /* The NES's frames run and not yet shown, and those dropped for the last one run. */
+  int play_nes_queued(void);
+  void play_nes_flush(void);
   int play_doom_picture(uint32_t *out, int max, int *width, int *height, uint64_t *version);
   void play_doom_close(void);
 

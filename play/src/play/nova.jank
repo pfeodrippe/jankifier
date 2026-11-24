@@ -232,6 +232,7 @@
       (do
         (doseq [[[f ks] [next-f _]] (partition 2 1 to-level)]
           (p/nes-run! ks (- next-f f)))
+        (p/nes-flush!)
         (reset! st {:step 0 :told (told)})
         nil)))
 

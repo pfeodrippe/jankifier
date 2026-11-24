@@ -129,10 +129,18 @@ namespace play
     return bytes(ram.data(), play_nes_cartridge_ram(ram.data(), static_cast<int>(ram.size())));
   }
 
-  // A saved state is kept here, by a number (jank keeps the number).
-  inline std::vector<std::vector<unsigned char>> &nes_states()
+  // A saved state is kept here, by a number (jank keeps the number), with the picture the
+  // console showed then (restored with it: a restore shows it at once).
+  struct nes_state
   {
-    static std::vector<std::vector<unsigned char>> states;
+    std::vector<unsigned char> bytes;
+    std::vector<uint32_t> picture;
+    int width{}, height{};
+  };
+
+  inline std::vector<nes_state> &nes_states()
+  {
+    static std::vector<nes_state> states;
     return states;
   }
 
@@ -143,10 +151,25 @@ namespace play
     {
       return rt::jank_nil;
     }
-    std::vector<unsigned char> s(static_cast<size_t>(size));
-    play_nes_save(s.data(), size);
+    nes_state s;
+    s.bytes.resize(static_cast<size_t>(size));
+    play_nes_save(s.bytes.data(), size);
+    s.picture.resize(640 * 480);
+    int const n(play_nes_latest(s.picture.data(), static_cast<int>(s.picture.size()), &s.width, &s.height));
+    s.picture.resize(static_cast<size_t>(std::max(n, 0)));
     nes_states().push_back(std::move(s));
     return integer(static_cast<int64_t>(nes_states().size() - 1));
+  }
+
+  inline object_ref nes_queued()
+  {
+    return integer(play_nes_queued());
+  }
+
+  inline object_ref nes_flush()
+  {
+    play_nes_flush();
+    return rt::jank_nil;
   }
 
   inline object_ref nes_restore(object_ref const which)
@@ -157,7 +180,12 @@ namespace play
       return integer(-1);
     }
     auto const &s(nes_states()[i]);
-    return integer(play_nes_restore(s.data(), static_cast<int>(s.size())));
+    int const r(play_nes_restore(s.bytes.data(), static_cast<int>(s.bytes.size())));
+    if(r == 0 && !s.picture.empty())
+    {
+      play_nes_show(s.picture.data(), static_cast<int>(s.picture.size()), s.width, s.height);
+    }
+    return integer(r);
   }
 
   // NetHack.

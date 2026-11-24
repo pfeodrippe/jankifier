@@ -7,7 +7,7 @@
 ;; from its start to go back. A game a harness agent played (play.agent) has its
 ;; conversation above it, as the harness shows any (harness.cards), and that conversation's
 ;; timeline leads: played, dragged or stepped there, the game goes to the actions whose
-;; calls it shows (a few on, played frame by frame).
+;; calls it shows (a few on are played, and their frames shown at the game's speed).
 ;;
 ;;   (replay/save! :nova @nova/decisions {:player-settings ...})   ; the file's path
 ;;   (replay/open! "path.edn")      ; the game again, in a card: the picture and the model's side
@@ -165,7 +165,9 @@ namespace play_replay_native
   "To step `i`: the game as it was when the model decided step `i` (from the save kept
   there, or played up to it), and an agent's conversation at that step's call."
   [i]
-  (go-to! i true))
+  (let [at (go-to! i true)]
+    (p/nes-flush!)
+    at))
 
 (declare follow!)
 
@@ -231,12 +233,13 @@ namespace play_replay_native
                               (count (filter (fn [d] (and (:entry d) (< (:entry d) n))) steps)))]
               (cond
                 (and (> target at) (<= (- target at) 4))
-                (binding [p/*frame-pause* 16667]
-                  (dotimes [_ (- target at)]
-                    (step-played! false)))
+                (dotimes [_ (- target at)]
+                  (step-played! false))
 
                 (not= target at)
-                (go-to! target false))))
+                (do (go-to! target false)
+                    ;; A jump: its target at once, not the frames that got there.
+                    (p/nes-flush!)))))
           (cpp/usleep 100000)
           (recur)))
       (catch :default _ nil))))
@@ -252,9 +255,12 @@ namespace play_replay_native
           (let [{:keys [at steps]} @replaying]
             (when (< (inc at) (count steps))
               (if (= pace :fluid)
-                ;; Each action played frame by frame.
-                (binding [p/*frame-pause* 16667]
-                  (step-played! true))
+                ;; Each action played, and its frames shown (at the game's speed) before the next.
+                (do (step-played! true)
+                    (loop []
+                      (when (and @running (pos? (p/nes-queued)))
+                        (cpp/usleep 20000)
+                        (recur))))
                 (do (step!)
                     (cpp/usleep (long (/ 1000000 pace)))))
               (recur)))))
