@@ -308,6 +308,14 @@
            ended "On her right the level ends: nothing is past it, and walking right is blocked. The way on is elsewhere: a door (D) or a ladder (H). "
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
                             (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
+           ;; Ground below the gap: a drop onto it, not a jump across (from a high platform an
+           ;; agent jumped "a gap 5 blocks wide" and came down into a pit beyond it).
+           (and gap (pos? gap) (not (fall? st (inc px))))
+           (let [depth (first (filter (fn [dy] (not (contains? #{"." "o" "~"} (at 1 dy)))) (range 2 16)))]
+             (str "On her right the ground stops, with ground " (dec depth) " blocks down below it: a step right drops her onto it"
+                  " (the ground at her own height is " gap (if (< gap 5) "" " or more") " blocks on: "
+                  (cond (<= gap 2) "jump-right gets across" (<= gap 4) "high-jump-right gets across" :else "too far to jump across") ")."))
+
            (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide: jump-right to cross it"
                                      (when (> gap 1) ", then right while in the air (a jump alone is short: wait in the air and she falls in)")
                                      ".")
