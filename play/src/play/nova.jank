@@ -105,7 +105,8 @@
   "The level around Nova as runs of the same thing on a row, positions relative to her (x
   right, y down; her feet at 0, 0): one line a row that has something, in the columns
   `before` behind her to `after` ahead."
-  ([st] (runs st 6 18))
+  ;; 24 ahead: with 18, an agent at a wall could not see where a jump over it lands.
+  ([st] (runs st 6 24))
   ([st before after]
    (let [px (long (:x st)) py (feet-row st)
          objects (set (map (fn [o] [(:x o) (:y o)]) (:objects st)))
