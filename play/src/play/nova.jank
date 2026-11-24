@@ -165,14 +165,14 @@
 
 (defn- fall-edge
   "How far (blocks) the edge of a fall is from Nova that way (`dir` 1 right, -1 left), when one
-  starts within 3 columns: her ground stops there over 2 or more empty columns with nothing to
+  starts within 8 columns: her ground stops there over 2 or more empty columns with nothing to
   land on below. nil when none."
   [st dir]
   (let [px (long (:x st)) py (feet-row st)
         at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))]
     (when-let [d (first (filter (fn [d] (and (= "." (at (* dir d) 1)) (= "." (at (* dir (inc d)) 1))
                                            (fall? st (+ px (* dir d)))))
-                                [1 2 3]))]
+                                (range 1 9)))]
       (if (pos? dir) (- (+ px d) (:x st)) (- (:x st) (+ (- px d) 1))))))
 
 (defn- step-blocks
