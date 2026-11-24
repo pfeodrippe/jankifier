@@ -338,7 +338,7 @@
   (when (cpp/play.doom_finished)
     (let [s (state)
           {:keys [goal-item timeout]} (get scenarios @chosen)]
-      (cond (pos? (:dead s 0)) "You died."
+      (cond (or (cpp/play.doom_dead) (pos? (:dead s 0))) "You died."
             (and (pos? timeout) (>= (:tic s 0) timeout)) "Time ran out."
             goal-item (str "You won: you picked up the " goal-item ".")
             (some (fn [e] (< (first (bearing s e)) 96.0)) (cpp/play.doom_exits))

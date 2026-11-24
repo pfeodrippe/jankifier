@@ -44,6 +44,9 @@ extern "C"
   int play_doom_rays(double *out, int max);
   // The sectors' floor and ceiling heights kept now, for play_doom_moved.
   void play_doom_mark();
+  // 1 when the player is dead (asked of the game: after the episode's end, its last state
+  // can still say otherwise), else 0.
+  int play_doom_dead();
   // A console command given to Doom (for checks: give health, god), done on the next tic.
   void play_doom_command(char const *command);
   // The map's exits and teleporters: each line's middle x, y and what it is (1 an exit walked

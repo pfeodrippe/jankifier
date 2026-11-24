@@ -448,6 +448,11 @@ namespace play
     return list;
   }
 
+  inline object_ref doom_dead()
+  {
+    return play_doom_dead() ? object_ref{ rt::jank_true } : object_ref{ rt::jank_false };
+  }
+
   inline object_ref doom_command(object_ref const command)
   {
     play_doom_command(rt::to_string(command).c_str());

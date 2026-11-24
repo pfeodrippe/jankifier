@@ -1160,6 +1160,11 @@ extern "C"
     return n;
   }
 
+  int play_doom_dead()
+  {
+    return doom_now && doom_now->isPlayerDead() ? 1 : 0;
+  }
+
   void play_doom_command(char const *command)
   {
     if(doom_now)
