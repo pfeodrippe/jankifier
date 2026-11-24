@@ -264,6 +264,9 @@
                   " to reach the ground " d (if (= 1 d) " block " " blocks ") (name dir) "; waiting drops her in. ")
              "She is in the air over a fall (nothing below her, no ground near): steer the way she was going. "))
          (when ledge "She stands on a ledge (=): down drops her through it. ")
+         ;; The game takes her onto a ladder from above when down is held on its top
+         ;; (src/player.s): a way down nothing told the agent of.
+         (when (and (:on-ground st) (= "H" (at 0 1))) "She stands on a ladder's top (H): down climbs down it. ")
          (when (and (:on-ground st) (= "-" (at 0 1))) "She stands on a platform (-): down doesn't drop through it. ")
          (when-let [ds (seq (dangers st))]
            (str "Near her, what may hurt her when it touches her: "
@@ -418,6 +421,9 @@
           "Nova is facing " (name (:facing st))
           (cond (:on-ground st) ", on the ground" (:jumping st) ", jumping" :else ", in the air")
           ", moving " (one-place (:vx st)) " blocks a frame across. Health " (:health st) ".\n"
+          ;; An agent took a dying Nova for a game that had ended, and stopped playing.
+          (when (zero? (:health st))
+            "Health 0: she has died. A few waits and the game starts this part of the level again, her health back to 4.\n")
           (around st) "\n"
           (if (seq (:objects st))
             (str "Objects (blocks from her: + is right, + is down): "
@@ -438,7 +444,8 @@
 (def actions
   "What a player can do in a step: a name and the buttons held, for `step-frames` frames."
   {:right [:right] :left [:left] :jump [:a] :jump-right [:a :right] :jump-left [:a :left]
-   :down [:down] :up [:up] :attack [:b] :wait [] :face-right [:right] :face-left [:left]})
+   :down [:down] :up [:up] :attack [:b] :wait [] :face-right [:right] :face-left [:left]
+   :high-jump [:a] :high-jump-right [:a :right] :high-jump-left [:a :left]})
 
 (def step-frames 8)
 
@@ -458,8 +465,9 @@
   "How act! plays an action, for replays (each agent's step says the version it was played
   with): 1 the first, 2 with up stepping to a door or ladder near her first, 3 with a door's
   new area waited for, 4 waited for until it is done changing, 5 with up at a door stopping
-  her in its column first, 6 with face-right and face-left. Raised whenever act! changes."
-  6)
+  her in its column first, 6 with face-right and face-left, 7 with high jumps. Raised whenever
+  act! changes."
+  7)
 
 (defn- step-to!
   "Nova walked a frame at a time to the middle of column `col` (at most 40 frames)."
@@ -572,21 +580,40 @@
   (p/nes-run! [dir] 1)
   (p/nes-run! [] 1))
 
-(defn act!
-  "One step: the action's buttons held for its frames, then released for one (so a jump can
-  be pressed again); face-right and face-left turn her where she stands (face!); up at a door
-  in her column or within 2 blocks stops her and walks her to its middle first (door-up!),
-  and up with a ladder within 2 blocks on her row steps to it first (a step walks 1 to 3
-  blocks: the agent walked past the door it meant to take); through a door, frames run until
-  the new area hasn't changed for 20 frames (at most 240). The area is drawn and its objects
-  set over about 10 frames, and she can't move for about 20: version 3 stopped at the first
-  thing drawn, and the agent saw half an area, the last area's owl, and a right that didn't
-  move her."
+(defn act-v6!
+  "One step as version 6 played it: jumps held 8 frames (cut short as she rises)."
   [action]
   (case action
     :face-right (face! :right)
     :face-left (face! :left)
     (act-v5! action)))
+
+(defn- high-jump!
+  "A full jump (`dir` :right, :left or nil): the jump button held, with the direction, until
+  she stops rising (at most 40 frames), then released for one frame. Let go while she rises,
+  the game cuts the jump short (src/player.s, PlayerJumpCancel): the 8-frame jumps topped out
+  near 2 blocks, and an agent fell short of a higher ledge across a gap."
+  [dir]
+  (p/nes-run! (if dir [:a dir] [:a]) 2)
+  (loop [i 2]
+    (when (and (< i 40) (neg? (:vy (state))))
+      (p/nes-run! (if dir [:a dir] [:a]) 1)
+      (recur (inc i))))
+  (p/nes-run! [] 1))
+
+(defn act!
+  "One step: the action's buttons held for its frames, then released for one (so a jump can
+  be pressed again); high-jump, high-jump-right and high-jump-left hold the jump until she
+  stops rising (high-jump!); face-right and face-left turn her where she stands (face!); up
+  at a door in her column or within 2 blocks stops her and walks her to its middle first
+  (door-up!), and up with a ladder within 2 blocks on her row steps to it first; through a
+  door, frames run until the new area hasn't changed for 20 frames (at most 240)."
+  [action]
+  (case action
+    :high-jump (high-jump! nil)
+    :high-jump-right (high-jump! :right)
+    :high-jump-left (high-jump! :left)
+    (act-v6! action)))
 
 ;; Into the game: the menus, then level 1-1.
 
@@ -663,14 +690,17 @@
        "her, and so do enemies she touches. Getting right is what counts: coins and prize blocks "
        "(!) are extras, not worth much time. Each action holds the "
        "controller's buttons for a moment (8 frames): right and left walk; jump jumps straight "
-       "up; jump-right and jump-left jump forward; down, standing on a ledge (=), drops her "
-       "through it (not through a platform, -); up climbs a ladder (H) she is at, or goes through a door (D); attack uses "
+       "up; jump-right and jump-left jump forward (short jumps); high-jump, high-jump-right and "
+       "high-jump-left hold the jump for a full one, higher and further (for a higher ledge or a "
+       "wide gap); down, standing on a ledge (=), drops her "
+       "through it (not through a platform, -), and climbs down a ladder (H) she stands on; up climbs a ladder (H) she is at, or goes through a door (D); attack uses "
        "Nova's ability (the B button), shooting the way she faces; face-right and face-left turn her "
        "where she stands (to shoot without stepping closer); wait does nothing. Holding a "
        "direction while in the air steers her. When a wall is too high, look for another way: "
        "under a ledge, or back."))
 
-(def model-actions [:right :jump-right :jump :left :jump-left :up :down :attack :wait :face-right :face-left])
+(def model-actions [:right :jump-right :jump :left :jump-left :high-jump-right :high-jump :high-jump-left
+                    :up :down :attack :wait :face-right :face-left])
 
 (defonce decisions (atom []))
 
