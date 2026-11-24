@@ -433,6 +433,10 @@
            (and gap (pos? gap) (not (fall? st (inc px))))
            (let [depth (first (filter (fn [dy] (not (contains? #{"." "o" "~"} (at 1 dy)))) (range 2 16)))]
              (str "On her right the ground stops, with ground " (dec depth) " blocks down below it: a step right drops her onto it"
+                  ;; What follows that ground: a fall a few blocks on (an agent dropped off a
+                  ;; platform steering right and carried over the 4 blocks below into the pit).
+                  (when-let [k (first (filter (fn [d] (fall? st (+ px d))) (range 2 10)))]
+                    (str ", and that ground ends " (dec k) " blocks on over a fall: drop without pressing right, then walk to that fall's edge"))
                   " (the ground at her own height is " gap (if (< gap 5) "" " or more") " blocks on: "
                   (cond (<= gap 2) "jump-right gets across" (<= gap 4) "high-jump-right gets across" :else "too far to jump across") ")."))
 
