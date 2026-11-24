@@ -71,11 +71,19 @@ namespace play_replay_native
    :nethack {:title "NetHack" :start! #'nethack/start! :act! #'nethack/act! :stop! #'nethack/stop! :picture #'nethack/picture
              :play-model! #'nethack/play-model! :decisions #'nethack/decisions :saves false}
    :doom {:title "Doom" :start! #'doom/start! :act! #'doom/act! :stop! #'doom/stop! :picture #'doom/picture
-          :play-model! #'doom/play-model! :decisions #'doom/decisions :saves false}
+          :version #'doom/version :acts {1 #'doom/act-v1! 2 #'doom/act-v2! 3 #'doom/act!}
+          :play-model! #'doom/play-model! :decisions #'doom/decisions :conversation #'doom/conversation
+          :saves false}
    :wnw {:title "Witch n' Wiz" :start! #'wnw/start! :act! #'wnw/act! :stop! #'wnw/stop!
          ;; How actions were played by version (a recording says its own; 1 when it doesn't).
          :version 2 :acts {1 #'wnw/act-v1! 2 #'wnw/act!}
          :play-model! #'wnw/play-model! :decisions #'wnw/decisions}})
+
+(defn- deref-version
+  "A game's actions' version now (a number, or a var of one: 1 when not said)."
+  [game]
+  (let [v (get-in games [game :version] 1)]
+    (if (var? v) @v v)))
 
 (defn save!
   "A game's decisions (each {:action :probs :told ...}) written to a file of `folder`, with
@@ -84,7 +92,7 @@ namespace play_replay_native
   ([game decisions about]
    (cpp/play_replay_native.make_dirs folder)
    (let [path (str folder "/" (name game) "-" (cpp/play_replay_native.stamp) ".edn")]
-     (spit path (pr-str {:game game :about (assoc about :version (get-in games [game :version] 1))
+     (spit path (pr-str {:game game :about (assoc about :version (deref-version game))
                          :steps (vec decisions)}))
      path)))
 
@@ -95,7 +103,7 @@ namespace play_replay_native
   recording's path."
   ([game deciders steps] (record! game deciders steps {}))
   ([game deciders steps opts]
-   (let [{:keys [start! play-model! decisions stop!]} (get games game)]
+   (let [{:keys [start! play-model! decisions stop! conversation]} (get games game)]
      (when-let [failed (start!)]
        (throw (ex-info (str "the game didn't start: " failed) {})))
      (let [playing (play-model! deciders steps (dissoc opts :minutes))]
@@ -109,9 +117,14 @@ namespace play_replay_native
              (stop!))))
        (future
          @playing
-         (save! game @@decisions
-                {:steps steps :opts opts
-                 :settings (if (vector? deciders) (mapv (fn [d] @(:config d)) deciders) @(:config deciders))}))))))
+         (let [path (save! game @@decisions
+                           {:steps steps :opts (dissoc opts :minutes)
+                            ;; The choices as a conversation beside it (a replay shows it).
+                            :agent (boolean (and conversation @@conversation))
+                            :settings (if (vector? deciders) (mapv (fn [d] @(:config d)) deciders) @(:config deciders))})]
+           (when-let [conv (and conversation @@conversation)]
+             (harness.core/save! conv (str/replace path #"\.edn$" ".agent.edn")))
+           path))))))
 
 (defonce st (atom {}))
 (defonce replaying (atom nil))
@@ -130,10 +143,14 @@ namespace play_replay_native
       (hc/to-entry! "replay agent" (:entry d)))))
 
 (defn- act-of
-  "The game's action as the recording played it (its version)."
-  [r]
-  (let [{:keys [acts] :as g} (get games (:game r))]
-    (if acts (get acts (:version (:about r) 1)) (:act! g))))
+  "The game's action as the recording played it (its version), for step `step` (an agent's
+  step says its own: the game may have changed while it played)."
+  ([r] (act-of r nil))
+  ([r step]
+   (let [{:keys [acts] :as g} (get games (:game r))]
+     (if acts
+       (get acts (or (:version step) (:version (:about r)) 1))
+       (:act! g)))))
 
 (defn- go-to!
   "To step `i` (go!), the conversation moved there too when `push`."
@@ -147,7 +164,7 @@ namespace play_replay_native
       (false? (get-in games [game :saves]))
       (let [from (if (< i at) (do (start!) 0) at)]
         (doseq [k (range from i)]
-          (act! (:action (get steps k)))))
+          ((act-of @replaying (get steps k)) (:action (get steps k)))))
 
       (<= i known)
       (p/nes-restore! (get @saves i))
@@ -155,7 +172,7 @@ namespace play_replay_native
       :else
       (do (p/nes-restore! (get @saves known))
           (doseq [k (range known i)]
-            (act! (:action (get steps k)))
+            ((act-of @replaying (get steps k)) (:action (get steps k)))
             (swap! saves conj (p/nes-save!)))))
     (swap! replaying assoc :at i)
     (show! i push)
@@ -211,7 +228,7 @@ namespace play_replay_native
     (when (< (inc at) (count steps))
       (when savable
         (p/nes-restore! (get @saves at)))
-      ((act-of r) (:action (get steps at)))
+      ((act-of r (get steps at)) (:action (get steps at)))
       (when (and savable (= (count @saves) (inc at)))
         (swap! saves conj (p/nes-save!)))
       (swap! replaying assoc :at (inc at))

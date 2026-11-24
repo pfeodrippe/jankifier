@@ -15,6 +15,7 @@
             [harness.core :as h]
             [play.core :as p]
             [play.decide :as decide]
+            [play.doom :as doom]
             [play.nova :as nova]
             [play.replay :as replay]
             [play.wnw :as wnw]))
@@ -27,6 +28,13 @@
          :actions wnw/model-actions :rules wnw/rules :st #'wnw/st :watch! #'wnw/watch!
          :same? (fn [a b] (= a b))
          :progress (fn [s] {:room (inc (:room s)) :screen (:state s)})}
+   :doom {:start! #'doom/start! :state #'doom/state :told #'doom/told :act! #'doom/act! :version #'doom/version
+          :actions doom/model-actions :rules doom/rules :st #'doom/st :watch! #'doom/watch!
+          ;; A shot changes the ammo: only a step that changes none of these changed nothing.
+          :same? (fn [a b] (= (select-keys a [:x :y :angle :health :ammo :kills])
+                              (select-keys b [:x :y :angle :health :ammo :kills])))
+          :progress (fn [s] {:kills (long (:kills s)) :health (long (:health s)) :items (long (:items s))
+                             :x (long (:x s)) :y (long (:y s))})}
    :nova {:start! #'nova/start! :state #'nova/state :told #'nova/told :act! #'nova/act!
           :actions nova/model-actions :rules nova/rules :st #'nova/st :watch! #'nova/watch!
           :same? (fn [a b] (and (= (:x a) (:x b)) (= (:y a) (:y b))))
@@ -81,6 +89,8 @@
                                   :thinking (when a (last-of a :thinking))
                                   :said (when a (str "act " (pr-str (vec names))))
                                   :agent-step (when a (:step-count @a))
+                                  ;; The version the game's actions were played with now.
+                                  :version (when-let [v (:version g)] (if (var? v) @v v))
                                   ;; Where this call's entry goes in the conversation.
                                   :entry (when a (count (:entries @a)))}]
                         (swap! steps conj step)
