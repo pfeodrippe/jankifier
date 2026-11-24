@@ -50,6 +50,70 @@ that jank can drive it in the process:
 
 All three are built from source in `vendor/`, which this repository doesn't keep.
 
+## A model playing
+
+`play.decide` makes a model a player: the game is told as text, and the model's answer is
+scored as each allowed action's name, so it gives a probability for every action and can't
+answer anything else (about a second a choice). A player's settings are in an atom, read at
+every choice, so they change while a game goes on:
+
+```clojure
+(require '[inkling.core :as ink] '[play.decide :as decide] '[play.replay :as replay])
+(def m (ink/open "../inkling/models/inkling-2-mini.ink"))
+
+(def p (wnw/model-player m))              ; nova/, wnw/, nethack/, doom/ each have one
+(decide/tune! p {:think 800})             ; it thinks up to 800 tokens before each choice
+(def team (mapv (fn [i] (wnw/model-player m {:think 800 :seed i})) (range 3)))
+(wnw/play-model! team 100 {:combine :vote})   ; a committee: its members think together
+```
+
+The settings: `:think` (tokens of thinking first, 0 for none), `:effort`, `:temperature`,
+`:style` (how to think; `decide/terse` is a short style after the caveman skill's rules,
+github.com/JuliusBrussee/caveman: the model's thinking doesn't follow it), `:answer`
+(`:scored`, or `:free`: it writes its answer and the first action named is taken),
+`:memory` (`:fresh`, each choice from the rules; or `:conversation`, one conversation
+started again when the context is nearly full), `:seed`, `:recent` (its last actions it is
+told). A committee's members that think do it in one forward a token (`generate-batch!`):
+the same thoughts as alone, sooner.
+
+`play.agent` makes the game a harness agent's task: its own conversation, thinking as long as
+it likes, and two tools, `look` and `act` (actions in a row, stopped at one that changes
+nothing). Its conversation is shown above the game as the harness shows any agent
+(`harness.cards`).
+
+```clojure
+(require '[play.agent :as agent])
+(def run (agent/play! :wnw m {:minutes 10}))   ; a future of the result
+```
+
+On Witch n' Wiz from power-on (23 Nov 2026): the agent finished 4 rooms in 10 minutes, a
+committee of three thinking players and one thinking player 2 rooms each, and the player
+without thinking none in 3 minutes. The decision players start every choice afresh and in
+room 3 fell into the same pocket again and again; the agent remembered it.
+
+How a game is told matters more than how the model is asked: a map of characters makes it
+count them, so the levels can also be told as runs of things with their positions
+(`(reset! wnw/telling {:map :runs})`, the same for Nova), with what each move from where the
+player is would do.
+
+## Recordings and replays
+
+A game played by a model can be kept (`replay/record!`, and `agent/play!` always) in
+`~/Documents/jankifier/replay/games/`: each step's action, what the model was told, its
+probabilities, votes and thinking, and an agent's conversation beside it. The games are
+deterministic, so a replay plays the game again from its start:
+
+```clojure
+(replay/open! "/Users/.../wnw-20261123-183740.edn")   ; the game's card, the conversation above it
+(replay/play!)      ; an agent's game follows its conversation's timeline: played, dragged or
+                    ; stepped there, the game goes to the actions whose calls it shows
+(replay/go! 20)     ; to step 20
+(replay/stop!)
+```
+
+The NES's frames are queued and shown at the game's own speed while what plays runs as fast
+as it goes (a model never waits for the screen); a jump shows its step at once.
+
 ## The core
 
 fceumm, built from source (GPL-2.0; not kept in this repository):
