@@ -251,6 +251,17 @@
     (when (and (pos? (first hs)) (>= n 3))
       [(first hs) (nth hs (dec n)) n (fall? st (+ px d n))])))
 
+(defn- fall-behind
+  "Where a fall starts behind the wall at column offset `d` on Nova's right (the first column
+  after it with nothing on her row, a fall below): the offset, or nil. From partway up lock
+  stairs an agent read only \"a wall 1 block high\", jumped it steering on, and came down in the
+  pit behind."
+  [st d]
+  (let [px (long (:x st)) py (feet-row st)
+        open? (fn [c] (not (contains? #{"#" "!" "L"} (block-char ((:map st) (+ px c) py)))))]
+    (when-let [end (first (filter open? (range d (+ d 9))))]
+      (when (fall? st (+ px end)) end))))
+
 (defn- stairs-text
   "The sentence for steps up from column offset `d`."
   [[h0 top n fall-behind] d]
@@ -315,6 +326,16 @@
                   (if (= ch "H")
                     ": stand at it, then up climbs it. "
                     ": stand in it (its column), then up goes through it. "))))
+         ;; In the air above ground, a fall just ahead and the ground across it higher than
+         ;; she is: steering on carries her into the fall (agents came off a spring over lock
+         ;; stairs, steered on, and fell into the pit behind them, its far side above them).
+         (when (and (not (:on-ground st)) (not (fall? st px)) (> (:vx st) 0.0))
+           (when-let [f (first (filter (fn [d] (fall? st (+ px d))) (range 1 5)))]
+             (when-let [far (first (filter (fn [d] (not (fall? st (+ px d)))) (range (inc f) (+ f 7))))]
+               (let [top (first (filter (fn [r] (contains? #{"#" "!" "L" "=" "-"} (block-char ((:map st) (+ px far) r)))) (range 0 rows)))]
+                 (when (and top (< top py))
+                   (str "She is in the air above ground, and a fall starts " f (if (= 1 f) " block" " blocks")
+                        " right, its far side higher than she is: stop pressing right (wait) to come down on the ground here; steering on carries her into the fall. "))))))
          ;; In the air over a fall: an agent waited after two steers and fell in.
          (when-let [[dir d] (over-fall st)]
            (if dir
@@ -392,6 +413,15 @@
          (cond
            ended "On her right the level ends: nothing is past it, and walking right is blocked. The way on is elsewhere: a door (D) or a ladder (H). "
            (and (pos? wall) (stairs st 1)) (stairs-text (stairs st 1) 1)
+           (and (pos? wall) (<= wall 2) (fall-behind st 1))
+           (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high, and behind it, from x "
+                (fall-behind st 1) ", a fall (no floor below): get onto the wall with a " (if (= 1 wall) "jump-right" "high-jump-right")
+                " on its own (no right after it: steering on carries her over into the fall), then jump the fall from its top"
+                ;; The fall 2 columns on: both at once works too (in replay, from the third of lock
+                ;; stairs a high-jump-right steered across landed beyond the pit; the jump-right
+                ;; steered that the agent chose fell short; with the fall 3 on it fell in).
+                (when (<= (fall-behind st 1) 2) "; or both at once: high-jump-right, then right while in the air (a jump-right steered falls short)")
+                ".")
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
                             (case wall
                               1 "jump-right gets over it."
