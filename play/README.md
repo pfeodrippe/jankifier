@@ -108,11 +108,16 @@ deterministic, so a replay plays the game again from its start:
 
 ```clojure
 (replay/open! "/Users/.../wnw-20261123-183740.edn")   ; the game's card, the conversation above it
-(replay/play!)      ; an agent's game follows its conversation's timeline: played, dragged or
-                    ; stepped there, the game goes to the actions whose calls it shows
+(replay/play!)      ; an agent's game played on at the game's own pace, its conversation moved
+                    ; to each step's call (the conversation's play button does the same)
+(replay/play! :conversation)  ; or its conversation's timeline at the agent's own pace: the
+                    ; game waits while the agent thinks
 (replay/go! 20)     ; to step 20
 (replay/stop!)
 ```
+
+Dragged or stepped by hand, the conversation's timeline takes the game to the actions whose
+calls it shows.
 
 The NES's frames are queued and shown at the game's own speed while what plays runs as fast
 as it goes (a model never waits for the screen); a jump shows its step at once.
