@@ -27,7 +27,7 @@
 (def addr {:player-x 0x26 :player-x-sub 0x25 :player-y 0x27 :player-y-sub 0x28
            :player-vx 0x29 :player-vx-sub 0x2A :player-vy 0x2B :player-vy-sub 0x2C
            :player-dir 0x43 :jumping 0x45 :on-ground 0x46 :health 0x4B
-           :object-f1 0x2D :object-f2 0x463 :object-x 0x3E3 :object-y 0x403 :level 0xA7})
+           :object-f1 0x2D :object-f2 0x463 :object-f3 0x473 :object-x 0x3E3 :object-y 0x403 :level 0xA7})
 
 ;; The level map is in the cartridge's RAM at $6000: 16 rows a column, a byte a block.
 (def rows 16)
@@ -39,9 +39,12 @@
 
 (defn state
   "The game now, from its RAM: {:x :y :vx :vy :facing :on-ground :jumping :health :level
-  :objects [{:type :x :y :stunned}] :map (fn [col row] block-id)}. x and y are in blocks (16
-  pixels); y grows downwards. An enemy her shot hit is stunned for a while (ObjectF2 is
-  ENEMY_STATE_STUNNED, $82): it can't hurt her then (src/object.s, EnemyPlayerTouchHurt)."
+  :objects [{:type :x :y :stunned :facing :flying}] :map (fn [col row] block-id)}. x and y are
+  in blocks (16 pixels); y grows downwards. An enemy her shot hit is stunned for a while
+  (ObjectF2 is ENEMY_STATE_STUNNED, $82): it can't hurt her then (src/object.s,
+  EnemyPlayerTouchHurt). An object's facing is ObjectF1's low bit (set: left), the way an enemy
+  walks (src/object.s, EnemyWalk). An owl with ObjectF3 set flies: it turns to face her and
+  flies up when she is above it (src/enemy.s, ObjectOwl); the other owls walk a platform."
   []
   (let [ram (p/nes-ram)
         cart (p/cartridge-ram)
@@ -63,7 +66,9 @@
                      {:type (get blocks/objects (bit-shift-right f1 1) (str "object " (bit-shift-right f1 1)))
                       :x (nth ram (+ (get addr :object-x) i))
                       :y (nth ram (+ (get addr :object-y) i))
-                      :stunned (= 0x82 (nth ram (+ (get addr :object-f2) i)))}))
+                      :stunned (= 0x82 (nth ram (+ (get addr :object-f2) i)))
+                      :facing (if (odd? f1) :left :right)
+                      :flying (and (= 4 (bit-shift-right f1 1)) (pos? (nth ram (+ (get addr :object-f3) i))))}))
      ;; Outside the rows (above the top) is empty: a negative row read the column before's.
      :map (fn [col row]
             (let [i (+ (* col rows) row)]
@@ -145,14 +150,23 @@
     "BOULDER" "FALLING_SPIKE" "CLOUD_SWORD" "FIREWORK_SHOT" "LASER_BEAM" "BEAM_EMITTER" "FINAL_PROJECTILE"
     "SCHEME_TEAM" "TOAST" "FRY" "FRIES"})
 
+(def walkers
+  "The enemies that walk (src/object.s, EnemyWalk): their facing is the way they go."
+  #{"GOOMBA" "OWL" "FIRE_WALK"})
+
+(defn- toward?
+  "Whether danger [type dx dy object] walks toward Nova."
+  [[t dx _ o]]
+  (and (contains? walkers t) (not (zero? dx)) (= (:facing o) (if (pos? dx) :left :right))))
+
 (defn- dangers
-  "The objects that may hurt Nova within 3 blocks across and 2 up or down of her: [[type dx dy] ...],
-  nearest first (dy from her feet's row)."
+  "The objects that may hurt Nova within 3 blocks across and 2 up or down of her: [[type dx dy
+  object] ...], nearest first (dy from her feet's row)."
   [st]
   (let [px (long (:x st)) py (feet-row st)]
     (->> (:objects st)
          (remove (fn [o] (or (contains? harmless (:type o)) (:stunned o))))
-         (map (fn [o] [(:type o) (- (long (:x o)) px) (- (long (:y o)) py)]))
+         (map (fn [o] [(:type o) (- (long (:x o)) px) (- (long (:y o)) py) o]))
          (filter (fn [[_ dx dy]] (and (<= (max dx (- dx)) 3) (<= (max dy (- dy)) 2))))
          (sort-by (fn [[_ dx dy]] (+ (max dx (- dx)) (max dy (- dy))))))))
 
@@ -371,14 +385,21 @@
          (when (and (:on-ground st) (= "-" (at 0 1))) "She stands on a platform (-): down doesn't drop through it. ")
          (when-let [ds (seq (dangers st))]
            (str "Near her, what may hurt her when it touches her: "
-                (str/join ", " (for [[t dx dy] ds]
+                (str/join ", " (for [[t dx dy o :as d] ds]
                                  (str t (when (contains? unshootable t) " (shots don't hurt it)") " "
                                       (cond (zero? dx) "at her column"
                                             (pos? dx) (str dx (if (= 1 dx) " block" " blocks") " right")
                                             :else (str (- dx) (if (= -1 dx) " block" " blocks") " left"))
                                       (cond (zero? dy) " (her row)"
                                             (neg? dy) (str ", " (- dy) " above")
-                                            :else (str ", " dy " below")))))
+                                            :else (str ", " dy " below"))
+                                      ;; Which way it walks (ObjectF1's low bit): the owl-wall
+                                      ;; play stunned owls walking toward her, and missed ones
+                                      ;; walking away.
+                                      (when (and (contains? walkers t) (not (zero? dx)))
+                                        (if (toward? d) ", walking toward her" ", walking away from her"))
+                                      (when (:flying o)
+                                        " (a flying owl: it turns to face her, and flies up when she is above it: a jump near it brings it up into her)"))))
                 ;; The advice by where the nearest is: "jump over it" for one 2 above had the
                 ;; agent reasoning about it for minutes.
                 (let [[t dx dy] (first ds)]
@@ -405,7 +426,7 @@
                          (not (contains? unshootable t)))
                     (str ": it is on top of the wall ahead (her shot from down here passes under it): "
                          (when (= 1 (first wall-near)) "step left 1 block first (at the wall's foot it touches her as it comes to the edge); then, ")
-                         "facing it, high-jump (straight up), then attack: at the jump's top her shot is on its row. Again until it is stunned, then high-jump-right onto the wall")
+                         "when it walks toward her (a shot doesn't catch one walking away), facing it, high-jump (straight up) and attack right after it, with no wait between: the high-jump ends at the jump's top, where her shot is on its row. Again until it is stunned, then high-jump-right onto the wall")
                     ;; One walking on the wall ahead: up there it is on her row (an owl pacing a
                     ;; 2-high wall held agents for minutes; this play got past it in replay).
                     (and (<= dy -2) wall-near (pos? dx) (>= dx (first wall-near)))
@@ -514,7 +535,14 @@
                          ;; A taller wall just behind a step decides the advice (an agent read
                          ;; "1 block high" for a step in front of a lock wall 6 high).
                          taller (first (filter (fn [col] (> (height col) (max h 2))) (range (inc d) (+ d 4))))
-                         top (if taller (height taller) h)]
+                         top (if taller (height taller) h)
+                         ;; An enemy walking on the wall's top (its row just above it): the
+                         ;; advice for one there was given only within 3 blocks, and an agent
+                         ;; 4 blocks back took "high-jump-right gets over it" and jumped into an
+                         ;; owl.
+                         on-top (first (filter (fn [o] (and (not (contains? harmless (:type o))) (not (:stunned o))
+                                                            (<= (+ px d) (long (:x o)) (+ px d 6)) (= (long (:y o)) (- py h))))
+                                               (:objects st)))]
                      (str "On her right the way is clear for " (dec d) (if (= 2 d) " block" " blocks") ", then a wall "
                           h (if (= 1 h) " block" " blocks") " high"
                           ;; Named when the map calls it something else (an agent didn't match
@@ -525,9 +553,21 @@
                           ;; was the way on, which "too high: look for another way" hid).
                           (cond
                             (and taller (<= h 2)) (str " (" (if (= h 1) "jump-right" "high-jump-right") " gets her onto the low part; the one behind it is too high to jump: see what is on the low part)")
+                            (and on-top (<= h 2))
+                            (let [t (:type on-top)
+                                  way (if (= :left (:facing on-top)) ", walking toward her" ", walking away from her")]
+                              (cond
+                                (= "GOOMBA" t)
+                                (str " (a GOOMBA walks on top of it" way ": waiting below the wall's edge, it walks off onto her; from 1 to 3 blocks before the wall, high-jump-right onto it, then right in the air: landing on the GOOMBA flattens it).")
+                                (and (= 2 h) (not (contains? unshootable t)))
+                                (str " (" t " walks on top of it" way ": don't jump up into it. From 1 or 2 blocks back from the wall, when it walks toward her, facing it, high-jump (straight up) and attack right after it, with no wait between: the high-jump ends at the jump's top, where her shot is on its row. Once it is stunned, high-jump-right onto the wall).")
+                                :else (str " (" (if (= h 1) "jump-right" "high-jump-right") " gets over it; " t " is on top of it" way ").")))
                             :else (case top 1 " (jump-right gets over it)." 2 " (high-jump-right gets over it)." " (too high to jump: look for another way).")))))
                    "On her right the way is clear."))
-         (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right."))
+         ;; A jump-right alone from beside spikes came down on them (right is held 8 frames,
+         ;; while she still pushes against them): nearly every agent was hurt there. In replay,
+         ;; two rights after it, or a lone high-jump-right, cleared them.
+         (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right: to clear them, jump-right then right twice while in the air, or a high-jump-right on its own (a jump-right alone from beside them comes down on them)."))
          (when fall-left (str " On her left "
                               (if (= 1 fall-left)
                                 "her ground stops right where she stands"
@@ -554,10 +594,22 @@
    ;; Waiting beside one on her row (or at her head) that walks: an agent waited with a GOOMBA
    ;; 1 block away and was hurt.
    (when (and (= action :wait) (:on-ground st))
-     (when-let [[t dx] (first (filter (fn [[t dx dy]] (and (<= 1 (max dx (- dx)) 2) (<= -1 dy 0) (not= "FLAMES" t))) (dangers st)))]
+     (when-let [[t dx] (first (filter (fn [[t dx dy :as d]] (and (<= 1 (max dx (- dx)) 2) (<= -1 dy 0) (not= "FLAMES" t)
+                                                                 (or (not (contains? walkers t)) (toward? d))))
+                                      (dangers st)))]
        (let [way (if (pos? dx) "right" "left") n (max dx (- dx))]
          (str t " is " n (if (= 1 n) " block" " blocks") " on her " way ": waiting beside it, it walks into her and hurts her. "
               "Jump over it now (jump-" way "), or step away from it."))))
+   ;; In the air above spikes, an action that doesn't steer lands her on them (agents waited
+   ;; after a jump-right beside spikes and came down on them).
+   (when (and (not (:on-ground st)) (contains? #{:wait :attack :down :jump :high-jump} action))
+     (let [py (feet-row st)
+           below (fn [col] (first (remove (fn [c] (contains? #{"." "o"} c))
+                                          (map (fn [row] (block-char ((:map st) col row))) (range (inc py) rows)))))]
+       (when (some (fn [col] (= "^" (below col))) (distinct [(long (:x st)) (long (+ (:x st) 0.9))]))
+         (let [way (if (neg? (:vx st)) "left" "right")]
+           (str "she is in the air above spikes: " (name action) " lets her land on them. Press " way
+                " (twice) to carry past them.")))))
    ;; In the air over a fall, an action that doesn't steer lets her drop in (an agent waited
    ;; after two steers and fell).
    (when (contains? #{:wait :attack :down :jump} action)
@@ -599,7 +651,9 @@
               spikes (first (filter (fn [d] (some (fn [dy] (= "^" (block-char ((:map st) (+ px (* dir d)) (+ py dy))))) [0 1])) [1 2]))]
           (when spikes
             (str "spikes " spikes (if (= 1 spikes) " block" " blocks") " on her " (name action) ": a step " (name action)
-                 " walks onto them, and they hurt her. Jump over them (jump-" (name action) ").")))
+                 " walks onto them, and they hurt her. Jump over them: jump-" (name action) ", then " (name action)
+                 " twice while in the air, or a high-jump-" (name action) " on its own (a jump-" (name action)
+                 " alone from beside them comes down on them).")))
         ;; A danger in her way (her row or her head's, within 3 blocks that way: enemies come
         ;; toward her): an agent at 1 health walked on into a GOOMBA 3 blocks away.
         (when-let [[t dx] (first (filter (fn [[_ dx dy]] (and (<= 1 (* dir dx) 3) (<= -1 dy 0))) (dangers st)))]
