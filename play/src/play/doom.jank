@@ -100,12 +100,17 @@
     [(down x) (down y)]))
 
 (defn- visit!
-  "The squares on the way from state `before` to state `s` kept as visited."
+  "The squares on the way from state `before` to state `s`, and those around them, kept as
+  visited (a corridor is wider than a square: only the squares walked through left its sides
+  new ground)."
   [before s]
   (let [dx (- (:x s) (:x before)) dy (- (:y s) (:y before))
         n (inc (long (/ (cpp/play.sqrt (+ (* dx dx) (* dy dy))) 32.0)))]
-    (swap! visited into (for [i (range (inc n))]
-                          (square (+ (:x before) (* dx (/ i n))) (+ (:y before) (* dy (/ i n))))))))
+    (swap! visited into (for [i (range (inc n))
+                              :let [[c r] (square (+ (:x before) (* dx (/ i n))) (+ (:y before) (* dy (/ i n))))]
+                              oc [-1 0 1]
+                              or [-1 0 1]]
+                          [(+ c oc) (+ r or)]))))
 
 (defn- new-ground?
   "Whether walking from `s` toward direction `a` (degrees, left positive) for `far` units
@@ -138,6 +143,20 @@
               " (a lift's edge: use it on or beside the lift within 64 units; it goes down, waits about 3 seconds, then comes up)"
               " (a switch: use presses it within 64 units)")
     nil))
+
+(defn- frontier
+  "Which way the nearest square the player hasn't stood in is, walking the map (as an automap
+  would show it), as a line; nil when there is none."
+  [s]
+  (let [path (cpp/play.doom_frontier (vec @visited) cell)]
+    (when (seq path)
+      (let [seen (take-while (fn [[x y]] (cpp/play.doom_sees x y)) path)
+            [x y] (if (seq seen) (last seen) (first path))
+            [_ a] (bearing s {:x x :y y})]
+        (str "Nearest new ground, walking the map: about " (* (long cell) (count path)) " away; head "
+             (direction a) (when-let [t (turns a)] (str " " t))
+             (when (< (count seen) (count path)) ", then follow the way")
+             ".\n")))))
 
 (defn- walls
   "How far the player can walk in each direction a whole number of turns away and behind
@@ -238,6 +257,7 @@
           ", kills " (long (:kills s)) ", items " (long (:items s)) (when (pos? (:dead s 0)) ", dead") ".\n"
           "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees.\n"
           (walls s)
+          (frontier s)
           (if (seq (filter shown? (:objects s)))
             (str "In view (what fights, what can be picked up, barrels):\n"
                  (str/join "\n"

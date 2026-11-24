@@ -813,6 +813,101 @@ extern "C"
     return 1;
   }
 
+  int play_doom_frontier(int const *visited, int n, double const cell, double *out, int max)
+  {
+    if(doom_vars.size() < 5 || doom_walls.empty())
+    {
+      return 0;
+    }
+    // Whether the player can walk straight from a to b: no wall, closed door or opening too low
+    // between (ledges aside: a square's own height isn't known).
+    auto const walkable([&](double const ax, double const ay, double const bx, double const by) {
+      double const dx{ bx - ax }, dy{ by - ay };
+      for(auto const &w : doom_walls)
+      {
+        if(!w.blocking && w.sides > 1 && w.ceiling - w.floor >= 56.0)
+        {
+          continue;
+        }
+        double const ex{ w.x2 - w.x1 }, ey{ w.y2 - w.y1 };
+        double const det{ ex * dy - dx * ey };
+        if(std::abs(det) < 1e-9)
+        {
+          continue;
+        }
+        double const wx{ w.x1 - ax }, wy{ w.y1 - ay };
+        double const t{ (ex * wy - wx * ey) / det };
+        double const u{ (dx * wy - dy * wx) / det };
+        if(t > 0.0 && t < 1.0 && u >= 0.0 && u <= 1.0)
+        {
+          return false;
+        }
+      }
+      return true;
+    });
+    auto const square([&](double const v) { return static_cast<long long>(std::floor(v / cell)); });
+    using key = std::pair<long long, long long>;
+    std::map<key, bool> seen;
+    for(int i{}; i < n; ++i)
+    {
+      seen[{ visited[2 * i], visited[2 * i + 1] }] = true;
+    }
+    double const px{ doom_vars[3] }, py{ doom_vars[4] };
+    key const start{ square(px), square(py) };
+    // Breadth first from the player's square; a square's way in is kept to give the path.
+    std::map<key, key> from{ { start, start } };
+    std::deque<key> next{ start };
+    auto const middle([&](key const &k) {
+      return std::make_pair((static_cast<double>(k.first) + 0.5) * cell, (static_cast<double>(k.second) + 0.5) * cell);
+    });
+    int steps{};
+    while(!next.empty() && steps < 4000)
+    {
+      ++steps;
+      key const k{ next.front() };
+      next.pop_front();
+      if(!seen.count(k))
+      {
+        // The path back to the start, its squares' middles from the start on.
+        std::vector<key> path;
+        for(key at{ k }; at != start; at = from[at])
+        {
+          path.push_back(at);
+        }
+        std::reverse(path.begin(), path.end());
+        int m{};
+        for(auto const &p : path)
+        {
+          if(2 * (m + 1) > max)
+          {
+            break;
+          }
+          auto const [x, y](middle(p));
+          out[2 * m] = x;
+          out[2 * m + 1] = y;
+          ++m;
+        }
+        return m;
+      }
+      auto const [ax, ay](k == start ? std::make_pair(px, py) : middle(k));
+      for(auto const [ox, oy] : { std::make_pair(1, 0), std::make_pair(-1, 0), std::make_pair(0, 1), std::make_pair(0, -1) })
+      {
+        key const nk{ k.first + ox, k.second + oy };
+        if(from.count(nk))
+        {
+          continue;
+        }
+        auto const [bx, by](middle(nk));
+        if(walkable(ax, ay, bx, by))
+        {
+          from[nk] = k;
+          next.push_back(nk);
+        }
+      }
+    }
+    return 0;
+  }
+
   void play_doom_mark()
   {
     doom_marked = doom_sectors;
