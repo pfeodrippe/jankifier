@@ -98,7 +98,7 @@
                                :else (block-char ((:map st) col row))))))))))
 
 (def char-names
-  {"#" "solid" "=" "ledge" "H" "ladder" "D" "door" "o" "coins" "^" "spikes" "s" "spring" "?" "sign"
+  {"#" "solid" "=" "ledge" "-" "platform" "H" "ladder" "D" "door" "o" "coins" "^" "spikes" "s" "spring" "?" "sign"
    "!" "prize block" "~" "water or lava" "L" "lock" "k" "key" "+" "heart" "E" "exit" "e" "object"})
 
 (defn runs
@@ -239,6 +239,7 @@
                     ": stand at it, then up climbs it. "
                     ": stand in it (its column), then up goes through it. "))))
          (when ledge "She stands on a ledge (=): down drops her through it. ")
+         (when (and (:on-ground st) (= "-" (at 0 1))) "She stands on a platform (-): down doesn't drop through it. ")
          (when-let [ds (seq (dangers st))]
            (str "Near her, what may hurt her when it touches her: "
                 (str/join ", " (for [[t dx dy] ds]
@@ -381,7 +382,7 @@
             (str "The level around her, by row (y: blocks down from her feet, negative above; x: blocks "
                  "right of her, negative behind; empty space left out):\n"
                  (runs st))
-            (str "The level around her, a character a block (N Nova, e an object, . empty, # solid, = a ledge, "
+            (str "The level around her, a character a block (N Nova, e an object, . empty, # solid, = a ledge, - a platform down doesn't drop through, "
                  "H a ladder, D a door, o coin, ^ spikes, s spring, ? sign, ! prize block, ~ water or lava, "
                  "L a lock, k a key, + a heart, E the exit); rows go down, and it shows a few columns behind "
                  "her and more ahead:\n"
@@ -600,7 +601,7 @@
        "(!) are extras, not worth much time. Each action holds the "
        "controller's buttons for a moment (8 frames): right and left walk; jump jumps straight "
        "up; jump-right and jump-left jump forward; down, standing on a ledge (=), drops her "
-       "through it; up climbs a ladder (H) she is at, or goes through a door (D); attack uses "
+       "through it (not through a platform, -); up climbs a ladder (H) she is at, or goes through a door (D); attack uses "
        "Nova's ability (the B button); wait does nothing. Holding a "
        "direction while in the air steers her. When a wall is too high, look for another way: "
        "under a ledge, or back."))
