@@ -34,7 +34,8 @@
                      :timeout 2100 :title "a corridor (ViZDoom's deadly_corridor)" :goal-item "GreenArmor"
                      :goal (str "Get to the green armor (GreenArmor) at the end of the corridor and walk onto "
                                 "it: picking it up wins. Monsters on both sides shoot at you; at the hardest "
-                                "skill a few hits kill you. You have 2100 tics (60 seconds of game time).")}
+                                "skill a few hits kill you: kill them before you walk past them. You have 2100 "
+                                "tics (60 seconds of game time).")}
    ;; The same at Doom's middle skill (ViZDoom's deadly_corridor is at the hardest: the agent died
    ;; there in 76 tics, three actions).
    :deadly-corridor-3 {:scenario (p/vendor "ViZDoom" "scenarios" "deadly_corridor.wad") :map "map01" :skill 3
