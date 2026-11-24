@@ -242,9 +242,14 @@
                                       (cond (zero? dy) " (her row)"
                                             (neg? dy) (str ", " (- dy) " above")
                                             :else (str ", " dy " below")))))
-                (if (every? (fn [[t]] (contains? unshootable t)) ds)
-                  ": jump over it or wait for it to pass"
-                  ": jump over it, wait for it to pass, or attack it")
+                ;; The advice by where the nearest is: "jump over it" for one 2 above had the
+                ;; agent reasoning about it for minutes.
+                (let [[_ _ dy] (first ds)]
+                  (cond
+                    (<= dy -2) ": it is above her: walk on under it (a jump would touch it), or wait for it to move"
+                    (pos? dy) ": it is below her: don't drop onto it"
+                    (every? (fn [[t]] (contains? unshootable t)) ds) ": jump over it or wait for it to pass"
+                    :else ": jump over it, wait for it to pass, or attack it"))
                 ;; A shot starts about 2 blocks ahead of her: one closer is passed over.
                 (when (some (fn [[_ dx dy]] (and (<= 1 (max dx (- dx)) 2) (zero? dy))) ds)
                   " (one 1 or 2 blocks from her on her row is too close to shoot: her shot starts past it; step back first, or jump over it)")
