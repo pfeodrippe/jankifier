@@ -576,9 +576,14 @@
              (reset! st (cond-> {:step (inc i) :action a :told (told) :result (str "reward " r)}
                           (map? d) (assoc :decision d :told (:told d))))
              (recur (inc i)))))
-       (catch :default _ nil))
-     (reset! running false)
-     :done)))
+       (reset! running false)
+       :done
+       (catch :default e
+         (reset! running false)
+         ;; What went wrong, shown in the card and returned.
+         (let [why (str "failed: " (try (ex-message e) (catch :default _ nil)) " " (pr-str e))]
+           (swap! st assoc :result why)
+           why))))))
 
 (defn stop! [] (reset! running false))
 

@@ -275,15 +275,59 @@ namespace play_decide
      {:action action :probs mean :members members :votes votes
       :seconds (- (cpp/play_decide.seconds) began)})))
 
+(defn conversation
+  "A conversation the choices are shown in, as the harness shows an agent's
+  (harness.cards/watch! takes it; harness.core/save! and harness.cards/replay! too): each
+  choice a turn, what the model was told, its thinking, and its answer with each action's
+  probability."
+  []
+  (atom {:entries [] :state :idle :live nil :generated 0 :seconds 0.0 :tools []
+         :born (cpp/play_decide.seconds)}))
+
+(defn- probs-text
+  "The actions' probabilities, the likeliest first, those of 1% or more."
+  [probs]
+  (str/join ", " (map (fn [[a q]] (str (name a) " " (/ (long (* 100 q)) 100.0)))
+                      (sort-by (fn [[_ q]] (- q)) (filter (fn [[_ q]] (>= q 0.01)) probs)))))
+
+(defn- shown!
+  "Decision `d` (on the game as `told`) added to conversation `conv` as a turn: the index of
+  its answer's entry (where a replay's game goes past its action)."
+  [conv d told]
+  (let [v @conv
+        now (- (cpp/play_decide.seconds) (:born v))
+        began (- now (or (:seconds d) 0.0))
+        step (inc (count (filter (fn [e] (= :user (:role e))) (:entries v))))
+        answer (str (name (:action d))
+                    "\n" (probs-text (:probs d))
+                    (when-let [vs (:votes d)]
+                      (str "\nvotes: " (str/join ", " (map (fn [[a c]] (str (name a) " " c)) vs))))
+                    (when-let [said (:said d)] (str "\nanswered: " (str/trim said))))
+        entries (cond-> [{:role :user :text (str told) :began began :ended began :step step}]
+                  (:thinking d) (conj {:role :thinking :text (:thinking d) :began began :ended now :step step
+                                       :cut (boolean (:cut d))})
+                  true (conj {:role :model :text answer :began now :ended now :step step}))
+        at (+ (count (:entries v)) (dec (count entries)))]
+    (swap! conv (fn [v] (-> v
+                            (update :entries into entries)
+                            (assoc :state :done :step-count step)
+                            (update :generated + (or (:thought-tokens d) 0))
+                            (update :seconds + (or (:seconds d) 0.0)))))
+    at))
+
 (defn chooser
   "A game's chooser for its `play!`: from a state, the decision. `told` is the function that
   tells a state (pass its var, #'told, so that redefining it applies at once); `deciders` a
   player or a vector of players (a committee, `opts` as committee!'s); each decision is kept
-  in `log` (an atom of a vector) with what the model was told."
+  in `log` (an atom of a vector) with what the model was told, and, with :conversation in
+  `opts` (a `conversation`), shown there as a turn (its :entry, the answer's place)."
   ([deciders told log] (chooser deciders told log {}))
   ([deciders told log opts]
    (fn [state]
      (let [t (told state)
-           d (assoc (if (vector? deciders) (committee! deciders t opts) (choose! deciders t)) :told t)]
+           conv (:conversation opts)
+           _ (when conv (swap! conv assoc :state :thinking))
+           d (assoc (if (vector? deciders) (committee! deciders t opts) (choose! deciders t)) :told t)
+           d (if conv (assoc d :entry (shown! conv d t)) d)]
        (swap! log conj d)
        d))))
