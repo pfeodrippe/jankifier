@@ -52,6 +52,10 @@
         rel (loop [r rel] (cond (> r 180.0) (recur (- r 360.0)) (< r -180.0) (recur (+ r 360.0)) :else r))]
     [(cpp/play.sqrt (+ (* dx dx) (* dy dy))) rel]))
 
+;; The monsters (ViZDoom's names).
+(def enemies #{"Zombieman" "ShotgunGuy" "ChaingunGuy" "DoomImp" "Demon" "Spectre" "LostSoul" "Cacodemon"
+               "HellKnight" "BaronOfHell" "Arachnotron" "PainElemental" "Revenant" "Fatso" "Archvile"})
+
 (defn- direction [a]
   (cond (< (max a (- a)) 1.0) "ahead"
         (pos? a) (str (long a) " degrees left")
@@ -99,9 +103,16 @@
                            (for [o (sort-by (fn [o] (first (bearing s o))) (:objects s))
                                  :let [[d a] (bearing s o)]]
                              (str "- " (:name o) ", " (long d) " away, "
-                                  (cond (< (max a (- a)) 5.0) "straight ahead"
-                                        (pos? a) (str (long a) " degrees to the left")
-                                        :else (str (long (- a)) " degrees to the right"))))))
+                                  (let [enemy (contains? enemies (:name o))
+                                        side (if (pos? a) "left" "right")
+                                        turns (max 1 (long (+ 0.5 (/ (max a (- a)) 30.0))))]
+                                    (cond (< (max a (- a)) 5.0)
+                                          (str "straight ahead" (when enemy " (in your sights: attack hits it)"))
+                                          :else
+                                          (str (long (max a (- a))) " degrees to the " side
+                                               (when enemy
+                                                 (str " (turn-" side (if (= 1 turns) " once" (str " " turns " times"))
+                                                      " to aim at it)")))))))))
             "Nothing in view.")))))
 
 (defn start!
@@ -118,8 +129,6 @@
 
 ;; A scripted player.
 
-(def enemies #{"Zombieman" "ShotgunGuy" "ChaingunGuy" "DoomImp" "Demon" "Spectre" "LostSoul" "Cacodemon"
-               "HellKnight" "BaronOfHell" "Arachnotron" "PainElemental" "Revenant" "Fatso" "Archvile"})
 
 (defonce memory (atom {:last nil :stuck 0}))
 
