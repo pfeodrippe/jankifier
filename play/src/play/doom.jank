@@ -263,7 +263,9 @@
                  (str/join "\n"
                            (for [o (take shown-at-most (sort-by (fn [o] (first (bearing s o))) (filter shown? (:objects s))))
                                  :let [[d a] (bearing s o)]]
-                             (str "- " (:name o) ", " (long d) " away, "
+                             (str "- " (:name o)
+                                  (when (str/ends-with? (str (:name o)) "Ball") " (a fireball coming: step aside, shooting it does nothing)")
+                                  ", " (long d) " away, "
                                   (let [enemy (alive? o)
                                         side (if (pos? a) "left" "right")]
                                     (cond (< (max a (- a)) aimed-within)
