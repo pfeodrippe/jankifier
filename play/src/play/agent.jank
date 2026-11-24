@@ -46,8 +46,9 @@
              ;; A step onto a trap seen before is not done (an agent stepped back into a bear
              ;; trap again and again).
              :caution #'nethack/caution
-             ;; Answers to the game's messages and menus don't move the @.
-             :still #{:more :enter :escape :yes :no :select-all}
+             ;; No :still: an answer to a message or a menu changes the screen, and one that
+             ;; changes nothing should stop the list (an agent pressed more eight times with
+             ;; nothing to answer, told nothing).
              :actions nethack/model-actions :rules nethack/rules :st #'nethack/st :watch! #'nethack/watch!
              ;; Walking into a wall takes no turn: the screen stays the same.
              :same? (fn [a b] (and (= (:screen a) (:screen b)) (= (:message a) (:message b))))
