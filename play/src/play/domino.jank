@@ -67,6 +67,16 @@
         (recur (inc y))
         y))))
 
+(defn- lands-at
+  "The row a pill put at column x (lying or standing) would land at from the top: its lower
+  half's (both halves', lying)."
+  [pl x vertical]
+  (let [free? (fn [[c r]] (or (< r 0) (and (< -1 c width) (< r height) (nil? (get-in (:field pl) [r c])))))]
+    (loop [y 0]
+      (if (every? free? (pill-cells x (inc y) vertical))
+        (recur (inc y))
+        y))))
+
 (defn- runs
   "A field as runs of the same thing on a row, with their x: a line a row that has something."
   [pl]
@@ -97,7 +107,18 @@
                  (if (:vertical pl) "above it" "to its right")
                  (if (:vertical pl) " (standing)" " (lying)") ". Dropped now, it would land at row "
                  (landing pl) ". Next pill: " (str/join " and " (:next pl)) ".\n"))
-          "Your field, 8 wide (x 0 to 7) and 16 high (y 0 at the top, 15 at the bottom), by row "
+          (when (= "pill falling" (:state pl))
+            (str "Where to put it: xN-lying puts " c1 " at x N and " c2 " at x N+1; xN-lying-turned "
+                 c2 " at x N and " c1 " at x N+1; xN-standing " c1 " at the bottom of column N and " c2
+                 " on top; xN-standing-turned " c2 " at the bottom and " c1 " on top. It falls as far as it can. "
+                 "Where it lands (the row of its lower half, lying: both halves): lying "
+                 (str/join ", " (for [x (range (dec width))] (str "x" x " " (lands-at pl x false))))
+                 "; standing " (str/join ", " (for [x (range width)] (str "x" x " " (lands-at pl x true))))
+                 ".\n"))
+          "How high each column is filled (the top row with something, from x 0 to 7; - for empty): "
+          (str/join " " (for [x (range width)]
+                          (or (first (keep (fn [row] (when (get-in (:field pl) [row x]) row)) (range height))) "-")))
+          ".\nYour field, 8 wide (x 0 to 7) and 16 high (y 0 at the top, 15 at the bottom), by row "
           "(empty cells left out):\n"
           (let [r (runs pl)] (if (seq r) r "(empty)"))))))
 
@@ -132,6 +153,66 @@
         (reset! st {:step 0 :told (told 0)})
         nil)))
 
+;; Placements: where a pill goes, worked there by the buttons.
+
+(def placements
+  "Every placement's name: xN-lying (N 0 to 6), xN-lying-turned, xN-standing (N 0 to 7),
+  xN-standing-turned."
+  (vec (for [x (range width)
+             o ["lying" "lying-turned" "standing" "standing-turned"]
+             :when (or (< x (dec width)) (str/starts-with? o "standing"))]
+         (keyword (str "x" x "-" o)))))
+
+(defn- target
+  "A placement's column and the B presses that turn a new pill to it: B goes lying, standing,
+  lying turned (halves swapped), standing turned, and round again."
+  [placement]
+  (let [[_ x o] (re-matches #"x(\d+)-(.*)" (name placement))]
+    {:x (parse-long x) :turns (get {"lying" 0 "standing" 1 "lying-turned" 2 "standing-turned" 3} o 0)}))
+
+(defn- next-press
+  "A player's next buttons on the way to its target ({:x :turns :left}): B while turns are
+  left, then left or right to the column (as the pill is now: a wall can move it), then up
+  (the drop). nil once dropped."
+  [pl goal]
+  (cond
+    (:done goal) nil
+    (not= "pill falling" (:state pl)) nil
+    (pos? (:left goal)) [:b]
+    (< (:x pl) (:x goal)) [:right]
+    (> (:x pl) (:x goal)) [:left]
+    :else [:up]))
+
+(defn place!
+  "Both players' pills worked to their placements at once and dropped, then the frames until
+  both have a new pill (or the game ended). A placement nil: that player waits."
+  [p1 p2]
+  (loop [goals [(when p1 (assoc (target p1) :left (:turns (target p1))))
+                (when p2 (assoc (target p2) :left (:turns (target p2))))]
+         i 0]
+    (let [s (state)
+          presses (mapv (fn [pl goal] (when goal (next-press pl goal))) s goals)]
+      (when (and (< i 40) (some some? presses))
+        (p/nes-run2! (or (first presses) []) (or (second presses) []) press-frames)
+        (p/nes-run2! [] [] press-frames)
+        (recur (mapv (fn [goal press]
+                       (cond (nil? goal) nil
+                             (= press [:b]) (update goal :left dec)
+                             (= press [:up]) (assoc goal :done true)
+                             (nil? press) (assoc goal :done true)
+                             :else goal))
+                     goals presses)
+               (inc i)))))
+  ;; Until both have a new pill at the top (or someone won or lost).
+  (loop [i 0]
+    (let [s (state)]
+      (when (and (< i 400)
+                 (not (every? (fn [pl] (or (contains? #{"won" "lost"} (:state pl))
+                                          (and (= "pill falling" (:state pl)) (<= (:y pl) 1))))
+                              s)))
+        (p/nes-run2! [] [] 1)
+        (recur (inc i))))))
+
 ;; Model players.
 
 (def rules
@@ -140,13 +221,13 @@
        "each in a field of its own. Viruses sit in your field, each red, green or blue. Pills of "
        "two halves fall from the top, one at a time; each half is red, green or blue. Make a line "
        "of 4 or more of the same colour, across or down (viruses and pill halves together), to "
-       "clear it. Clear all your viruses before the other player clears theirs to win. Actions: "
-       "left and right move the falling pill a column; rotate turns it (lying or standing; turning "
-       "it twice swaps its halves); drop puts it down at once where it would land; down makes it "
-       "fall faster; wait does nothing (it falls by itself, slowly). Put a pill's halves on or "
-       "beside viruses of their colour."))
+       "clear it; what is left above falls. Clear all your viruses before the other player clears "
+       "theirs to win; a column filled to the top loses. Each turn you choose where your pill "
+       "goes: its column, and lying or standing, which way round (the turn says what each "
+       "placement does with this pill's colours). Put halves on or beside viruses of their colour, "
+       "and keep the columns low."))
 
-(def model-actions [:left :right :rotate :drop :down :wait])
+(def model-actions placements)
 
 (defonce decisions (atom [[] []]))
 (defonce running (atom false))
@@ -157,9 +238,9 @@
   ([m settings] (decide/player m (merge {:rules rules :actions model-actions} settings))))
 
 (defn play-models!
-  "`steps` steps of two model players against each other, in the background: at each, both
-  choose at the same time on their own threads (the engine makes their tokens one forward),
-  then both actions are done together. Each decision kept in `decisions` (player 1's, player
+  "`steps` pills of two model players against each other, in the background: for each, both
+  choose a placement at the same time on their own threads (the engine makes their tokens one
+  forward), then both pills are worked there together and dropped. Each decision kept in `decisions` (player 1's, player
   2's). A future, done when the steps are or a player has won or lost; (stop!) ends it."
   [[p1 p2] steps]
   (reset! decisions [[] []])
@@ -175,7 +256,7 @@
                   f2 (future (decide/choose! p2 t2))
                   d1 (assoc @f1 :told t1)
                   d2 (assoc @f2 :told t2)]
-              (act! (:action d1) (:action d2))
+              (place! (:action d1) (:action d2))
               (swap! decisions (fn [[a b]] [(conj a d1) (conj b d2)]))
               (reset! st {:step (inc i) :action (:action d1) :decision d1 :told t1
                           :result (str "player 2: " (name (:action d2)))})
