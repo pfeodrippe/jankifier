@@ -178,6 +178,16 @@
   [o]
   (contains? enemies (:name o)))
 
+(defn- threats
+  "The monsters alive that can see the player (nothing of the map between: anywhere around,
+  in view or not), within 1500: [object distance degrees], the nearest first."
+  [s]
+  (vec (sort-by second (for [o (cpp/play.doom_monsters)
+                             :when (alive? o)
+                             :let [[d a] (bearing s o)]
+                             :when (and (< d 1500.0) (cpp/play.doom_sees (:x o) (:y o)))]
+                         [o d a]))))
+
 (defn- moved
   "How the player moved from `before` to `s`, as a sentence (and what the last action did:
   monsters killed, a door that opened)."
@@ -192,13 +202,9 @@
          (when (< (- (:health s) (:health before)) 0) (str ", and lost " (long (- (:health before) (:health s))) " health"))
          "."
          (when (< (- (:health s) (:health before)) 0)
-           (let [near (take 3 (sort-by first (for [o (cpp/play.doom_monsters)
-                                                   :when (alive? o)
-                                                   :let [[d a] (bearing s o)]
-                                                   :when (< d 1200.0)]
-                                               [d a o])))]
+           (let [near (take 3 (for [[o d a] (threats s)] [d a o]))]
              (when (seq near)
-               (str " Monsters near you (seen or not): "
+               (str " Monsters that can see you: "
                     (str/join "; " (for [[d a o] near]
                                      (str (:name o) " " (long d) " away, " (direction a)
                                           (when-let [t (turns a)] (str " " t)))))
@@ -207,16 +213,6 @@
            (when (pos? n) (str " You killed " n (if (= 1 n) " monster." " monsters."))))
          (when-let [said @note] (reset! note nil) (str " " said))
          "\n")))
-
-(defn- threats
-  "The monsters alive that can see the player (nothing of the map between: anywhere around,
-  in view or not), within 1500: [object distance degrees], the nearest first."
-  [s]
-  (vec (sort-by second (for [o (cpp/play.doom_monsters)
-                             :when (alive? o)
-                             :let [[d a] (bearing s o)]
-                             :when (and (< d 1500.0) (cpp/play.doom_sees (:x o) (:y o)))]
-                         [o d a]))))
 
 (defn over
   "Why the game is over (the player died, or reached the exit: Doom's episode ends there), or
