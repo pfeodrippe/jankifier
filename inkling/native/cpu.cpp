@@ -1369,7 +1369,8 @@ namespace inkling
     }
   }
 
-  void eval(session &s, int32_t const *ids, size_t const n)
+  // An eval as it is made alone (eval queues single tokens for a shared forward).
+  void eval_direct(session &s, int32_t const *ids, size_t const n)
   {
     if(s.pos + static_cast<int64_t>(n) > s.context)
     {
@@ -1418,6 +1419,91 @@ namespace inkling
     }
   }
 
+  namespace
+  {
+    // Whether a session's token can go in a shared forward (eval_batch's conditions).
+    bool batchable(session const &s)
+    {
+      auto const &m{ *s.model };
+      return m.auto_batch && m.batching && m.use_gpu && !m.ablated() && s.gpu && !s.trace && !s.all_logits
+             && !s.capturing && !s.record && !s.tap_ring && !s.draft_model;
+    }
+
+    // One token, in the next forward: the thread that finds no forward running makes one of
+    // every token waiting (at most max_batch, a session once); the others wait for theirs.
+    void eval_queued(session &s, int32_t const id)
+    {
+      auto &q{ *s.model->batching };
+      model::batch_queue::request r{ &s, id, false, nullptr };
+      std::unique_lock<std::mutex> lock{ q.m };
+      q.waiting.push_back(&r);
+      while(!r.done)
+      {
+        if(q.running)
+        {
+          q.cv.wait(lock);
+          continue;
+        }
+        std::vector<model::batch_queue::request *> taken, left;
+        for(auto *const w : q.waiting)
+        {
+          bool const again{ std::any_of(taken.begin(), taken.end(), [&](auto const *t) { return t->s == w->s; }) };
+          (again || taken.size() >= static_cast<size_t>(max_batch) ? left : taken).push_back(w);
+        }
+        q.waiting = std::move(left);
+        q.running = true;
+        lock.unlock();
+        std::exception_ptr error;
+        try
+        {
+          if(taken.size() == 1)
+          {
+            eval_direct(*taken[0]->s, &taken[0]->id, 1);
+          }
+          else
+          {
+            std::vector<session *> sessions;
+            std::vector<int32_t> ids;
+            for(auto const *const t : taken)
+            {
+              sessions.push_back(t->s);
+              ids.push_back(t->id);
+            }
+            eval_batch(sessions, ids);
+          }
+        }
+        catch(...)
+        {
+          error = std::current_exception();
+        }
+        lock.lock();
+        for(auto *const t : taken)
+        {
+          t->error = error;
+          t->done = true;
+        }
+        q.running = false;
+        q.cv.notify_all();
+      }
+      if(r.error)
+      {
+        std::rethrow_exception(r.error);
+      }
+    }
+  }
+
+  void eval(session &s, int32_t const *ids, size_t const n)
+  {
+    // A token that can share a forward, and would be taken alone (its checks first, so
+    // that a bad token fails only its own eval).
+    if(n == 1 && batchable(s) && s.pos + 1 <= s.context && ids[0] >= 0 && ids[0] < s.model->cfg.vocab)
+    {
+      eval_queued(s, ids[0]);
+      return;
+    }
+    eval_direct(s, ids, n);
+  }
+
   void eval(session &s, std::vector<int32_t> const &ids)
   {
     eval(s, ids.data(), ids.size());
@@ -1429,9 +1515,16 @@ namespace inkling
     {
       fail("eval_batch takes a token for each session");
     }
-    if(sessions.size() > static_cast<size_t>(max_chunk))
+    if(sessions.size() > static_cast<size_t>(max_batch))
     {
-      fail("eval_batch takes at most " + std::to_string(max_chunk) + " sessions");
+      // Forwards of max_batch sessions at most.
+      for(size_t i{}; i < sessions.size(); i += static_cast<size_t>(max_batch))
+      {
+        size_t const end{ std::min(sessions.size(), i + static_cast<size_t>(max_batch)) };
+        eval_batch({ sessions.begin() + static_cast<ptrdiff_t>(i), sessions.begin() + static_cast<ptrdiff_t>(end) },
+                   { ids.begin() + static_cast<ptrdiff_t>(i), ids.begin() + static_cast<ptrdiff_t>(end) });
+      }
+      return;
     }
     model *const m{ sessions.front()->model };
     bool together{ m->use_gpu && !m->ablated() };
@@ -1455,7 +1548,7 @@ namespace inkling
       // One at a time: the same as a batch, without its speed.
       for(size_t i{}; i < sessions.size(); ++i)
       {
-        eval(*sessions[i], &ids[i], 1);
+        eval_direct(*sessions[i], &ids[i], 1);
       }
       return;
     }

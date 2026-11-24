@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <condition_variable>
+#include <exception>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -97,6 +98,22 @@ namespace inkling
 
   struct scratch;
   void forward(session &s, int32_t const *ids, int32_t n);
+
+  // The tokens waiting for the next forward (model::auto_batch).
+  struct model::batch_queue
+  {
+    struct request
+    {
+      session *s{};
+      int32_t id{};
+      bool done{};
+      std::exception_ptr error;
+    };
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<request *> waiting;
+    bool running{};
+  };
 
   // The Metal backend (metal.mm). metal_open gives null when it can't run
   // this model. metal_new_session allocates the session's caches (s.caches

@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <thread>
 
 namespace
 {
@@ -36,8 +38,10 @@ namespace
                  "  inkling batchcheck MODEL.ink [N] [STEPS] [CTX]\n"
                  "                                     N sessions (8), each after a prompt of its own length,\n"
                  "                                     decode STEPS (32) greedy tokens one session at a time\n"
-                 "                                     and all in one forward (eval_batch): each step's logits\n"
-                 "                                     compared bit by bit, and the time of a step each way\n"
+                 "                                     and all in one forward (eval_batch), then each on its\n"
+                 "                                     own thread (eval, its tokens gathered in shared\n"
+                 "                                     forwards): each step's logits compared bit by bit with\n"
+                 "                                     alone, and the time of a step each way\n"
                  "  inkling rowcheck MODEL.ink PROMPT [ROWS]\n"
                  "                                     evaluates ROWS (8) tokens after the prompt in one\n"
                  "                                     forward, keeping each row's logits, and compares\n"
@@ -134,7 +138,7 @@ int main(int argc, char **argv)
       int const steps{ argc > 4 ? std::atoi(argv[4]) : 32 };
       int const ctx{ argc > 5 ? std::atoi(argv[5]) : 2048 };
       using owned = std::unique_ptr<inkling::session, void (*)(inkling::session *)>;
-      std::vector<owned> alone, together;
+      std::vector<owned> alone, together, threaded;
       std::vector<inkling::session *> batch;
       for(int i{}; i < n; ++i)
       {
@@ -148,10 +152,23 @@ int main(int argc, char **argv)
         auto const prompt{ inkling::tokenize(*m, text, true) };
         alone.emplace_back(inkling::new_session(*m, ctx), inkling::free_session);
         together.emplace_back(inkling::new_session(*m, ctx), inkling::free_session);
+        threaded.emplace_back(inkling::new_session(*m, ctx), inkling::free_session);
         inkling::eval(*alone.back(), prompt);
         inkling::eval(*together.back(), prompt);
+        inkling::eval(*threaded.back(), prompt);
         batch.push_back(together.back().get());
       }
+      // Each session's logits at each step, as a hash (for the threads' comparison).
+      auto const hash_of{ [](std::vector<float> const &x) {
+        uint64_t h{ 1469598103934665603ull };
+        auto const *const p{ reinterpret_cast<unsigned char const *>(x.data()) };
+        for(size_t i{}; i < x.size() * sizeof(float); ++i)
+        {
+          h = (h ^ p[i]) * 1099511628211ull;
+        }
+        return h;
+      } };
+      std::vector<std::vector<uint64_t>> hashes(static_cast<size_t>(n));
       size_t const v{ alone[0]->logits.size() };
       double t_alone{}, t_batch{};
       bool same{ true };
@@ -170,6 +187,10 @@ int main(int argc, char **argv)
           inkling::eval(*alone[static_cast<size_t>(i)], &next[static_cast<size_t>(i)], 1);
         }
         double const a1{ now() };
+        for(int i{}; i < n; ++i)
+        {
+          hashes[static_cast<size_t>(i)].push_back(hash_of(alone[static_cast<size_t>(i)]->logits));
+        }
         inkling::eval_batch(batch, next);
         double const a2{ now() };
         // The first step of each way is left out of the times (buffers touched first).
@@ -203,11 +224,41 @@ int main(int argc, char **argv)
           }
         }
       }
+      // Each session on its own thread, plain evals: their tokens meet in shared forwards.
+      std::atomic<int> differing{};
+      double const h0{ now() };
+      {
+        std::vector<std::thread> threads;
+        for(int i{}; i < n; ++i)
+        {
+          threads.emplace_back([&, i] {
+            auto &s{ *threaded[static_cast<size_t>(i)] };
+            for(int step{}; step < steps; ++step)
+            {
+              uint64_t rng{ 1 };
+              int32_t const id{ inkling::sample(s.logits.data(), static_cast<int32_t>(v), 0.0f, 1.0f, 0, rng) };
+              inkling::eval(s, &id, 1);
+              if(hash_of(s.logits) != hashes[static_cast<size_t>(i)][static_cast<size_t>(step)])
+              {
+                ++differing;
+              }
+            }
+          });
+        }
+        for(auto &t : threads)
+        {
+          t.join();
+        }
+      }
+      double const t_threads{ now() - h0 };
       int const timed{ std::max(1, steps - 1) };
       std::printf("%d sessions at positions %d to %d, %d steps\n", n, static_cast<int>(alone.front()->pos),
                   static_cast<int>(alone.back()->pos), steps);
       std::printf("one at a time: %.1f ms a step (%.1f tokens/s)\n", 1e3 * t_alone / timed, n * timed / t_alone);
       std::printf("in one forward: %.1f ms a step (%.1f tokens/s)\n", 1e3 * t_batch / timed, n * timed / t_batch);
+      std::printf("each on its thread: %.1f ms a step (%.1f tokens/s), %d of %d steps' logits differ from alone\n",
+                  1e3 * t_threads / steps, n * steps / t_threads, differing.load(), n * steps);
+      same = same && differing == 0;
       std::printf(same ? "OK: every session's logits are the same bits as alone, at every step\n"
                        : "DIFFERENT: a batch isn't each session alone\n");
       return same ? 0 : 1;

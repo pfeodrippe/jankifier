@@ -91,7 +91,9 @@
   experts' inputs as the checkpoint's reference does; false keeps FP32),
   :split-attention (one token over a long context: the global layers'
   attention split across the keys, then merged; the same arithmetic, in
-  another order)."
+  another order), :auto-batch (one token evaluated on different sessions from
+  different threads made one forward when they meet; the same bits; on by
+  default)."
   [m k v]
   (cpp/inkling.jank_layer.set_option m k v))
 

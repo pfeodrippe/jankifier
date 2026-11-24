@@ -336,6 +336,10 @@ namespace inkling::jank_layer
       {
         m->split_attention = rt::truthy(value);
       }
+      else if(k == ":auto-batch")
+      {
+        m->auto_batch = rt::truthy(value);
+      }
       else
       {
         throw std::runtime_error{ "inkling: unknown option " + k };
@@ -348,7 +352,7 @@ namespace inkling::jank_layer
   {
     auto const m{ model_of(o) };
     return map_builder{}("threads", num(m->threads))("quantize-expert-inputs", boolean(m->quantize_expert_inputs))(
-             "split-attention", boolean(m->split_attention))(
+             "split-attention", boolean(m->split_attention))("auto-batch", boolean(m->auto_batch))(
              "gpu",
              boolean(m->use_gpu && m->gpu))("gpu-available", boolean(m->gpu != nullptr))
       .m;

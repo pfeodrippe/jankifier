@@ -247,6 +247,13 @@ namespace inkling
     // different threads wait for each other (the workers, and the weight
     // copies made on first use, are the model's).
     std::mutex running;
+    // Evals of one token on different sessions from different threads are
+    // made one forward (eval_batch) when they meet: a token that comes while a
+    // forward runs waits, and the next forward takes every token waiting. Each
+    // session ends as after its own eval (the same bits). Off: each its own.
+    bool auto_batch{ true };
+    struct batch_queue;
+    std::unique_ptr<batch_queue> batching;
 
     model();
     ~model();
@@ -454,6 +461,10 @@ namespace inkling
   inline constexpr int32_t max_chunk{ 512 };
   // Tokens an eval with all_logits takes at most (one forward on the GPU).
   inline constexpr int32_t max_rows{ 16 };
+  // Sessions in one forward at most (eval_batch makes forwards of this many): over 16
+  // rows, the forward's matrix-product and grouped-expert kernels add in another order,
+  // and a session's bits would not be those it gets alone.
+  inline constexpr int32_t max_batch{ 16 };
   // Positions a session keeps hidden states for a draft model (a window of
   // 1,024 and room for a chunk).
   inline constexpr int32_t tap_slots{ 1024 + max_chunk };

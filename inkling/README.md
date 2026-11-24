@@ -221,10 +221,20 @@ Each session's rows go through the projections, norms and experts together;
 its own cache, convolution histories and attention are its own (the forward
 runs in segments of rows by session). `batchcheck` decodes N sessions, at
 different positions, one at a time and together, and compares every logit of
-every step: the same bits. Decoding 8 sessions together gives 112 tokens/s in
-all (one session alone: 46), 16 sessions 108 (each row reads its own experts,
-so 16 rows cost twice 8). Sessions that can't share a forward (on the CPU,
+every step: the same bits. Decoding 8 sessions together gives about 100-110
+tokens/s in all (one session alone: 46), 16 sessions about the same (each row
+reads its own experts, so 16 rows cost twice 8). A forward takes 16 sessions at
+most: over 16 rows its matrix-product and grouped-expert kernels add in
+another order, and the bits would not be each session's alone (larger batches
+are made forwards of 16). Sessions that can't share a forward (on the CPU,
 keeping every row's logits, capturing, drafting) are evaluated one at a time.
+
+Without asking: evals of one token from different threads, on different
+sessions, are made one forward when they meet (`:auto-batch`, on by default).
+A token that comes while a forward runs waits, and the next forward takes every
+token waiting, so agents each on its own thread share forwards with nothing
+changed in them. `batchcheck`'s last part does this with a thread a session:
+8 threads 86 tokens/s in all, 32 threads 80, the same bits as alone.
 
 `ink/model-ptr` and `ink/session-ptr` give the C++ objects for direct
 interop:
@@ -318,9 +328,11 @@ One forward pass runs at a time on a model: evals of its sessions from
 different threads wait for each other.
 
 The model file is mapped, not read. On top of it: 1.3 GB of half-float
-weight copies once a batch has run; per session, the caches (8 global visits
-hold `context` positions of 4 KB each: 270 MB at 8,192 tokens, 8.6 GB at
-262,144) and up to 0.5 GB of attention scratch.
+weight copies once a batch has run; one set of working buffers for the model's
+forwards (they run one at a time), with up to 0.5 GB of attention scratch; and
+per session, its caches: 8 global visits hold `context` positions of 4 KB each
+(270 MB at 8,192 tokens, 8.6 GB at 262,144), and the local visits a ring of
+their window and a chunk each (about 230 MB whatever the context).
 
 ## Changing a kernel
 

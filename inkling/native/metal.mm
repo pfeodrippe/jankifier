@@ -178,6 +178,8 @@ namespace inkling
     }
   }
 
+  struct metal_scratch;
+
   struct metal_backend
   {
     id<MTLDevice> device;
@@ -201,8 +203,14 @@ namespace inkling
     std::vector<id<MTLBuffer>> rel;
     id<MTLBuffer> e4m3;
     id<MTLBuffer> dummy;
+    // The forwards' working buffers, one set for the model (its forwards run one at a time),
+    // made at the first forward and made again larger for a larger context.
+    std::unique_ptr<metal_scratch> scratch;
+    ~metal_backend();
   };
 
+  // A session's own buffers: its caches, its convolutions' histories, what a draft's check
+  // keeps, its taps.
   struct metal_session
   {
     metal_backend *backend{};
@@ -213,6 +221,15 @@ namespace inkling
     std::vector<std::array<id<MTLBuffer>, 4>> kept;
     // The taps' ring for a draft model (session::tap_ring), when kept.
     id<MTLBuffer> taps;
+  };
+
+  // A forward's working buffers, for chunks of up to `tmax` tokens, batches of up to
+  // max_batch sessions, and contexts of up to `context` tokens (the batched attention's
+  // scores).
+  struct metal_scratch
+  {
+    uint32_t tmax{};
+    int64_t context{};
     id<MTLBuffer> ids, stream, q, r, gate, sink, kraw, vraw, dynk, dynv, kc, vc, attended, out, ffn_in, xq, xmax, chosen,
       cw, act, amax, ffn, hidden, logits, rlogits, qg, bias, scores, inv, part;
     // A controller's normalized pair and its projection, for each of 3 inputs.
@@ -225,6 +242,8 @@ namespace inkling
     size_t scores_bytes{};
     id<MTLBuffer> normed[3];
   };
+
+  metal_backend::~metal_backend() = default;
 
   namespace
   {
@@ -521,11 +540,7 @@ namespace inkling
       auto g{ std::make_unique<metal_session>() };
       g->backend = &b;
       g->tmax = static_cast<uint32_t>(max_chunk);
-      size_t const t{ g->tmax };
-      size_t const h{ static_cast<size_t>(c.hidden) };
       size_t const f{ sizeof(float) };
-      size_t const qw{ static_cast<size_t>(c.heads) * c.head_dim };
-      size_t const kw{ static_cast<size_t>(c.kv_heads) * c.head_dim };
       for(auto &vc : s.caches)
       {
         id<MTLBuffer> const kb{ scratch_buffer(b, vc.kv_elements() * 2) };
@@ -546,6 +561,31 @@ namespace inkling
         g->conv.push_back(hist);
         g->kept.push_back(kept);
       }
+      return g.release();
+    }
+  }
+
+  // The model's working buffers for a forward of sessions of up to `context` tokens: made
+  // the first time, and again when a larger context needs larger ones.
+  metal_scratch &scratch_for(model &m, int64_t const context)
+  {
+    auto &b{ *m.gpu };
+    if(b.scratch && b.scratch->context >= context)
+    {
+      return *b.scratch;
+    }
+    @autoreleasepool
+    {
+      auto const &c{ m.cfg };
+      b.scratch.reset();
+      auto g{ std::make_unique<metal_scratch>() };
+      g->tmax = static_cast<uint32_t>(max_chunk);
+      g->context = context;
+      size_t const t{ g->tmax };
+      size_t const h{ static_cast<size_t>(c.hidden) };
+      size_t const f{ sizeof(float) };
+      size_t const qw{ static_cast<size_t>(c.heads) * c.head_dim };
+      size_t const kw{ static_cast<size_t>(c.kv_heads) * c.head_dim };
       g->ids = scratch_buffer(b, t * sizeof(int32_t));
       g->stream = scratch_buffer(b, (stream_slots + 6) * t * h * f);
       for(size_t z{}; z < 3; ++z)
@@ -561,7 +601,7 @@ namespace inkling
       g->qg = scratch_buffer(b, (c.kv_heads * t * per + 32) * c.head_dim * f);
       g->bias = scratch_buffer(b, t * c.heads * std::max(c.rel_extent, c.window) * f);
       g->inv = scratch_buffer(b, t * c.heads * f);
-      size_t const slots{ static_cast<size_t>((s.context + 31) / 32 * 32) };
+      size_t const slots{ static_cast<size_t>((context + 31) / 32 * 32) };
       size_t const full{ c.kv_heads * ((t * per + 31) / 32 * 32) * slots * f };
       g->scores_bytes = std::min(full, std::max<size_t>(512u << 20, c.kv_heads * 32 * slots * f));
       g->scores = scratch_buffer(b, g->scores_bytes);
@@ -600,8 +640,10 @@ namespace inkling
       g->route_out = scratch_buffer(b, t * c.top_k * h * f);
       // Up to max_rows tokens' outputs (all_logits).
       g->hidden = scratch_buffer(b, std::max<size_t>(t, max_rows) * h * f);
-      g->logits = scratch_buffer(b, static_cast<size_t>(max_rows) * (c.unpadded_vocab + 4) * f);
-      return g.release();
+      // Up to max_rows tokens' logits (all_logits), or a batch's (a row a session).
+      g->logits = scratch_buffer(b, static_cast<size_t>(std::max(max_rows, max_batch)) * (c.unpadded_vocab + 4) * f);
+      b.scratch = std::move(g);
+      return *b.scratch;
     }
   }
 
@@ -1043,14 +1085,26 @@ namespace inkling
     @autoreleasepool
     {
       session &s{ *segs.front().s };
-      auto &g{ *s.gpu };
-      auto &b{ *g.backend };
+      // The first session's own buffers (a single session's forward, captures, taps), and
+      // the model's working buffers, for the largest of the sessions' contexts.
+      auto &own{ *s.gpu };
+      auto &b{ *own.backend };
       auto &m{ *s.model };
+      int64_t largest{};
+      for(auto const &seg : segs)
+      {
+        largest = std::max<int64_t>(largest, seg.s->context);
+      }
+      if(segs.size() > static_cast<size_t>(max_batch))
+      {
+        fail("a batch has at most " + std::to_string(max_batch) + " sessions");
+      }
+      auto &g{ scratch_for(m, largest) };
       bool const several{ segs.size() > 1 };
       for(auto const &seg : segs)
       {
         if(several
-           && (seg.s->model != s.model || !seg.s->gpu || seg.s->gpu->tmax != g.tmax || seg.s->capturing
+           && (seg.s->model != s.model || !seg.s->gpu || seg.s->gpu->tmax != own.tmax || seg.s->capturing
                || seg.s->record || seg.s->all_logits || seg.s->tap_ring || seg.s->draft_model || seg.n > 16))
         {
           fail("a batch's sessions are of one model, on the GPU, and don't capture, record, keep every "
@@ -1063,7 +1117,7 @@ namespace inkling
       }
       auto const &c{ m.cfg };
       uint32_t const h{ static_cast<uint32_t>(c.hidden) };
-      uint32_t const tmax{ g.tmax };
+      uint32_t const tmax{ own.tmax };
       uint32_t const nt{ static_cast<uint32_t>(tokens) };
       uint32_t const p0{ static_cast<uint32_t>(s.pos) };
       uint32_t const taps{ static_cast<uint32_t>(c.conv_taps) };
@@ -1269,7 +1323,7 @@ namespace inkling
         use(b.tap_store, "tap_store");
         [e setBytes:&p length:sizeof(p) atIndex:0];
         bind(1, src);
-        bind(2, g.taps);
+        bind(2, own.taps);
         threads(h, count, 1);
       } };
 
@@ -1655,8 +1709,8 @@ namespace inkling
           field(&visit_capture::r, g.r, 0, static_cast<size_t>(nt) * c.heads * c.rel_dim);
           field(&visit_capture::sink, g.sink, 0, static_cast<size_t>(nt) * c.heads);
           field(&visit_capture::gate, g.gate, 0, nt * qw);
-          sync(vm ? &vm->conv[0] : nullptr, vf ? &vf->conv[0] : nullptr, g.conv[vi][0], 0, (taps - 1) * kw);
-          sync(vm ? &vm->conv[1] : nullptr, vf ? &vf->conv[1] : nullptr, g.conv[vi][1], 0, (taps - 1) * kw);
+          sync(vm ? &vm->conv[0] : nullptr, vf ? &vf->conv[0] : nullptr, own.conv[vi][0], 0, (taps - 1) * kw);
+          sync(vm ? &vm->conv[1] : nullptr, vf ? &vf->conv[1] : nullptr, own.conv[vi][1], 0, (taps - 1) * kw);
           if(vm)
           {
             vm->k.resize(nt * kw);
@@ -1712,7 +1766,7 @@ namespace inkling
             use(b.att_scores, std::string{ "att_scores" } + kind);
             [e setBytes:&p length:sizeof(p) atIndex:0];
             bind(1, g.qg);
-            bind(2, g.k[vi]);
+            bind(2, own.k[vi]);
             bind(3, g.bias);
             bind(4, g.scores);
             groups(p.nkp / 32, p.rows / 32, p.kvh, 32);
@@ -1725,7 +1779,7 @@ namespace inkling
             use(b.att_pv, std::string{ "att_pv" } + kind);
             [e setBytes:&p length:sizeof(p) atIndex:0];
             bind(1, g.scores);
-            bind(2, g.v[vi]);
+            bind(2, own.v[vi]);
             bind(3, g.inv);
             bind(4, g.gate);
             bind(5, g.attended);
@@ -1848,7 +1902,7 @@ namespace inkling
         if(stage())
         {
           field(&visit_capture::after_attention, g.stream, partial_offset(), static_cast<size_t>(nt) * h);
-          sync(vm ? &vm->conv[2] : nullptr, vf ? &vf->conv[2] : nullptr, g.conv[vi][2], 0, static_cast<size_t>(taps - 1) * h);
+          sync(vm ? &vm->conv[2] : nullptr, vf ? &vf->conv[2] : nullptr, own.conv[vi][2], 0, static_cast<size_t>(taps - 1) * h);
         }
 
         // Feed-forward: input, routing, experts.
@@ -2062,7 +2116,7 @@ namespace inkling
         if(stage())
         {
           field(&visit_capture::partial, g.stream, partial_offset(), static_cast<size_t>(nt) * h);
-          sync(vm ? &vm->conv[3] : nullptr, vf ? &vf->conv[3] : nullptr, g.conv[vi][3], 0, static_cast<size_t>(taps - 1) * h);
+          sync(vm ? &vm->conv[3] : nullptr, vf ? &vf->conv[3] : nullptr, own.conv[vi][3], 0, static_cast<size_t>(taps - 1) * h);
         }
       }
 

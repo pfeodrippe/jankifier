@@ -393,7 +393,10 @@ namespace inkling
     std::fprintf(stderr, "\ninkling: wrote %s (%zu tensors, %zu files)\n", out_path.c_str(), tensors.size(), files.size());
   }
 
-  model::model() = default;
+  model::model()
+    : batching{ std::make_unique<batch_queue>() }
+  {
+  }
 
   model::~model()
   {
