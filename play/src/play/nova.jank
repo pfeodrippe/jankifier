@@ -47,7 +47,9 @@
         cart (p/cartridge-ram)
         at (fn [k] (nth ram (get addr k)))]
     {:x (+ (at :player-x) (/ (at :player-x-sub) 256.0))
-     :y (+ (at :player-y) (/ (at :player-y-sub) 256.0))
+     ;; Above the level's top the byte wraps to 255: such a y is negative (an agent was told
+     ;; she moved 255 blocks).
+     :y (let [y (+ (at :player-y) (/ (at :player-y-sub) 256.0))] (if (>= y 128) (- y 256) y))
      :vx (signed (at :player-vx) (at :player-vx-sub))
      :vy (signed (at :player-vy) (at :player-vy-sub))
      :facing (if (zero? (at :player-dir)) :right :left)
@@ -62,9 +64,10 @@
                       :x (nth ram (+ (get addr :object-x) i))
                       :y (nth ram (+ (get addr :object-y) i))
                       :stunned (= 0x82 (nth ram (+ (get addr :object-f2) i)))}))
+     ;; Outside the rows (above the top) is empty: a negative row read the column before's.
      :map (fn [col row]
             (let [i (+ (* col rows) row)]
-              (if (and (>= col 0) (< i (count cart))) (nth cart i) 0)))}))
+              (if (and (>= col 0) (<= 0 row) (< row rows) (< i (count cart))) (nth cart i) 0)))}))
 
 (defn block-char [id]
   (if (< id (count blocks/block-chars)) (subs blocks/block-chars id (inc id)) "?"))
@@ -73,7 +76,9 @@
   "The row of the level Nova's feet are in: her y is her top, and she is a block and a half
   tall (standing on row 8, her y is 6.5)."
   [st]
-  (long (+ (:y st) 1)))
+  (let [v (+ (:y st) 1)]
+    ;; Down to the row below when above the level's top (long cuts toward zero).
+    (if (neg? v) (dec (long v)) (long v))))
 
 (defn view
   "The level around Nova as text: `before` columns behind her and `after` ahead, every row.
