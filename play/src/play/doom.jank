@@ -391,6 +391,13 @@
                                  :let [[d a] (bearing s o)]]
                              (str "- " (:name o)
                                   (when (str/ends-with? (str (:name o)) "Ball") " (a fireball coming: step aside, shooting it does nothing)")
+                                  (case (:category o)
+                                    "Weapon" " (a weapon: walk over it to pick it up)"
+                                    "Ammo" " (ammo: walk over it)"
+                                    "Health" " (health: walk over it)"
+                                    "Armor" " (armor: walk over it)"
+                                    "Monster" " (a monster)"
+                                    nil)
                                   ", " (long d) " away, "
                                   (let [enemy (alive? o)
                                         side (if (pos? a) "left" "right")]
