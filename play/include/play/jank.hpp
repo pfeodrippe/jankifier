@@ -364,6 +364,34 @@ namespace play
 
   // How far the player can walk: [{:angle :distance :door} ...], angles to the left of
   // where it faces.
+  // [{:name :x :y}]: the monsters anywhere in the map, seen or not (killed ones are named
+  // Dead...).
+  inline object_ref doom_monsters()
+  {
+    std::vector<char> text(65536);
+    play_doom_monsters(text.data(), static_cast<int>(text.size()));
+    object_ref list{ rt::obj::persistent_vector::empty() };
+    std::string const all(text.data());
+    size_t start{};
+    while(start < all.size())
+    {
+      auto const end(all.find('\n', start));
+      std::string const line(all.substr(start, end == std::string::npos ? std::string::npos : end - start));
+      start = end == std::string::npos ? all.size() : end + 1;
+      char name[128]{};
+      double x{}, y{};
+      if(std::sscanf(line.c_str(), "%127s %lf %lf", name, &x, &y) == 3)
+      {
+        object_ref o{ rt::obj::persistent_array_map::empty() };
+        o = rt::assoc(o, kw("name"), str(name));
+        o = rt::assoc(o, kw("x"), num(x));
+        o = rt::assoc(o, kw("y"), num(y));
+        list = rt::conj(list, o);
+      }
+    }
+    return list;
+  }
+
   inline object_ref doom_mark()
   {
     play_doom_mark();

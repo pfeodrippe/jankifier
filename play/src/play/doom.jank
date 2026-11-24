@@ -191,6 +191,18 @@
          (when (>= (max turn (- turn)) 1.0) (str " and turned " (direction turn)))
          (when (< (- (:health s) (:health before)) 0) (str ", and lost " (long (- (:health before) (:health s))) " health"))
          "."
+         (when (< (- (:health s) (:health before)) 0)
+           (let [near (take 3 (sort-by first (for [o (cpp/play.doom_monsters)
+                                                   :when (alive? o)
+                                                   :let [[d a] (bearing s o)]
+                                                   :when (< d 1200.0)]
+                                               [d a o])))]
+             (when (seq near)
+               (str " Monsters near you (seen or not): "
+                    (str/join "; " (for [[d a o] near]
+                                     (str (:name o) " " (long d) " away, " (direction a)
+                                          (when-let [t (turns a)] (str " " t)))))
+                    "."))))
          (let [n (- (long (:kills s)) (long (:kills before)))]
            (when (pos? n) (str " You killed " n (if (= 1 n) " monster." " monsters."))))
          (when-let [said @note] (reset! note nil) (str " " said))
@@ -327,8 +339,9 @@
   version it was played with): 1 the first (attack held 8 tics, turns 10), 2 with aim, 3
   with turns of a fixed angle, 4 with forward-left and forward-right stepping to the side
   instead of turning, 5 with each move waited out until the player stops, 6 with use waiting
-  for a lift to start. Raised whenever act! changes."
-  6)
+  for a lift to start, 7 with attack not fired with no monster in view. Raised whenever act!
+  changes."
+  7)
 
 (def ^:private v1-tics
   {:forward 12 :back 12 :strafe-left 12 :strafe-right 12 :forward-left 12 :forward-right 12
@@ -359,41 +372,50 @@
 
 (defn- acted!
   "An action, its buttons as `moves` has them, as act! plays it (a move waited out until the
-  player stops when `settle`): the reward."
-  [moves settle lift-wait action]
+  player stops when `settle`; use waiting for a lift with `lift-wait`; attack not fired with no
+  monster in view with `hold-fire`): the reward."
+  [moves settle lift-wait hold-fire action]
   (case action
     :turn-left (turn! turn-degrees)
     :turn-right (turn! (- turn-degrees))
     :use (use! lift-wait)
+    (if (and hold-fire (= action :attack) (not (nearest-enemy (state))))
+      (do (reset! note "No monster in view: not fired.")
+          0.0)
     (let [before (state)
           aimed (if (= action :attack) (aim!) 0.0)
           reward (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics)))
           reward (+ reward (if settle (settled!) 0.0))]
       (visit! before (state))
-      reward)))
+      reward))))
 
 (defn act-v3!
   "An action as version 3 played it: forward-left and forward-right walked while turning."
   [action]
-  (acted! arcs false false action))
+  (acted! arcs false false false action))
 
 (defn act-v4!
   "An action as version 4 played it: a move not waited out (the player slid on into the next
   action)."
   [action]
-  (acted! actions false false action))
+  (acted! actions false false false action))
 
 (defn act-v5!
   "An action as version 5 played it: use not waiting for a lift to start."
   [action]
-  (acted! actions true false action))
+  (acted! actions true false false action))
+
+(defn act-v6!
+  "An action as version 6 played it: attack fired with no monster in view."
+  [action]
+  (acted! actions true true false action))
 
 (defn act!
   "One step: the action's buttons held for its tics, then a move waited out until the player
   stops; turn-left and turn-right turn turn-degrees, attack turns to the nearest monster in
   view first (if there is one), use says what opened; the reward."
   [action]
-  (acted! actions true true action))
+  (acted! actions true true true action))
 
 ;; A scripted player.
 
@@ -451,8 +473,8 @@
        "forward and back walk (about 100 units: each move is waited out until you stop), turn-left and "
        "turn-right turn 30 degrees, forward-left and "
        "forward-right walk ahead and to the side at once, without turning, strafe-left and strafe-right step sideways, attack "
-       "turns to the nearest monster in view and shoots it (with none in view, it shoots "
-       "straight ahead), use opens a door within 64 units straight ahead or "
+       "turns to the nearest monster in view and shoots it (with none in view, it doesn't "
+       "fire), use opens a door within 64 units straight ahead or "
        "presses a switch right in front of you, wait does nothing. Distances are in map units: "
        "the player is 32 wide, a corridor about 128. Directions: your facing is in degrees "
        "counterclockwise, 0 east (x grows) and 90 north (y grows); turn-left adds 30 to it, "

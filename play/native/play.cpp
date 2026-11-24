@@ -239,6 +239,8 @@ namespace
     double floor, ceiling, x, y;
   };
   std::vector<sector_seen> doom_sectors, doom_marked;
+  // The last state's monsters anywhere in the map (seen or not): name, x and y.
+  std::string doom_monsters;
 
   // What the last state of Doom shows: its picture (queued), variables and objects in view,
   // and with `rays`, how far the player can walk each way.
@@ -251,6 +253,16 @@ namespace
     }
     doom_tic = state->number;
     doom_vars = state->gameVariables;
+    doom_monsters.clear();
+    for(auto const &o : state->objects)
+    {
+      if(o.category == "Monster")
+      {
+        char line[160];
+        std::snprintf(line, sizeof line, "%s %.0f %.0f\n", o.name.c_str(), o.positionX, o.positionY);
+        doom_monsters += line;
+      }
+    }
     doom_sectors.clear();
     for(auto const &sector : state->sectors)
     {
@@ -654,6 +666,7 @@ extern "C"
       game->setWindowVisible(false);
       game->setSoundEnabled(false);
       game->setLabelsBufferEnabled(true);
+      game->setObjectsInfoEnabled(true);
       game->setSectorsInfoEnabled(true);
       game->setRenderHud(true);
       game->setAvailableButtons(doom_buttons);
@@ -747,6 +760,12 @@ extern "C"
   // How far the player can walk in each of doom_ray_angles' directions: angle, distance, what
   // ends it (use_kind's kinds) and its line's use special, four numbers a direction; the count
   // of directions.
+  int play_doom_monsters(char *out, int size)
+  {
+    std::snprintf(out, static_cast<size_t>(size), "%s", doom_monsters.c_str());
+    return static_cast<int>(doom_monsters.size());
+  }
+
   void play_doom_mark()
   {
     doom_marked = doom_sectors;
