@@ -67,7 +67,7 @@ namespace play_replay_native
   "Each game a replay can play again: how it starts from power-on and how a step is done
   (vars, so that a redefinition applies)."
   {:nova {:title "Nova the Squirrel" :start! #'nova/start! :act! #'nova/act! :stop! #'nova/stop!
-          :version #'nova/version :acts {1 #'nova/act-v1! 2 #'nova/act-v2! 3 #'nova/act-v3! 4 #'nova/act-v4! 5 #'nova/act-v5! 6 #'nova/act-v6! 7 #'nova/act!}
+          :version #'nova/version :acts {1 #'nova/act-v1! 2 #'nova/act-v2! 3 #'nova/act-v3! 4 #'nova/act-v4! 5 #'nova/act-v5! 6 #'nova/act-v6! 7 #'nova/act-v7! 8 #'nova/act!}
           :play-model! #'nova/play-model! :decisions #'nova/decisions}
    :nethack {:title "NetHack" :start! #'nethack/start! :act! #'nethack/act! :stop! #'nethack/stop! :picture #'nethack/picture
              :play-model! #'nethack/play-model! :decisions #'nethack/decisions :saves false}
@@ -155,6 +155,12 @@ namespace play_replay_native
 (defonce st (atom {}))
 (defonce replaying (atom nil))
 (defonce running (atom false))
+;; While the game is played on by itself (play! :fluid), the conversation follows the game
+;; rather than the game the conversation (an agent's thinking left the game still).
+(defonce fluid (atom false))
+;; Where play! :fluid last put the conversation (hc/shown-entries): moved elsewhere, the
+;; person moved it, and the game follows it again.
+(defonce pushed (atom nil))
 
 (defn- show!
   "Step `i` of the replay shown: the picture is the console's now (after the steps before it).
@@ -166,7 +172,8 @@ namespace play_replay_native
     (reset! st {:step i :action (:action d) :decision d :told (:told d)
                 :result (str "replay, step " i " of " (count steps))})
     (when (and push (:conversation @replaying) (:entry d))
-      (hc/to-entry! "replay agent" (:entry d)))))
+      (hc/to-entry! "replay agent" (:entry d))
+      (reset! pushed (hc/shown-entries "replay agent")))))
 
 (defn- act-of
   "The game's action as the recording played it (its version), for step `step` (an agent's
@@ -211,13 +218,14 @@ namespace play_replay_native
     (p/nes-flush!)
     at))
 
-(declare follow!)
+(declare follow! play! stop!)
 
 (defn open!
   "A recording played again from its start, in a card pinned at the top of the window: the
   game's picture and, beside it, the model's side of each step."
   [path]
   (reset! running false)
+  (reset! fluid false)
   (let [r (read-string (slurp path))
         {:keys [title]} (get games (:game r))]
     (when-let [failed (start-as! r)]
@@ -225,7 +233,14 @@ namespace play_replay_native
     (let [conversation (str/replace path #"\.edn$" ".agent.edn")
           conversation (when (and (:agent (:about r)) (cpp/play_replay_native.exists conversation)) conversation)]
       (when conversation
-        (hc/replay! conversation "replay agent"))
+        (hc/replay! conversation "replay agent")
+        ;; Its play button plays the game on (from the start again at the end).
+        (hc/handle-play! "replay agent"
+                         {:play (fn [] (let [{:keys [at steps]} @replaying]
+                                         (when (>= (inc at) (count steps)) (go! 0))
+                                         (play! :fluid)))
+                          :pause stop!
+                          :playing? (fn [] @running)}))
       (reset! replaying (assoc r :at 0 :path path :conversation conversation :token (str path "@" (cpp/play_decide.seconds))
                                :saves (atom (if (false? (get-in games [(:game r) :saves])) [] [(p/nes-save!)])))))
     ;; In the game's own card's place: there is one console.
@@ -269,7 +284,12 @@ namespace play_replay_native
     (try
       (loop []
         (when (= token (:token @replaying))
-          (when-let [n (hc/shown-entries "replay agent")]
+          ;; The timeline moved by hand while the game played on: the game follows it again
+          ;; (scrubbed back, it stayed at the end).
+          (when (and @fluid @pushed (not= @pushed (hc/shown-entries "replay agent")))
+            (reset! running false)
+            (reset! fluid false))
+          (when-let [n (and (not @fluid) (hc/shown-entries "replay agent"))]
             (let [{:keys [at steps]} @replaying
                   target (min (dec (count steps))
                               (count (filter (fn [d] (and (:entry d) (< (:entry d) n))) steps)))]
@@ -307,24 +327,32 @@ namespace play_replay_native
                     (cpp/usleep (long (/ 1000000 pace)))))
               (recur)))))
       (catch :default _ nil))
-    (reset! running false))
+    (reset! running false)
+    ;; Done: the timeline leads again (dragged after the end, the game didn't follow).
+    (reset! fluid false))
   :playing)
 
 (defn play!
-  "The replay going on by itself, in the background. An agent's game: its conversation's
-  timeline played (the game follows it, each action's frames at the game's own speed).
-  Else `per-second` steps a second (2 when not said), or with :fluid (`(play! :fluid)`) each
-  step's frames at the game's own speed. stop! pauses it."
-  ([] (play! 2))
+  "The replay going on by itself, in the background. An agent's game: the game played on,
+  each step's frames at the game's own speed, its conversation moved to each step's call
+  (`(play!)`); or its conversation's timeline played at its own pace, the game following it
+  (`(play! :conversation)`: the game waits while the agent thinks). Else `per-second` steps a
+  second (2 when not said), or with :fluid each step's frames at the game's own speed. stop!
+  pauses it."
+  ([] (play! (if (:conversation @replaying) :fluid 2)))
   ([pace]
-   (if (:conversation @replaying)
-     (do (hc/play! "replay agent") :playing)
-     (play-steps! pace))))
+   (if (and (:conversation @replaying) (= pace :conversation))
+     (do (reset! fluid false) (hc/play! "replay agent") :playing)
+     (do (when (:conversation @replaying)
+           (hc/pause! "replay agent")
+           (reset! fluid true))
+         (play-steps! pace)))))
 
 (defn stop!
   "The replay paused (an agent's conversation with it)."
   []
   (reset! running false)
+  (reset! fluid false)
   (when (:conversation @replaying)
     (hc/pause! "replay agent"))
   nil)

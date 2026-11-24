@@ -470,7 +470,12 @@
   (when-let [dir (and (:on-ground st) ({:jump-right 1 :high-jump-right 1 :jump-left -1 :high-jump-left -1} action))]
     (when-let [edge (fall-edge st dir)]
       (when (and (< (+ 0.6 (* 9.0 (max 0.0 (* dir (:vx st))))) edge 6.0)
-                 (not (some (fn [[_ dx dy]] (and (< 0 (* dir dx) (inc edge)) (<= -1 dy 0))) (dangers st))))
+                 (not (some (fn [[_ dx dy]] (and (< 0 (* dir dx) (inc edge)) (<= -1 dy 0))) (dangers st)))
+                 ;; Nor when a wall on her row stands before the edge: the jump is onto it (an
+                 ;; agent at the foot of a wall, the fall behind it, was refused both ways).
+                 (let [px (long (:x st)) py (feet-row st)]
+                   (not-any? (fn [k] (contains? #{"#" "!" "L"} (block-char ((:map st) (+ px (* dir k)) py))))
+                             (range 1 (inc (long edge))))))
         (let [way (if (pos? dir) "right" "left")]
           (str "the edge of the fall ahead is " (tenths edge) " blocks on her " way ": a jump from this far back falls short."
                " Step " way " toward it first (a step that would go over is not done, and said so), then jump from there.")))))
@@ -593,9 +598,9 @@
   "How act! plays an action, for replays (each agent's step says the version it was played
   with): 1 the first, 2 with up stepping to a door or ladder near her first, 3 with a door's
   new area waited for, 4 waited for until it is done changing, 5 with up at a door stopping
-  her in its column first, 6 with face-right and face-left, 7 with high jumps. Raised whenever
-  act! changes."
-  7)
+  her in its column first, 6 with face-right and face-left, 7 with high jumps, 8 with a death's restart waited
+  for. Raised whenever act! changes."
+  8)
 
 (defn- step-to!
   "Nova walked a frame at a time to the middle of column `col` (at most 40 frames)."
@@ -729,19 +734,39 @@
       (recur (inc i))))
   (p/nes-run! [] 1))
 
-(defn act!
-  "One step: the action's buttons held for its frames, then released for one (so a jump can
-  be pressed again); high-jump, high-jump-right and high-jump-left hold the jump until she
-  stops rising (high-jump!); face-right and face-left turn her where she stands (face!); up
-  at a door in her column or within 2 blocks stops her and walks her to its middle first
-  (door-up!), and up with a ladder within 2 blocks on her row steps to it first; through a
-  door, frames run until the new area hasn't changed for 20 frames (at most 240)."
+(defn act-v7!
+  "One step as version 7 played it: after a death, no wait for the area to restart."
   [action]
   (case action
     :high-jump (high-jump! nil)
     :high-jump-right (high-jump! :right)
     :high-jump-left (high-jump! :left)
     (act-v6! action)))
+
+(defn- settle-area!
+  "Frames until the area hasn't changed for 20 frames (at most 300): the game draws an area
+  and sets its objects over some frames, after a door or a death."
+  []
+  (loop [i 0 still 0 seen (area-now (state))]
+    (when (and (< i 300) (< still 20))
+      (p/nes-run! [] 1)
+      (let [now (area-now (state))]
+        (recur (inc i) (if (= now seen) (inc still) 0) now)))))
+
+(defn act!
+  "One step: act-v7!, and when it ended in a death, frames until the restarted area has
+  settled (the game shows LOADING while it restarts: the agent's next actions changed
+  nothing, and the objects listed were still those of where she died)."
+  [action]
+  (let [before (state)]
+    (act-v7! action)
+    (let [after (state)]
+      (when (or (died? before after) (zero? (:health after)))
+        (loop [i 0]
+          (when (and (< i 400) (zero? (:health (state))))
+            (p/nes-run! [] 1)
+            (recur (inc i))))
+        (settle-area!)))))
 
 ;; Into the game: the menus, then level 1-1.
 

@@ -44,7 +44,10 @@
 (defonce ^:private built (atom {}))         ; [name index] -> {:entry :width :open :item}
 (defonce ^:private frame-panel (atom nil))  ; {:frame :width :panel}: once a frame
 (defonce ^:private drawn (atom nil))        ; where the last frame drew the panel's parts
-(defonce ^:private plays (atom {}))         ; name -> {:mode :live|:paused|:playing :t :at :speed}
+(defonce ^:private plays (atom {}))
+;; name -> {:play :pause :playing?}: the play button of a conversation whose game is played
+;; by something else (a replay playing its game on at the game's own pace).
+(defonce ^:private play-handlers (atom {}))         ; name -> {:mode :live|:paused|:playing :t :at :speed}
 (defonce ^:private scheduled (atom {}))     ; name -> {:entries :schedule}
 
 ;; Sizes, in points.
@@ -798,18 +801,21 @@
         hit (fn [bx] (c/clicked? (- bx 12) (- cy 12) (+ bx 12) (+ cy 12)))
         shade (fn [bx] (when (hot bx) (c/rect! (- bx 12) (- cy 12) (+ bx 12) (+ cy 12) c/rule 0.35 5.0)))]
     (c/line! (+ x 10) y (- (+ x width) 10) y c/rule 1.0)
-    ;; Play, or pause while playing.
+    ;; Play, or pause while playing (or what plays its game, when something does).
     (shade b1)
-    (if (or (= mode :playing) following)
-      (do (c/rect! (- b1 5) (- cy 6) (- b1 1) (+ cy 6) c/ink 1.0 1.0)
-          (c/rect! (+ b1 2) (- cy 6) (+ b1 6) (+ cy 6) c/ink 1.0 1.0))
-      (c/triangle! (- b1 4) (- cy 7) (- b1 4) (+ cy 7) (+ b1 7) cy c/ink 1.0))
-    (when (hit b1)
-      (cond
-        (or (= mode :playing) following) (to-time! named t false)
-        ;; At the end: on with the turn when one goes, else from the start again.
-        (>= t (- total 0.01)) (if running (live! named) (to-time! named 0.0 true))
-        :else (to-time! named t true)))
+    (let [h (get @play-handlers named)
+          on (if h ((:playing? h)) (or (= mode :playing) following))]
+      (if on
+        (do (c/rect! (- b1 5) (- cy 6) (- b1 1) (+ cy 6) c/ink 1.0 1.0)
+            (c/rect! (+ b1 2) (- cy 6) (+ b1 6) (+ cy 6) c/ink 1.0 1.0))
+        (c/triangle! (- b1 4) (- cy 7) (- b1 4) (+ cy 7) (+ b1 7) cy c/ink 1.0))
+      (when (hit b1)
+        (cond
+          h (if on ((:pause h)) ((:play h)))
+          on (to-time! named t false)
+          ;; At the end: on with the turn when one goes, else from the start again.
+          (>= t (- total 0.01)) (if running (live! named) (to-time! named 0.0 true))
+          :else (to-time! named t true))))
     ;; From the start.
     (shade b2)
     (c/rect! (- b2 6) (- cy 6) (- b2 3) (+ cy 6) c/ink 1.0 1.0)
@@ -1147,6 +1153,17 @@
             p (get @plays named {:mode :live})
             t (if (= (:mode p) :live) (:total sched) (min (:total sched) (:t p)))]
         (count (:entries (at-time v t sched)))))))
+
+(defn handle-play!
+  "The play button of the conversation `named` given to `handlers` {:play :pause :playing?}
+  (functions of nothing): a replay plays its game on at the game's own pace and moves the
+  conversation along (clicked, the button played the agent's own timing, the game waiting
+  while it thought). nil gives the button back."
+  [named handlers]
+  (if handlers
+    (swap! play-handlers assoc (str named) handlers)
+    (swap! play-handlers dissoc (str named)))
+  nil)
 
 (defn pause!
   "The conversation `named` stopped where it is shown."
