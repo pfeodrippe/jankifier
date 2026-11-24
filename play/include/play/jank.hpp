@@ -87,6 +87,12 @@ namespace play
     return num(std::sqrt(rt::to_real(x)));
   }
 
+  // x rounded to the nearest whole number, halves away from zero.
+  inline object_ref round_half(object_ref const x)
+  {
+    return num(std::round(rt::to_real(x)));
+  }
+
   inline object_ref cos(object_ref const x)
   {
     return num(std::cos(rt::to_real(x)));

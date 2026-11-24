@@ -195,38 +195,50 @@
       (apply str (map last (concat (remove (fn [[how _ _]] (= how :teleport)) seen)
                                    (take 1 (sort-by second (filter (fn [[how _ _]] (= how :teleport)) seen)))))))))
 
+(defn- legs
+  "The way along `path` (points, from the player in state `s` on) as stretches to walk: each
+  [turns distance], turns a whole number of turn-left (positive) or turn-right (negative) from
+  the facing the stretch before left, points needing no turn joined into one stretch."
+  [s path]
+  (loop [points path at [(:x s) (:y s)] facing (:angle s) out []]
+    (if (empty? points)
+      out
+      (let [[x y] (first points)
+            [ax ay] at
+            dx (- x ax) dy (- y ay)
+            far (cpp/play.sqrt (+ (* dx dx) (* dy dy)))
+            heading (degrees (cpp/play.atan2 dy dx))
+            turn (loop [d (- heading facing)] (cond (> d 180.0) (recur (- d 360.0)) (< d -180.0) (recur (+ d 360.0)) :else d))
+            k (long (cpp/play.round_half (/ turn 30.0)))]
+        (if (< far 1.0)
+          (recur (rest points) at facing out)
+          (if (and (zero? k) (seq out))
+            (recur (rest points) [x y] facing (conj (pop out) [(first (peek out)) (+ (second (peek out)) far)]))
+            (recur (rest points) [x y] (+ facing (* 30.0 k)) (conj out [k far]))))))))
+
+(defn- leg-text
+  "A stretch to walk ([turns distance]) as words: 2 turn-left, about 150 ahead."
+  [[k far]]
+  (str (cond (pos? k) (str k " turn-left, ")
+             (neg? k) (str (- k) " turn-right, ")
+             :else "")
+       "about " (long far) " ahead"))
+
 (defn- frontier
-  "Which way the nearest part of the map (a sector) the player hasn't stood in is, walking the
-  map (as an automap would show it), as a line."
+  "The nearest part of the map (a sector) the player hasn't stood in or been near, walking the
+  map (as an automap would show it), and the way there stretch by stretch, as a line."
   [s]
   (let [path (cpp/play.doom_frontier (vec @visited) cell)]
     (if (empty? path)
       "No new ground can be walked to from here: a lift or a switch may lead on.\n"
-      (let [seen (take-while (fn [[x y]] (cpp/play.doom_sees x y)) path)
-            far (long (reduce + 0.0 (map (fn [[ax ay] [bx by]]
+      (let [far (long (reduce + 0.0 (map (fn [[ax ay] [bx by]]
                                            (cpp/play.sqrt (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
-                                         (cons [(:x s) (:y s)] path) path)))]
-        (if (seq seen)
-          (let [[x y] (last seen)
-                [_ a] (bearing s {:x x :y y})]
-            (str "Nearest new ground, walking the map: about " far " away; head "
-                 (direction a) (when-let [t (turns a)] (str " " t))
-                 (when (< (count seen) (count path)) ", then follow the way")
-                 ".\n"))
-          ;; The way's first point is round a corner: the open way (64 free or more) nearest
-          ;; its direction.
-          (let [[x y] (first path)
-                [_ a] (bearing s {:x x :y y})
-                gap (fn [r] (let [d (- (:angle r) a)
-                                  d (loop [d d] (cond (> d 180.0) (recur (- d 360.0)) (< d -180.0) (recur (+ d 360.0)) :else d))]
-                              (max d (- d))))
-                open (first (seq (sort-by gap (filter (fn [r] (>= (:distance r) 64.0)) (cpp/play.doom_rays)))))]
-            (str "Nearest new ground, walking the map: about " far " away, round a corner"
-                 (when open
-                   (let [b (:angle open)]
-                     (str "; head " (if (>= (max b (- b)) 179.0) "behind" (direction b))
-                          (when-let [t (turns b)] (str " " t)))))
-                 ", then follow the way.\n")))))))
+                                         (cons [(:x s) (:y s)] path) path)))
+            ways (legs s path)]
+        (str "Nearest new ground, walking the map: about " far " away. The way there: "
+             (str/join "; then " (map leg-text (take 4 ways)))
+             (when (> (count ways) 4) "; and on")
+             " (forward walks about 100, run about 170).\n")))))
 
 (defn- walls
   "How far the player can walk in each direction a whole number of turns away and behind
