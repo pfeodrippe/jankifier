@@ -92,6 +92,58 @@
                                                       (if (= x0 x1) (str " at x " x0) (str " x " x0 " to " x1)))))
                                        groups))))))
 
+(declare placements)
+
+(defn- effects
+  "What each placement of this pill does once it lands: [{:placement :clears :viruses :longest
+  :color :row}], the ones that clear first (more viruses first), then the longest line made. A
+  line of 4 or more of a colour clears (viruses and pill halves together). Two model players
+  told only where pills land built shelves of pills over their viruses: 12 pills each, none
+  cleared."
+  [pl]
+  (let [[c1 c2] (:colors pl)]
+    (->> (for [p placements
+               :let [[_ xs o] (re-matches #"x(\d+)-(.*)" (name p))
+                     x (parse-long xs)
+                     standing (str/starts-with? o "standing")
+                     turned (str/ends-with? o "turned")
+                     y (lands-at pl x standing)
+                     [a b] (if turned [c2 c1] [c1 c2])
+                     halves (if standing [[x y a] [x (dec y) b]] [[x y a] [(inc x) y b]])
+                     field (reduce (fn [f [cx cy c]] (if (<= 0 cy) (assoc-in f [cy cx] {:kind "pill" :color c}) f))
+                                   (:field pl) halves)
+                     color-at (fn [cx cy] (when (and (< -1 cx width) (< -1 cy height)) (:color (get-in field [cy cx]))))
+                     line (fn [cx cy dx dy c]
+                            (let [run (fn [sx sy] (take-while (fn [[qx qy]] (= c (color-at qx qy)))
+                                                              (map (fn [i] [(+ cx (* i sx)) (+ cy (* i sy))]) (range 1 9))))]
+                              (concat [[cx cy]] (run dx dy) (run (- dx) (- dy)))))
+                     lines (for [[cx cy c] halves :when (<= 0 cy) [dx dy] [[1 0] [0 1]]]
+                             {:color c :cells (line cx cy dx dy c)})
+                     clearing (filter (fn [l] (>= (count (:cells l)) 4)) lines)
+                     cleared (set (mapcat :cells clearing))
+                     viruses (count (filter (fn [[qx qy]] (= "virus" (:kind (get-in field [qy qx])))) cleared))
+                     longest (apply max-key (fn [l] (count (:cells l))) lines)]
+               :when (seq lines)]
+           {:placement p :clears (seq clearing) :viruses viruses :row y
+            :longest (count (:cells longest)) :color (:color longest)
+            :on-virus (count (filter (fn [[qx qy]] (= "virus" (:kind (get-in field [qy qx])))) (:cells longest)))})
+         (sort-by (fn [e] [(if (:clears e) 0 1) (- (:viruses e)) (- (:on-virus e)) (- (:longest e)) (- (:row e))])))))
+
+(defn- effects-text
+  "The best few placements in words."
+  [pl]
+  (let [es (take 5 (effects pl))]
+    (when (seq es)
+      (str "What the best placements do (a line of 4 or more of a colour clears): "
+           (str/join "; " (for [e es]
+                            (str (name (:placement e)) " "
+                                 (if (:clears e)
+                                   (str "clears a " (:color e) " line" (when (pos? (:viruses e)) (str " with " (:viruses e) (if (= 1 (:viruses e)) " virus" " viruses"))))
+                                   (str "makes a " (:color e) " line of " (:longest e)
+                                        (when (pos? (:on-virus e)) (str " with " (:on-virus e) (if (= 1 (:on-virus e)) " virus" " viruses")))))
+                                 " (lands at row " (:row e) ")")))
+           ".\n"))))
+
 (defn told
   "What player `player` (0 or 1) is told: its pill and where it would land, its field, the
   other's viruses left."
@@ -114,7 +166,8 @@
                  "Where it lands (the row of its lower half, lying: both halves): lying "
                  (str/join ", " (for [x (range (dec width))] (str "x" x " " (lands-at pl x false))))
                  "; standing " (str/join ", " (for [x (range width)] (str "x" x " " (lands-at pl x true))))
-                 ".\n"))
+                 ".\n"
+                 (effects-text pl)))
           "How high each column is filled (the top row with something, from x 0 to 7; - for empty): "
           (str/join " " (for [x (range width)]
                           (or (first (keep (fn [row] (when (get-in (:field pl) [row x]) row)) (range height))) "-")))
