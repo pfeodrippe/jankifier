@@ -28,13 +28,15 @@
   {:coder (str "\n\nYou are the coder of a team of three agents on one task. You write the jank code, its "
                "assertions and its `verification` map in " file ". The modeler writes the Veil model in "
                model " (read it when your `verification` map has to match it), and the coordinator "
-               "runs the verify tool and tells you what to do. Test your code with the eval tool. "
+               "tells you what to do. Test your code with the eval tool, and run the verify tool on "
+               file " once both files are there. "
                "Answer with what you did and what the coordinator should know.")
    :modeler (str "\n\nYou are the modeler of a team of three agents on one task. You write the Veil model "
                  "of the code in " model ": VEIL.md says how, and examples/parking.lean is a model that "
                  "passes. The coder writes " file " (read it: the model must describe what the code "
-                 "does), and the coordinator runs the verify tool and tells you what to do. Answer "
-                 "with what you did and what the coordinator should know.")
+                 "does), and the coordinator tells you what to do. Run the verify tool on " file
+                 " once both files are there. Answer with what you did and what the coordinator "
+                 "should know.")
    :coordinator (str "\n\nYou coordinate a team of two agents on this task: the coder writes " file
                      " and the modeler writes " model ". Hand the work out at once: ask both "
                      "(ask_both asks them together, and they work at the same time), each with what "
@@ -47,16 +49,22 @@
   "A team on model `m` for the code in `file` (its model: the same path with .lean):
   {:coordinator :coder :modeler}, three agents. `opts`: :system (the text all three are
   told first: the situation, VERIFY.md), :agent (harness.core/agent's options for all three,
-  beside the tools and system: :context, :effort, :sampling, ...), and
-  :coordinator-effort (:medium: at the effort a worker thinks at, a coordinator designs
-  the whole work in its own thinking instead of handing it out). Drafting is off: each
-  agent's tokens come one at a time, so that the workers' share forwards."
-  [m {:keys [file system agent coordinator-effort] :or {coordinator-effort :medium}}]
+  beside the tools and system: :context, :effort, :sampling, ...), :coordinator-effort
+  (:medium: at the effort a worker thinks at, a coordinator designs the whole work in its
+  own thinking instead of handing it out), and :worker-max-tokens (24576, tokens a
+  worker's step may take: at the most effort a worker thinks its whole stretch, then on,
+  and a step of 12288 ended it before it wrote anything). The workers have the verify tool
+  too, to check their part. Drafting is off: each agent's tokens come one at a time, so
+  that the workers' share forwards."
+  [m {:keys [file system agent coordinator-effort worker-max-tokens]
+      :or {coordinator-effort :medium worker-max-tokens 24576}}]
   (let [model (str/replace file #"\.jank$" ".lean")
         parts (roles file model)
         base (merge agent {:draft nil})
-        coder (h/agent m (merge base {:tools (tools/defaults) :system (str system (:coder parts))}))
-        modeler (h/agent m (merge base {:tools (tools/defaults) :system (str system (:modeler parts))}))
+        worker (merge base {:max-tokens worker-max-tokens})
+        worker-tools (conj (tools/defaults) (verify/tool))
+        coder (h/agent m (merge worker {:tools worker-tools :system (str system (:coder parts))}))
+        modeler (h/agent m (merge worker {:tools worker-tools :system (str system (:modeler parts))}))
         defaults (tools/defaults)
         pick (fn [n] (some (fn [t] (when (= (:name t) n) t)) defaults))
         asks [{:name "ask_coder"
