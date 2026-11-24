@@ -549,7 +549,7 @@
       ;; Said outright that a call's contents don't count: a game agent took each of its
       ;; actions for a step and rationed them.
       (str "\n\n[the harness] Step " used " of " max-steps " (" left " left). A step is one message of "
-           "yours with its calls, however much each call holds (a tool taking a list counts once); the turn "
+           "yours, whatever its calls hold: a call with a list of 20 things is one step, not 20; the turn "
            "ends when the steps run out, finished or not."))))
 
 (defn- turn!
