@@ -144,6 +144,19 @@
               " (a switch: use presses it within 64 units)")
     nil))
 
+(defn- exits
+  "The exits in sight (nothing of the map between: an exit line's middle), as lines; nil when
+  none is."
+  [s]
+  (let [seen (for [e (cpp/play.doom_exits)
+                   :when (cpp/play.doom_sees (:x e) (:y e))
+                   :let [[d a] (bearing s e)]]
+               (str (if (= :walk (:how e)) "The exit, in sight: walk over it to finish the level, "
+                        "The exit switch, in sight: use it to finish the level, ")
+                    (long d) " away, " (direction a) (when-let [t (turns a)] (str " " t)) ".\n"))]
+    (when (seq seen)
+      (apply str seen))))
+
 (defn- frontier
   "Which way the nearest part of the map (a sector) the player hasn't stood in is, walking the
   map (as an automap would show it), as a line."
@@ -239,13 +252,16 @@
          "\n")))
 
 (defn over
-  "Why the game is over (the player died, or reached the exit: Doom's episode ends there), or
-  nil while it goes on."
+  "Why the game is over, or nil while it goes on: the player died, reached the exit (within 96
+  of an exit line), or the level ended elsewhere (Doom's episode also ends on a floor that ends
+  the level: in Freedoom's MAP01, one where the player stands with 10 health or less)."
   []
   (when (cpp/play.doom_finished)
-    (if (pos? (:dead (state) 0))
-      "You died."
-      "You finished the level: you reached the exit.")))
+    (let [s (state)]
+      (cond (pos? (:dead s 0)) "You died."
+            (some (fn [e] (< (first (bearing s e)) 96.0)) (cpp/play.doom_exits))
+            "You finished the level: you reached the exit."
+            :else "The level ended, but not at its exit: a floor ended it (some do when your health is 10 or less)."))))
 
 (defn told
   "What a model is told: the player's numbers (and how it moved since `before`, the state a
@@ -262,6 +278,7 @@
           ", kills " (long (:kills s)) ", items " (long (:items s)) (when (pos? (:dead s 0)) ", dead") ".\n"
           "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees.\n"
           (walls s)
+          (exits s)
           (frontier s)
           (if (seq (filter shown? (:objects s)))
             (str "In view (what fights, what can be picked up, barrels):\n"

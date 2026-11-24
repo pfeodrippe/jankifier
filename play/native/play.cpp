@@ -981,6 +981,40 @@ extern "C"
     return 0;
   }
 
+  int play_doom_exits(double *out, int max)
+  {
+    if(!doom_last)
+    {
+      return 0;
+    }
+    std::set<std::array<long long, 2>> said;
+    int n{};
+    for(auto const &sector : doom_last->sectors)
+    {
+      for(auto const &l : sector.lines)
+      {
+        double const how{ use_kind(l.crossSpecial) == 2 ? 1.0 : use_kind(l.useSpecial) == 2 ? 2.0 : 0.0 };
+        double const x{ (l.x1 + l.x2) / 2.0 }, y{ (l.y1 + l.y2) / 2.0 };
+        if(how > 0.0 && said.insert({ std::llround(x), std::llround(y) }).second && 3 * (n + 1) <= max)
+        {
+          out[3 * n] = x;
+          out[3 * n + 1] = y;
+          out[3 * n + 2] = how;
+          ++n;
+        }
+      }
+    }
+    return n;
+  }
+
+  void play_doom_command(char const *command)
+  {
+    if(doom_now)
+    {
+      doom_now->sendGameCommand(command);
+    }
+  }
+
   void play_doom_mark()
   {
     doom_marked = doom_sectors;

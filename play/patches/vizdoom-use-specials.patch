@@ -1,52 +1,56 @@
 diff --git a/include/ViZDoomTypes.h b/include/ViZDoomTypes.h
-index 42a8a35..eab61e5 100644
+index 42a8a35..f04ce52 100644
 --- a/include/ViZDoomTypes.h
 +++ b/include/ViZDoomTypes.h
-@@ -97,6 +97,8 @@ namespace vizdoom{
+@@ -97,6 +97,9 @@ namespace vizdoom{
          double x2;
          double y2;
          bool isBlocking;
 +        bool useFromBack; // whether useSpecial works from the back side too (Doom's front side is right of x1,y1 -> x2,y2)
-+        int useSpecial; // the action special a player's use sets off (0: none): doors 10-14, 202, 249; exits 243, 244
++        int useSpecial;
++        int crossSpecial; // the action special walking over the line sets off (0: none): an exit 243, 244 // the action special a player's use sets off (0: none): doors 10-14, 202, 249; exits 243, 244
      };
  
      struct Sector{
 diff --git a/src/lib/ViZDoomSharedMemory.h b/src/lib/ViZDoomSharedMemory.h
-index 663e5e0..5324d7b 100644
+index 663e5e0..8ff986d 100644
 --- a/src/lib/ViZDoomSharedMemory.h
 +++ b/src/lib/ViZDoomSharedMemory.h
-@@ -98,6 +98,8 @@ namespace vizdoom {
+@@ -98,6 +98,9 @@ namespace vizdoom {
      struct SMLine{
          double position[4];
          bool isBlocking;
 +        bool useFromBack;
 +        int useSpecial;
++        int crossSpecial;
      };
  
      struct SMGameState {
 diff --git a/src/vizdoom/src/viz_game.cpp b/src/vizdoom/src/viz_game.cpp
-index b826e3b..4e39e2e 100644
+index b826e3b..f89eb51 100644
 --- a/src/vizdoom/src/viz_game.cpp
 +++ b/src/vizdoom/src/viz_game.cpp
-@@ -620,6 +620,8 @@ void VIZ_GameStateUpdateSectors(){
+@@ -620,6 +620,9 @@ void VIZ_GameStateUpdateSectors(){
  
          lineIds.insert({line, i});
          vizLine->isBlocking = (line->flags & (ML_BLOCKING|ML_BLOCKEVERYTHING|ML_BLOCK_PLAYERS));
 +        vizLine->useSpecial = (line->activation & (SPAC_Use|SPAC_UseThrough|SPAC_UseBack)) ? line->special : 0;
 +        vizLine->useFromBack = (line->activation & SPAC_UseBack) != 0;
++        vizLine->crossSpecial = (line->activation & (SPAC_Cross|SPAC_AnyCross)) ? line->special : 0;
  
          VIZ_DebugMsg(4, VIZ_FUNC, "line: %d, position: (%f, %f), (%f, %f), isBlocking: %d",
                  i, vizLine->position[0], vizLine->position[1], vizLine->position[2], vizLine->position[3], vizLine->isBlocking);
 diff --git a/src/vizdoom/src/viz_game.h b/src/vizdoom/src/viz_game.h
-index c4914fd..3fd3cdd 100644
+index c4914fd..5777e46 100644
 --- a/src/vizdoom/src/viz_game.h
 +++ b/src/vizdoom/src/viz_game.h
-@@ -115,6 +115,8 @@ struct VIZLine{
+@@ -115,6 +115,9 @@ struct VIZLine{
      double position[4];
      //int frontSector, backSector;
      bool isBlocking;
 +    bool useFromBack; // whether the use special works from the line's back side too
 +    int useSpecial; // the action special a player's use sets off (0: none)
++    int crossSpecial; // the action special a player walking over the line sets off (0: none)
  };
  
  struct VIZGameState{

@@ -414,6 +414,29 @@ namespace play
     return list;
   }
 
+  // [{:x :y :how}]: the map's exits, :how :walk (walking over the line) or :use.
+  inline object_ref doom_exits()
+  {
+    double v[3 * 32]{};
+    int const n(play_doom_exits(v, 3 * 32));
+    object_ref list{ rt::obj::persistent_vector::empty() };
+    for(int i{}; i < n; ++i)
+    {
+      object_ref r{ rt::obj::persistent_array_map::empty() };
+      r = rt::assoc(r, kw("x"), num(v[3 * i]));
+      r = rt::assoc(r, kw("y"), num(v[3 * i + 1]));
+      r = rt::assoc(r, kw("how"), kw(v[3 * i + 2] < 1.5 ? "walk" : "use"));
+      list = rt::conj(list, r);
+    }
+    return list;
+  }
+
+  inline object_ref doom_command(object_ref const command)
+  {
+    play_doom_command(rt::to_string(command).c_str());
+    return rt::jank_nil;
+  }
+
   inline object_ref doom_mark()
   {
     play_doom_mark();

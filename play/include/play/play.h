@@ -43,6 +43,11 @@ extern "C"
   int play_doom_rays(double *out, int max);
   // The sectors' floor and ceiling heights kept now, for play_doom_moved.
   void play_doom_mark();
+  // A console command given to Doom (for checks: give health, god), done on the next tic.
+  void play_doom_command(char const *command);
+  // The map's exits: each exit line's middle x, y and how it is set off (1 walking over it, 2
+  // using it), three numbers an exit; the count.
+  int play_doom_exits(double *out, int max);
   // The way to the nearest sector the player hasn't stood in, sector to sector across the
   // lines they share that the player can cross (room to stand, a step up of at most 24, or a
   // door): the middles of those lines, x and y each, into `out`; their count (0: none found).
