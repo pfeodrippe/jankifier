@@ -434,8 +434,9 @@
 (defn caution
   "Why action `action` should not be done now (nil: it may be): a step right or left on the
   ground with a fall's edge nearer that way than a step walks (nothing to land on down to the
-  map's bottom), or with a danger in her way within 3 blocks that way: she would fall in, or
-  be hurt, which never helps. A drop to a floor is let be."
+  map's bottom), or with a danger in her way within 3 blocks that way; a forward jump at a
+  fall's edge further off than a jump at her speed reaches; in the air over a fall, an action that doesn't steer:
+  she would fall in, or be hurt, which never helps. A drop to a floor is let be."
   [st action]
   (or
    ;; In the air over a fall, an action that doesn't steer lets her drop in (an agent waited
@@ -445,6 +446,18 @@
        (when dir
          (str "she is in the air over a fall (nothing below her): " (name action) " lets her drop into it. Press "
               (name dir) " (ground " d (if (= 1 d) " block " " blocks ") (name dir) ") to carry over."))))
+  ;; A jump at a fall from too far back falls short. In replay, walking (0.11 a frame) jumps
+  ;; from 1.46 landed and from 1.8 fell in; from rest, from 0.42 landed and from 0.91 fell in
+  ;; (an agent high-jumped from rest 2.6 back): the reach is about 0.6 blocks and 9 times her
+  ;; speed that way. Let be when a danger stands between her and the edge (she may need to
+  ;; jump it).
+  (when-let [dir (and (:on-ground st) ({:jump-right 1 :high-jump-right 1 :jump-left -1 :high-jump-left -1} action))]
+    (when-let [edge (fall-edge st dir)]
+      (when (and (< (+ 0.6 (* 9.0 (max 0.0 (* dir (:vx st))))) edge 6.0)
+                 (not (some (fn [[_ dx dy]] (and (< 0 (* dir dx) (inc edge)) (<= -1 dy 0))) (dangers st))))
+        (let [way (if (pos? dir) "right" "left")]
+          (str "the edge of the fall ahead is " (tenths edge) " blocks on her " way ": a jump from this far back falls short."
+               " Step " way " toward it first (a step that would go over is not done, and said so), then jump from there.")))))
   ;; A fall's edge nearer than a step walks is walked into (an agent stepped off from a block
   ;; before the edge).
   (when-let [dir (and (:on-ground st) ({:right 1 :left -1} action))]
