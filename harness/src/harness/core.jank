@@ -298,10 +298,25 @@
 
 (defn repeating?
   "Whether thinking `text` goes round in the same words: a sentence of 30 characters or more
-  said three times."
+  said three times; one piece between spaces 60% or more of its last 30, 20 at least (\"! ! !\");
+  or one word of 3 letters or more 40% or more of its last 40 words, 24 at least (\"relative —
+  relative —\"). No substrings: strings are bytes, and one cut inside a character threw. A text
+  ending inside a character (thinking cut mid-token) can't be split by a regex: false then,
+  never a thrown generation.
+  A game agent's thinking ended a long turn in such loops."
   [text]
-  (let [parts (remove (fn [x] (< (count x) 30)) (map str/trim (str/split (str text) #"[.?!\n]")))]
-    (boolean (some (fn [[_ n]] (>= n 3)) (frequencies parts)))))
+  (try
+  (let [t (str text)
+        parts (remove (fn [x] (< (count x) 30)) (map str/trim (str/split t #"[.?!\n]")))
+        pieces (take-last 30 (remove str/blank? (str/split t #"\s+")))
+        words (take-last 40 (remove (fn [w] (< (count w) 3)) (str/split t #"[^A-Za-z]+")))]
+    (boolean
+     (or (some (fn [[_ k]] (>= k 3)) (frequencies parts))
+         (and (>= (count pieces) 20)
+              (some (fn [[_ k]] (>= k (* 0.6 (count pieces)))) (frequencies pieces)))
+         (and (>= (count words) 24)
+              (some (fn [[_ k]] (>= k (* 0.4 (count words)))) (frequencies (map str/lower-case words)))))))
+    (catch :default _ false)))
 
 (defn- speak!
   "The model's frames from where the session is, until its turn ends: a token sampled, then
