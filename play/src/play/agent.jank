@@ -38,7 +38,7 @@
                               (select-keys b [:x :y :angle :health :ammo :kills :changes])))
           :progress (fn [s] {:kills (long (:kills s)) :health (long (:health s)) :items (long (:items s))
                              :x (long (:x s)) :y (long (:y s))})}
-   :nova {:start! #'nova/start! :state #'nova/state :told #'nova/told :act! #'nova/act!
+   :nova {:start! #'nova/start! :state #'nova/state :told #'nova/told :act! #'nova/act! :version #'nova/version
           :actions nova/model-actions :rules nova/rules :st #'nova/st :watch! #'nova/watch!
           :same? (fn [a b] (and (= (:x a) (:x b)) (= (:y a) (:y b))))
           :progress (fn [s] {:x (/ (long (* 10 (:x s))) 10.0) :health (:health s)})}})

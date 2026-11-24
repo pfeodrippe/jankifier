@@ -247,12 +247,44 @@
   (player.s), so it is held 12."
   {:down 12})
 
-(defn act!
-  "One step: the action's buttons held for its frames, then released for one (so a jump can
-  be pressed again)."
+(defn act-v1!
+  "One step as version 1 played it: the action's buttons held for its frames, then released
+  for one (so a jump can be pressed again)."
   [action]
   (p/nes-run! (get actions action []) (get action-frames action step-frames))
   (p/nes-run! [] 1))
+
+(def version
+  "How act! plays an action, for replays (each agent's step says the version it was played
+  with): 1 the first, 2 with up stepping to a door or ladder near her first. Raised whenever
+  act! changes."
+  2)
+
+(defn- step-to!
+  "Nova walked a frame at a time to the middle of column `col` (at most 40 frames)."
+  [col]
+  (loop [i 0]
+    (let [dx (- (+ col 0.5) (:x (state)))]
+      (when (and (> (max dx (- dx)) 0.25) (< i 40))
+        (p/nes-run! [(if (pos? dx) :right :left)] 1)
+        (recur (inc i)))))
+  (p/nes-run! [] 2))
+
+(defn act!
+  "One step: the action's buttons held for its frames, then released for one (so a jump can
+  be pressed again); up with a door or a ladder within 2 blocks on her row (and none at her
+  column) steps to it first (a step walks 1 to 3 blocks: the agent walked past the door it
+  meant to take)."
+  [action]
+  (when (= action :up)
+    (let [st (state)
+          px (long (:x st)) py (feet-row st)
+          at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
+          here (or (contains? #{"D" "H"} (at 0 0)) (= "H" (at 0 -1)))
+          near (first (for [dx [1 -1 2 -2] :when (contains? #{"D" "H"} (at dx 0))] dx))]
+      (when (and near (not here))
+        (step-to! (+ px near)))))
+  (act-v1! action))
 
 ;; Into the game: the menus, then level 1-1.
 
