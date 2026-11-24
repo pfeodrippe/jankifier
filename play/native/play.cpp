@@ -128,7 +128,8 @@ namespace
   // from the map's lines: a line stops it when it is one-sided or impassable, or when the
   // opening between its two sectors is lower than the player (56 units); a door is a line of
   // a sector whose ceiling is down on its floor.
-  std::array<double, 7> const doom_ray_angles{ 90, 45, 20, 0, -20, -45, -90 };
+  // Multiples of a turn (30 degrees: play.doom's turn-left and turn-right), and behind.
+  std::array<double, 8> const doom_ray_angles{ 90, 60, 30, 0, -30, -60, -90, 180 };
   // Each direction's distance and whether a closed door ends it.
   std::vector<std::pair<double, bool>> doom_rays;
 

@@ -73,14 +73,25 @@
         (pos? a) (str (long a) " degrees left")
         :else (str (long (- a)) " degrees right")))
 
+(defn- turns
+  "How many turns face direction `a` (degrees, left positive), as words: (2 turn-left)."
+  [a]
+  (let [n (long (+ 0.5 (/ (max a (- a)) 30.0)))]
+    (cond (zero? n) nil
+          (>= (max a (- a)) 179.0) "(6 turns)"
+          :else (str "(" n (if (pos? a) " turn-left" " turn-right") ")"))))
+
 (defn- walls
-  "How far the player can walk in some directions (cpp/play.doom_rays), as a sentence."
+  "How far the player can walk in each direction a whole number of turns away and behind
+  (cpp/play.doom_rays), as lines."
   []
-  (str "Free way before a wall: "
-       (str/join ", " (map (fn [r] (str (direction (:angle r)) " " (long (:distance r))
-                                        (when (:door r) " (closed: a door or a pillar; use opens a door)")))
+  (str "Free way before a wall:\n"
+       (str/join "\n" (map (fn [r] (let [a (:angle r)]
+                                     (str "- " (if (>= (max a (- a)) 179.0) "behind" (direction a))
+                                          (when-let [t (turns a)] (str " " t)) ": " (long (:distance r))
+                                          (when (:door r) " (closed: a door or a pillar; use opens a door)"))))
                            (cpp/play.doom_rays)))
-       ".\n"))
+       "\n"))
 
 (defonce ^:private note
   ;; What the last action did that the state doesn't say (use: whether something opened).
@@ -136,6 +147,7 @@
                                           (str "straight ahead" (when enemy " (in your sights: attack hits it)"))
                                           :else
                                           (str (long (max a (- a))) " degrees to the " side
+                                               (when-let [t (turns a)] (str " " t))
                                                (when enemy " (attack turns to the nearest monster)"))))))))
             "Nothing in view.")))))
 
@@ -199,8 +211,9 @@
   "How act! plays an action, for replays (each recording, and each agent's step, says the
   version it was played with): 1 the first (attack held 8 tics, turns 10), 2 with aim, 3
   with turns of a fixed angle, 4 with forward-left and forward-right stepping to the side
-  instead of turning. Raised whenever act! changes."
-  4)
+  instead of turning, 5 with each move waited out until the player stops. Raised whenever
+  act! changes."
+  5)
 
 (def ^:private v1-tics
   {:forward 12 :back 12 :strafe-left 12 :strafe-right 12 :forward-left 12 :forward-right 12
@@ -216,27 +229,48 @@
   [action]
   (if (= action :aim) (aim!) (act-v1! action)))
 
+(defn- settled!
+  "Tics run with no key held until the player stops (Doom's momentum carries it on after the
+  keys are let go, so a step's length depended on how fast it already went), at most 40:
+  the reward."
+  []
+  (loop [i 0 reward 0.0 still 0 s (state)]
+    (if (or (>= still 2) (>= i 40) (cpp/play.doom_finished))
+      reward
+      (let [r (cpp/play.doom_act 0 1)
+            n (state)
+            dx (- (:x n) (:x s)) dy (- (:y n) (:y s))]
+        (recur (inc i) (+ reward r) (if (< (+ (* dx dx) (* dy dy)) 0.25) (inc still) 0) n)))))
+
 (defn- acted!
-  "An action, its buttons as `moves` has them, as act! plays it: the reward."
-  [moves action]
+  "An action, its buttons as `moves` has them, as act! plays it (a move waited out until the
+  player stops when `settle`): the reward."
+  [moves settle action]
   (case action
     :turn-left (turn! turn-degrees)
     :turn-right (turn! (- turn-degrees))
     :use (use!)
-    (let [aimed (if (= action :attack) (aim!) 0.0)]
-      (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics))))))
+    (let [aimed (if (= action :attack) (aim!) 0.0)
+          reward (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics)))]
+      (+ reward (if settle (settled!) 0.0)))))
 
 (defn act-v3!
   "An action as version 3 played it: forward-left and forward-right walked while turning."
   [action]
-  (acted! arcs action))
+  (acted! arcs false action))
+
+(defn act-v4!
+  "An action as version 4 played it: a move not waited out (the player slid on into the next
+  action)."
+  [action]
+  (acted! actions false action))
 
 (defn act!
-  "One step: the action's buttons held for its tics; turn-left and turn-right turn
-  turn-degrees, attack turns to the nearest monster in view first (if there is one), use
-  says what opened; the reward."
+  "One step: the action's buttons held for its tics, then a move waited out until the player
+  stops; turn-left and turn-right turn turn-degrees, attack turns to the nearest monster in
+  view first (if there is one), use says what opened; the reward."
   [action]
-  (acted! actions action))
+  (acted! actions true action))
 
 ;; A scripted player.
 
@@ -291,12 +325,15 @@
   "What a model playing Doom is told of the game."
   (str "You play Doom (Freedoom's first map), seen from the player's eyes. Find the way to the "
        "exit, and shoot the monsters that attack you. Each action holds the keys for a moment: "
-       "forward and back walk (about 50 units), turn-left and turn-right turn 30 degrees, forward-left and "
+       "forward and back walk (about 100 units: each move is waited out until you stop), turn-left and "
+       "turn-right turn 30 degrees, forward-left and "
        "forward-right walk ahead and to the side at once, without turning, strafe-left and strafe-right step sideways, attack "
        "turns to the nearest monster in view and shoots it (with none in view, it shoots "
        "straight ahead), use opens a door within 64 units straight ahead or "
        "presses a switch right in front of you, wait does nothing. Distances are in map units: "
-       "the player is 32 wide, a corridor about 128."))
+       "the player is 32 wide, a corridor about 128. Directions: your facing is in degrees "
+       "counterclockwise, 0 east (x grows) and 90 north (y grows); turn-left adds 30 to it, "
+       "turn-right takes 30 away. Each direction you are told says how many turns face it."))
 
 (def model-actions
   [:forward :turn-left :turn-right :forward-left :forward-right :back :strafe-left :strafe-right :attack :use
