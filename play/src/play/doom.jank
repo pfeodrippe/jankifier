@@ -263,6 +263,8 @@
   ([seed]
    (or (cpp/play.doom_open engine wad "map01" seed 320)
        (let [s (state)]
+         ;; Nothing said of a game before this one.
+         (reset! note nil)
          (reset! visited #{})
          (visit! s s)
          (reset! st {:step 0 :told (told)})
