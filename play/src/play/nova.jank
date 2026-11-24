@@ -120,9 +120,25 @@
   ;; positions relative to Nova (no counting needed).
   (atom {:map :grid}))
 
+(def harmless
+  "Objects that don't hurt Nova (the others may: enemies, fire, shots)."
+  #{"POOF" "PLAYER_PROJECTILE" "CHECKPOINT" "COLLECTIBLE" "MOVING_PLATFORM_HORIZ" "MOVING_PLATFORM_LINE"
+    "MOVING_PLATFORM_PUSH" "BUDDY" "POTION" "EXPLOSION"})
+
+(defn- dangers
+  "The objects that may hurt Nova within 3 blocks across and 2 up or down of her: [[type dx dy] ...],
+  nearest first (dy from her feet's row)."
+  [st]
+  (let [px (long (:x st)) py (feet-row st)]
+    (->> (:objects st)
+         (remove (fn [o] (contains? harmless (:type o))))
+         (map (fn [o] [(:type o) (- (long (:x o)) px) (- (long (:y o)) py)]))
+         (filter (fn [[_ dx dy]] (and (<= (max dx (- dx)) 3) (<= (max dy (- dy)) 2))))
+         (sort-by (fn [[_ dx dy]] (+ (max dx (- dx)) (max dy (- dy))))))))
+
 (defn- around
-  "What is next to Nova, from the map: the wall on her right and how high, a gap or spikes
-  ahead on the ground, as sentences."
+  "What is next to Nova, from the map and the objects: the dangers near her, the wall on her
+  right and how high, a gap or spikes ahead on the ground, as sentences."
   [st]
   (let [px (long (:x st)) py (feet-row st)
         at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
@@ -147,10 +163,23 @@
              (str "A " (if (= ch "H") "ladder (H)" "door (D)") " is " n (if (= 1 n) " block" " blocks")
                   " to her " (if (pos? dx) "right" "left") ". ")))
          (when ledge "She stands on a ledge (=): down drops her through it. ")
+         (when-let [ds (seq (dangers st))]
+           (str "Near her, what may hurt her when it touches her: "
+                (str/join ", " (for [[t dx dy] ds]
+                                 (str t " "
+                                      (cond (zero? dx) "at her column"
+                                            (pos? dx) (str dx (if (= 1 dx) " block" " blocks") " right")
+                                            :else (str (- dx) (if (= -1 dx) " block" " blocks") " left"))
+                                      (cond (zero? dy) " (her row)"
+                                            (neg? dy) (str ", " (- dy) " above")
+                                            :else (str ", " dy " below")))))
+                ": jump over it, wait for it to pass, or attack it. "))
          (cond
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
                             (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
            (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide: jump-right to cross it.")
+           (some (fn [[_ dx dy]] (and (< 0 dx 3) (<= (max dy (- dy)) 1))) (dangers st))
+           "On her right the ground goes on, but something that hurts is in the way."
            :else "On her right the way is clear.")
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right.")))))
 
