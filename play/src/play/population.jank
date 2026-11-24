@@ -216,7 +216,9 @@
                   (doseq [mem dropped]
                     (swap! (:copy mem) assoc :retired true)
                     (h/stop! (:agent mem))
-                    (h/close! (:agent mem)))
+                    ;; Freed apart: closing waits for a compaction in progress, minutes when
+                    ;; four agents share the model, and the cut waited with it.
+                    (future (h/close! (:agent mem))))
                   (let [forks (vec (map-indexed (fn [i _] (fork! game m (assoc opts :seed (+ next-id i)) (nth kept (mod i (count kept))) (+ next-id i)))
                                                 dropped))]
                     (reset! members (with-meta (into kept forks) {:game game}))
