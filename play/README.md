@@ -141,9 +141,10 @@ Built from ViZDoom 9d44650 and NLE 2319f29, with Homebrew's boost and sdl2. ViZD
 is a program it starts (on macOS `build/bin/vizdoom.app/Contents/MacOS/vizdoom`); link
 `build/bin/libvizdoom.a` with boost_filesystem, boost_thread and boost_chrono (the dylib
 exports nothing). `patches/vizdoom-use-specials.patch` gives each line the action a player's
-use sets off (ViZDoom gives a line's ends and whether it blocks), so that a closed door, the
-exit switch and other switches can be told from a wall: without it, every sector whose floor
-meets its ceiling looked like a door.
+use sets off and whether it works from the line's back side (ViZDoom gives a line's ends and
+whether it blocks), so that a closed door, a lift, the exit switch and other switches can be
+told from a wall, from the side they work from: without it, every sector whose floor meets
+its ceiling looked like a door.
 
 ## Checking it
 

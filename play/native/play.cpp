@@ -166,6 +166,7 @@ namespace
       bool blocking;
       double ceiling, floor;
       int special;
+      bool from_back;
     };
     // A line is in each of its sectors' lists: keyed by its ends, either way round.
     std::map<std::array<long long, 4>, wall> walls;
@@ -182,7 +183,7 @@ namespace
         if(at == walls.end())
         {
           walls.emplace(key, wall{ l.x1, l.y1, l.x2, l.y2, l.isBlocking, sector.ceilingHeight, sector.floorHeight,
-                                   l.useSpecial });
+                                   l.useSpecial, l.useFromBack });
         }
         else
         {
@@ -221,7 +222,10 @@ namespace
         if(t > 0.0 && u >= 0.0 && u <= 1.0 && t < best)
         {
           best = t;
-          special = w.special;
+          // Use works from the line's front side (right of x1,y1 -> x2,y2), and from its back
+          // only when the line says so: from the wrong side it is a wall.
+          bool const front{ ex * (py - w.y1) - ey * (px - w.x1) < 0.0 };
+          special = front || w.from_back ? w.special : 0;
         }
       }
       doom_rays.emplace_back(best, special);
