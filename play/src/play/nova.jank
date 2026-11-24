@@ -327,13 +327,19 @@
            ;; How far clear, and the wall after it: "clear" with a wall 5 blocks on read as a
            ;; contradiction to an agent.
            :else (if-let [d (first (filter (fn [dx] (solid? (at dx 0))) (range 2 13)))]
-                   (let [h (count (take-while (fn [dy] (solid? (at d (- dy)))) (range 0 8)))]
+                   (let [height (fn [col] (count (take-while (fn [dy] (solid? (at col (- dy)))) (range 0 8))))
+                         h (height d)
+                         ;; A taller wall just behind a step decides the advice (an agent read
+                         ;; "1 block high" for a step in front of a lock wall 6 high).
+                         taller (first (filter (fn [col] (> (height col) (max h 2))) (range (inc d) (+ d 4))))
+                         top (if taller (height taller) h)]
                      (str "On her right the way is clear for " (dec d) (if (= 2 d) " block" " blocks") ", then a wall "
                           h (if (= 1 h) " block" " blocks") " high"
                           ;; Named when the map calls it something else (an agent didn't match
                           ;; the wall to the map's lock).
                           (let [c (at d 0)] (when (not= "#" c) (str " (the " (get char-names c c) " at x " d ")")))
-                          (if (<= h 2) " (jump-right gets over it)." " (too high to jump: look for another way).")))
+                          (when taller (str ", and behind it at x " taller " one " top " high"))
+                          (if (<= top 2) " (jump-right gets over it)." " (too high to jump: look for another way).")))
                    "On her right the way is clear."))
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right."))
          (when fall-left (str " On her left "
