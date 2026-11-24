@@ -202,7 +202,13 @@
   (when (and (not (:on-ground st)) (fall? st (long (:x st))))
     (let [px (long (:x st))
           going (cond (> (:vx st) 0.01) :right (< (:vx st) -0.01) :left :else (:facing st))
-          ground-at (fn [dir d] (not (fall? st (if (= dir :right) (+ px d) (- px d)))))
+          py (feet-row st)
+          ;; Ground she can come down onto: not a fall, and open at her own row there (ground
+          ;; higher than her is a wall she hits: an agent steered on toward "ground 2 blocks
+          ;; right" that was a stair top above her, and fell in front of it).
+          ground-at (fn [dir d] (let [col (if (= dir :right) (+ px d) (- px d))]
+                                  (and (not (fall? st col))
+                                       (not (contains? #{"#" "!" "L" "=" "-"} (block-char ((:map st) col py)))))))
           ahead (first (filter (fn [d] (ground-at going d)) (range 1 4)))
           nearest (first (for [d (range 1 6) dir [going (if (= going :right) :left :right)]
                                :when (ground-at dir d)]
