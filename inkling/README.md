@@ -232,9 +232,12 @@ keeping every row's logits, capturing, drafting) are evaluated one at a time.
 Without asking: evals of one token from different threads, on different
 sessions, are made one forward when they meet (`:auto-batch`, on by default).
 A token that comes while a forward runs waits, and the next forward takes every
-token waiting, so agents each on its own thread share forwards with nothing
-changed in them. `batchcheck`'s last part does this with a thread a session:
-8 threads 86 tokens/s in all, 32 threads 80, the same bits as alone.
+token waiting; a forward about to start also waits a little (3 ms at most) for
+the sessions that gave a token in the last 100 ms (two sessions would otherwise
+take turns, a forward each). So agents each on its own thread share forwards
+with nothing changed in them. `batchcheck`'s last part does this with a thread
+a session: 2 threads 65 tokens/s in all (alone 38), 8 threads 102, the same
+bits as alone.
 
 `ink/model-ptr` and `ink/session-ptr` give the C++ objects for direct
 interop:

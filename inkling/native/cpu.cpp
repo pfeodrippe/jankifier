@@ -1433,16 +1433,47 @@ namespace inkling
     // every token waiting (at most max_batch, a session once); the others wait for theirs.
     void eval_queued(session &s, int32_t const id)
     {
+      using clock = std::chrono::steady_clock;
+      // A session is decoding when it gave a token this lately; a forward waits this long at
+      // most for their next ones (a token's sampling takes about a millisecond).
+      auto const lately{ std::chrono::milliseconds{ 100 } };
+      auto const patience{ std::chrono::microseconds{ 3000 } };
       auto &q{ *s.model->batching };
       model::batch_queue::request r{ &s, id, false, nullptr };
       std::unique_lock<std::mutex> lock{ q.m };
       q.waiting.push_back(&r);
+      q.seen[&s] = clock::now();
+      q.cv.notify_all();
       while(!r.done)
       {
         if(q.running)
         {
           q.cv.wait(lock);
           continue;
+        }
+        // The sessions decoding lately whose token isn't here yet: waited for, a little.
+        {
+          auto const now{ clock::now() };
+          for(auto it{ q.seen.begin() }; it != q.seen.end();)
+          {
+            it = now - it->second > lately ? q.seen.erase(it) : std::next(it);
+          }
+          auto const missing{ [&] {
+            size_t here{};
+            for(auto const &[who, _] : q.seen)
+            {
+              here += std::any_of(q.waiting.begin(), q.waiting.end(), [&](auto const *w) { return w->s == who; }) ? 1 : 0;
+            }
+            return here < q.seen.size() && q.waiting.size() < static_cast<size_t>(max_batch);
+          } };
+          if(missing())
+          {
+            q.cv.wait_until(lock, now + patience, [&] { return q.running || r.done || !missing(); });
+            if(q.running || r.done)
+            {
+              continue;
+            }
+          }
         }
         std::vector<model::batch_queue::request *> taken, left;
         for(auto *const w : q.waiting)

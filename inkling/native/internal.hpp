@@ -8,6 +8,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <exception>
+#include <chrono>
+#include <unordered_map>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -113,6 +115,10 @@ namespace inkling
     std::condition_variable cv;
     std::vector<request *> waiting;
     bool running{};
+    // When each session last gave a token: those that did lately are decoding, and their
+    // next token is waited for a little before a forward goes without it (two sessions
+    // would otherwise take turns, a token each, never meeting).
+    std::unordered_map<session const *, std::chrono::steady_clock::time_point> seen;
   };
 
   // The Metal backend (metal.mm). metal_open gives null when it can't run
