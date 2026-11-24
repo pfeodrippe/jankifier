@@ -119,7 +119,7 @@
                      :when (seq groups)]
                  (str "y " (- row py)
                       ;; The two rows the agent kept working out: hers, and the one she stands on.
-                      (case (- row py) 0 " (her row: the row she stands in)" 1 " (under her feet: what she stands on)" "")
+                      (case (- row py) 0 " (her row: the row she stands in; solid here is a wall in her way)" 1 " (under her feet: what she stands on)" "")
                       ": "
                       (str/join ", " (map (fn [g] (let [[x0 c] (first g) [x1 _] (last g)]
                                                     (str (get char-names c c) " "
