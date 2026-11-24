@@ -25,6 +25,13 @@ extern "C"
 #include <string>
 #include <vector>
 
+#include <libproc.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ;
+
 namespace
 {
   void say(char *error, int size, std::string const &what)
@@ -102,6 +109,9 @@ namespace
   std::mutex doom_lock;
   std::unique_ptr<vizdoom::DoomGame> doom_now;
   std::vector<uint32_t> doom_picture;
+  // Doom's tics' pictures not yet shown: one each 1/35 s (its own rate), at most 70 kept.
+  std::deque<std::vector<uint32_t>> doom_queued;
+  std::chrono::steady_clock::time_point doom_popped{};
   unsigned doom_width{}, doom_height{};
   uint64_t doom_shown{};
   std::vector<double> doom_vars;
@@ -191,8 +201,9 @@ namespace
     }
   }
 
-  // What the last state of Doom shows: its picture, variables and objects in view.
-  void doom_take()
+  // What the last state of Doom shows: its picture (queued), variables and objects in view,
+  // and with `rays`, how far the player can walk each way.
+  void doom_take(bool const rays = true)
   {
     auto const state(doom_now->getState());
     if(!state)
@@ -201,7 +212,7 @@ namespace
     }
     doom_tic = state->number;
     doom_vars = state->gameVariables;
-    if(doom_vars.size() > 5)
+    if(rays && doom_vars.size() > 5)
     {
       doom_cast(*state, doom_vars[3], doom_vars[4], doom_vars[5]);
     }
@@ -227,9 +238,58 @@ namespace
         picture[i] = uint32_t{ bytes[3 * i] } << 16 | uint32_t{ bytes[3 * i + 1] } << 8 | bytes[3 * i + 2];
       }
       std::lock_guard<std::mutex> hold{ doom_lock };
-      doom_picture = std::move(picture);
-      ++doom_shown;
+      doom_queued.push_back(std::move(picture));
+      while(doom_queued.size() > 70)
+      {
+        doom_queued.pop_front();
+      }
     }
+  }
+
+  // The Doom engines this process started that are running (its children named vizdoom).
+  std::vector<pid_t> doom_engines()
+  {
+    std::vector<pid_t> pids(512);
+    int const bytes{ proc_listpids(PROC_PPID_ONLY, static_cast<uint32_t>(getpid()), pids.data(),
+                                   static_cast<int>(pids.size() * sizeof(pid_t))) };
+    pids.resize(bytes > 0 ? static_cast<size_t>(bytes) / sizeof(pid_t) : 0);
+    std::vector<pid_t> engines;
+    for(auto const pid : pids)
+    {
+      char name[64]{};
+      if(pid > 0 && proc_name(pid, name, sizeof(name)) > 0 && std::strcmp(name, "vizdoom") == 0)
+      {
+        engines.push_back(pid);
+      }
+    }
+    return engines;
+  }
+
+  // A watcher for Doom engine `engine`: a shell of its own process group (a signal to this
+  // process's group doesn't reach it) that ends the engine once this process is gone. The
+  // engine is a process of its own, which a closed game ends, but a killed jank process
+  // leaves running (and it ignores SIGTERM). The watcher ends when the engine does.
+  void doom_watch(pid_t engine)
+  {
+    std::string const script{ "(while kill -0 " + std::to_string(getpid()) + " 2>/dev/null; do kill -0 "
+                              + std::to_string(engine) + " 2>/dev/null || exit 0; sleep 1; done; kill -9 "
+                              + std::to_string(engine) + " 2>/dev/null) </dev/null >/dev/null 2>&1 &" };
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&attr, 0);
+    char sh[]{ "/bin/sh" };
+    char c[]{ "-c" };
+    std::vector<char> text(script.begin(), script.end());
+    text.push_back('\0');
+    char *argv[]{ sh, c, text.data(), nullptr };
+    pid_t pid{};
+    if(posix_spawn(&pid, "/bin/sh", nullptr, &attr, argv, environ) == 0)
+    {
+      // The shell leaves the watcher running in the background and ends at once.
+      waitpid(pid, nullptr, 0);
+    }
+    posix_spawnattr_destroy(&attr);
   }
 
   int copy_picture(std::mutex &lock, std::vector<uint32_t> const &picture, unsigned w, unsigned h, uint64_t shown,
@@ -533,6 +593,7 @@ extern "C"
         doom_now->close();
         doom_now.reset();
       }
+      auto const before(doom_engines());
       auto game(std::make_unique<vizdoom::DoomGame>());
       game->setViZDoomPath(engine);
       game->setDoomGamePath(wad);
@@ -551,10 +612,21 @@ extern "C"
       game->setMode(vizdoom::PLAYER);
       game->init();
       game->newEpisode();
+      for(auto const pid : doom_engines())
+      {
+        if(std::find(before.begin(), before.end(), pid) == before.end())
+        {
+          doom_watch(pid);
+        }
+      }
       doom_width = game->getScreenWidth();
       doom_height = game->getScreenHeight();
       doom_now = std::move(game);
       doom_shown = 0;
+      {
+        std::lock_guard<std::mutex> hold{ doom_lock };
+        doom_queued.clear();
+      }
       doom_take();
       return 0;
     }
@@ -582,10 +654,16 @@ extern "C"
     }
     try
     {
-      auto const reward(doom_now->makeAction(held, static_cast<unsigned>(std::max(tics, 1))));
-      if(!doom_now->isEpisodeFinished())
+      // A tic at a time (the same tics as all at once), each one's picture queued.
+      int const n{ std::max(tics, 1) };
+      double reward{};
+      for(int i{}; i < n && !doom_now->isEpisodeFinished(); ++i)
       {
-        doom_take();
+        reward += doom_now->makeAction(held, 1);
+        if(!doom_now->isEpisodeFinished())
+        {
+          doom_take(i == n - 1);
+        }
       }
       return reward;
     }
@@ -631,6 +709,17 @@ extern "C"
 
   int play_doom_picture(uint32_t *out, int max, int *width, int *height, uint64_t *version)
   {
+    {
+      std::lock_guard<std::mutex> hold{ doom_lock };
+      auto const now(std::chrono::steady_clock::now());
+      if(!doom_queued.empty() && now - doom_popped >= std::chrono::microseconds{ 28571 })
+      {
+        doom_picture = std::move(doom_queued.front());
+        doom_queued.pop_front();
+        ++doom_shown;
+        doom_popped = now;
+      }
+    }
     return copy_picture(doom_lock, doom_picture, doom_width, doom_height, doom_shown, out, max, width, height, version);
   }
 

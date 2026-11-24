@@ -81,14 +81,15 @@
   ;; What the last action did that the state doesn't say (use: whether something opened).
   (atom nil))
 
-(defn- fallen
-  "How many monsters' bodies are in view (ViZDoom names them Dead...)."
-  [s]
-  (count (filter (fn [o] (str/starts-with? (str (:name o)) "Dead")) (:objects s))))
+(defn- alive?
+  "Whether object `o` is a monster that is alive (ViZDoom names a killed one Dead and its
+  class: DeadZombieman)."
+  [o]
+  (contains? enemies (:name o)))
 
 (defn- moved
   "How the player moved from `before` to `s`, as a sentence (and what the last action did:
-  a monster that fell, a door that opened)."
+  monsters killed, a door that opened)."
   [before s]
   (let [dx (- (:x s) (:x before)) dy (- (:y s) (:y before))
         far (cpp/play.sqrt (+ (* dx dx) (* dy dy)))
@@ -99,8 +100,8 @@
          (when (>= (max turn (- turn)) 1.0) (str " and turned " (direction turn)))
          (when (< (- (:health s) (:health before)) 0) (str ", and lost " (long (- (:health before) (:health s))) " health"))
          "."
-         (let [n (- (long (fallen s)) (long (fallen before)))]
-           (when (pos? n) (str " " n (if (= 1 n) " monster fell" " monsters fell") " (dead).")))
+         (let [n (- (long (:kills s)) (long (:kills before)))]
+           (when (pos? n) (str " You killed " n (if (= 1 n) " monster." " monsters."))))
          (when-let [said @note] (reset! note nil) (str " " said))
          "\n")))
 
@@ -124,7 +125,7 @@
                            (for [o (sort-by (fn [o] (first (bearing s o))) (:objects s))
                                  :let [[d a] (bearing s o)]]
                              (str "- " (:name o) ", " (long d) " away, "
-                                  (let [enemy (contains? enemies (:name o))
+                                  (let [enemy (alive? o)
                                         side (if (pos? a) "left" "right")]
                                     (cond (< (max a (- a)) aimed-within)
                                           (str "straight ahead" (when enemy " (in your sights: attack hits it)"))
@@ -138,7 +139,7 @@
   [s]
   ;; (seq first: jank's `first` of an empty sort crashes the process.)
   (first (seq (sort-by second (for [o (:objects s)
-                               :when (contains? enemies (:name o))
+                               :when (alive? o)
                                :let [[d a] (bearing s o)]]
                            [o d a])))))
 
@@ -229,13 +230,13 @@
 (defn- abs-diff [a b] (let [d (- a b)] (if (neg? d) (- d) d)))
 
 (defn scripted [s]
-  (let [targets (filter (fn [o] (contains? enemies (:name o))) (:objects s))
+  (let [targets (filter alive? (:objects s))
         stuck? (when-let [l (:last @memory)]
                  (< (+ (abs-diff (:x l) (:x s)) (abs-diff (:y l) (:y s))) 2.0))]
     (swap! memory (fn [m] {:last s :stuck (if stuck? (inc (:stuck m)) 0)}))
+    ;; (attack turns to the nearest monster itself.)
     (if (seq targets)
-      (let [[_ a] (bearing s (first (sort-by (fn [o] (first (bearing s o))) targets)))]
-        (cond (> a 6.0) :turn-left (< a -6.0) :turn-right :else :attack))
+      :attack
       (let [stuck (:stuck @memory)]
         (cond
           (= stuck 2) :use
