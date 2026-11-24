@@ -119,7 +119,8 @@ namespace
   int doom_tic{};
   std::vector<vizdoom::GameVariable> const doom_variables{ vizdoom::HEALTH,     vizdoom::ARMOR,     vizdoom::AMMO2,
                                                            vizdoom::POSITION_X, vizdoom::POSITION_Y, vizdoom::ANGLE,
-                                                           vizdoom::KILLCOUNT,  vizdoom::ITEMCOUNT, vizdoom::DEAD };
+                                                           vizdoom::KILLCOUNT,  vizdoom::ITEMCOUNT, vizdoom::DEAD,
+                                                           vizdoom::POSITION_Z };
   std::vector<vizdoom::Button> const doom_buttons{ vizdoom::MOVE_FORWARD, vizdoom::MOVE_BACKWARD, vizdoom::TURN_LEFT,
                                                    vizdoom::TURN_RIGHT,   vizdoom::ATTACK,        vizdoom::USE,
                                                    vizdoom::MOVE_LEFT,    vizdoom::MOVE_RIGHT };
@@ -158,7 +159,7 @@ namespace
     }
   }
 
-  void doom_cast(vizdoom::GameState const &state, double const px, double const py, double const angle)
+  void doom_cast(vizdoom::GameState const &state, double const px, double const py, double const pz, double const angle)
   {
     struct wall
     {
@@ -203,7 +204,8 @@ namespace
       int kind{};
       for(auto const &[_, w] : walls)
       {
-        if(!w.blocking && w.ceiling - w.floor >= 56.0)
+        // Open: not blocking, room for the player (56 high), and a floor it can step up to (24).
+        if(!w.blocking && w.ceiling - w.floor >= 56.0 && w.floor - pz <= 24.0)
         {
           continue;
         }
@@ -240,7 +242,7 @@ namespace
     doom_vars = state->gameVariables;
     if(rays && doom_vars.size() > 5)
     {
-      doom_cast(*state, doom_vars[3], doom_vars[4], doom_vars[5]);
+      doom_cast(*state, doom_vars[3], doom_vars[4], doom_vars.size() > 9 ? doom_vars[9] : 0.0, doom_vars[5]);
     }
     std::string objects;
     for(auto const &l : state->labels)
