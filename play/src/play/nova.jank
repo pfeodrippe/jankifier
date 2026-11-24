@@ -251,8 +251,13 @@
                                             :else (str ", " dy " below")))))
                 ;; The advice by where the nearest is: "jump over it" for one 2 above had the
                 ;; agent reasoning about it for minutes.
-                (let [[_ _ dy] (first ds)]
+                (let [[t dx dy] (first ds)]
                   (cond
+                    ;; One in her column at her height touches her: a GOOMBA there hurt an agent
+                    ;; again and again while it shot (too close) and waited.
+                    (and (zero? dx) (<= -1 dy 0))
+                    (str ": it is touching her, and hurts her again and again: get away from it now (a step left, or a jump)"
+                         (when-not (contains? unshootable t) ", then shoot it from 3 blocks or more (a shot stuns it)"))
                     (and (<= dy -2) (pos? wall)) ": it is above her, where a jump over the wall goes (her shot goes along her row, not up): wait for it to walk away, then jump"
                     (<= dy -2) ": it is above her: walk on under it (a jump would touch it), or wait for it to move"
                     (pos? dy) ": it is below her: don't drop onto it"
@@ -260,12 +265,12 @@
                     :else ": jump over it, wait for it to pass, or attack it (a shot stuns it: stunned, it can't hurt her and she walks through it)"))
                 ;; Her shot goes the way she faces: an agent facing away fired at nothing.
                 (let [[t dx dy] (first ds)]
-                  (when (and (zero? dy) (not (zero? dx)) (not (contains? unshootable t))
+                  (when (and (<= -1 dy 0) (not (zero? dx)) (not (contains? unshootable t))
                              (not= (:facing st) (if (pos? dx) :right :left)))
                     (str " (her shot goes the way she faces, " (name (:facing st)) " now: a step "
                          (if (pos? dx) "right" "left") " turns her toward it)")))
                 ;; A shot starts about 2 blocks ahead of her: one closer is passed over.
-                (when (some (fn [[_ dx dy]] (and (<= 1 (max dx (- dx)) 2) (zero? dy))) ds)
+                (when (some (fn [[_ dx dy]] (and (<= 1 (max dx (- dx)) 2) (<= -1 dy 0))) ds)
                   " (one 1 or 2 blocks from her on her row is too close to shoot: her shot starts past it; step back first, or jump over it)")
                 ". "))
          (cond
