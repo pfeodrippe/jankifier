@@ -322,6 +322,12 @@
                   " to reach the ground " d (if (= 1 d) " block " " blocks ") (name dir) "; waiting drops her in. ")
              "She is in the air over a fall (nothing below her, no ground near): steer the way she was going. "))
          (when ledge "She stands on a ledge (=): down drops her through it. ")
+         ;; A heart in view gives back health (an agent at 1 health passed one by).
+         (when-let [[dx dy] (first (sort-by (fn [[dx dy]] (+ (max dx (- dx)) (max dy (- dy))))
+                                           (for [dx (range -6 25) dy (range -7 4) :when (= "+" (at dx dy))] [dx dy])))]
+           (str "A heart (+) " (cond (zero? dx) "at her column" (pos? dx) (str dx " right") :else (str (- dx) " left"))
+                (cond (zero? dy) "" (neg? dy) (str ", " (- dy) " above") :else (str ", " dy " below"))
+                ": touching it gives back health. "))
          ;; What a spring does (an agent on the low part of a wall, a spring beside it, took the
          ;; wall for impassable and shot at a lock).
          (when-let [d (first (filter (fn [dx] (= "s" (at dx 0))) [1 -1 2 -2 3 -3 4 -4 5 -5 6 -6]))]
