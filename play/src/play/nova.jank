@@ -163,6 +163,28 @@
   (let [py (feet-row st)]
     (every? (fn [row] (contains? #{"." "o" "~"} (block-char ((:map st) col row)))) (range (+ py 2) rows))))
 
+(defn- fall-edge
+  "How far (blocks) the edge of a fall is from Nova that way (`dir` 1 right, -1 left), when one
+  starts within 3 columns: her ground stops there over 2 or more empty columns with nothing to
+  land on below. nil when none."
+  [st dir]
+  (let [px (long (:x st)) py (feet-row st)
+        at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))]
+    (when-let [d (first (filter (fn [d] (and (= "." (at (* dir d) 1)) (= "." (at (* dir (inc d)) 1))
+                                           (fall? st (+ px (* dir d)))))
+                                [1 2 3]))]
+      (if (pos? dir) (- (+ px d) (:x st)) (- (:x st) (+ (- px d) 1))))))
+
+(defn- step-blocks
+  "How far a step that way (`dir`) walks her, and a tenth more: about 0.35 blocks from rest and
+  7.5 times her speed that way more (measured: 0.33 at rest, 0.75 at 0.047 a frame, 1.1 at
+  0.109). A fall's edge nearer than this is walked into; jumps from about this far cleared the
+  pits (from further back they fell short)."
+  [st dir]
+  (+ 0.45 (* 7.5 (max 0.0 (* dir (:vx st))))))
+
+(defn- tenths [x] (/ (long (* 10 x)) 10.0))
+
 (defn- around
   "What is next to Nova, from the map and the objects: the dangers near her, the wall on her
   right and how high, a gap or spikes ahead on the ground, as sentences."
@@ -173,8 +195,12 @@
         wall (count (take-while (fn [dy] (solid? (at 1 (- dy)))) (range 0 6)))
         gap (when (:on-ground st)
               (count (take-while (fn [dx] (= "." (at dx 1))) (range 1 6))))
+        ;; A fall on her left within 4 blocks: where her ground stops (an agent backing away
+        ;; from a danger walked into the pit it had jumped).
+        fall-left (when (:on-ground st)
+                    (first (filter (fn [dx] (and (= "." (at (- dx) 1)) (fall? st (- px dx)))) (range 1 5))))
         ;; A gap further ahead on her ground (within 8 blocks): where it starts and how wide,
-        ;; and whether it has a floor below within 4 rows (else a fall).
+        ;; and whether it has a floor below (else a fall).
         gap-ahead (when (and (:on-ground st) (not (pos? (or gap 0))))
                     (when-let [from (first (filter (fn [dx] (= "." (at dx 1))) (range 2 9)))]
                       (let [width (count (take-while (fn [dx] (= "." (at dx 1))) (range from (+ from 8))))
@@ -234,22 +260,36 @@
                        (str "On her right the ground goes on " (dec from) (if (= 2 from) " block" " blocks")
                             ", then stops: a gap " width (if (= 1 width) " block" " blocks") " wide"
                             (if floor "" ", with no floor below (a fall)")
-                            ": walk to its edge, then jump-right, then right while in the air to carry over it."))
+                            (let [edge (when-not floor (fall-edge st 1))]
+                              (cond
+                                (and edge (< edge (step-blocks st 1)))
+                                (str ": its edge is " (tenths edge) " blocks ahead: jump-right from here, then right while in the air (a step right would carry her over the edge).")
+                                edge
+                                (str ": its edge is " (tenths edge) " blocks ahead: step right toward it (a step that would go over is not done, and said so), then jump-right from there, then right while in the air (jumping from further back falls short).")
+                                :else ": walk to its edge, then jump-right, then right while in the air to carry over it."))))
            (some (fn [[_ dx dy]] (and (< 0 dx 3) (<= (max dy (- dy)) 1))) (dangers st))
            "On her right the ground goes on, but something that hurts is in the way."
            :else "On her right the way is clear.")
-         (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right.")))))
+         (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right."))
+         (when fall-left (str " On her left "
+                              (if (= 1 fall-left)
+                                "her ground stops right where she stands"
+                                (str "the ground goes on " (dec fall-left) (if (= 2 fall-left) " block" " blocks") ", then stops"))
+                              ", over a fall (no floor below): walking left goes into it.")))))
 
 (defn caution
-  "Why action `action` should not be done now (nil: it may be): a walk right on the ground
-  with the ground stopping right ahead over a fall (nothing to land on down to the map's
-  bottom): she would fall in, which never helps. A drop to a floor is let be."
+  "Why action `action` should not be done now (nil: it may be): a step right or left on the
+  ground with a fall's edge nearer that way than a step walks (nothing to land on down to the
+  map's bottom): she would fall in, which never helps. A drop to a floor is let be."
   [st action]
-  (let [px (long (:x st)) py (feet-row st)
-        at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))]
-    (when (and (= action :right) (:on-ground st) (= "." (at 1 1)) (= "." (at 2 1))
-               (fall? st (inc px)))
-      "the ground stops right ahead over a fall (no floor below): right walks her into it. Jump-right, then right while in the air.")))
+  ;; A fall's edge nearer than a step walks is walked into (an agent stepped off from a block
+  ;; before the edge).
+  (when-let [dir (and (:on-ground st) ({:right 1 :left -1} action))]
+    (when-let [edge (fall-edge st dir)]
+      (when (< edge (step-blocks st dir))
+        (str "the ground stops " (tenths edge) " blocks on her " (name action)
+             " over a fall (no floor below): a step " (name action) " carries her into it. Jump-" (name action)
+             " from here, then " (name action) " while in the air, to cross it.")))))
 
 (defn- moved
   "How far Nova went from `before` to `st`, as a sentence (or that she died and starts again)."
