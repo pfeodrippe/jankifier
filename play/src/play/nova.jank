@@ -249,8 +249,8 @@
   "The sentence for steps up from column offset `d`."
   [[h0 top n fall-behind] d]
   (str "On her right are steps up, a column each from x " d " to x " (+ d n -1) " (" h0 " to " top
-       " blocks high): jump-right onto the first, then each next with another jump-right, stopping on each"
-       " (steering right in the air carries her past the top)"
+       " blocks high): climb them a step at a time, each with a jump-right on its own and no right after it"
+       " (rights after a jump steer her on past the step, and past the top into what is behind it)"
        (when fall-behind ", and behind the top is a fall: from the top, jump-right over it, then right in the air")
        ". "))
 
