@@ -43,11 +43,10 @@ extern "C"
   int play_doom_rays(double *out, int max);
   // The sectors' floor and ceiling heights kept now, for play_doom_moved.
   void play_doom_mark();
-  // The way to the nearest square of side `cell` the player hasn't stood in (`visited`: n
-  // squares, column and row each), walking square to square from the player's past no wall or
-  // closed door (lines as the last rays saw them): the middles of the path's squares, x and y
-  // each, into `out`; their count (0: none found).
-  int play_doom_frontier(int const *visited, int n, double cell, double *out, int max);
+  // The way to the nearest sector the player hasn't stood in, sector to sector across the
+  // lines they share that the player can cross (room to stand, a step up of at most 24, or a
+  // door): the middles of those lines, x and y each, into `out`; their count (0: none found).
+  int play_doom_frontier(double *out, int max);
   // 1 when nothing of the map (a wall, a closed door, a floor or ceiling past the eyes) is
   // between the player's eyes and point x, y (lines as the last rays saw them), else 0.
   int play_doom_sees(double x, double y);

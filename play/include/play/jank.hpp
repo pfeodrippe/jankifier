@@ -397,20 +397,12 @@ namespace play
     return play_doom_sees(rt::to_real(x), rt::to_real(y)) ? object_ref{ rt::jank_true } : object_ref{ rt::jank_false };
   }
 
-  // [[x y] ...]: the way to the nearest square not in `visited` (a seq of [column row]), its
-  // squares' middles from the player on; empty when there is none.
-  inline object_ref doom_frontier(object_ref const visited, object_ref const cell)
+  // [[x y] ...]: the way to the nearest sector the player hasn't stood in, the middles of the
+  // lines it crosses; empty when there is none.
+  inline object_ref doom_frontier()
   {
-    std::vector<int> squares;
-    for(auto it(rt::seq(visited)); it != rt::jank_nil; it = rt::next(it))
-    {
-      auto const sq(rt::first(it));
-      squares.push_back(static_cast<int>(rt::to_int(rt::first(sq))));
-      squares.push_back(static_cast<int>(rt::to_int(rt::second(sq))));
-    }
     std::vector<double> out(2 * 512);
-    int const n(play_doom_frontier(squares.data(), static_cast<int>(squares.size() / 2), rt::to_real(cell), out.data(),
-                                   static_cast<int>(out.size())));
+    int const n(play_doom_frontier(out.data(), static_cast<int>(out.size())));
     object_ref list{ rt::obj::persistent_vector::empty() };
     for(int i{}; i < n; ++i)
     {

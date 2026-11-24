@@ -17,6 +17,9 @@ extern "C"
 #include <array>
 #include <chrono>
 #include <deque>
+#include <queue>
+#include <set>
+#include <tuple>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -172,6 +175,38 @@ namespace
   // The last cast's lines, and the player's eyes' height then (41 above its feet).
   std::vector<doom_wall> doom_walls;
   double doom_eye{};
+  // The last state of Doom, for its sectors' outlines.
+  vizdoom::GameStatePtr doom_last;
+
+  // The sectors the player has stood in since the game started (their indices).
+  std::set<int> doom_sectors_been;
+
+  // The index of the sector whose outline holds point x, y (by the crossings of a line from
+  // it), or -1 outside the map.
+  int doom_sector_at(double const x, double const y)
+  {
+    if(!doom_last)
+    {
+      return -1;
+    }
+    auto const &sectors(doom_last->sectors);
+    for(size_t i{}; i < sectors.size(); ++i)
+    {
+      bool inside{};
+      for(auto const &l : sectors[i].lines)
+      {
+        if((l.y1 > y) != (l.y2 > y) && x < l.x1 + (y - l.y1) * (l.x2 - l.x1) / (l.y2 - l.y1))
+        {
+          inside = !inside;
+        }
+      }
+      if(inside)
+      {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
+  }
 
   void doom_cast(vizdoom::GameState const &state, double const px, double const py, double const pz, double const angle)
   {
@@ -268,6 +303,14 @@ namespace
     }
     doom_tic = state->number;
     doom_vars = state->gameVariables;
+    doom_last = state;
+    if(doom_vars.size() > 4)
+    {
+      if(int const k{ doom_sector_at(doom_vars[3], doom_vars[4]) }; k >= 0)
+      {
+        doom_sectors_been.insert(k);
+      }
+    }
     doom_monsters.clear();
     for(auto const &o : state->objects)
     {
@@ -672,6 +715,8 @@ extern "C"
         doom_now.reset();
       }
       auto const before(doom_engines());
+      doom_sectors_been.clear();
+      doom_last.reset();
       auto game(std::make_unique<vizdoom::DoomGame>());
       game->setViZDoomPath(engine);
       game->setDoomGamePath(wad);
@@ -813,95 +858,123 @@ extern "C"
     return 1;
   }
 
-  int play_doom_frontier(int const *visited, int n, double const cell, double *out, int max)
+  int play_doom_frontier(double *out, int max)
   {
-    if(doom_vars.size() < 5 || doom_walls.empty())
+    if(!doom_last || doom_vars.size() < 5)
     {
       return 0;
     }
-    // Whether the player can walk straight from a to b: no wall, closed door or opening too low
-    // between (ledges aside: a square's own height isn't known).
-    auto const walkable([&](double const ax, double const ay, double const bx, double const by) {
-      double const dx{ bx - ax }, dy{ by - ay };
-      for(auto const &w : doom_walls)
+    auto const &sectors(doom_last->sectors);
+    int const here{ doom_sector_at(doom_vars[3], doom_vars[4]) };
+    if(here < 0)
+    {
+      return 0;
+    }
+    // The lines two sectors share, keyed by their ends either way round: those sectors, and
+    // the line itself.
+    using key = std::array<long long, 4>;
+    std::map<key, std::vector<std::pair<int, vizdoom::Line const *>>> shared;
+    for(size_t i{}; i < sectors.size(); ++i)
+    {
+      for(auto const &l : sectors[i].lines)
       {
-        if(!w.blocking && w.sides > 1 && w.ceiling - w.floor >= 56.0)
+        key k{ std::llround(l.x1), std::llround(l.y1), std::llround(l.x2), std::llround(l.y2) };
+        if(std::make_pair(k[2], k[3]) < std::make_pair(k[0], k[1]))
         {
-          continue;
+          k = { k[2], k[3], k[0], k[1] };
         }
-        double const ex{ w.x2 - w.x1 }, ey{ w.y2 - w.y1 };
-        double const det{ ex * dy - dx * ey };
-        if(std::abs(det) < 1e-9)
+        shared[k].emplace_back(static_cast<int>(i), &l);
+      }
+    }
+    // Each sector's ways out: the sector beyond, and the middle of the line between, when the
+    // player can cross it (not blocking; room to stand beyond, 56 high, and a step up of at
+    // most 24; or a door, which opens).
+    std::vector<std::vector<std::tuple<int, double, double>>> ways(sectors.size());
+    for(auto const &[_, sides] : shared)
+    {
+      if(sides.size() != 2)
+      {
+        continue;
+      }
+      for(int d{}; d < 2; ++d)
+      {
+        auto const [a, la](sides[d]);
+        auto const [b, lb](sides[1 - d]);
+        auto const &sa(sectors[a]);
+        auto const &sb(sectors[b]);
+        bool const door{ use_kind(la->useSpecial) == 1 || use_kind(lb->useSpecial) == 1 };
+        double const top{ std::min(sa.ceilingHeight, sb.ceilingHeight) };
+        bool const open{ !la->isBlocking && sb.ceilingHeight - sb.floorHeight >= 56.0 && top - sb.floorHeight >= 56.0
+                         && sb.floorHeight - sa.floorHeight <= 24.0 };
+        if(open || door)
         {
-          continue;
-        }
-        double const wx{ w.x1 - ax }, wy{ w.y1 - ay };
-        double const t{ (ex * wy - wx * ey) / det };
-        double const u{ (dx * wy - dy * wx) / det };
-        if(t > 0.0 && t < 1.0 && u >= 0.0 && u <= 1.0)
-        {
-          return false;
+          ways[a].emplace_back(b, (la->x1 + la->x2) / 2.0, (la->y1 + la->y2) / 2.0);
         }
       }
-      return true;
-    });
-    auto const square([&](double const v) { return static_cast<long long>(std::floor(v / cell)); });
-    using key = std::pair<long long, long long>;
-    std::map<key, bool> seen;
-    for(int i{}; i < n; ++i)
-    {
-      seen[{ visited[2 * i], visited[2 * i + 1] }] = true;
     }
-    double const px{ doom_vars[3] }, py{ doom_vars[4] };
-    key const start{ square(px), square(py) };
-    // Breadth first from the player's square; a square's way in is kept to give the path.
-    std::map<key, key> from{ { start, start } };
-    std::deque<key> next{ start };
-    auto const middle([&](key const &k) {
-      return std::make_pair((static_cast<double>(k.first) + 0.5) * cell, (static_cast<double>(k.second) + 0.5) * cell);
-    });
-    int steps{};
-    while(!next.empty() && steps < 4000)
+    // A sector worth going to: a room or a corridor (its box at least 64 a side and 32768 in
+    // area), not a lighting patch, a step or an alcove the player passes by.
+    std::vector<bool> worth(sectors.size());
+    for(size_t i{}; i < sectors.size(); ++i)
     {
-      ++steps;
-      key const k{ next.front() };
-      next.pop_front();
-      if(!seen.count(k))
+      double x0{ 1e18 }, y0{ 1e18 }, x1{ -1e18 }, y1{ -1e18 };
+      for(auto const &l : sectors[i].lines)
       {
-        // The path back to the start, its squares' middles from the start on.
-        std::vector<key> path;
-        for(key at{ k }; at != start; at = from[at])
+        x0 = std::min({ x0, l.x1, l.x2 });
+        y0 = std::min({ y0, l.y1, l.y2 });
+        x1 = std::max({ x1, l.x1, l.x2 });
+        y1 = std::max({ y1, l.y1, l.y2 });
+      }
+      worth[i] = x1 - x0 >= 64.0 && y1 - y0 >= 64.0 && (x1 - x0) * (y1 - y0) >= 32768.0;
+    }
+    // Nearest first (Dijkstra over the lines' middles), to such a sector the player hasn't
+    // stood in.
+    std::vector<double> dist(sectors.size(), 1e18);
+    std::vector<int> back(sectors.size(), -1);
+    std::vector<std::pair<double, double>> at(sectors.size());
+    using item = std::pair<double, int>;
+    std::priority_queue<item, std::vector<item>, std::greater<item>> next;
+    dist[here] = 0.0;
+    at[here] = { doom_vars[3], doom_vars[4] };
+    next.push({ 0.0, here });
+    while(!next.empty())
+    {
+      auto const [d, k](next.top());
+      next.pop();
+      if(d > dist[k])
+      {
+        continue;
+      }
+      if(worth[k] && !doom_sectors_been.count(k))
+      {
+        std::vector<std::pair<double, double>> path;
+        for(int s{ k }; s != here; s = back[s])
         {
-          path.push_back(at);
+          path.push_back(at[s]);
         }
         std::reverse(path.begin(), path.end());
         int m{};
-        for(auto const &p : path)
+        for(auto const &[x, y] : path)
         {
           if(2 * (m + 1) > max)
           {
             break;
           }
-          auto const [x, y](middle(p));
           out[2 * m] = x;
           out[2 * m + 1] = y;
           ++m;
         }
         return m;
       }
-      auto const [ax, ay](k == start ? std::make_pair(px, py) : middle(k));
-      for(auto const [ox, oy] : { std::make_pair(1, 0), std::make_pair(-1, 0), std::make_pair(0, 1), std::make_pair(0, -1) })
+      for(auto const &[b, x, y] : ways[k])
       {
-        key const nk{ k.first + ox, k.second + oy };
-        if(from.count(nk))
+        double const nd{ d + std::hypot(x - at[k].first, y - at[k].second) };
+        if(nd < dist[b])
         {
-          continue;
-        }
-        auto const [bx, by](middle(nk));
-        if(walkable(ax, ay, bx, by))
-        {
-          from[nk] = k;
-          next.push_back(nk);
+          dist[b] = nd;
+          back[b] = k;
+          at[b] = { x, y };
+          next.push({ nd, b });
         }
       }
     }

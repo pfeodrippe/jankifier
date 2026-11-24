@@ -145,15 +145,20 @@
     nil))
 
 (defn- frontier
-  "Which way the nearest square the player hasn't stood in is, walking the map (as an automap
-  would show it), as a line; nil when there is none."
+  "Which way the nearest part of the map (a sector) the player hasn't stood in is, walking the
+  map (as an automap would show it), as a line."
   [s]
-  (let [path (cpp/play.doom_frontier (vec @visited) cell)]
-    (when (seq path)
+  (let [path (cpp/play.doom_frontier)]
+    (if (empty? path)
+      "No new ground can be walked to from here: a lift or a switch may lead on.\n"
       (let [seen (take-while (fn [[x y]] (cpp/play.doom_sees x y)) path)
             [x y] (if (seq seen) (last seen) (first path))
             [_ a] (bearing s {:x x :y y})]
-        (str "Nearest new ground, walking the map: about " (* (long cell) (count path)) " away; head "
+        (str "Nearest new ground, walking the map: about "
+             (long (reduce + 0.0 (map (fn [[ax ay] [bx by]]
+                                        (cpp/play.sqrt (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
+                                      (cons [(:x s) (:y s)] path) path)))
+             " away; head "
              (direction a) (when-let [t (turns a)] (str " " t))
              (when (< (count seen) (count path)) ", then follow the way")
              ".\n")))))
