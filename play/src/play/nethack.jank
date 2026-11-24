@@ -53,6 +53,8 @@
         (re-matches #"[a-zA-Z@&;:']" ch) (str "a monster or person (" ch ")")
         :else (str "'" ch "'")))
 
+(declare open-door?)
+
 (defn- around
   "What is next to the @ (the cursor) in each direction, as a sentence."
   [s]
@@ -66,7 +68,12 @@
       (str "Next to you: "
            (str/join ", " (for [[label dr dc] [["north" -1 0] ["north-east" -1 1] ["east" 0 1] ["south-east" 1 1]
                                                ["south" 1 0] ["south-west" 1 -1] ["west" 0 -1] ["north-west" -1 -1]]]
-                            (str label " " (char-name (at dr dc)))))
+                            (let [ch (at dr dc)]
+                              (str label " "
+                                   ;; | and - are walls, or open doors: the wall around tells.
+                                   (if (contains? #{"|" "-"} ch)
+                                     (if (open-door? s (+ col dc) (+ row dr -1)) "an open door" "a wall")
+                                     (char-name ch))))))
            ".\n"))))
 
 (defonce ^{:doc "Traps seen on the map: #{[dungeon-level x y]}. Once the @ stands on one the map
@@ -100,6 +107,98 @@
       (when (contains? @traps [depth (+ x dx) (+ y dy)])
         (str "a trap (^) you have seen is " (name action) " of you: stepping onto it springs it again "
              "(a bear trap holds you for turns, an arrow or dart trap hurts). Go around it.")))))
+
+;; The way through the map: a search from the @ over the squares one can walk (an open door
+;; told from a wall by the wall around it), for the stairs down when they are in view, else
+;; for the nearest place the unexplored goes on from (a doorway with unseen space beyond it,
+;; a corridor's end). An agent counted terminal columns, was 6 off, and went round the same
+;; rooms for minutes. The map is the screen's rows 1 to 21 (a map row is the screen row less
+;; one, a column the screen column).
+
+(defn- map-cell [s x y]
+  (let [line (get (:screen s) (inc y) "")]
+    (if (and (<= 0 x) (< x (count line)) (<= 0 y) (< y 21)) (subs line x (inc x)) " ")))
+
+(defn- open-door?
+  "An open door: a | with wall on both its left and right (in a wall of -), or a - with wall
+  above and below it (in a wall of |), and not its own kind in line (a wall's | has | above or
+  below; a corner - next to a doorway has wall only one way)."
+  [s x y]
+  (let [c (map-cell s x y) wall? (fn [cc] (contains? #{"|" "-"} cc))]
+    (or (and (= "|" c) (not= "|" (map-cell s x (dec y))) (not= "|" (map-cell s x (inc y)))
+             (wall? (map-cell s (dec x) y)) (wall? (map-cell s (inc x) y)))
+        (and (= "-" c) (not= "-" (map-cell s (dec x) y)) (not= "-" (map-cell s (inc x) y))
+             (wall? (map-cell s x (dec y))) (wall? (map-cell s x (inc y)))))))
+
+(defn- passable-at? [s x y]
+  (let [c (map-cell s x y)]
+    (or (not (contains? #{" " "|" "-"} c)) (open-door? s x y))))
+
+(def ^:private way-steps {[0 -1] "north" [0 1] "south" [1 0] "east" [-1 0] "west"
+            [1 -1] "north-east" [-1 -1] "north-west" [1 1] "south-east" [-1 1] "south-west"})
+
+(defn- way-search
+  "Breadth first from the @ over passable squares: {[x y] [dx dy from]}."
+  [s]
+  (let [{:keys [x y]} (:stats s)]
+    (loop [frontier [[x y]] seen {[x y] nil}]
+      (if (empty? frontier)
+        seen
+        (let [[px py] (first frontier)
+              here (map-cell s px py)
+              next (for [[dx dy] (keys way-steps)
+                         :let [nx (+ px dx) ny (+ py dy)]
+                         :when (and (not (contains? seen [nx ny]))
+                                    (passable-at? s nx ny)
+                                    ;; No diagonal step into or out of a doorway (+, or a
+                                    ;; door square in a wall line).
+                                    (or (zero? dx) (zero? dy)
+                                        (and (not= "+" here) (not= "+" (map-cell s nx ny)))))]
+                     [nx ny dx dy])]
+          (recur (into (vec (rest frontier)) (map (fn [[nx ny]] [nx ny]) next))
+                 (reduce (fn [m [nx ny dx dy]] (assoc m [nx ny] [dx dy [px py]])) seen next)))))))
+
+(defn- path-to [seen goal]
+  (loop [at goal acc ()]
+    (let [[dx dy from] (get seen at)]
+      (if (nil? dx) (vec acc) (recur from (conj acc [dx dy]))))))
+
+(defn- legs
+  "Moves as runs of the same direction: \"3 east, 2 south-east\"."
+  [moves]
+  (str/join ", " (for [run (partition-by identity moves)] (str (count run) " " (get way-steps (first run))))))
+
+(defn- doorway?
+  "A door square: + or an open door, or a floor square in a wall line (a broken door)."
+  [s x y]
+  (let [c (map-cell s x y) wall? (fn [cc] (contains? #{"|" "-"} cc))]
+    (or (= "+" c) (open-door? s x y)
+        (and (= "." c) (or (and (wall? (map-cell s (dec x) y)) (wall? (map-cell s (inc x) y)))
+                           (and (wall? (map-cell s x (dec y))) (wall? (map-cell s x (inc y)))))))))
+
+(defn- frontier?
+  "Where the unexplored may go on: a doorway with unseen space beyond it, or a corridor square
+  with one passable square around it (its end, or where it goes on unseen). A corridor is
+  always next to rock, so being next to unseen space alone says nothing."
+  [s [x y]]
+  (let [around (filter (fn [[dx dy]] (passable-at? s (+ x dx) (+ y dy))) (keys way-steps))]
+    (or (and (doorway? s x y)
+             (some (fn [[dx dy]] (= " " (map-cell s (+ x dx) (+ y dy)))) [[0 -1] [0 1] [1 0] [-1 0]]))
+        (and (= "#" (map-cell s x y)) (<= (count around) 1)))))
+
+(defn- way
+  "Sentences: the way to the stairs down when they are in view, else to the nearest edge of
+  what has been seen."
+  [s]
+  (let [seen (way-search s)
+        stairs (first (filter (fn [p] (= ">" (map-cell s (first p) (second p)))) (keys seen)))
+        dist (fn [p] (count (path-to seen p)))]
+    (cond
+      stairs (str "The way to the stairs down (>): " (legs (path-to seen stairs)) ".")
+      :else (when-let [f (first (sort-by dist (filter (fn [p] (frontier? s p)) (keys seen))))]
+              (when (pos? (dist f))
+                (str "No stairs down in view. The nearest way into what you haven't seen: "
+                     (legs (path-to seen f)) "."))))))
 
 (def ^:private direction-names
   {[0 -1] "north" [0 1] "south" [1 0] "east" [-1 0] "west"
@@ -140,6 +239,7 @@
           (:xp-level st) ", dungeon level " (:depth st) ", gold " (:gold st) ", turn " (:turn st)
           ", " (get hunger-names (:hunger st) "hunger unknown") ".\n"
           (around s)
+          (when (:normal s) (when-let [w (way s)] (str w "\n")))
           (let [{:keys [depth x y]} (:stats s)]
             (when (contains? @traps [depth x y])
               "You stand on a trap you saw before (the map shows you, not the ^): moving off it may take some tries if it holds you.\n"))
