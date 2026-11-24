@@ -77,8 +77,11 @@ told). A committee's members that think do it in one forward a token (`generate-
 the same thoughts as alone, sooner.
 
 `play.agent` makes the game a harness agent's task: its own conversation, thinking as long as
-it likes, and two tools, `look` and `act` (actions in a row, stopped at one that changes
-nothing). Its conversation is shown above the game as the harness shows any agent
+it likes, and three tools: `look`, `act` (actions in a row, stopped at one that changes
+nothing) and `notes` (what it keeps across compactions). A game can name actions that aren't
+meant to change anything (`:still`: Nova's attack and wait), and can refuse an action that
+only harms, saying why (`:caution`: Nova's step into a pit whose edge is nearer than a step
+walks). Its conversation is shown above the game as the harness shows any agent
 (`harness.cards`).
 
 ```clojure
