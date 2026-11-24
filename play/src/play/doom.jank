@@ -115,7 +115,7 @@
                                           (str "straight ahead" (when enemy " (in your sights: attack hits it)"))
                                           :else
                                           (str (long (max a (- a))) " degrees to the " side
-                                               (when enemy " (aim turns to the nearest monster)"))))))))
+                                               (when enemy " (attack turns to the nearest monster)"))))))))
             "Nothing in view.")))))
 
 (defn- nearest-enemy
@@ -146,12 +146,11 @@
         reward))))
 
 (defn act!
-  "One step: the action's buttons held for its tics (aim: turned to the nearest monster);
-  the reward."
+  "One step: the action's buttons held for its tics (attack: turned to the nearest monster in
+  view first, if there is one); the reward."
   [action]
-  (if (= action :aim)
-    (aim!)
-    (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) (get action-tics action step-tics))))
+  (let [aimed (if (= action :attack) (aim!) 0.0)]
+    (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) (get action-tics action step-tics)))))
 
 ;; A scripted player.
 
@@ -207,15 +206,15 @@
   (str "You play Doom (Freedoom's first map), seen from the player's eyes. Find the way to the "
        "exit, and shoot the monsters that attack you. Each action holds the keys for a moment: "
        "forward and back walk (about 50 units), turn-left and turn-right turn about 30 degrees, forward-left and "
-       "forward-right walk while turning, strafe-left and strafe-right step sideways, aim turns "
-       "to the nearest monster in view (so that it is in your sights), attack shoots straight "
-       "ahead (aim first: a shot off by a few degrees misses), use opens a door or "
+       "forward-right walk while turning, strafe-left and strafe-right step sideways, attack "
+       "turns to the nearest monster in view and shoots it (with none in view, it shoots "
+       "straight ahead), use opens a door or "
        "presses a switch right in front of you, wait does nothing. Distances are in map units: "
        "the player is 32 wide, a corridor about 128."))
 
 (def model-actions
-  [:forward :turn-left :turn-right :forward-left :forward-right :back :strafe-left :strafe-right :aim :attack
-   :use :wait])
+  [:forward :turn-left :turn-right :forward-left :forward-right :back :strafe-left :strafe-right :attack :use
+   :wait])
 
 (defonce decisions (atom []))
 ;; The last model game's conversation (play.decide/conversation), shown above the game.
