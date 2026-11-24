@@ -294,8 +294,10 @@
         empty-col? (fn [c] (every? (fn [row] (zero? ((:map st) c row))) (range rows)))
         end-col (first (filter (fn [c] (every? empty-col? (range c (+ c 12)))) (range px (+ px 40))))
         ended (and end-col (<= (- end-col px) 4) (loaded? st))
-        ;; The nearest ladder or door on her row within 4 blocks, when she isn't at one.
-        near (first (for [dx [1 -1 2 -2 3 -3 4 -4]
+        ;; The nearest ladder or door on her row in the view, when she isn't at one (within 4
+        ;; only, an agent under a tower went back up, the ladder on its way 11 blocks right
+        ;; unmentioned).
+        near (first (for [d (range 1 25) dx [d (- d)]
                           :let [ch (at dx 0)]
                           :when (contains? #{"H" "D"} ch)]
                       [dx ch]))]
