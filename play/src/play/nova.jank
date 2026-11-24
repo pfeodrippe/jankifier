@@ -299,7 +299,10 @@
         ;; unmentioned).
         near (first (for [d (range 1 25) dx [d (- d)]
                           :let [ch (at dx 0)]
-                          :when (contains? #{"H" "D"} ch)]
+                          ;; Only one she can walk to: nothing solid on her row before it (a
+                          ;; door behind a 6-high wall was named as if it were on her way).
+                          :when (and (contains? #{"H" "D"} ch)
+                                     (not-any? (fn [k] (solid? (at (if (pos? dx) k (- k)) 0))) (range 1 d)))]
                       [dx ch]))]
     (str (when-not (loaded? st) "The area is still being drawn (after a door): wait a moment. ")
          (when ladder "She is at a ladder (H): up climbs it. ")
