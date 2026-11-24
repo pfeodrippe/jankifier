@@ -155,6 +155,14 @@
   (let [px (long (:x st))]
     (some (fn [c] (some (fn [row] (pos? ((:map st) c row))) (range rows))) (range (max 0 (- px 20)) (+ px 40)))))
 
+(defn- fall?
+  "Whether column `col` below the row under Nova's feet holds nothing to land on down to the
+  map's bottom (empty, coins, water or lava): a fall out of the level. A drop of 6 to a floor
+  read as one when only 2 to 5 blocks down were looked at."
+  [st col]
+  (let [py (feet-row st)]
+    (every? (fn [row] (contains? #{"." "o" "~"} (block-char ((:map st) col row)))) (range (+ py 2) rows))))
+
 (defn- around
   "What is next to Nova, from the map and the objects: the dangers near her, the wall on her
   right and how high, a gap or spikes ahead on the ground, as sentences."
@@ -170,7 +178,7 @@
         gap-ahead (when (and (:on-ground st) (not (pos? (or gap 0))))
                     (when-let [from (first (filter (fn [dx] (= "." (at dx 1))) (range 2 9)))]
                       (let [width (count (take-while (fn [dx] (= "." (at dx 1))) (range from (+ from 8))))
-                            floor (some (fn [dy] (not= "." (at from dy))) (range 2 6))]
+                            floor (not (fall? st (+ px from)))]
                         [from width floor])))
         spikes (first (filter (fn [dx] (or (= "^" (at dx 0)) (= "^" (at dx 1)))) (range 1 5)))
         ledge (and (:on-ground st) (= "=" (at 0 1)))
@@ -234,13 +242,13 @@
 
 (defn caution
   "Why action `action` should not be done now (nil: it may be): a walk right on the ground
-  with the ground stopping right ahead over a fall (no floor 2 to 5 blocks down, as the text
-  says \"no floor below\"): she would fall in, which never helps. A drop to a floor is let be."
+  with the ground stopping right ahead over a fall (nothing to land on down to the map's
+  bottom): she would fall in, which never helps. A drop to a floor is let be."
   [st action]
   (let [px (long (:x st)) py (feet-row st)
         at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))]
     (when (and (= action :right) (:on-ground st) (= "." (at 1 1)) (= "." (at 2 1))
-               (not (some (fn [dy] (not= "." (at 1 dy))) (range 2 6))))
+               (fall? st (inc px)))
       "the ground stops right ahead over a fall (no floor below): right walks her into it. Jump-right, then right while in the air.")))
 
 (defn- moved
