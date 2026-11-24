@@ -13,6 +13,7 @@
   (:require [clojure.string :as str]
             [harness.cards :as hc]
             [harness.core :as h]
+            [harness.tools :as harness-tools]
             [play.core :as p]
             [play.decide :as decide]
             [play.doom :as doom]
@@ -41,11 +42,13 @@
           :progress (fn [s] {:x (/ (long (* 10 (:x s))) 10.0) :health (:health s)})}})
 
 (def guidance
-  (str "\n\nYou play through two tools. look tells you the game as it is now. act does actions "
+  (str "\n\nYou play through tools. look tells you the game as it is now. act does actions "
        "in order (one, or several you have planned) and tells you what each changed and the "
-       "game after them; it stops at an action that changes nothing. Plan from what you are "
-       "told, act, and read what changed. Keep playing: when a turn ends you are asked to go "
-       "on."))
+       "game after them; it stops at an action that changes nothing. notes keeps your own notes "
+       "apart from the conversation: keep in them where you have been, what is a dead end, what "
+       "you have tried and what came of it, and read them before you choose where to go. Plan "
+       "from what you are told, act, and read what changed. Keep playing: when a turn ends you "
+       "are asked to go on."))
 
 (defonce running (atom false))
 (defonce current (atom nil))
@@ -98,7 +101,51 @@
                         (if (same? before after)
                           (str (str/join "\n" (conj said (str (name k) ": " changed " Stopped here: it changed nothing.")))
                                "\n\nThe game now:\n" (told after before))
-                          (recur (rest left) (conj said (str (name k) ": " changed)))))))))))}]))
+                          (recur (rest left) (conj said (str (name k) ": " changed)))))))))))}
+     (harness-tools/notes)]))
+
+(defn- playing!
+  "Agent `a` playing game `game` (already where it should start) for `minutes`, in the
+  background, asked `first-ask` first and to go on after: a future of the result (play!'s)."
+  [game a minutes first-ask about]
+  (let [g (get games game)
+        began (cpp/play_decide.seconds)
+        minutes-of (fn [] (/ (- (cpp/play_decide.seconds) began) 60.0))]
+    (reset! running true)
+    (reset! current a)
+    (hc/watch! a (str (name game) " agent"))
+    (future
+      (try
+        (loop [i 0]
+          (when (and @running (< (minutes-of) minutes))
+            (h/ask! a (if (zero? i) first-ask "Go on playing."))
+            ;; The turn, cut at the time.
+            (loop []
+              (when-not (realized? (:turn @a))
+                (if (or (not @running) (>= (minutes-of) minutes))
+                  (h/stop! a)
+                  (cpp/usleep 200000))
+                (recur)))
+            (h/answer a)
+            (recur (inc i))))
+        (catch :default _ nil))
+      (reset! running false)
+      (let [path (replay/save! game @steps about)
+            conversation (str/replace path #"\.edn$" ".agent.edn")]
+        (h/save! a conversation)
+        (h/close! a)
+        {:recording path :conversation conversation :actions (count @steps)
+         :progress ((:progress g) ((:state g))) :minutes (/ (long (* 10 (minutes-of))) 10.0)}))))
+
+(defn- agent-of
+  "A game agent on model `m` with `opts` (play!'s)."
+  [g m {:keys [effort context max-steps max-thinking temperature seed]}]
+  (h/agent m {:tools (tools g) :system (str (:rules g) guidance) :effort effort :context context
+              :max-steps max-steps :max-thinking max-thinking
+              :sampling {:temperature temperature :seed seed}}))
+
+(def ^:private defaults
+  {:minutes 10 :effort :medium :context 32768 :max-steps 40 :max-thinking 1200 :temperature 1.0 :seed 1})
 
 (defn play!
   "Game `game` (a key of `games`) played from its start by a harness agent on model `m`, for
@@ -106,45 +153,34 @@
   :minutes}. `opts`: :effort (:medium), :context (32768), :max-steps a turn (40),
   :max-thinking (1200), :temperature (1.0, as the model's publisher evaluates it: greedy
   thinking goes round in the same sentences), :seed (1)."
-  [game m {:keys [minutes effort context max-steps max-thinking temperature seed]
-           :or {minutes 10 effort :medium context 32768 max-steps 40 max-thinking 1200 temperature 1.0 seed 1}}]
-  (let [g (get games game)]
+  [game m opts]
+  (let [opts (merge defaults opts)
+        g (get games game)]
     (when-let [failed ((:start! g))]
       (throw (ex-info (str "the game didn't start: " failed) {})))
     ((:watch! g))
     (reset! steps [])
-    (reset! running true)
-    (let [a (h/agent m {:tools (tools g) :system (str (:rules g) guidance) :effort effort :context context
-                        :max-steps max-steps :max-thinking max-thinking
-                        :sampling {:temperature temperature :seed seed}})
-          began (cpp/play_decide.seconds)
-          minutes-of (fn [] (/ (- (cpp/play_decide.seconds) began) 60.0))]
-      (reset! current a)
-      (hc/watch! a (str (name game) " agent"))
-      (future
-        (try
-          (loop [i 0]
-            (when (and @running (< (minutes-of) minutes))
-              (h/ask! a (if (zero? i)
-                          "Play the game. Look first."
-                          "Go on playing."))
-              ;; The turn, cut at the time.
-              (loop []
-                (when-not (realized? (:turn @a))
-                  (if (or (not @running) (>= (minutes-of) minutes))
-                    (h/stop! a)
-                    (cpp/usleep 200000))
-                  (recur)))
-              (h/answer a)
-              (recur (inc i))))
-          (catch :default _ nil))
-        (reset! running false)
-        (let [path (replay/save! game @steps {:agent true :effort effort :minutes minutes
-                                              :temperature temperature :seed seed :context context})
-              conversation (str/replace path #"\.edn$" ".agent.edn")]
-          (h/save! a conversation)
-          (h/close! a)
-          {:recording path :conversation conversation :actions (count @steps)
-           :progress ((:progress g) ((:state g))) :minutes (/ (long (* 10 (minutes-of))) 10.0)})))))
+    (playing! game (agent-of g m opts) (:minutes opts) "Play the game. Look first."
+          (assoc (select-keys opts [:effort :minutes :temperature :seed :context]) :agent true))))
+
+(defn resume!
+  "A game an agent played (its recording's path), gone on with for `minutes` more: the game
+  played again to where it was (each step with the version it was played with), and the
+  agent's conversation made again (harness.core/resume!), then asked to go on. The new
+  recording holds the steps before too. `opts` as play!'s (the run's own, by default)."
+  [path m opts]
+  (let [r (read-string (slurp path))
+        game (:game r)
+        g (get games game)
+        opts (merge defaults (select-keys (:about r) [:effort :context :temperature :seed]) opts)
+        conversation (str/replace path #"\.edn$" ".agent.edn")]
+    (replay/catch-up! r)
+    ((:watch! g))
+    (reset! steps (vec (:steps r)))
+    (let [a (agent-of g m opts)]
+      (h/resume! a conversation)
+      (playing! game a (:minutes opts)
+            "The game was stopped and has been started again where it was: look, and go on playing."
+            (assoc (select-keys opts [:effort :minutes :temperature :seed :context]) :agent true :resumed path)))))
 
 (defn stop! [] (reset! running false))

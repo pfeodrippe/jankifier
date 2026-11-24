@@ -126,6 +126,21 @@ namespace play_replay_native
              (harness.core/save! conv (str/replace path #"\.edn$" ".agent.edn")))
            path))))))
 
+(declare act-of)
+
+(defn catch-up!
+  "Recording `r` (or a file's path) played again from its start without being shown: each
+  step's action with the version it was played with; the game left where it ended. r."
+  [r]
+  (let [r (if (string? r) (read-string (slurp r)) r)
+        {:keys [start!]} (get games (:game r))]
+    (when-let [failed (start!)]
+      (throw (ex-info (str "the game didn't start: " failed) {})))
+    (doseq [step (:steps r)]
+      ((act-of r step) (:action step)))
+    (p/nes-flush!)
+    r))
+
 (defonce st (atom {}))
 (defonce replaying (atom nil))
 (defonce running (atom false))

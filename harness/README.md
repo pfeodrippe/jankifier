@@ -80,6 +80,7 @@ The default tools (`(tools/defaults)`):
 | `functions`, `describe` | what a namespace defines, and one function's parameters and documentation |
 | `read_file`, `write_file`, `edit_file`, `list_dir` | files |
 | `shell` | a command line, its output and exit code |
+| `notes` | the agent's own notes, kept apart from the conversation: they stay when it is summarized (the summary shows them), and are saved with it |
 
 `eval` is an evaluation like one from an editor: it sees the engine
 (`inkling.core`), this harness, and through `(harness.core/me)` the

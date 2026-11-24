@@ -708,7 +708,9 @@
                      (case (:role e)
                        :user (frame v :user nil :text (:text e))
                        :check (when-not (:passed e) (frame v :user nil :text (str "[the harness] " (:text e))))
-                       :compacted (frame v :user nil :text (str "[the harness] What happened before, in short:\n\n" (:text e)))
+                       :compacted (frame v :user nil :text (str "[the harness] What happened before, in short:\n\n" (:text e)
+                                                                (when (seq (:notes v))
+                                                                  (str "\n\nYour notes (the notes tool):\n" (:notes v)))))
                        (:thinking :model :call :result) (step-tokens step)
                        nil)))
                  (steps-of entries)))))
@@ -918,6 +920,10 @@
   [a]
   (let [v @a]
     {:entries (:entries v)
+     ;; What the model saw last (after a compaction: the summary, then what was kept).
+     :view (:view v)
+     ;; The model's own notes (the notes tool).
+     :notes (:notes v)
      :tools (mapv :name (:tools v))
      :effort (:effort v)
      :state (:state v)
@@ -936,6 +942,22 @@
   "A conversation read from a file `save!` wrote."
   [path]
   (read-string (slurp (str path))))
+
+(defn resume!
+  "Agent `a` (new, with the same tools and system as the conversation's) given a kept
+  conversation (`recording`, or a file's path) to go on with: its entries, and its session
+  made again for what the model saw last (the recording's view; in an older recording, from
+  its last summary on). The next `ask!` goes on from there."
+  [a recording]
+  (let [r (if (string? recording) (load-recording recording) recording)
+        entries (vec (:entries r))
+        from (last (keep-indexed (fn [i e] (when (= :compacted (:role e)) i)) entries))
+        view (vec (or (:view r) (if from (subvec entries from) entries)))]
+    (swap! a assoc :entries entries :view view :effort-said true :notes (:notes r)
+           :generated (or (:generated r) 0) :seconds (or (:seconds r) 0.0)
+           :step-count (count (filter (fn [e] (= :user (:role e))) entries)))
+    (rebuild! a)
+    a))
 
 (defn status
   "Where the agent is: {:state :position :context :generated :seconds :tokens-per-second}."

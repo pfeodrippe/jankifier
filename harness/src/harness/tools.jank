@@ -314,6 +314,25 @@
       (throw (ex-info (str "the sandbox wasn't applied: " failed) {:profile profile})))
     profile))
 
+(defn notes
+  "The notes tool: the agent's own notes, kept apart from its conversation (in its atom, as
+  :notes), so that they stay when the conversation is summarized (the summary shows them),
+  and saved with it."
+  []
+  (h/tool {:name "notes"
+           :doc (str "Your own notes, kept apart from the conversation: they stay when it is summarized. "
+                     "With text, it replaces them (give all you want kept); without, it gives them. Keep "
+                     "what you have tried and what came of it, what failed and why, and what to do next.")
+           :params {:text {:type "string" :doc "all the notes to keep (left out: read them)"}}
+           :required []
+           :fn (fn [{:keys [text]}]
+                 (let [a (:agent (h/me))]
+                   (if (some? text)
+                     (do (swap! a assoc :notes (str text))
+                         (str "Kept (" (count (str text)) " characters)."))
+                     (let [n (:notes @a)]
+                       (if (seq n) n "(No notes yet.)")))))}))
+
 (defn defaults
   "The default tools, a vector to give an agent (or to pick from: each is a map with
   :name). eval runs code in this process; the others are the usual ones for files and
@@ -347,4 +366,5 @@
                              :timeout {:type "number"
                                        :doc "seconds it may take (optional: 120)"}}
                     :optional [:timeout]
-                    :limit 12000})])
+                    :limit 12000})
+   (notes)])
