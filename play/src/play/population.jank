@@ -19,6 +19,7 @@
             [play.core :as p]
             [play.nethack :as nethack]
             [play.nova :as nova]
+            [play.wnw :as wnw]
             [play.replay :as replay]))
 
 ;; A game's copy: what is kept of it while another agent plays, and how it is put back.
@@ -61,6 +62,11 @@
              :score (fn [s c] (if (:done s)
                                 -1
                                 (+ (* 100000 (:depth (:stats s))) (* 10 (count (:seen c))) (:xp-level (:stats s)))))}
+:wnw {:take (fn [c] (assoc c :save (p/nes-save!)))
+         :put! (fn [c] (p/nes-restore! (:save c)))
+         :fresh (fn [_] {:save (p/nes-save!)})
+         ;; Rooms finished: the room's index.
+         :score (fn [s _] (:room s))}
    :nova {:take (fn [c] (assoc c :save (p/nes-save!)))
           :put! (fn [c] (p/nes-restore! (:save c)))
           :fresh (fn [_] {:save (p/nes-save!)})
