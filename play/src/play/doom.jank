@@ -512,7 +512,8 @@
        "presses a switch right in front of you, wait does nothing. Distances are in map units: "
        "the player is 32 wide, a corridor about 128. Directions: your facing is in degrees "
        "counterclockwise, 0 east (x grows) and 90 north (y grows); turn-left adds 30 to it, "
-       "turn-right takes 30 away. Each direction you are told says how many turns face it."))
+       "turn-right takes 30 away. Each direction you are told says how many turns face it. Armor "
+       "takes part of each hit until it runs out; health items heal, and at 0 health you die."))
 
 (def model-actions
   [:forward :turn-left :turn-right :forward-left :forward-right :back :strafe-left :strafe-right :attack :use
