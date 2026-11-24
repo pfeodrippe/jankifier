@@ -327,6 +327,9 @@
                    (let [h (count (take-while (fn [dy] (solid? (at d (- dy)))) (range 0 8)))]
                      (str "On her right the way is clear for " (dec d) (if (= 2 d) " block" " blocks") ", then a wall "
                           h (if (= 1 h) " block" " blocks") " high"
+                          ;; Named when the map calls it something else (an agent didn't match
+                          ;; the wall to the map's lock).
+                          (let [c (at d 0)] (when (not= "#" c) (str " (the " (get char-names c c) " at x " d ")")))
                           (if (<= h 2) " (jump-right gets over it)." " (too high to jump: look for another way).")))
                    "On her right the way is clear."))
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right."))
