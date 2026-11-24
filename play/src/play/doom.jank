@@ -157,6 +157,21 @@
   ;; What the last action did that the state doesn't say (use: whether something opened).
   (atom nil))
 
+(def shown-categories
+  "The kinds of objects a player is told of (ViZDoom's categories): what fights, what can be
+  picked up, and barrels; not decorations, trees, lights, bodies or effects."
+  #{"Monster" "Ammo" "Armor" "Health" "Weapon" "Powerup" "Power" "Artifact" "Key" "Hazard"})
+
+(def shown-at-most
+  "How many objects in view a player is told of, the nearest first."
+  12)
+
+(defn- shown?
+  "Whether object `o` is one a player is told of (and projectiles coming: an imp's fireball)."
+  [o]
+  (or (contains? shown-categories (:category o))
+      (str/ends-with? (str (:name o)) "Ball")))
+
 (defn- alive?
   "Whether object `o` is a monster that is alive (ViZDoom names a killed one Dead and its
   class: DeadZombieman)."
@@ -195,10 +210,10 @@
           ", kills " (long (:kills s)) ", items " (long (:items s)) (when (pos? (:dead s 0)) ", dead") ".\n"
           "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees.\n"
           (walls s)
-          (if (seq (:objects s))
-            (str "In view:\n"
+          (if (seq (filter shown? (:objects s)))
+            (str "In view (what fights, what can be picked up, barrels):\n"
                  (str/join "\n"
-                           (for [o (sort-by (fn [o] (first (bearing s o))) (:objects s))
+                           (for [o (take shown-at-most (sort-by (fn [o] (first (bearing s o))) (filter shown? (:objects s))))
                                  :let [[d a] (bearing s o)]]
                              (str "- " (:name o) ", " (long d) " away, "
                                   (let [enemy (alive? o)

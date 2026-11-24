@@ -275,8 +275,8 @@ namespace
         continue;
       }
       char line[256];
-      std::snprintf(line, sizeof line, "%s %.0f %.0f %u %u %u %u\n", l.objectName.c_str(), l.objectPositionX,
-                    l.objectPositionY, l.x, l.y, l.width, l.height);
+      std::snprintf(line, sizeof line, "%s %.0f %.0f %u %u %u %u %s\n", l.objectName.c_str(), l.objectPositionX,
+                    l.objectPositionY, l.x, l.y, l.width, l.height, l.objectCategory.c_str());
       objects += line;
     }
     doom_objects = objects;

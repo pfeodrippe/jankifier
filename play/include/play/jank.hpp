@@ -311,7 +311,8 @@ namespace play
     return rt::make_box(play_doom_finished() == 1);
   }
 
-  // {:tic :health :armor :ammo :x :y :angle :kills :items :dead :objects [{:name :x :y :box [x y w h]}]}
+  // {:tic :health :armor :ammo :x :y :angle :kills :items :dead :objects [{:name :x :y :box [x y w h]
+  // :category}]}: the category ViZDoom gives each object (Monster, Health, Decoration, ...).
   inline object_ref doom_state()
   {
     double v[16]{};
@@ -340,10 +341,12 @@ namespace play
       char name[128]{};
       double x{}, y{};
       unsigned bx{}, by{}, bw{}, bh{};
-      if(std::sscanf(line.c_str(), "%127s %lf %lf %u %u %u %u", name, &x, &y, &bx, &by, &bw, &bh) == 7)
+      char category[64]{};
+      if(std::sscanf(line.c_str(), "%127s %lf %lf %u %u %u %u %63s", name, &x, &y, &bx, &by, &bw, &bh, category) >= 7)
       {
         object_ref o{ rt::obj::persistent_array_map::empty() };
         o = rt::assoc(o, kw("name"), str(name));
+        o = rt::assoc(o, kw("category"), str(category));
         o = rt::assoc(o, kw("x"), num(x));
         o = rt::assoc(o, kw("y"), num(y));
         object_ref box{ rt::obj::persistent_vector::empty() };
