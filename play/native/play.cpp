@@ -208,6 +208,25 @@ namespace
     return -1;
   }
 
+  // How wide a thing of `category` (ViZDoom's) is to a player walking into it, or 0 when it
+  // can be walked through (an item, a body, an effect).
+  double doom_solid_radius(std::string const &category)
+  {
+    if(category == "Monster")
+    {
+      return 20.0;
+    }
+    if(category == "Hazard")
+    {
+      return 10.0;
+    }
+    if(category == "Decoration" || category == "LightSource" || category == "Vegetation")
+    {
+      return 16.0;
+    }
+    return 0.0;
+  }
+
   void doom_cast(vizdoom::GameState const &state, double const px, double const py, double const pz, double const angle)
   {
     using wall = doom_wall;
@@ -276,6 +295,30 @@ namespace
           // only when the line says so: from the wrong side it is a wall.
           bool const front{ ex * (py - w.y1) - ey * (px - w.x1) < 0.0 };
           special = front || w.from_back ? w.special : 0;
+        }
+      }
+      // Things a player can't walk through (a monster, a barrel, a column, a tree, a lamp: a
+      // circle about their size), nearer than the wall: the special -1 says so.
+      for(auto const &o : state.objects)
+      {
+        double const r{ doom_solid_radius(o.category) };
+        if(r <= 0.0)
+        {
+          continue;
+        }
+        // The ray p + t d meets the circle (o, r + 16, the player's own radius beside it).
+        double const ox{ o.positionX - px }, oy{ o.positionY - py };
+        double const along{ ox * dx + oy * dy };
+        double const across2{ ox * ox + oy * oy - along * along };
+        double const reach{ r + 16.0 };
+        if(along > 0.0 && across2 < reach * reach)
+        {
+          double const t{ along - std::sqrt(reach * reach - across2) };
+          if(t > 0.0 && t < best)
+          {
+            best = t;
+            special = -1;
+          }
         }
       }
       doom_rays.emplace_back(best, special);
@@ -1046,7 +1089,7 @@ extern "C"
     {
       out[4 * n] = doom_ray_angles[i];
       out[4 * n + 1] = doom_rays[i].first;
-      out[4 * n + 2] = use_kind(doom_rays[i].second);
+      out[4 * n + 2] = doom_rays[i].second < 0 ? 4 : use_kind(doom_rays[i].second);
       out[4 * n + 3] = doom_rays[i].second;
     }
     return n;

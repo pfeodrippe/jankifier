@@ -477,7 +477,7 @@ namespace play
       int const kind{ static_cast<int>(v[4 * i + 2]) };
       if(kind > 0)
       {
-        r = rt::assoc(r, kw("ends"), kw(kind == 1 ? "door" : kind == 2 ? "exit" : "switch"));
+        r = rt::assoc(r, kw("ends"), kw(kind == 1 ? "door" : kind == 2 ? "exit" : kind == 4 ? "thing" : "switch"));
         r = rt::assoc(r, kw("special"), integer(static_cast<int64_t>(v[4 * i + 3])));
       }
       list = rt::conj(list, r);

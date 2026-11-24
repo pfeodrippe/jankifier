@@ -139,6 +139,7 @@
   (case (:ends r)
     :door " (a closed door: use opens it within 64 units)"
     :exit " (the exit switch: use it within 64 units to finish the level)"
+    :thing " (a monster, a barrel, a column or a tree in the way)"
     :switch (if (contains? lifts (:special r))
               " (a lift's edge: use it on or beside the lift within 64 units; it goes down, waits about 3 seconds, then comes up)"
               " (a switch: use presses it within 64 units)")
