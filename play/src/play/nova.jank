@@ -250,6 +250,12 @@
                     (pos? dy) ": it is below her: don't drop onto it"
                     (every? (fn [[t]] (contains? unshootable t)) ds) ": jump over it or wait for it to pass"
                     :else ": jump over it, wait for it to pass, or attack it"))
+                ;; Her shot goes the way she faces: an agent facing away fired at nothing.
+                (let [[t dx dy] (first ds)]
+                  (when (and (zero? dy) (not (zero? dx)) (not (contains? unshootable t))
+                             (not= (:facing st) (if (pos? dx) :right :left)))
+                    (str " (her shot goes the way she faces, " (name (:facing st)) " now: a step "
+                         (if (pos? dx) "right" "left") " turns her toward it)")))
                 ;; A shot starts about 2 blocks ahead of her: one closer is passed over.
                 (when (some (fn [[_ dx dy]] (and (<= 1 (max dx (- dx)) 2) (zero? dy))) ds)
                   " (one 1 or 2 blocks from her on her row is too close to shoot: her shot starts past it; step back first, or jump over it)")
