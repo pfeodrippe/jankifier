@@ -183,8 +183,8 @@
                  (the turn then ends when the session is full). See `compact!`.
     :compact-reserve tokens kept free before compacting (15% of the context, at least
                  16384, at most a quarter of it)
-    :compact-keep    recent tokens kept as they are beside the summary (15000, at most 30%
-                 of the context)
+    :compact-keep    recent tokens kept as they are beside the summary (15000, at most 20%
+                 of the context: the summary is ready only after the agent has added more)
     :draft       drafting (inkling.core/speculate!): from the context, {:least 6 :most 15}
                  by default, nil off; with :model K also with the draft model, up to K
                  tokens a check (inkling.core/draft-model!). The tokens are the same either
@@ -213,7 +213,7 @@
             :draft (if (contains? opts :draft) draft {:least 6 :most 15})
             :compact-reserve (or compact-reserve
                                  (long (min (* 0.25 size) (max 16384.0 (* 0.15 size)))))
-            :compact-keep (or compact-keep (long (min 15000.0 (* 0.3 size))))
+            :compact-keep (or compact-keep (long (min 15000.0 (* 0.2 size))))
             ;; :entries is the whole conversation; :view what the model sees of it (the
             ;; same, until a compaction puts a summary in place of its older part).
             :entries [] :view [] :state :idle :live nil :stop false :turn nil
@@ -840,22 +840,24 @@
         (recorded! a e)
         true))))
 
-(def ^:private compact-early
-  ;; Tokens before a compaction is due that one is begun apart: the agent adds a few thousand
-  ;; while the summary is written (about a minute).
-  4096)
+(defn- compact-early
+  "Tokens before a compaction is due that one is begun apart: the reserve, at least 4096 (a
+  game agent added about 5000 while one was made, in 90 seconds)."
+  [v]
+  (max 4096 (:compact-reserve v)))
 
 (defn- compaction-soon?
   "Whether a compaction should be begun apart from the agent, to be ready before it is due:
-  the session within compact-early of the reserve, and 2048 tokens or more added since the
-  last one (else a small session compacts again and again, each time for little)."
+  the session within compact-early of the reserve, and half that added since the last one
+  (else a small session compacts again and again, each time for little)."
   [a]
   (let [v @a
         s (:session v)
-        at (ink/position s)]
+        at (ink/position s)
+        early (compact-early v)]
     (boolean (and (:compact v)
-                  (> at (- (:context (ink/info s)) (:compact-reserve v) compact-early))
-                  (> at (+ (or (:compacted-at v) 0) 2048))))))
+                  (> at (- (:context (ink/info s)) (:compact-reserve v) early))
+                  (> at (+ (or (:compacted-at v) 0) (quot early 2)))))))
 
 (defn- background!
   "A compaction begun apart from the agent, which goes on meanwhile (one at a time)."

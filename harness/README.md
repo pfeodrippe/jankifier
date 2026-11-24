@@ -139,8 +139,8 @@ continues it.
 When the session nears its end, the conversation's older part is replaced by a
 summary the model writes (`:compact`, `summarize` by default), the recent part
 (`:compact-keep` tokens) kept as it is. The summary is begun apart from the
-agent 4096 tokens before it is due (and once 2048 or more have been added
-since the last one): a
+agent `:compact-reserve` tokens (at least 4096) before it is due, and once half
+that has been added since the last one: a
 session of its own writes it, and another is evaluated with it and the part
 kept, while the agent goes on (the engine batches their tokens; long
 evaluations go in pieces of 512 tokens, so that the agent's come between). At
