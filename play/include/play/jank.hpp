@@ -392,6 +392,11 @@ namespace play
     return list;
   }
 
+  inline object_ref doom_sees(object_ref const x, object_ref const y)
+  {
+    return play_doom_sees(rt::to_real(x), rt::to_real(y)) ? object_ref{ rt::jank_true } : object_ref{ rt::jank_false };
+  }
+
   inline object_ref doom_mark()
   {
     play_doom_mark();

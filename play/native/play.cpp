@@ -158,16 +158,24 @@ namespace
     }
   }
 
+  // A line of the map as the rays see it: its ends, whether it blocks, the lowest ceiling and
+  // highest floor of its sectors, its use special, and how many sectors it is in (1: a wall).
+  struct doom_wall
+  {
+    double x1, y1, x2, y2;
+    bool blocking;
+    double ceiling, floor;
+    int special;
+    bool from_back;
+    int sides;
+  };
+  // The last cast's lines, and the player's eyes' height then (41 above its feet).
+  std::vector<doom_wall> doom_walls;
+  double doom_eye{};
+
   void doom_cast(vizdoom::GameState const &state, double const px, double const py, double const pz, double const angle)
   {
-    struct wall
-    {
-      double x1, y1, x2, y2;
-      bool blocking;
-      double ceiling, floor;
-      int special;
-      bool from_back;
-    };
+    using wall = doom_wall;
     // A line is in each of its sectors' lists: keyed by its ends, either way round.
     std::map<std::array<long long, 4>, wall> walls;
     for(auto const &sector : state.sectors)
@@ -183,7 +191,7 @@ namespace
         if(at == walls.end())
         {
           walls.emplace(key, wall{ l.x1, l.y1, l.x2, l.y2, l.isBlocking, sector.ceilingHeight, sector.floorHeight,
-                                   l.useSpecial, l.useFromBack });
+                                   l.useSpecial, l.useFromBack, 1 });
         }
         else
         {
@@ -192,9 +200,16 @@ namespace
           w.ceiling = std::min(w.ceiling, sector.ceilingHeight);
           w.floor = std::max(w.floor, sector.floorHeight);
           w.special = std::max(w.special, l.useSpecial);
+          ++w.sides;
         }
       }
     }
+    doom_walls.clear();
+    for(auto const &[_, w] : walls)
+    {
+      doom_walls.push_back(w);
+    }
+    doom_eye = pz + 41.0;
     doom_rays.clear();
     for(double const a : doom_ray_angles)
     {
@@ -764,6 +779,38 @@ extern "C"
   {
     std::snprintf(out, static_cast<size_t>(size), "%s", doom_monsters.c_str());
     return static_cast<int>(doom_monsters.size());
+  }
+
+  int play_doom_sees(double const x, double const y)
+  {
+    if(doom_vars.size() < 5)
+    {
+      return 0;
+    }
+    double const px{ doom_vars[3] }, py{ doom_vars[4] };
+    double const dx{ x - px }, dy{ y - py };
+    for(auto const &w : doom_walls)
+    {
+      // Sight passes a line of two sectors whose opening is around the eyes' height.
+      if(w.sides > 1 && w.ceiling - w.floor > 0.0 && w.floor < doom_eye && w.ceiling > doom_eye)
+      {
+        continue;
+      }
+      double const ex{ w.x2 - w.x1 }, ey{ w.y2 - w.y1 };
+      double const det{ ex * dy - dx * ey };
+      if(std::abs(det) < 1e-9)
+      {
+        continue;
+      }
+      double const wx{ w.x1 - px }, wy{ w.y1 - py };
+      double const t{ (ex * wy - wx * ey) / det };
+      double const u{ (dx * wy - dy * wx) / det };
+      if(t > 0.0 && t < 1.0 && u >= 0.0 && u <= 1.0)
+      {
+        return 0;
+      }
+    }
+    return 1;
   }
 
   void play_doom_mark()

@@ -43,6 +43,9 @@ extern "C"
   int play_doom_rays(double *out, int max);
   // The sectors' floor and ceiling heights kept now, for play_doom_moved.
   void play_doom_mark();
+  // 1 when nothing of the map (a wall, a closed door, a floor or ceiling past the eyes) is
+  // between the player's eyes and point x, y (lines as the last rays saw them), else 0.
+  int play_doom_sees(double x, double y);
   // The monsters anywhere in the map, seen or not, a line each: name x y.
   int play_doom_monsters(char *out, int size);
   // The sectors whose floor or ceiling moved since play_doom_mark: each one's middle x, y and
