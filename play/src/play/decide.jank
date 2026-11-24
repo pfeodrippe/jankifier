@@ -52,12 +52,6 @@ namespace play_decide
   {:rules "" :actions [] :think 0 :effort "0.2" :temperature 0.6 :style nil :answer :scored :memory :fresh
    :seed 0 :recent 6 :context 8192})
 
-(def terse
-  "A :style asking for short thinking: fragments, no filler, the numbers kept (after the
-  caveman skill's rules, github.com/JuliusBrussee/caveman)."
-  (str "Think in short fragments, one fact per line: what is near, what each action would do, "
-       "the choice. No articles, filler, hedging or restating the question. Keep numbers and "
-       "negations exact."))
 
 (defn- id [m piece] (ink/token-id m piece))
 

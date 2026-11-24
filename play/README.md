@@ -68,8 +68,8 @@ every choice, so they change while a game goes on:
 ```
 
 The settings: `:think` (tokens of thinking first, 0 for none), `:effort`, `:temperature`,
-`:style` (how to think; `decide/terse` is a short style after the caveman skill's rules,
-github.com/JuliusBrussee/caveman: the model's thinking doesn't follow it), `:answer`
+`:style` (how to think, said with the rules; the model's thinking keeps its own way of
+writing whatever it is told), `:answer`
 (`:scored`, or `:free`: it writes its answer and the first action named is taken),
 `:memory` (`:fresh`, each choice from the rules; or `:conversation`, one conversation
 started again when the context is nearly full), `:seed`, `:recent` (its last actions it is

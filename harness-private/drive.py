@@ -81,12 +81,6 @@ TASKS = {
 
 PLAIN_TAIL = "\n\nTest it with the eval tool until you are sure it is right, then say what you did."
 
-# The terse mode (an experiment): plain, and the model told to write its messages tersely,
-# in our words after the caveman skill's rules (github.com/JuliusBrussee/caveman).
-TERSE = ("\n\nWrite tersely: the answer first, then nothing more. No greetings, hedging, recaps, "
-         "closers or narration between tool calls. Short plain words, one idea a sentence. Keep "
-         "code, commands, paths, names and errors exactly as they are, and every number and "
-         "negation.")
 
 
 def verified_tail(file):
@@ -233,7 +227,7 @@ def make_home(mode):
     os.makedirs(TMP)
     os.makedirs(HOME + '/work')
     shutil.copy(HARNESS + '/JANK.md', HOME)
-    if mode == 'verified':
+    if mode in ('verified', 'team'):
         # The verified mode's guides and examples: what the check asks (VERIFY.md), how to
         # write Veil (VEIL.md, examples/veil/), and a pair that passes.
         for f in ['VERIFY.md', 'VEIL.md']:
@@ -262,7 +256,7 @@ def confine_form():
 
 def setup(port):
     ev(port, "(require '[inkling.core :as ink] '[harness.core :as h] '[harness.tools :as tools] "
-             "'[harness.verify :as verify])")
+             "'[harness.verify :as verify] '[harness.team :as team])")
     ev(port, '(def m (ink/open "../inkling/models/inkling-2-mini.ink"))', 300)
     ev(port, '(some? (verify/veil-session))', 300)
     ev(port, '(reset! verify/lake-project (str (cpp/harness.real_path @verify/lake-project)))')
@@ -305,8 +299,8 @@ def setup(port):
 
 def run_form(task, mode, seed):
     t = TASKS[task]
-    verified = mode == 'verified'
-    terse = mode == 'terse'
+    team = mode == 'team'
+    verified = mode == 'verified' or team
     ask = t['ask'] + (verified_tail(t['file']) if verified else PLAIN_TAIL)
     recording = f'{OUT}/{task}-{mode}-{seed}.edn'
     return f'''
@@ -315,12 +309,11 @@ def run_form(task, mode, seed):
       live (str {jstr(OUT + '/live.edn')})
       current (atom nil)
       looped (atom false)
-      system (str tools/situation (when verified (str "\\n\\n" (slurp "VERIFY.md"))) {jstr(TERSE) if terse else '""'})
-      a (h/agent m {{:tools (vec (concat (tools/defaults) (when verified [(verify/tool)])))
-                    :system system
-                    ;; 128k tokens: about 4.3 GB of the engine's caches. There is no compaction,
-                    ;; and the long thinking of effort 0.99 fills a context quickly.
-                    :context 131072
+      system (str tools/situation (when verified (str "\\n\\n" (slurp "VERIFY.md"))))
+      opts {{;; 128k tokens: about 4.3 GB of the engine's caches (64k each for a team's
+             ;; three agents). There is no compaction, and the long thinking of effort 0.99
+             ;; fills a context quickly.
+                    :context {65536 if team else 131072}
                     :max-steps 80
                     ;; As the publisher evaluates Inkling (temperature 1, top-p off, effort
                     ;; 0.99), with room for the thinking that effort asks for.
@@ -328,7 +321,6 @@ def run_form(task, mode, seed):
                     :max-thinking 8192
                     :max-tokens 12288
                     :sampling {{:temperature 1.0 :seed {int(seed)}}}
-                    :obligations (when verified (verify/gate file))
                     :on-entry (fn [_]
                                 (when-let [x @current]
                                   (h/save! x live)
@@ -340,21 +332,32 @@ def run_form(task, mode, seed):
                                                (every? (fn [e] (clojure.string/starts-with? (str (:text e)) "(This call gave exactly this result before")) rs))
                                       (reset! looped true)
                                       ;; (Not h/stop!, which waits for the turn: this runs inside it.)
-                                      (swap! x assoc :stop true)))))}})
+                                      (swap! x assoc :stop true)))))}}
+      ;; A team (the coordinator has the task, the verify tool and the gate), or one agent.
+      tm (when {'true' if team else 'false'} (team/team m {{:file file :system system :agent opts}}))
+      a (if tm
+          (:coordinator tm)
+          (h/agent m (merge opts {{:tools (vec (concat (tools/defaults) (when verified [(verify/tool)])))
+                                  :system system
+                                  :obligations (when verified (verify/gate file))}})))
       _ (reset! current a)
       began (cpp/harness.seconds)
       _ (h/ask! a {jstr(ask)})
       _ (h/answer a)
       seconds (- (cpp/harness.seconds) began)
       _ (h/save! a {jstr(recording)})
+      _ (when tm
+          (h/save! (:coder tm) {jstr(recording[:-4] + '-coder.edn')})
+          (h/save! (:modeler tm) {jstr(recording[:-4] + '-modeler.edn')}))
       check (when verified (verify/attempt (fn [] (verify/check file))))
       st (h/status a)
       r {{:task :{task} :mode :{mode} :seed {int(seed)} :file file
          :verified (when verified (boolean (:ok check)))
          :checks (count (filter (fn [e] (= :check (:role e))) (h/entries a)))
-         :tokens (:generated st) :seconds seconds :state (:state st) :looped @looped
+         :tokens (if tm (reduce + (map (fn [k] (:generated (h/status (get tm k)))) [:coordinator :coder :modeler])) (:generated st))
+         :seconds seconds :state (:state st) :looped @looped
          :recording {jstr(recording)}}}]
-  (h/close! a)
+  (if tm (team/close! tm) (h/close! a))
   (pr-str r))'''
 
 
