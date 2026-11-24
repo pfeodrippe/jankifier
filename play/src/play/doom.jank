@@ -186,7 +186,7 @@
                                   (let [enemy (alive? o)
                                         side (if (pos? a) "left" "right")]
                                     (cond (< (max a (- a)) aimed-within)
-                                          (str "straight ahead" (when enemy " (in your sights: attack hits it)"))
+                                          (str "straight ahead" (when enemy " (in your sights)"))
                                           :else
                                           (str (long (max a (- a))) " degrees to the " side
                                                (when-let [t (turns a)] (str " " t))
