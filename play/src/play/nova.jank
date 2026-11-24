@@ -313,8 +313,8 @@
 (def version
   "How act! plays an action, for replays (each agent's step says the version it was played
   with): 1 the first, 2 with up stepping to a door or ladder near her first, 3 with a door's
-  new area waited for. Raised whenever act! changes."
-  3)
+  new area waited for, 4 waited for until it is done changing. Raised whenever act! changes."
+  4)
 
 (defn- step-to!
   "Nova walked a frame at a time to the middle of column `col` (at most 40 frames)."
@@ -344,12 +344,9 @@
   [action]
   (if (= action :up) (act-v2-up!) (act-v1! action)))
 
-(defn act!
-  "One step: the action's buttons held for its frames, then released for one (so a jump can
-  be pressed again); up with a door or a ladder within 2 blocks on her row (and none at her
-  column) steps to it first (a step walks 1 to 3 blocks: the agent walked past the door it
-  meant to take), and through a door, frames run until the new area is drawn (at most 180:
-  the agent stood looking at an empty area that said the level ended)."
+(defn act-v3!
+  "One step as version 3 played it: through a door, frames run until anything near her is
+  drawn."
   [action]
   (if (= action :up)
     (let [level (:level (state))]
@@ -359,6 +356,33 @@
           (when (and (< i 180) (not (loaded? (state))))
             (p/nes-run! [] 1)
             (recur (inc i))))))
+    (act-v1! action)))
+
+(defn- area-now
+  "The map near Nova and the objects' types, to tell when a new area is done changing."
+  [st]
+  (let [px (long (:x st))]
+    [(vec (for [c (range (max 0 (- px 20)) (+ px 40)) r (range rows)] ((:map st) c r)))
+     (mapv :type (:objects st))]))
+
+(defn act!
+  "One step: the action's buttons held for its frames, then released for one (so a jump can
+  be pressed again); up with a door or a ladder within 2 blocks on her row (and none at her
+  column) steps to it first (a step walks 1 to 3 blocks: the agent walked past the door it
+  meant to take), and through a door, frames run until the new area hasn't changed for 20
+  frames (at most 240). The area is drawn and its objects set over about 10 frames, and she
+  can't move for about 20: version 3 stopped at the first thing drawn, and the agent saw half
+  an area, the last area's owl, and a right that didn't move her."
+  [action]
+  (if (= action :up)
+    (let [level (:level (state))]
+      (act-v2-up!)
+      (when (not= level (:level (state)))
+        (loop [i 0 still 0 seen (area-now (state))]
+          (when (and (< i 240) (< still 20))
+            (p/nes-run! [] 1)
+            (let [now (area-now (state))]
+              (recur (inc i) (if (= now seen) (inc still) 0) now))))))
     (act-v1! action)))
 
 ;; Into the game: the menus, then level 1-1.
