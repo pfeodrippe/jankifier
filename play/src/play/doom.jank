@@ -34,7 +34,15 @@
                      :timeout 2100 :title "a corridor (ViZDoom's deadly_corridor)" :goal-item "GreenArmor"
                      :goal (str "Get to the green armor (GreenArmor) at the end of the corridor and walk onto "
                                 "it: picking it up wins. Monsters on both sides shoot at you; at the hardest "
-                                "skill a few hits kill you. You have 2100 tics (60 seconds of game time).")}})
+                                "skill a few hits kill you. You have 2100 tics (60 seconds of game time).")}
+   ;; The same at Doom's middle skill (ViZDoom's deadly_corridor is at the hardest: the agent died
+   ;; there in 76 tics, three actions).
+   :deadly-corridor-3 {:scenario (p/vendor "ViZDoom" "scenarios" "deadly_corridor.wad") :map "map01" :skill 3
+                       :timeout 2100 :title "a corridor (ViZDoom's deadly_corridor, at Doom's middle skill)"
+                       :goal-item "GreenArmor"
+                       :goal (str "Get to the green armor (GreenArmor) at the end of the corridor and walk "
+                                  "onto it: picking it up wins. Monsters on both sides shoot at you: kill them "
+                                  "before you walk past them. You have 2100 tics (60 seconds of game time).")}})
 
 (defonce chosen
   ;; The scenario start! plays (scenario! chooses it).
@@ -93,6 +101,13 @@
 (def pi 3.141592653589793)
 
 (defn- degrees [r] (* r (/ 180.0 pi)))
+
+(defn- compass
+  "Angle `a` (degrees, counterclockwise from east) as one of eight compass words."
+  [a]
+  (let [a (loop [a a] (cond (< a 0.0) (recur (+ a 360.0)) (>= a 360.0) (recur (- a 360.0)) :else a))]
+    (nth ["east" "north-east" "north" "north-west" "west" "south-west" "south" "south-east"]
+         (mod (long (/ (+ a 22.5) 45.0)) 8))))
 
 (defn bearing
   "Where an object is from the player: [distance degrees], degrees to the left positive
@@ -358,7 +373,7 @@
           (when before (moved before s))
           "Health " (long (:health s)) ", armor " (long (:armor s)) ", ammo " (long (:ammo s))
           ", kills " (long (:kills s)) ", items " (long (:items s)) (when (pos? (:dead s 0)) ", dead") ".\n"
-          "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees.\n"
+          "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees (" (compass (:angle s)) ").\n"
           (walls s)
           (exits s)
           (frontier s)
