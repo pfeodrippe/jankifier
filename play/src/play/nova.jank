@@ -194,7 +194,7 @@
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right.")))))
 
 (defn- moved
-  "How far Nova went from `before` to `st`, as a sentence."
+  "How far Nova went from `before` to `st`, as a sentence (or that she died and starts again)."
   [before st]
   (let [dx (- (:x st) (:x before))
         dy (- (:y st) (:y before))
@@ -202,9 +202,17 @@
         across (when (>= (max dx (- dx)) 0.05) (str (far dx) " blocks " (if (pos? dx) "right" "left")))
         down (when (>= (max dy (- dy)) 0.05) (str (far dy) " blocks " (if (pos? dy) "down" "up")))
         parts (remove nil? [across down])]
-    (if (seq parts)
+    (cond
+      ;; Health back up while she jumped far back in the same area (or another): the game
+      ;; started this part again after she died.
+      (and (> (:health st) (:health before)) (< dx -8.0))
+      (str "Nova died (her health ran out, or she fell) and starts this part of the level again, "
+           "her health back to " (:health st) ".\n")
+
+      (seq parts)
       (str "Since the last action she moved " (str/join " and " parts) ".\n")
-      "Since the last action she hasn't moved.\n")))
+
+      :else "Since the last action she hasn't moved.\n")))
 
 (defn told
   "What a model is told of the game: Nova's state (and how she moved since `before`, the
