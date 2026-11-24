@@ -131,7 +131,10 @@
                         (str "\n\nThe other agents told you:\n"
                              (str/join "\n" (for [e new] (str "- agent " (:from e) ": " (:text e))))))]
             (reset! (:read mem) (count @board))
-            (h/ask! (:agent mem) (str (if (zero? i) first-ask "Go on playing: a new turn, with its own steps (the game is as you left it).") heard)))
+            ;; A reminder to share: no agent used tell_others in two runs, unasked.
+            (h/ask! (:agent mem) (str (if (zero? i) first-ask "Go on playing: a new turn, with its own steps (the game is as you left it).")
+                                      heard
+                                      "\n\nWhen you find something the other agents should know (the stairs down, a trap, a dead end, what worked), tell_others.")))
           (h/answer (:agent mem))
           (recur (inc i))))
       (catch :default _ nil))
