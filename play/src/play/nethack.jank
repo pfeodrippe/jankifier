@@ -113,14 +113,23 @@
   {:north [0 -1] :south [0 1] :east [1 0] :west [-1 0]
    :north-east [1 -1] :north-west [-1 -1] :south-east [1 1] :south-west [-1 1]})
 
+(declare open-door? map-cell)
+
 (defn caution
-  "Why `action` should not be done now (nil: it may be): a step onto a trap seen before."
+  "Why `action` should not be done now (nil: it may be): a step onto a trap seen before; a
+  diagonal step into a door (NetHack allows none: an agent tried again and again)."
   [s action]
   (when-let [[dx dy] (get steps-by-direction action)]
-    (let [{:keys [depth x y]} (:stats s)]
-      (when (contains? @traps [depth (+ x dx) (+ y dy)])
+    (let [{:keys [depth x y]} (:stats s)
+          tx (+ x dx) ty (+ y dy)]
+      (cond
+        (contains? @traps [depth tx ty])
         (str "a trap (^) you have seen is " (name action) " of you: stepping onto it springs it again "
-             "(a bear trap holds you for turns, an arrow or dart trap hurts). Go around it.")))))
+             "(a bear trap holds you for turns, an arrow or dart trap hurts). Go around it.")
+        (and (not (zero? dx)) (not (zero? dy))
+             (or (= "+" (map-cell s tx ty)) (open-door? s tx ty)))
+        (str "the " (name action) " square is a door: no one steps into a door diagonally. Step "
+             "beside it first, then into it straight (north, south, east or west).")))))
 
 ;; The way through the map: a search from the @ over the squares one can walk (an open door
 ;; told from a wall by the wall around it), for the stairs down when they are in view, else
@@ -382,7 +391,7 @@
        "takes everything), open opens a door next to you (a direction follows), kick kicks (a "
        "direction follows), wait waits a turn, rest rests up to 20 turns (it stops when "
        "something comes into view): HP comes back slowly, so rest when it is low and nothing is "
-       "near. ^ is a trap: don't step on one you have seen (a bear trap holds you for turns). "
+       "near. You can't step into or out of a door diagonally: go straight through it. ^ is a trap: don't step on one you have seen (a bear trap holds you for turns). "
        "Your pet (a little dog d, a kitten f or a pony u, by your role) starts next to you and "
        "follows you; it fights for you: don't attack it (walking into it swaps places with it)."))
 
