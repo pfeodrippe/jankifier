@@ -294,16 +294,26 @@
 (defn caution
   "Why action `action` should not be done now (nil: it may be): a step right or left on the
   ground with a fall's edge nearer that way than a step walks (nothing to land on down to the
-  map's bottom): she would fall in, which never helps. A drop to a floor is let be."
+  map's bottom), or with a danger in her way within 3 blocks that way: she would fall in, or
+  be hurt, which never helps. A drop to a floor is let be."
   [st action]
   ;; A fall's edge nearer than a step walks is walked into (an agent stepped off from a block
   ;; before the edge).
   (when-let [dir (and (:on-ground st) ({:right 1 :left -1} action))]
-    (when-let [edge (fall-edge st dir)]
-      (when (< edge (step-blocks st dir))
-        (str "the ground stops " (tenths edge) " blocks on her " (name action)
-             " over a fall (no floor below): a step " (name action) " carries her into it. Jump-" (name action)
-             " from here, then " (name action) " while in the air, to cross it.")))))
+    (or (when-let [edge (fall-edge st dir)]
+          (when (< edge (step-blocks st dir))
+            (str "the ground stops " (tenths edge) " blocks on her " (name action)
+                 " over a fall (no floor below): a step " (name action) " carries her into it. Jump-" (name action)
+                 " from here, then " (name action) " while in the air, to cross it.")))
+        ;; A danger in her way (her row or her head's, within 3 blocks that way: enemies come
+        ;; toward her): an agent at 1 health walked on into a GOOMBA 3 blocks away.
+        (when-let [[t dx] (first (filter (fn [[_ dx dy]] (and (<= 1 (* dir dx) 3) (<= -1 dy 0))) (dangers st)))]
+          (let [n (* dir dx)]
+            (str t " is " n (if (= 1 n) " block" " blocks") " on her " (name action) ", in her way: a step " (name action)
+                 " walks into it, and it hurts her. "
+                 (if (contains? unshootable t)
+                   "Jump over it, or wait for it to pass."
+                   (str "Jump over it, or attack it (a shot stuns it" (when (<= n 2) "; this near, step back first: her shot starts past it") ")."))))))))
 
 (defn- moved
   "How far Nova went from `before` to `st`, as a sentence (or that she died and starts again)."
