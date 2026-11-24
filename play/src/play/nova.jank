@@ -294,6 +294,118 @@
     (when-let [d (first (filter (fn [dx] (solid? dx 0)) (range 1 4)))]
       [d (count (take-while (fn [dy] (solid? d (- dy))) (range 0 6)))])))
 
+;; The way on through the map: from where she stands, the places she can stand and how she gets
+;; between them (walk, fall, jump, ladder, spring, drop through a ledge), searched breadth first
+;; for the one furthest right. Agents stood for minutes before a wall whose way on went left to
+;; a ladder, down it and right under the wall, and on a ledge whose way on was down through it.
+;; The moves are rough (a jump: up to 2 rows up and 4 across; a spring: 6 up), enough to find
+;; which way to go, not how to make each jump: the other sentences say that.
+
+(defn- way-cell [cells c r]
+  (if (and (<= 0 c) (< c (count cells)) (<= 0 r) (< r rows)) (block-char (get-in cells [c r])) "."))
+
+(defn- way-solid? [x] (contains? #{"#" "!" "L"} x))
+
+(defn- way-stand?
+  "Whether she can stand with her feet in row r of column c: her two rows free, something to
+  stand on below (or a ladder at her feet), not in water or lava, not on spikes."
+  [cells c r]
+  (and (<= 1 r 14)
+       (not (way-solid? (way-cell cells c r))) (not (way-solid? (way-cell cells c (dec r))))
+       (not= "~" (way-cell cells c r))
+       (or (contains? #{"#" "!" "L" "-" "=" "H" "s"} (way-cell cells c (inc r))) (= "H" (way-cell cells c r)))
+       (not= "^" (way-cell cells c (inc r)))))
+
+(defn- way-fall
+  "Where she lands falling from row r in column c (nil: out of the level, into lava or onto spikes)."
+  [cells c r]
+  (loop [r r]
+    (cond
+      (> r 14) nil
+      (= "~" (way-cell cells c r)) nil
+      (= "^" (way-cell cells c (inc r))) nil
+      (way-stand? cells c r) r
+      (way-solid? (way-cell cells c (inc r))) nil
+      :else (recur (inc r)))))
+
+(defn- way-moves
+  "[[kind col row] ...] from standing at (c, r)."
+  [cells c r]
+  (let [on (way-cell cells c (inc r))
+        free? (fn [cc rr] (not (way-solid? (way-cell cells cc rr))))
+        clear? (fn [cc r1 r2] (every? (fn [rr] (free? cc rr)) (range r2 (inc r1))))]
+    (concat
+     (for [d [1 -1]
+           :let [c2 (+ c d)]
+           :when (and (free? c2 r) (free? c2 (dec r)))
+           :let [r2 (way-fall cells c2 r)]
+           :when r2]
+       [(if (= r2 r) :walk :fall) c2 r2])
+     (when (and (= "H" (way-cell cells c (dec r))) (way-stand? cells c (dec r))) [[:climb-up c (dec r)]])
+     (when (and (= "H" (way-cell cells c (inc r))) (way-stand? cells c (inc r))) [[:climb-down c (inc r)]])
+     (when (= "=" on) (when-let [r2 (way-fall cells c (+ r 2))] [[:drop c r2]]))
+     (let [up (if (= "s" on) 6 2)]
+       (for [dc (range -4 5)
+             dr (range (- up) 1)
+             :when (not (and (zero? dc) (zero? dr)))
+             :let [c2 (+ c dc) r2 (+ r dr)]
+             :when (and (way-stand? cells c2 r2)
+                        (clear? c (dec r) (- r2 2))
+                        (clear? c2 r2 (- r2 2))
+                        (every? (fn [cc] (free? cc (- (min r r2) 2))) (range (min c c2) (inc (max c c2)))))]
+         [(if (= "s" on) :spring :jump) c2 r2])))))
+
+(defn- way-on
+  "A sentence for the way on when it doesn't start straight to the right (it goes left, down a
+  ladder or through a ledge first): its legs until 6 columns past her, in her coordinates."
+  [st]
+  (when (:on-ground st)
+    (let [cells (vec (for [c (range 256)] (vec (for [r (range rows)] ((:map st) c r)))))
+          c0 (long (+ (:x st) 0.5))
+          r0 (feet-row st)
+          seen (loop [frontier [[c0 r0]] seen {[c0 r0] nil} n 0]
+                 (if (or (empty? frontier) (> n 4000))
+                   seen
+                   (let [[pc pr] (first frontier)
+                         next (remove (fn [[_ c2 r2]] (contains? seen [c2 r2])) (way-moves cells pc pr))]
+                     (recur (into (vec (rest frontier)) (map (fn [[_ c2 r2]] [c2 r2]) next))
+                            (reduce (fn [m [k c2 r2]] (assoc m [c2 r2] [k [pc pr]])) seen next)
+                            (inc n)))))
+          goal (last (sort-by (fn [[cc rr]] [cc (- rr)]) (keys seen)))
+          path (loop [at goal acc ()]
+                 (let [[k from] (get seen at)]
+                   (if (nil? k) (vec acc) (recur from (conj acc [k (first at) (second at)])))))
+          legs (loop [c c0 moves path acc []]
+                 (if (empty? moves)
+                   acc
+                   (let [[k c2 _] (first moves)
+                         kind (cond (#{:climb-down :climb-up :drop :spring} k) k
+                                    (> c2 c) :right (< c2 c) :left :else :still)
+                         prev (peek acc)]
+                     (recur c2 (rest moves)
+                            (if (and prev (= kind (first prev)) (#{:right :left} kind))
+                              (conj (pop acc) [kind c2])
+                              (conj acc [kind c2]))))))
+          ;; Up to 6 columns past her, and a spring or ladder up right after (where the way
+          ;; goes up from there).
+          upto (let [i (first (keep-indexed (fn [i [_ c]] (when (>= c (+ c0 6)) i)) legs))]
+                 (cond (nil? i) legs
+                       (#{:spring :climb-up} (first (get legs (inc i)))) (take (+ i 2) legs)
+                       :else (take (inc i) legs)))]
+      (when (and (> (first goal) c0) (some (fn [[k]] (#{:left :climb-down :climb-up :drop} k)) upto))
+        (str "The way on, from the map: "
+             (str/join ", then "
+                       (for [[k c] upto]
+                         (case k
+                           :left (str "left to x " (- c c0))
+                           :right (str "right to x " (- c c0))
+                           :climb-down "down the ladder there (down)"
+                           :climb-up "up the ladder there (up)"
+                           :drop "down through the ledge (down)"
+                           :spring "onto the spring there (it bounces her up)"
+                           "on")))
+             ". ")))))
+
 (defn- around
   "What is next to Nova, from the map and the objects: the dangers near her, the wall on her
   right and how high, a gap or spikes ahead on the ground, as sentences."
@@ -401,8 +513,10 @@
                                       (when (:flying o)
                                         " (a flying owl: it turns to face her, and flies up when she is above it: a jump near it brings it up into her)"))))
                 ;; The advice by where the nearest is: "jump over it" for one 2 above had the
-                ;; agent reasoning about it for minutes.
-                (let [[t dx dy] (first ds)]
+                ;; agent reasoning about it for minutes. With more than one, it says which it is
+                ;; for: advice for FLAMES read as advice for the FIRE_WALK after it in the list.
+                (let [[t dx dy] (first ds)
+                      advice
                   (cond
                     ;; One in her column at her height touches her: a GOOMBA there hurt an agent
                     ;; again and again while it shot (too close) and waited.
@@ -439,7 +553,14 @@
                     (= dy -1)
                     (str ": it is a block up, at her head (on a ledge or step): her shot passes under it and walking into it hurts"
                          (if (= "GOOMBA" t) ": jump onto it or over it" ": wait for it to move, or jump over it"))
+                    ;; One a block below her (she on a step or a block's top): shots from up there
+                    ;; at a FIRE_WALK below never stunned it (12 tries), and stepping down when it
+                    ;; was 3 or more blocks off and shooting at once did (see the fire-maker text).
+                    (and (= dy 1) (not (contains? unshootable t)))
+                    (str ": it is a block below her (her shot from up here passes over it): don't drop onto it. When it is 3 or more blocks from her, step down toward it and attack at once"
+                         (when (= "GOOMBA" t) ", or land on it from above"))
                     (pos? dy) ": it is below her: don't drop onto it"
+                    (contains? unshootable t) ": jump over it or wait for it to pass (shots don't hurt it)"
                     (every? (fn [[t]] (contains? unshootable t)) ds) ": jump over it or wait for it to pass"
                     ;; On her row and shootable: by how far. An agent waited (eight waits) while a
                     ;; GOOMBA 3 blocks away walked into her, as "wait for it to pass" allowed.
@@ -448,7 +569,8 @@
                     (and (zero? dy) (<= 1 (max dx (- dx)) 2) (not (contains? unshootable t)))
                     (str ": too close to shoot (her shot starts past it), and waiting beside it, it may walk into her: jump over it now (jump-"
                          (if (pos? dx) "right" "left") "), or step back to 3 blocks from it and shoot it")
-                    :else ": jump over it, wait for it to pass, or attack it (a shot stuns it: stunned, it can't hurt her and she walks through it)"))
+                    :else ": jump over it, wait for it to pass, or attack it (a shot stuns it: stunned, it can't hurt her and she walks through it)")]
+                  (if (next ds) (str ". The nearest, the " t advice) advice))
                 ;; Where the flames come from (src/enemy.s: a FIRE_WALK throws FLAMES and a
                 ;; FIRE_JUMP bounces in place making fire, each only while not stunned; FLAMES
                 ;; despawn on a timer): agents were hurt waiting beside a FIRE_JUMP and walking
@@ -738,6 +860,7 @@
           (when (zero? (:health st))
             "Health 0: she has died. A few waits and the game starts this part of the level again, her health back to 4.\n")
           (around st) "\n"
+          (when-let [w (way-on st)] (str w "\n"))
           (if (seq (:objects st))
             (str "Objects (blocks from her: + is right, + is down): "
                  (str/join ", " (map (fn [o] (str (:type o) (when (:stunned o) " (stunned: harmless, she can walk through it)") " at (" (- (long (:x o)) px) ", " (- (long (:y o)) py) ")")) (:objects st))) ".\n")
