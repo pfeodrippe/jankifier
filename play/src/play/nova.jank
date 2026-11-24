@@ -250,6 +250,7 @@
   [[h0 top n fall-behind] d]
   (str "On her right are steps up, a column each from x " d " to x " (+ d n -1) " (" h0 " to " top
        " blocks high): climb them a step at a time, each with a jump-right on its own and no right after it"
+       " (a high-jump-right for a step 2 higher than the one she is on)"
        " (rights after a jump steer her on past the step, and past the top into what is behind it)"
        (when fall-behind ", and behind the top is a fall: from the top, jump-right over it, then right in the air")
        ". "))
@@ -333,7 +334,11 @@
                     (and (zero? dx) (<= -1 dy 0))
                     (str ": it is touching her, and hurts her again and again: get away from it now (a step left, or a jump)"
                          (when-not (contains? unshootable t) ", then shoot it from 3 blocks or more (a shot stuns it)"))
-                    (and (<= dy -2) (pos? wall)) ": it is above her, where a jump over the wall goes (her shot goes along her row, not up): wait for it to walk away, then jump"
+                    ;; One walking on the wall ahead: up there it is on her row (an owl pacing a
+                    ;; 2-high wall held agents for minutes; this play got past it in replay).
+                    (and (<= dy -2) (pos? wall))
+                    (str ": it is above her, on top of the wall ahead (her shot goes along her row, not up): when it is 3 or more blocks along that wall, "
+                         (if (<= wall 1) "jump-right" "high-jump-right") " onto the wall, then shoot it there (up there it is on her row)")
                     (<= dy -2) ": it is above her: walk on under it (a jump would touch it), or wait for it to move"
                     (pos? dy) ": it is below her: don't drop onto it"
                     (every? (fn [[t]] (contains? unshootable t)) ds) ": jump over it or wait for it to pass"
@@ -354,7 +359,11 @@
            ended "On her right the level ends: nothing is past it, and walking right is blocked. The way on is elsewhere: a door (D) or a ladder (H). "
            (and (pos? wall) (stairs st 1)) (stairs-text (stairs st 1) 1)
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
-                            (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
+                            (case wall
+                              1 "jump-right gets over it."
+                              ;; From rest against it a jump-right rose 1.94 and fell back.
+                              2 "high-jump-right gets over it (a jump-right only when she is already walking)."
+                              "it is too high to jump; look for another way."))
            ;; Ground below the gap: a drop onto it, not a jump across (from a high platform an
            ;; agent jumped "a gap 5 blocks wide" and came down into a pit beyond it).
            (and gap (pos? gap) (not (fall? st (inc px))))
@@ -403,7 +412,7 @@
                           ;; the wall to the map's lock).
                           (let [c (at d 0)] (when (not= "#" c) (str " (the " (get char-names c c) " at x " d ")")))
                           (when taller (str ", and behind it at x " taller " one " top " high"))
-                          (if (<= top 2) " (jump-right gets over it)." " (too high to jump: look for another way)."))))
+                          (case top 1 " (jump-right gets over it)." 2 " (high-jump-right gets over it)." " (too high to jump: look for another way)."))))
                    "On her right the way is clear."))
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right."))
          (when fall-left (str " On her left "
