@@ -248,6 +248,7 @@
                 ;; agent reasoning about it for minutes.
                 (let [[_ _ dy] (first ds)]
                   (cond
+                    (and (<= dy -2) (pos? wall)) ": it is above her, where a jump over the wall goes (her shot goes along her row, not up): wait for it to walk away, then jump"
                     (<= dy -2) ": it is above her: walk on under it (a jump would touch it), or wait for it to move"
                     (pos? dy) ": it is below her: don't drop onto it"
                     (every? (fn [[t]] (contains? unshootable t)) ds) ": jump over it or wait for it to pass"
@@ -376,8 +377,9 @@
 (def version
   "How act! plays an action, for replays (each agent's step says the version it was played
   with): 1 the first, 2 with up stepping to a door or ladder near her first, 3 with a door's
-  new area waited for, 4 waited for until it is done changing. Raised whenever act! changes."
-  4)
+  new area waited for, 4 waited for until it is done changing, 5 with up at a door stopping
+  her in its column first. Raised whenever act! changes."
+  5)
 
 (defn- step-to!
   "Nova walked a frame at a time to the middle of column `col` (at most 40 frames)."
@@ -428,18 +430,58 @@
     [(vec (for [c (range (max 0 (- px 20)) (+ px 40)) r (range rows)] ((:map st) c r)))
      (mapv :type (:objects st))]))
 
-(defn act!
-  "One step: the action's buttons held for its frames, then released for one (so a jump can
-  be pressed again); up with a door or a ladder within 2 blocks on her row (and none at her
-  column) steps to it first (a step walks 1 to 3 blocks: the agent walked past the door it
-  meant to take), and through a door, frames run until the new area hasn't changed for 20
-  frames (at most 240). The area is drawn and its objects set over about 10 frames, and she
-  can't move for about 20: version 3 stopped at the first thing drawn, and the agent saw half
-  an area, the last area's owl, and a right that didn't move her."
+(defn act-v4!
+  "One step as version 4 played it: up at a door pressed while she may still be sliding."
   [action]
   (if (= action :up)
     (let [level (:level (state))]
       (act-v2-up!)
+      (when (not= level (:level (state)))
+        (loop [i 0 still 0 seen (area-now (state))]
+          (when (and (< i 240) (< still 20))
+            (p/nes-run! [] 1)
+            (let [now (area-now (state))]
+              (recur (inc i) (if (= now seen) (inc still) 0) now))))))
+    (act-v1! action)))
+
+(defn- settle!
+  "Frames with no button until she stops sliding (at most 40)."
+  []
+  (loop [i 0]
+    (let [vx (:vx (state))]
+      (when (and (< i 40) (> (max vx (- vx)) 0.01))
+        (p/nes-run! [] 1)
+        (recur (inc i))))))
+
+(defn- door-up!
+  "Up at a door in her column or within 2 blocks on her row: she is stopped, walked to the
+  middle of its column, stopped again, then up (pressed while sliding, it slid her out of the
+  door's column and didn't take her through). Else up as version 2 played it (a ladder near
+  her stepped to first)."
+  []
+  (let [st (state)
+        px (long (:x st)) py (feet-row st)
+        door (first (for [dx [0 1 -1 2 -2] :when (= "D" (block-char ((:map st) (+ px dx) py)))] dx))]
+    (if door
+      (do (settle!)
+          (step-to! (+ px door))
+          (settle!)
+          (act-v1! :up))
+      (act-v2-up!))))
+
+(defn act!
+  "One step: the action's buttons held for its frames, then released for one (so a jump can
+  be pressed again); up at a door in her column or within 2 blocks stops her and walks her to
+  its middle first (door-up!), and up with a ladder within 2 blocks on her row steps to it
+  first (a step walks 1 to 3 blocks: the agent walked past the door it meant to take);
+  through a door, frames run until the new area hasn't changed for 20 frames (at most 240).
+  The area is drawn and its objects set over about 10 frames, and she can't move for about
+  20: version 3 stopped at the first thing drawn, and the agent saw half an area, the last
+  area's owl, and a right that didn't move her."
+  [action]
+  (if (= action :up)
+    (let [level (:level (state))]
+      (door-up!)
       (when (not= level (:level (state)))
         (loop [i 0 still 0 seen (area-now (state))]
           (when (and (< i 240) (< still 20))
