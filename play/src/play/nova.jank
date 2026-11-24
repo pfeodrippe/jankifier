@@ -317,6 +317,11 @@
                   " to reach the ground " d (if (= 1 d) " block " " blocks ") (name dir) "; waiting drops her in. ")
              "She is in the air over a fall (nothing below her, no ground near): steer the way she was going. "))
          (when ledge "She stands on a ledge (=): down drops her through it. ")
+         ;; What a spring does (an agent on the low part of a wall, a spring beside it, took the
+         ;; wall for impassable and shot at a lock).
+         (when-let [d (first (filter (fn [dx] (= "s" (at dx 0))) [1 -1 2 -2 3 -3 4 -4 5 -5 6 -6]))]
+           (str "A spring (s) " (max d (- d)) (if (= 1 (max d (- d))) " block " " blocks ") (if (pos? d) "right" "left")
+                " on her row: walking onto it bounces her up high (steer in the air to carry over a wall). "))
          ;; The game takes her onto a ladder from above when down is held on its top
          ;; (src/player.s): a way down nothing told the agent of.
          (when (and (:on-ground st) (= "H" (at 0 1))) "She stands on a ladder's top (H): down climbs down it. ")
