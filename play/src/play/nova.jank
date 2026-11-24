@@ -418,7 +418,11 @@
                           ;; the wall to the map's lock).
                           (let [c (at d 0)] (when (not= "#" c) (str " (the " (get char-names c c) " at x " d ")")))
                           (when taller (str ", and behind it at x " taller " one " top " high"))
-                          (case top 1 " (jump-right gets over it)." 2 " (high-jump-right gets over it)." " (too high to jump: look for another way)."))))
+                          ;; A low part in front of a high one can be jumped onto (a spring on it
+                          ;; was the way on, which "too high: look for another way" hid).
+                          (cond
+                            (and taller (<= h 2)) (str " (" (if (= h 1) "jump-right" "high-jump-right") " gets her onto the low part; the one behind it is too high to jump: see what is on the low part)")
+                            :else (case top 1 " (jump-right gets over it)." 2 " (high-jump-right gets over it)." " (too high to jump: look for another way).")))))
                    "On her right the way is clear."))
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right."))
          (when fall-left (str " On her left "
