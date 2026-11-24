@@ -151,6 +151,10 @@
         ledge (and (:on-ground st) (= "=" (at 0 1)))
         ladder (or (= "H" (at 0 0)) (= "H" (at 0 -1)))
         door (= "D" (at 0 0))
+        ;; The level's end on her right: nothing at all in the columns 2 to 12 past her (the
+        ;; level's data holds nothing there: walking right is blocked by the level's edge).
+        ended (every? (fn [dx] (every? (fn [row] (zero? ((:map st) (+ px dx) row))) (range rows)))
+                      (range 2 13))
         ;; The nearest ladder or door on her row within 4 blocks, when she isn't at one.
         near (first (for [dx [1 -1 2 -2 3 -3 4 -4]
                           :let [ch (at dx 0)]
@@ -176,6 +180,7 @@
                                             :else (str ", " dy " below")))))
                 ": jump over it, wait for it to pass, or attack it. "))
          (cond
+           ended "On her right the level ends: nothing is past it, and walking right is blocked. The way on is elsewhere: a door (D) or a ladder (H). "
            (pos? wall) (str "On her right is a wall " wall (if (= 1 wall) " block" " blocks") " high: walking right is blocked; "
                             (if (<= wall 2) "jump-right gets over it." "it is too high to jump; look for another way."))
            (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide: jump-right to cross it.")
