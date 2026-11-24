@@ -27,7 +27,7 @@
 (def addr {:player-x 0x26 :player-x-sub 0x25 :player-y 0x27 :player-y-sub 0x28
            :player-vx 0x29 :player-vx-sub 0x2A :player-vy 0x2B :player-vy-sub 0x2C
            :player-dir 0x43 :jumping 0x45 :on-ground 0x46 :health 0x4B
-           :object-f1 0x2D :object-x 0x3E3 :object-y 0x403 :level 0xA7})
+           :object-f1 0x2D :object-f2 0x463 :object-x 0x3E3 :object-y 0x403 :level 0xA7})
 
 ;; The level map is in the cartridge's RAM at $6000: 16 rows a column, a byte a block.
 (def rows 16)
@@ -39,8 +39,9 @@
 
 (defn state
   "The game now, from its RAM: {:x :y :vx :vy :facing :on-ground :jumping :health :level
-  :objects [{:type :x :y}] :map (fn [col row] block-id)}. x and y are in blocks (16
-  pixels); y grows downwards."
+  :objects [{:type :x :y :stunned}] :map (fn [col row] block-id)}. x and y are in blocks (16
+  pixels); y grows downwards. An enemy her shot hit is stunned for a while (ObjectF2 is
+  ENEMY_STATE_STUNNED, $82): it can't hurt her then (src/object.s, EnemyPlayerTouchHurt)."
   []
   (let [ram (p/nes-ram)
         cart (p/cartridge-ram)
@@ -59,7 +60,8 @@
                          :when (pos? f1)]
                      {:type (get blocks/objects (bit-shift-right f1 1) (str "object " (bit-shift-right f1 1)))
                       :x (nth ram (+ (get addr :object-x) i))
-                      :y (nth ram (+ (get addr :object-y) i))}))
+                      :y (nth ram (+ (get addr :object-y) i))
+                      :stunned (= 0x82 (nth ram (+ (get addr :object-f2) i)))}))
      :map (fn [col row]
             (let [i (+ (* col rows) row)]
               (if (and (>= col 0) (< i (count cart))) (nth cart i) 0)))}))
@@ -143,7 +145,7 @@
   [st]
   (let [px (long (:x st)) py (feet-row st)]
     (->> (:objects st)
-         (remove (fn [o] (contains? harmless (:type o))))
+         (remove (fn [o] (or (contains? harmless (:type o)) (:stunned o))))
          (map (fn [o] [(:type o) (- (long (:x o)) px) (- (long (:y o)) py)]))
          (filter (fn [[_ dx dy]] (and (<= (max dx (- dx)) 3) (<= (max dy (- dy)) 2))))
          (sort-by (fn [[_ dx dy]] (+ (max dx (- dx)) (max dy (- dy))))))))
@@ -249,7 +251,7 @@
                     (<= dy -2) ": it is above her: walk on under it (a jump would touch it), or wait for it to move"
                     (pos? dy) ": it is below her: don't drop onto it"
                     (every? (fn [[t]] (contains? unshootable t)) ds) ": jump over it or wait for it to pass"
-                    :else ": jump over it, wait for it to pass, or attack it"))
+                    :else ": jump over it, wait for it to pass, or attack it (a shot stuns it: stunned, it can't hurt her and she walks through it)"))
                 ;; Her shot goes the way she faces: an agent facing away fired at nothing.
                 (let [[t dx dy] (first ds)]
                   (when (and (zero? dy) (not (zero? dx)) (not (contains? unshootable t))
@@ -338,7 +340,7 @@
           (around st) "\n"
           (if (seq (:objects st))
             (str "Objects (blocks from her: + is right, + is down): "
-                 (str/join ", " (map (fn [o] (str (:type o) " at (" (- (long (:x o)) px) ", " (- (long (:y o)) py) ")")) (:objects st))) ".\n")
+                 (str/join ", " (map (fn [o] (str (:type o) (when (:stunned o) " (stunned: harmless, she can walk through it)") " at (" (- (long (:x o)) px) ", " (- (long (:y o)) py) ")")) (:objects st))) ".\n")
             "No objects near.\n")
           (if (= :runs (:map @telling))
             (str "The level around her, by row (y: blocks down from her feet, negative above; x: blocks "
