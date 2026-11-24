@@ -161,15 +161,20 @@
               :sampling {:temperature temperature :seed seed}
               ;; A game's results are its state, soon old: the summary is written from less
               ;; of them, and of the thinking, so that it is ready before the session fills.
-              :summary-result-chars 400 :summary-thinking-chars 400}))
+              :summary-result-chars 400 :summary-thinking-chars 400
+              ;; The recent part kept beside a summary: a few steps (the default, 20% of 64k, kept
+              ;; so much that a compaction left the session nearly as full).
+              :compact-keep 6000}))
 
 (def ^:private defaults
-  {:minutes 10 :effort :medium :context 32768 :max-steps 40 :max-thinking 1200 :temperature 1.0 :seed 1})
+  ;; 64k of context: a game agent adds about 6000 tokens a minute (its thinking mostly), and
+  ;; in 32k its compactions, 80 seconds each, came one after another.
+  {:minutes 10 :effort :medium :context 65536 :max-steps 40 :max-thinking 1200 :temperature 1.0 :seed 1})
 
 (defn play!
   "Game `game` (a key of `games`) played from its start by a harness agent on model `m`, for
   `minutes`, in the background: a future of {:recording :conversation :actions :progress
-  :minutes}. `opts`: :effort (:medium), :context (32768), :max-steps a turn (40),
+  :minutes}. `opts`: :effort (:medium), :context (65536), :max-steps a turn (40),
   :max-thinking (1200), :temperature (1.0, as the model's publisher evaluates it: greedy
   thinking goes round in the same sentences), :seed (1)."
   [game m opts]
