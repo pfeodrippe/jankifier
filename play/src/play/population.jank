@@ -26,10 +26,12 @@
 ;; actions from its start (replayed in well under a second) and the traps the agent's text
 ;; has noted. Nova's is the emulator's saved state.
 (defonce ^{:doc "The traps any agent's copy has noted (NetHack): #{[level x y]}."} shared-traps (atom #{}))
+(defonce ^{:doc "The stairs down any agent's copy has seen (NetHack): #{[level x y]}."} shared-stairs (atom #{}))
 
 (def copies
   {:nethack {:take (fn [c]
                     (swap! shared-traps into @nethack/traps)
+                    (swap! shared-stairs into @nethack/stairs)
                     ;; The squares shown so far, by level (the screen alone counts less when a
                     ;; menu covers the map: a score from it went down and up).
                     (let [s (nethack/state)
@@ -41,15 +43,18 @@
                                         :when (not= \space (nth line x))]
                                     [depth x r]))]
                       (-> c
-                          (assoc :traps @nethack/traps)
+                          (assoc :traps @nethack/traps :stairs @nethack/stairs)
                           (update :seen (fnil into #{}) shown))))
              :put! (fn [c]
                      (nethack/start! (:seed c 1))
-                     (doseq [k (:actions c)] (nethack/act! k))
+                     ;; Each screen looked at for traps and stairs (stairs seen before they were
+                     ;; remembered, then hidden under the @, came back this way).
+                     (doseq [k (:actions c)] (nethack/act! k) (nethack/note-map!))
                      ;; Its traps, and the traps any agent found on the first level: with the
                      ;; same seed that level is the same in every copy (deeper ones are made
                      ;; when first reached, from the game's random state then, so they differ).
-                     (reset! nethack/traps (into (:traps c #{}) (filter (fn [[d]] (= 1 d)) @shared-traps))))
+                     (reset! nethack/traps (into (:traps c #{}) (filter (fn [[d]] (= 1 d)) @shared-traps)))
+                     (reset! nethack/stairs (into (:stairs c #{}) (filter (fn [[d]] (= 1 d)) @shared-stairs))))
              :fresh (fn [seed] {:seed seed :actions [] :traps #{}})
              ;; Further on: deeper, then more of the dungeon seen, then more experience.
              ;; A game that has ended (the character died) is last.
@@ -177,6 +182,7 @@
     (reset! running true)
     (reset! board [])
     (reset! shared-traps #{})
+    (reset! shared-stairs #{})
     (reset! owner nil)
     (reset! holding nil)
     (when-let [failed ((:start! g))]

@@ -80,6 +80,18 @@
   shows the @, not the ^: an agent stepped back into the bear trap it had left, again and again."}
   traps (atom #{}))
 
+(defonce ^{:doc "Stairs down seen on the map: #{[dungeon-level x y]}. Standing on them, the map shows
+  the @: two agents found the stairs, stepped onto them and lost them."}
+  stairs (atom #{}))
+
+(declare note-traps!)
+
+(defn note-map!
+  "The traps and stairs on the screen now (and under the @ when the game's message speaks of
+  them) remembered: for a game played again key by key, whose screens nobody was told."
+  []
+  (note-traps! (state)))
+
 (defn- note-traps!
   "Adds the traps (^) on the screen's map (rows 1 to 21; a map row is the screen row less one),
   and the @'s square when the game's message speaks of a trap."
@@ -89,11 +101,13 @@
     ;; it): the square the @ is on when the game speaks of a trap is one too.
     (when (re-find #"trap|shoots out at you" (str/lower-case (str (:message s))))
       (swap! traps conj [depth (:x (:stats s)) (:y (:stats s))]))
+    (when (re-find #"staircase down here" (str/lower-case (str (:message s))))
+      (swap! stairs conj [depth (:x (:stats s)) (:y (:stats s))]))
     (doseq [r (range 1 22)
             :let [line (get (:screen s) r "")]
             c (range (count line))
-            :when (= \^ (nth line c))]
-      (swap! traps conj [depth c (dec r)]))))
+            :when (contains? #{\^ \>} (nth line c))]
+      (swap! (if (= \^ (nth line c)) traps stairs) conj [depth c (dec r)]))))
 
 (def ^:private steps-by-direction
   {:north [0 -1] :south [0 1] :east [1 0] :west [-1 0]
@@ -196,10 +210,15 @@
   what has been seen."
   [s]
   (let [seen (way-search s)
-        stairs (first (filter (fn [p] (= ">" (map-cell s (first p) (second p)))) (keys seen)))
+        depth (:depth (:stats s))
+        stairs (first (filter (fn [p] (or (= ">" (map-cell s (first p) (second p)))
+                                           (contains? @stairs [depth (first p) (second p)])))
+                              (keys seen)))
         dist (fn [p] (count (path-to seen p)))]
     (cond
-      stairs (str "The way to the stairs down (>): " (legs (path-to seen stairs)) ".")
+      (and stairs (pos? (count (path-to seen stairs))))
+      (str "The way to the stairs down (>): " (legs (path-to seen stairs)) ", then down.")
+      stairs nil
       :else (when-let [f (first (sort-by dist (filter (fn [p] (frontier? s p)) (keys seen))))]
               (when (pos? (dist f))
                 (str "No stairs down in view. The nearest way into what you haven't seen: "
@@ -246,6 +265,9 @@
           (around s)
           (when (:normal s) (when-let [w (way s)] (str w "\n")))
           (let [{:keys [depth x y]} (:stats s)]
+            (when (contains? @stairs [depth x y])
+              "You stand on the stairs down (>; the map shows you, not the >): the action down goes down them.\n"))
+          (let [{:keys [depth x y]} (:stats s)]
             (when (contains? @traps [depth x y])
               "You stand on a trap you saw before (the map shows you, not the ^): moving off it may take some tries if it holds you.\n"))
           (let [near (filter (fn [[d tx ty]] (and (= d (:depth (:stats s)))
@@ -269,6 +291,7 @@
   ([] (start! 1))
   ([seed]
    (reset! traps #{})
+   (reset! stairs #{})
    (let [dir (cpp/play.nethack_prepare run-dir nhdat)]
      (or (cpp/play.nethack_open library dir options seed)
          (do
