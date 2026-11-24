@@ -216,6 +216,20 @@
             (recur (rest points) [x y] facing (conj (pop out) [(first (peek out)) (+ (second (peek out)) far)]))
             (recur (rest points) [x y] (+ facing (* 30.0 k)) (conj out [k far]))))))))
 
+(defn- folded
+  "Stretches (legs's) with those shorter than 32 joined into the next: their turns added, so
+  that the way doesn't say to walk a few units between two turns."
+  [ways]
+  (loop [ways ways out []]
+    (if (empty? ways)
+      out
+      (let [[k d] (first ways)
+            more (rest ways)]
+        (if (and (< d 32.0) (seq more))
+          (let [[k2 d2] (first more)]
+            (recur (cons [(+ k k2) (+ d d2)] (rest more)) out))
+          (recur more (conj out [k d])))))))
+
 (defn- leg-text
   "A stretch to walk ([turns distance]) as words: 2 turn-left, about 150 ahead."
   [[k far]]
@@ -234,7 +248,7 @@
       (let [far (long (reduce + 0.0 (map (fn [[ax ay] [bx by]]
                                            (cpp/play.sqrt (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
                                          (cons [(:x s) (:y s)] path) path)))
-            ways (legs s path)]
+            ways (folded (legs s path))]
         (str "Nearest new ground, walking the map: about " far " away. The way there: "
              (str/join "; then " (map leg-text (take 4 ways)))
              (when (> (count ways) 4) "; and on")
