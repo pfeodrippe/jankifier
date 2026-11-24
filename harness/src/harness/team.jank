@@ -1,0 +1,92 @@
+;; SPDX-License-Identifier: MIT
+;; A team of agents on one model for verified work (VERIFY.md): a coordinator, who has the
+;; task and the verify tool and can only end its turn once the check passes, and two workers
+;; it asks: the coder writes the jank code, the modeler the Veil model. Each worker is an
+;; agent of its own, with its own conversation and the default tools. Asked together
+;; (ask_both), they work at the same time on their own threads, and the engine makes their
+;; tokens one forward when they meet (inkling's :auto-batch).
+;;
+;;   (def t (team/team m {:file "work/lru.jank" :system tools/situation}))
+;;   (h/ask! (:coordinator t) "the task")
+;;   (h/answer (:coordinator t))
+(ns harness.team
+  (:require [clojure.string :as str]
+            [harness.core :as h]
+            [harness.tools :as tools]
+            [harness.verify :as verify]))
+
+(defn- asked
+  "What agent `a` answers to `text` (it works until its turn ends)."
+  [a text]
+  (h/ask! a text)
+  (or (h/answer a)
+      (str "(It ended its turn without an answer: " (name (:state @a)) ".)")))
+
+(defn- roles
+  "The workers' and the coordinator's own parts of the system text."
+  [file model]
+  {:coder (str "\n\nYou are the coder of a team of three agents on one task. You write the jank code, its "
+               "assertions and its `verification` map in " file ". The modeler writes the Veil model in "
+               model " (read it when your `verification` map has to match it), and the coordinator "
+               "runs the verify tool and tells you what to do. Test your code with the eval tool. "
+               "Answer with what you did and what the coordinator should know.")
+   :modeler (str "\n\nYou are the modeler of a team of three agents on one task. You write the Veil model "
+                 "of the code in " model ": VEIL.md says how, and examples/parking.lean is a model that "
+                 "passes. The coder writes " file " (read it: the model must describe what the code "
+                 "does), and the coordinator runs the verify tool and tells you what to do. Answer "
+                 "with what you did and what the coordinator should know.")
+   :coordinator (str "\n\nYou coordinate a team of two agents on this task: the coder writes " file
+                     " and the modeler writes " model ". Hand the work out at once: ask both "
+                     "(ask_both asks them together, and they work at the same time), each with what "
+                     "the task asks of its file. They read the guides and examples themselves: don't "
+                     "design the code or the model, and don't write files. Then run the verify tool "
+                     "on " file ", send each what failed, and ask again until it passes. Your turn "
+                     "ends only once the check passes.")})
+
+(defn team
+  "A team on model `m` for the code in `file` (its model: the same path with .lean):
+  {:coordinator :coder :modeler}, three agents. `opts`: :system (the text all three are
+  told first: the situation, VERIFY.md), :agent (harness.core/agent's options for all three,
+  beside the tools and system: :context, :effort, :sampling, ...), and
+  :coordinator-effort (:medium: at the effort a worker thinks at, a coordinator designs
+  the whole work in its own thinking instead of handing it out). Drafting is off: each
+  agent's tokens come one at a time, so that the workers' share forwards."
+  [m {:keys [file system agent coordinator-effort] :or {coordinator-effort :medium}}]
+  (let [model (str/replace file #"\.jank$" ".lean")
+        parts (roles file model)
+        base (merge agent {:draft nil})
+        coder (h/agent m (merge base {:tools (tools/defaults) :system (str system (:coder parts))}))
+        modeler (h/agent m (merge base {:tools (tools/defaults) :system (str system (:modeler parts))}))
+        defaults (tools/defaults)
+        pick (fn [n] (some (fn [t] (when (= (:name t) n) t)) defaults))
+        asks [{:name "ask_coder"
+               :doc "Asks the coder (it writes the jank code) and gives its answer, once it has worked."
+               :params {:text {:type "string" :doc "what the coder should do"}}
+               :fn (fn [{:keys [text]}] (asked coder text))}
+              {:name "ask_modeler"
+               :doc "Asks the modeler (it writes the Veil model) and gives its answer, once it has worked."
+               :params {:text {:type "string" :doc "what the modeler should do"}}
+               :fn (fn [{:keys [text]}] (asked modeler text))}
+              {:name "ask_both"
+               :doc "Asks the coder and the modeler at once (they work at the same time) and gives both answers."
+               :params {:coder {:type "string" :doc "what the coder should do"}
+                        :modeler {:type "string" :doc "what the modeler should do"}}
+               :fn (fn [args]
+                     (h/ask! coder (:coder args))
+                     (h/ask! modeler (:modeler args))
+                     (str "The coder answered:\n" (or (h/answer coder) "(nothing)")
+                          "\n\nThe modeler answered:\n" (or (h/answer modeler) "(nothing)")))}]
+        coordinator (h/agent m (merge base
+                                      {:effort coordinator-effort
+                                       :tools (vec (concat asks
+                                                           (keep pick ["read_file" "list_dir"])
+                                                           [(verify/tool)]))
+                                       :system (str system (:coordinator parts))
+                                       :obligations (verify/gate file)}))]
+    {:coordinator coordinator :coder coder :modeler modeler}))
+
+(defn close!
+  "The team's agents' sessions freed."
+  [t]
+  (doseq [k [:coordinator :coder :modeler]]
+    (h/close! (get t k))))
