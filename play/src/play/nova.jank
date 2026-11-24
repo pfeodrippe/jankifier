@@ -403,7 +403,7 @@
            "On her right the ground goes on, but something that hurts is in the way."
            ;; How far clear, and the wall after it: "clear" with a wall 5 blocks on read as a
            ;; contradiction to an agent.
-           :else (if-let [d (first (filter (fn [dx] (solid? (at dx 0))) (range 2 13)))]
+           :else (if-let [d (first (filter (fn [dx] (solid? (at dx 0))) (range 2 25)))]
                    (if-let [up (stairs st d)]
                      (str "On her right the way is clear for " (dec d) (if (= 2 d) " block" " blocks") ". " (stairs-text up d))
                    (let [height (fn [col] (count (take-while (fn [dy] (solid? (at col (- dy)))) (range 0 8))))
