@@ -137,6 +137,13 @@
          (filter (fn [[_ dx dy]] (and (<= (max dx (- dx)) 3) (<= (max dy (- dy)) 2))))
          (sort-by (fn [[_ dx dy]] (+ (max dx (- dx)) (max dy (- dy))))))))
 
+(defn- loaded?
+  "Whether the level's map holds anything near Nova (going through a door, the new area is
+  drawn over some frames: until then it is empty)."
+  [st]
+  (let [px (long (:x st))]
+    (some (fn [c] (some (fn [row] (pos? ((:map st) c row))) (range rows))) (range (max 0 (- px 20)) (+ px 40)))))
+
 (defn- around
   "What is next to Nova, from the map and the objects: the dangers near her, the wall on her
   right and how high, a gap or spikes ahead on the ground, as sentences."
@@ -155,13 +162,14 @@
         ;; level's data holds nothing for 12 (walking right is blocked by the level's edge).
         empty-col? (fn [c] (every? (fn [row] (zero? ((:map st) c row))) (range rows)))
         end-col (first (filter (fn [c] (every? empty-col? (range c (+ c 12)))) (range px (+ px 40))))
-        ended (and end-col (<= (- end-col px) 4))
+        ended (and end-col (<= (- end-col px) 4) (loaded? st))
         ;; The nearest ladder or door on her row within 4 blocks, when she isn't at one.
         near (first (for [dx [1 -1 2 -2 3 -3 4 -4]
                           :let [ch (at dx 0)]
                           :when (contains? #{"H" "D"} ch)]
                       [dx ch]))]
-    (str (when ladder "She is at a ladder (H): up climbs it. ")
+    (str (when-not (loaded? st) "The area is still being drawn (after a door): wait a moment. ")
+         (when ladder "She is at a ladder (H): up climbs it. ")
          (when door "She is at a door (D): up goes through it. ")
          (when (and near (not ladder) (not door))
            (let [[dx ch] near
@@ -264,9 +272,9 @@
 
 (def version
   "How act! plays an action, for replays (each agent's step says the version it was played
-  with): 1 the first, 2 with up stepping to a door or ladder near her first. Raised whenever
-  act! changes."
-  2)
+  with): 1 the first, 2 with up stepping to a door or ladder near her first, 3 with a door's
+  new area waited for. Raised whenever act! changes."
+  3)
 
 (defn- step-to!
   "Nova walked a frame at a time to the middle of column `col` (at most 40 frames)."
@@ -278,21 +286,40 @@
         (recur (inc i)))))
   (p/nes-run! [] 2))
 
+(defn- act-v2-up!
+  "Up as version 2 played it: a door or a ladder within 2 blocks on her row (and none at her
+  column) stepped to first."
+  []
+  (let [st (state)
+        px (long (:x st)) py (feet-row st)
+        at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
+        here (or (contains? #{"D" "H"} (at 0 0)) (= "H" (at 0 -1)))
+        near (first (for [dx [1 -1 2 -2] :when (contains? #{"D" "H"} (at dx 0))] dx))]
+    (when (and near (not here))
+      (step-to! (+ px near))))
+  (act-v1! :up))
+
+(defn act-v2!
+  "One step as version 2 played it: up stepping to a door or ladder near her first."
+  [action]
+  (if (= action :up) (act-v2-up!) (act-v1! action)))
+
 (defn act!
   "One step: the action's buttons held for its frames, then released for one (so a jump can
   be pressed again); up with a door or a ladder within 2 blocks on her row (and none at her
   column) steps to it first (a step walks 1 to 3 blocks: the agent walked past the door it
-  meant to take)."
+  meant to take), and through a door, frames run until the new area is drawn (at most 180:
+  the agent stood looking at an empty area that said the level ended)."
   [action]
-  (when (= action :up)
-    (let [st (state)
-          px (long (:x st)) py (feet-row st)
-          at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
-          here (or (contains? #{"D" "H"} (at 0 0)) (= "H" (at 0 -1)))
-          near (first (for [dx [1 -1 2 -2] :when (contains? #{"D" "H"} (at dx 0))] dx))]
-      (when (and near (not here))
-        (step-to! (+ px near)))))
-  (act-v1! action))
+  (if (= action :up)
+    (let [level (:level (state))]
+      (act-v2-up!)
+      (when (not= level (:level (state)))
+        (loop [i 0]
+          (when (and (< i 180) (not (loaded? (state))))
+            (p/nes-run! [] 1)
+            (recur (inc i))))))
+    (act-v1! action)))
 
 ;; Into the game: the menus, then level 1-1.
 
