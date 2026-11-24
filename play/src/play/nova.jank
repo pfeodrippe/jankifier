@@ -469,6 +469,13 @@
                    "High-jump-right (the ground across is higher)"
                    (str "Jump-" (name action)))
                  " from here, then " (name action) " while in the air, to cross it.")))
+        ;; Spikes on her row or the ground just ahead (the text named them; a step onto them
+        ;; hurts).
+        (let [px (long (:x st)) py (feet-row st)
+              spikes (first (filter (fn [d] (some (fn [dy] (= "^" (block-char ((:map st) (+ px (* dir d)) (+ py dy))))) [0 1])) [1 2]))]
+          (when spikes
+            (str "spikes " spikes (if (= 1 spikes) " block" " blocks") " on her " (name action) ": a step " (name action)
+                 " walks onto them, and they hurt her. Jump over them (jump-" (name action) ").")))
         ;; A danger in her way (her row or her head's, within 3 blocks that way: enemies come
         ;; toward her): an agent at 1 health walked on into a GOOMBA 3 blocks away.
         (when-let [[t dx] (first (filter (fn [[_ dx dy]] (and (<= 1 (* dir dx) 3) (<= -1 dy 0))) (dangers st)))]
