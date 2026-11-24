@@ -146,17 +146,21 @@
     nil))
 
 (defn- exits
-  "The exits in sight (nothing of the map between: an exit line's middle), as lines; nil when
-  none is."
+  "The exits and teleporters in sight (nothing of the map between: the line's middle), as
+  lines; nil when none is."
   [s]
   (let [seen (for [e (cpp/play.doom_exits)
                    :when (cpp/play.doom_sees (:x e) (:y e))
                    :let [[d a] (bearing s e)]]
-               (str (if (= :walk (:how e)) "The exit, in sight: walk over it to finish the level, "
-                        "The exit switch, in sight: use it to finish the level, ")
-                    (long d) " away, " (direction a) (when-let [t (turns a)] (str " " t)) ".\n"))]
+               [(:how e) d (str (case (:how e)
+                                :walk "The exit, in sight: walk over it to finish the level, "
+                                :use "The exit switch, in sight: use it to finish the level, "
+                                "A teleporter, in sight: walk onto it to be carried elsewhere, ")
+                              (long d) " away, " (direction a) (when-let [t (turns a)] (str " " t)) ".\n")])]
+    ;; A teleporter's pad has several lines: its nearest said.
     (when (seq seen)
-      (apply str seen))))
+      (apply str (map last (concat (remove (fn [[how _ _]] (= how :teleport)) seen)
+                                   (take 1 (sort-by second (filter (fn [[how _ _]] (= how :teleport)) seen)))))))))
 
 (defn- frontier
   "Which way the nearest part of the map (a sector) the player hasn't stood in is, walking the

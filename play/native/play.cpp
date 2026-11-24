@@ -456,6 +456,138 @@ namespace
     posix_spawnattr_destroy(&attr);
   }
 
+  // The way from the player's sector to the nearest sector for which `wanted` holds (its
+  // index), sector to sector across the lines the player can cross (room to stand, a step up
+  // of at most 24, or a door): the middles of those lines into `out`, x and y each; their
+  // count (0: none).
+  template<typename F>
+  int doom_route(F const &wanted, double *out, int max, bool const strict = true,
+                 std::vector<std::array<double, 5>> *crossings = nullptr)
+  {
+    if(!doom_last || doom_vars.size() < 5)
+    {
+      return 0;
+    }
+    auto const &sectors(doom_last->sectors);
+    int const here{ doom_sector_at(doom_vars[3], doom_vars[4]) };
+    if(here < 0)
+    {
+      return 0;
+    }
+    // The lines two sectors share, keyed by their ends either way round: those sectors, and
+    // the line itself.
+    using key = std::array<long long, 4>;
+    std::map<key, std::vector<std::pair<int, vizdoom::Line const *>>> shared;
+    for(size_t i{}; i < sectors.size(); ++i)
+    {
+      for(auto const &l : sectors[i].lines)
+      {
+        key k{ std::llround(l.x1), std::llround(l.y1), std::llround(l.x2), std::llround(l.y2) };
+        if(std::make_pair(k[2], k[3]) < std::make_pair(k[0], k[1]))
+        {
+          k = { k[2], k[3], k[0], k[1] };
+        }
+        shared[k].emplace_back(static_cast<int>(i), &l);
+      }
+    }
+    // Each sector's ways out: the sector beyond, and the middle of the line between, when the
+    // player can cross it (not blocking; room to stand beyond, 56 high, and a step up of at
+    // most 24; or a door, which opens).
+    std::vector<std::vector<std::tuple<int, double, double>>> ways(sectors.size());
+    // Each way's line, for crossings: from a to b, the step up, the opening and the special.
+    std::map<std::pair<int, int>, std::array<double, 3>> how;
+    for(auto const &[_, sides] : shared)
+    {
+      if(sides.size() != 2)
+      {
+        continue;
+      }
+      for(int d{}; d < 2; ++d)
+      {
+        auto const [a, la](sides[d]);
+        auto const [b, lb](sides[1 - d]);
+        auto const &sa(sectors[a]);
+        auto const &sb(sectors[b]);
+        // A door opens; a lift (Plat_...) comes down when its edge is used, or when the player
+        // walks over a line that sets it off.
+        auto const lift([](int const special) {
+          return special == 60 || special == 62 || special == 63 || special == 64 || special == 65 || special == 206;
+        });
+        bool const door{ use_kind(la->useSpecial) == 1 || use_kind(lb->useSpecial) == 1 || lift(la->useSpecial)
+                         || lift(lb->useSpecial) || lift(la->crossSpecial) || lift(lb->crossSpecial) };
+        double const top{ std::min(sa.ceilingHeight, sb.ceilingHeight) };
+        bool const open{ !la->isBlocking && sb.ceilingHeight - sb.floorHeight >= 56.0 && top - sb.floorHeight >= 56.0
+                         && sb.floorHeight - sa.floorHeight <= 24.0 };
+        if(open || door || (!strict && !la->isBlocking))
+        {
+          how[{ a, b }] = { sb.floorHeight - sa.floorHeight, top - std::max(sa.floorHeight, sb.floorHeight),
+                            static_cast<double>(std::max({ la->useSpecial, lb->useSpecial, la->crossSpecial, lb->crossSpecial })) };
+          ways[a].emplace_back(b, (la->x1 + la->x2) / 2.0, (la->y1 + la->y2) / 2.0);
+        }
+      }
+    }
+    // Nearest first (Dijkstra over the lines' middles).
+    std::vector<double> dist(sectors.size(), 1e18);
+    std::vector<int> back(sectors.size(), -1);
+    std::vector<std::pair<double, double>> at(sectors.size());
+    using item = std::pair<double, int>;
+    std::priority_queue<item, std::vector<item>, std::greater<item>> next;
+    dist[here] = 0.0;
+    at[here] = { doom_vars[3], doom_vars[4] };
+    next.push({ 0.0, here });
+    while(!next.empty())
+    {
+      auto const [d, k](next.top());
+      next.pop();
+      if(d > dist[k])
+      {
+        continue;
+      }
+      if(k != here && wanted(k))
+      {
+        std::vector<std::pair<double, double>> path;
+        for(int s{ k }; s != here; s = back[s])
+        {
+          path.push_back(at[s]);
+          if(crossings)
+          {
+            auto const h(how[{ back[s], s }]);
+            crossings->push_back({ at[s].first, at[s].second, h[0], h[1], h[2] });
+          }
+        }
+        std::reverse(path.begin(), path.end());
+        if(crossings)
+        {
+          std::reverse(crossings->begin(), crossings->end());
+        }
+        int m{};
+        for(auto const &[x, y] : path)
+        {
+          if(2 * (m + 1) > max)
+          {
+            break;
+          }
+          out[2 * m] = x;
+          out[2 * m + 1] = y;
+          ++m;
+        }
+        return m;
+      }
+      for(auto const &[b, x, y] : ways[k])
+      {
+        double const nd{ d + std::hypot(x - at[k].first, y - at[k].second) };
+        if(nd < dist[b])
+        {
+          dist[b] = nd;
+          back[b] = k;
+          at[b] = { x, y };
+          next.push({ nd, b });
+        }
+      }
+    }
+    return 0;
+  }
+
   int copy_picture(std::mutex &lock, std::vector<uint32_t> const &picture, unsigned w, unsigned h, uint64_t shown,
                    uint32_t *out, int max, int *width, int *height, uint64_t *version)
   {
@@ -903,58 +1035,11 @@ extern "C"
 
   int play_doom_frontier(double *out, int max)
   {
-    if(!doom_last || doom_vars.size() < 5)
+    if(!doom_last)
     {
       return 0;
     }
     auto const &sectors(doom_last->sectors);
-    int const here{ doom_sector_at(doom_vars[3], doom_vars[4]) };
-    if(here < 0)
-    {
-      return 0;
-    }
-    // The lines two sectors share, keyed by their ends either way round: those sectors, and
-    // the line itself.
-    using key = std::array<long long, 4>;
-    std::map<key, std::vector<std::pair<int, vizdoom::Line const *>>> shared;
-    for(size_t i{}; i < sectors.size(); ++i)
-    {
-      for(auto const &l : sectors[i].lines)
-      {
-        key k{ std::llround(l.x1), std::llround(l.y1), std::llround(l.x2), std::llround(l.y2) };
-        if(std::make_pair(k[2], k[3]) < std::make_pair(k[0], k[1]))
-        {
-          k = { k[2], k[3], k[0], k[1] };
-        }
-        shared[k].emplace_back(static_cast<int>(i), &l);
-      }
-    }
-    // Each sector's ways out: the sector beyond, and the middle of the line between, when the
-    // player can cross it (not blocking; room to stand beyond, 56 high, and a step up of at
-    // most 24; or a door, which opens).
-    std::vector<std::vector<std::tuple<int, double, double>>> ways(sectors.size());
-    for(auto const &[_, sides] : shared)
-    {
-      if(sides.size() != 2)
-      {
-        continue;
-      }
-      for(int d{}; d < 2; ++d)
-      {
-        auto const [a, la](sides[d]);
-        auto const [b, lb](sides[1 - d]);
-        auto const &sa(sectors[a]);
-        auto const &sb(sectors[b]);
-        bool const door{ use_kind(la->useSpecial) == 1 || use_kind(lb->useSpecial) == 1 };
-        double const top{ std::min(sa.ceilingHeight, sb.ceilingHeight) };
-        bool const open{ !la->isBlocking && sb.ceilingHeight - sb.floorHeight >= 56.0 && top - sb.floorHeight >= 56.0
-                         && sb.floorHeight - sa.floorHeight <= 24.0 };
-        if(open || door)
-        {
-          ways[a].emplace_back(b, (la->x1 + la->x2) / 2.0, (la->y1 + la->y2) / 2.0);
-        }
-      }
-    }
     // A sector worth going to: a room or a corridor (its box at least 64 a side and 32768 in
     // area), not a lighting patch, a step or an alcove the player passes by.
     std::vector<bool> worth(sectors.size());
@@ -970,58 +1055,72 @@ extern "C"
       }
       worth[i] = x1 - x0 >= 64.0 && y1 - y0 >= 64.0 && (x1 - x0) * (y1 - y0) >= 32768.0;
     }
-    // Nearest first (Dijkstra over the lines' middles), to such a sector the player hasn't
-    // stood in.
-    std::vector<double> dist(sectors.size(), 1e18);
-    std::vector<int> back(sectors.size(), -1);
-    std::vector<std::pair<double, double>> at(sectors.size());
-    using item = std::pair<double, int>;
-    std::priority_queue<item, std::vector<item>, std::greater<item>> next;
-    dist[here] = 0.0;
-    at[here] = { doom_vars[3], doom_vars[4] };
-    next.push({ 0.0, here });
-    while(!next.empty())
+    // A teleporter's pad is worth going to too, small as it is (it carries the player
+    // elsewhere): a sector one of whose lines teleports.
+    std::vector<bool> pad(sectors.size());
+    for(size_t i{}; i < sectors.size(); ++i)
     {
-      auto const [d, k](next.top());
-      next.pop();
-      if(d > dist[k])
+      for(auto const &l : sectors[i].lines)
       {
-        continue;
+        pad[i] = pad[i] || l.crossSpecial == 70 || l.crossSpecial == 71;
       }
-      if(worth[k] && !doom_sectors_been.count(k))
+    }
+    return doom_route([&](int const k) { return (worth[k] || pad[k]) && !doom_sectors_been.count(k); }, out, max);
+  }
+
+  int play_doom_route(double const x, double const y, double *out, int max)
+  {
+    int const target{ doom_sector_at(x, y) };
+    return target < 0 ? 0 : doom_route([&](int const k) { return k == target; }, out, max);
+  }
+
+  int play_doom_route_any(double const x, double const y, double *out, int max)
+  {
+    int const target{ doom_sector_at(x, y) };
+    if(target < 0)
+    {
+      return 0;
+    }
+    std::vector<std::array<double, 5>> crossings;
+    std::vector<double> path(2 * 512);
+    doom_route([&](int const k) { return k == target; }, path.data(), static_cast<int>(path.size()), false, &crossings);
+    int n{};
+    for(auto const &c : crossings)
+    {
+      if(5 * (n + 1) > max)
       {
-        std::vector<std::pair<double, double>> path;
-        for(int s{ k }; s != here; s = back[s])
-        {
-          path.push_back(at[s]);
-        }
-        std::reverse(path.begin(), path.end());
-        int m{};
-        for(auto const &[x, y] : path)
-        {
-          if(2 * (m + 1) > max)
-          {
-            break;
-          }
-          out[2 * m] = x;
-          out[2 * m + 1] = y;
-          ++m;
-        }
-        return m;
+        break;
       }
-      for(auto const &[b, x, y] : ways[k])
+      std::copy(c.begin(), c.end(), out + 5 * n);
+      ++n;
+    }
+    return n;
+  }
+
+  int play_doom_specials(double *out, int max)
+  {
+    if(!doom_last)
+    {
+      return 0;
+    }
+    std::set<std::array<long long, 2>> said;
+    int n{};
+    for(auto const &sector : doom_last->sectors)
+    {
+      for(auto const &l : sector.lines)
       {
-        double const nd{ d + std::hypot(x - at[k].first, y - at[k].second) };
-        if(nd < dist[b])
+        double const x{ (l.x1 + l.x2) / 2.0 }, y{ (l.y1 + l.y2) / 2.0 };
+        if((l.useSpecial || l.crossSpecial) && said.insert({ std::llround(x), std::llround(y) }).second && 4 * (n + 1) <= max)
         {
-          dist[b] = nd;
-          back[b] = k;
-          at[b] = { x, y };
-          next.push({ nd, b });
+          out[4 * n] = x;
+          out[4 * n + 1] = y;
+          out[4 * n + 2] = l.useSpecial;
+          out[4 * n + 3] = l.crossSpecial;
+          ++n;
         }
       }
     }
-    return 0;
+    return n;
   }
 
   int play_doom_exits(double *out, int max)
@@ -1036,7 +1135,8 @@ extern "C"
     {
       for(auto const &l : sector.lines)
       {
-        double const how{ use_kind(l.crossSpecial) == 2 ? 1.0 : use_kind(l.useSpecial) == 2 ? 2.0 : 0.0 };
+        bool const teleport{ l.crossSpecial == 70 || l.crossSpecial == 71 };
+        double const how{ use_kind(l.crossSpecial) == 2 ? 1.0 : use_kind(l.useSpecial) == 2 ? 2.0 : teleport ? 3.0 : 0.0 };
         double const x{ (l.x1 + l.x2) / 2.0 }, y{ (l.y1 + l.y2) / 2.0 };
         if(how > 0.0 && said.insert({ std::llround(x), std::llround(y) }).second && 3 * (n + 1) <= max)
         {

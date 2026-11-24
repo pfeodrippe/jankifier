@@ -425,7 +425,7 @@ namespace play
       object_ref r{ rt::obj::persistent_array_map::empty() };
       r = rt::assoc(r, kw("x"), num(v[3 * i]));
       r = rt::assoc(r, kw("y"), num(v[3 * i + 1]));
-      r = rt::assoc(r, kw("how"), kw(v[3 * i + 2] < 1.5 ? "walk" : "use"));
+      r = rt::assoc(r, kw("how"), kw(v[3 * i + 2] < 1.5 ? "walk" : v[3 * i + 2] < 2.5 ? "use" : "teleport"));
       list = rt::conj(list, r);
     }
     return list;
@@ -435,6 +435,59 @@ namespace play
   {
     play_doom_command(rt::to_string(command).c_str());
     return rt::jank_nil;
+  }
+
+  // [[x y] ...]: the way from the player to the sector point x, y is in (play_doom_route).
+  inline object_ref doom_route(object_ref const x, object_ref const y)
+  {
+    std::vector<double> out(2 * 512);
+    int const n(play_doom_route(rt::to_real(x), rt::to_real(y), out.data(), static_cast<int>(out.size())));
+    object_ref list{ rt::obj::persistent_vector::empty() };
+    for(int i{}; i < n; ++i)
+    {
+      object_ref p{ rt::obj::persistent_vector::empty() };
+      p = rt::conj(p, num(out[2 * i]));
+      p = rt::conj(p, num(out[2 * i + 1]));
+      list = rt::conj(list, p);
+    }
+    return list;
+  }
+
+  // [{:x :y :step :opening :special}]: play_doom_route_any's lines crossed.
+  inline object_ref doom_route_any(object_ref const x, object_ref const y)
+  {
+    std::vector<double> out(5 * 256);
+    int const n(play_doom_route_any(rt::to_real(x), rt::to_real(y), out.data(), static_cast<int>(out.size())));
+    object_ref list{ rt::obj::persistent_vector::empty() };
+    for(int i{}; i < n; ++i)
+    {
+      object_ref r{ rt::obj::persistent_array_map::empty() };
+      r = rt::assoc(r, kw("x"), num(out[5 * i]));
+      r = rt::assoc(r, kw("y"), num(out[5 * i + 1]));
+      r = rt::assoc(r, kw("step"), num(out[5 * i + 2]));
+      r = rt::assoc(r, kw("opening"), num(out[5 * i + 3]));
+      r = rt::assoc(r, kw("special"), num(out[5 * i + 4]));
+      list = rt::conj(list, r);
+    }
+    return list;
+  }
+
+  // [[x y used walked] ...]: play_doom_specials's lines.
+  inline object_ref doom_specials()
+  {
+    std::vector<double> out(4 * 1024);
+    int const n(play_doom_specials(out.data(), static_cast<int>(out.size())));
+    object_ref list{ rt::obj::persistent_vector::empty() };
+    for(int i{}; i < n; ++i)
+    {
+      object_ref p{ rt::obj::persistent_vector::empty() };
+      for(int k{}; k < 4; ++k)
+      {
+        p = rt::conj(p, integer(static_cast<int64_t>(std::llround(out[4 * i + k]))));
+      }
+      list = rt::conj(list, p);
+    }
+    return list;
   }
 
   inline object_ref doom_mark()

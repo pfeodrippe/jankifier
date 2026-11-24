@@ -45,13 +45,23 @@ extern "C"
   void play_doom_mark();
   // A console command given to Doom (for checks: give health, god), done on the next tic.
   void play_doom_command(char const *command);
-  // The map's exits: each exit line's middle x, y and how it is set off (1 walking over it, 2
-  // using it), three numbers an exit; the count.
+  // The map's exits and teleporters: each line's middle x, y and what it is (1 an exit walked
+  // over, 2 an exit used, 3 a teleporter walked into), three numbers a line; the count.
   int play_doom_exits(double *out, int max);
+  // For checks: every line with a special a player sets off: its middle x, y, the special
+  // used and the special walked over (0: none), four numbers a line; their count.
+  int play_doom_specials(double *out, int max);
   // The way to the nearest sector the player hasn't stood in, sector to sector across the
   // lines they share that the player can cross (room to stand, a step up of at most 24, or a
   // door): the middles of those lines, x and y each, into `out`; their count (0: none found).
   int play_doom_frontier(double *out, int max);
+  // The way from the player to the sector point x, y is in, as play_doom_frontier gives it (for
+  // checks: whether a place can be walked to).
+  int play_doom_route(double x, double y, double *out, int max);
+  // For checks: the way to the sector point x, y is in across any line two sectors share that
+  // doesn't block, whatever the heights: each line crossed, its middle x, y, the step up, the
+  // opening and its special, five numbers a line; their count.
+  int play_doom_route_any(double x, double y, double *out, int max);
   // 1 when nothing of the map (a wall, a closed door, a floor or ceiling past the eyes) is
   // between the player's eyes and point x, y (lines as the last rays saw them), else 0.
   int play_doom_sees(double x, double y);
