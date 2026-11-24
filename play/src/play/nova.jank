@@ -155,7 +155,7 @@
         ;; level's data holds nothing for 12 (walking right is blocked by the level's edge).
         empty-col? (fn [c] (every? (fn [row] (zero? ((:map st) c row))) (range rows)))
         end-col (first (filter (fn [c] (every? empty-col? (range c (+ c 12)))) (range px (+ px 40))))
-        ended (and end-col (<= (- end-col px) 3))
+        ended (and end-col (<= (- end-col px) 4))
         ;; The nearest ladder or door on her row within 4 blocks, when she isn't at one.
         near (first (for [dx [1 -1 2 -2 3 -3 4 -4]
                           :let [ch (at dx 0)]
@@ -167,7 +167,10 @@
            (let [[dx ch] near
                  n (max dx (- dx))]
              (str "A " (if (= ch "H") "ladder (H)" "door (D)") " is " n (if (= 1 n) " block" " blocks")
-                  " to her " (if (pos? dx) "right" "left") ". ")))
+                  " to her " (if (pos? dx) "right" "left")
+                  (if (= ch "H")
+                    ": stand at it, then up climbs it. "
+                    ": stand in it (its column), then up goes through it. "))))
          (when ledge "She stands on a ledge (=): down drops her through it. ")
          (when-let [ds (seq (dangers st))]
            (str "Near her, what may hurt her when it touches her: "
