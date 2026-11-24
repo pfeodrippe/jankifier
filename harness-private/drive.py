@@ -308,6 +308,7 @@ def run_form(task, mode, seed):
       verified {'true' if verified else 'false'}
       live (str {jstr(OUT + '/live.edn')})
       current (atom nil)
+      workers (atom nil)
       looped (atom false)
       system (str tools/situation (when verified (str "\\n\\n" (slurp "VERIFY.md"))))
       opts {{;; 128k tokens: about 4.3 GB of the engine's caches (64k each for a team's
@@ -324,6 +325,10 @@ def run_form(task, mode, seed):
                     :on-entry (fn [_]
                                 (when-let [x @current]
                                   (h/save! x live)
+                                  ;; A team's workers too, beside it (live-coder.edn, ...).
+                                  (when-let [t @workers]
+                                    (doseq [k [:coder :modeler]]
+                                      (h/save! (get t k) (clojure.string/replace live #"\\.edn$" (str "-" (name k) ".edn")))))
                                   ;; Going round in a loop: the last six results all the
                                   ;; harness's "the same result as before". Ended, as the step
                                   ;; limit would end it later.
@@ -341,6 +346,7 @@ def run_form(task, mode, seed):
                                   :system system
                                   :obligations (when verified (verify/gate file))}})))
       _ (reset! current a)
+      _ (reset! workers tm)
       began (cpp/harness.seconds)
       _ (h/ask! a {jstr(ask)})
       _ (h/answer a)
