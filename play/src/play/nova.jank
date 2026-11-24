@@ -233,13 +233,15 @@
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right.")))))
 
 (defn caution
-  "Why planned action `action` should not be done now (nil: it may be): a walk right on the
-  ground with the ground stopping right ahead (a gap: she would fall in)."
+  "Why action `action` should not be done now (nil: it may be): a walk right on the ground
+  with the ground stopping right ahead over a fall (no floor 2 to 5 blocks down, as the text
+  says \"no floor below\"): she would fall in, which never helps. A drop to a floor is let be."
   [st action]
   (let [px (long (:x st)) py (feet-row st)
         at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))]
-    (when (and (= action :right) (:on-ground st) (= "." (at 1 1)) (= "." (at 2 1)))
-      "the ground stops right ahead (a gap): jump-right, then right while in the air.")))
+    (when (and (= action :right) (:on-ground st) (= "." (at 1 1)) (= "." (at 2 1))
+               (not (some (fn [dy] (not= "." (at 1 dy))) (range 2 6))))
+      "the ground stops right ahead over a fall (no floor below): right walks her into it. Jump-right, then right while in the air.")))
 
 (defn- moved
   "How far Nova went from `before` to `st`, as a sentence (or that she died and starts again)."
