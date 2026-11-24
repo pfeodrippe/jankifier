@@ -367,6 +367,16 @@
                     (pos? dy) ": it is below her: don't drop onto it"
                     (every? (fn [[t]] (contains? unshootable t)) ds) ": jump over it or wait for it to pass"
                     :else ": jump over it, wait for it to pass, or attack it (a shot stuns it: stunned, it can't hurt her and she walks through it)"))
+                ;; Where the flames come from (src/enemy.s: a FIRE_WALK throws FLAMES and a
+                ;; FIRE_JUMP bounces in place making fire, each only while not stunned; FLAMES
+                ;; despawn on a timer): agents were hurt waiting beside a FIRE_JUMP and walking
+                ;; into flames that kept coming.
+                (let [makers (distinct (keep (fn [[t]] (#{"FIRE_WALK" "FIRE_JUMP"} t)) ds))]
+                  (when (seq makers)
+                    (str " (" (str/join " and " makers) " " (if (= 1 (count makers)) "makes" "make")
+                         " the FLAMES while not stunned"
+                         (when (some #{"FIRE_JUMP"} makers) ", a FIRE_JUMP bouncing in place: don't stand beside it")
+                         ": stun it with a shot from 3 blocks or more on its row and the flames stop; FLAMES burn out in a moment)")))
                 ;; Only a GOOMBA is flattened by landing on it (src/enemy.s, GoombaSmoosh).
                 (when (= "GOOMBA" (first (first ds))) " (landing on a GOOMBA from above flattens it)")
                 ;; Her shot goes the way she faces: an agent facing away fired at nothing.
