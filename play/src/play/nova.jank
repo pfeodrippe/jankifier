@@ -566,7 +566,8 @@
                    "On her right the way is clear."))
          ;; A jump-right alone from beside spikes came down on them (right is held 8 frames,
          ;; while she still pushes against them): nearly every agent was hurt there. In replay,
-         ;; two rights after it, or a lone high-jump-right, cleared them.
+         ;; two rights after it, or a lone high-jump-right, cleared them; an agent added rights
+         ;; after a high-jump-right and was carried on into the owl past them.
          ;; A fire-maker further on than the dangers' 3 blocks: agents met them up close and
          ;; were hurt in nearly every run. In replay, against a FIRE_JUMP hopping toward her,
          ;; standing back on higher ground and shooting again and again was never hurt (30
@@ -589,7 +590,7 @@
                     (str " (it hops along, making FLAMES where it lands): stay where she is, face it (face-" way
                          "), and shoot again and again (attack, wait, wait, attack, ...): a shot stuns it when a hop brings it onto her row, and the flames stop. Don't jump toward it.")
                     (str " (it throws FLAMES around it): keep 3 or more blocks from it. Go onto its row only when it is 3 or more blocks from her, face it, and attack at once: a shot stuns it and the flames stop. Landing near it hurts.")))))
-         (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right: to clear them, jump-right then right twice while in the air, or a high-jump-right on its own (a jump-right alone from beside them comes down on them)."))
+         (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right: to clear them, jump-right, then right twice while in the air, and no more (a jump-right alone from beside them comes down on them; more rights carry her on into what is past them)."))
          (when fall-left (str " On her left "
                               (if (= 1 fall-left)
                                 "her ground stops right where she stands"
@@ -674,8 +675,8 @@
           (when spikes
             (str "spikes " spikes (if (= 1 spikes) " block" " blocks") " on her " (name action) ": a step " (name action)
                  " walks onto them, and they hurt her. Jump over them: jump-" (name action) ", then " (name action)
-                 " twice while in the air, or a high-jump-" (name action) " on its own (a jump-" (name action)
-                 " alone from beside them comes down on them).")))
+                 " twice while in the air, and no more (a jump-" (name action)
+                 " alone from beside them comes down on them; more carries her on past them).")))
         ;; A danger in her way (her row or her head's, within 3 blocks that way: enemies come
         ;; toward her): an agent at 1 health walked on into a GOOMBA 3 blocks away.
         (when-let [[t dx] (first (filter (fn [[_ dx dy]] (and (<= 1 (* dir dx) 3) (<= -1 dy 0))) (dangers st)))]

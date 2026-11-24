@@ -21,6 +21,10 @@ def char(name, f):
     for word, c in [('COIN', 'o'), ('SPIKE', '^'), ('LADDER', 'H'), ('SPRING', 's'), ('DOOR', 'D'), ('SIGN', '?'),
                     ('PRIZE', '!'), ('WATER', '~'), ('LAVA', '~'), ('LOCK', 'L'), ('KEY', 'k'), ('HEART', '+'),
                     ('EXIT', 'E'), ('GOAL', 'E')]:
+        # LOCK as a word of its own: SOLID_BLOCK, PICKUP_BLOCK, TOGGLE_BLOCK_ON and the other
+        # blocks hold "LOCK" inside "BLOCK", and plain solid blocks were all told as locks.
+        if word == 'LOCK' and word not in name.split('_'):
+            continue
         if word in name:
             return c
     if 'M_SOLID_ALL' in f:
