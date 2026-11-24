@@ -316,7 +316,8 @@
   (vec (sort-by second (for [o (cpp/play.doom_monsters)
                              :when (alive? o)
                              :let [[d a] (bearing s o)]
-                             :when (and (< d 1500.0) (cpp/play.doom_sees (:x o) (:y o)))]
+                             ;; Seen at its middle (its feet and 28): one on a ledge is seen over it.
+                             :when (and (< d 1500.0) (cpp/play.doom_sees_at (:x o) (:y o) (+ (:z o) 28.0)))]
                          [o d a]))))
 
 (defn- moved

@@ -68,10 +68,11 @@ extern "C"
   // doesn't block, whatever the heights: each line crossed, its middle x, y, the step up, the
   // opening and its special, five numbers a line; their count.
   int play_doom_route_any(double x, double y, double *out, int max);
-  // 1 when nothing of the map (a wall, a closed door, a floor or ceiling past the eyes) is
-  // between the player's eyes and point x, y (lines as the last rays saw them), else 0.
-  int play_doom_sees(double x, double y);
-  // The monsters anywhere in the map, seen or not, a line each: name x y.
+  // 1 when nothing of the map (a wall, a closed door, a floor or ceiling the line of sight
+  // passes below or above) is between the player's eyes and point x, y at height z (NaN: the
+  // eyes' height; lines as the last rays saw them), else 0.
+  int play_doom_sees(double x, double y, double z);
+  // The monsters anywhere in the map, seen or not, a line each: name x y z.
   int play_doom_monsters(char *out, int size);
   // The sectors whose floor or ceiling moved since play_doom_mark: each one's middle x, y and
   // its floor's and ceiling's change, four numbers a sector; the count.

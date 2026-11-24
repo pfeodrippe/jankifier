@@ -372,7 +372,7 @@ namespace play
 
   // How far the player can walk: [{:angle :distance :door} ...], angles to the left of
   // where it faces.
-  // [{:name :x :y}]: the monsters anywhere in the map, seen or not (killed ones are named
+  // [{:name :x :y :z}]: the monsters anywhere in the map, seen or not (killed ones are named
   // Dead...).
   inline object_ref doom_monsters()
   {
@@ -387,13 +387,14 @@ namespace play
       std::string const line(all.substr(start, end == std::string::npos ? std::string::npos : end - start));
       start = end == std::string::npos ? all.size() : end + 1;
       char name[128]{};
-      double x{}, y{};
-      if(std::sscanf(line.c_str(), "%127s %lf %lf", name, &x, &y) == 3)
+      double x{}, y{}, z{};
+      if(std::sscanf(line.c_str(), "%127s %lf %lf %lf", name, &x, &y, &z) == 4)
       {
         object_ref o{ rt::obj::persistent_array_map::empty() };
         o = rt::assoc(o, kw("name"), str(name));
         o = rt::assoc(o, kw("x"), num(x));
         o = rt::assoc(o, kw("y"), num(y));
+        o = rt::assoc(o, kw("z"), num(z));
         list = rt::conj(list, o);
       }
     }
@@ -402,7 +403,14 @@ namespace play
 
   inline object_ref doom_sees(object_ref const x, object_ref const y)
   {
-    return play_doom_sees(rt::to_real(x), rt::to_real(y)) ? object_ref{ rt::jank_true } : object_ref{ rt::jank_false };
+    return play_doom_sees(rt::to_real(x), rt::to_real(y), std::nan("")) ? object_ref{ rt::jank_true } : object_ref{ rt::jank_false };
+  }
+
+  // Whether the player's eyes see point x, y at height z (a monster's middle: its z and 28).
+  inline object_ref doom_sees_at(object_ref const x, object_ref const y, object_ref const z)
+  {
+    return play_doom_sees(rt::to_real(x), rt::to_real(y), rt::to_real(z)) ? object_ref{ rt::jank_true }
+                                                                           : object_ref{ rt::jank_false };
   }
 
   // [[x y] ...]: the way to the nearest sector the player hasn't stood in nor been near (the

@@ -361,7 +361,7 @@ namespace
       if(o.category == "Monster")
       {
         char line[160];
-        std::snprintf(line, sizeof line, "%s %.0f %.0f\n", o.name.c_str(), o.positionX, o.positionY);
+        std::snprintf(line, sizeof line, "%s %.0f %.0f %.0f\n", o.name.c_str(), o.positionX, o.positionY, o.positionZ);
         doom_monsters += line;
       }
     }
@@ -1010,7 +1010,7 @@ extern "C"
     return static_cast<int>(doom_monsters.size());
   }
 
-  int play_doom_sees(double const x, double const y)
+  int play_doom_sees(double const x, double const y, double const z)
   {
     if(doom_vars.size() < 5)
     {
@@ -1018,13 +1018,10 @@ extern "C"
     }
     double const px{ doom_vars[3] }, py{ doom_vars[4] };
     double const dx{ x - px }, dy{ y - py };
+    // The line of sight from the player's eyes to height z there (NaN: the eyes' height).
+    double const to{ std::isnan(z) ? doom_eye : z };
     for(auto const &w : doom_walls)
     {
-      // Sight passes a line of two sectors whose opening is around the eyes' height.
-      if(w.sides > 1 && w.ceiling - w.floor > 0.0 && w.floor < doom_eye && w.ceiling > doom_eye)
-      {
-        continue;
-      }
       double const ex{ w.x2 - w.x1 }, ey{ w.y2 - w.y1 };
       double const det{ ex * dy - dx * ey };
       if(std::abs(det) < 1e-9)
@@ -1034,7 +1031,14 @@ extern "C"
       double const wx{ w.x1 - px }, wy{ w.y1 - py };
       double const t{ (ex * wy - wx * ey) / det };
       double const u{ (dx * wy - dy * wx) / det };
-      if(t > 0.0 && t < 1.0 && u >= 0.0 && u <= 1.0)
+      if(!(t > 0.0 && t < 1.0 && u >= 0.0 && u <= 1.0))
+      {
+        continue;
+      }
+      // A wall, or a line of two sectors whose opening the line of sight passes above or
+      // below where it crosses (as Doom's sight does: a monster on a ledge is seen over it).
+      double const at{ doom_eye + t * (to - doom_eye) };
+      if(w.sides < 2 || w.ceiling - w.floor <= 0.0 || at <= w.floor || at >= w.ceiling)
       {
         return 0;
       }
