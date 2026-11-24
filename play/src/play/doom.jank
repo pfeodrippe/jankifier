@@ -73,6 +73,42 @@
         (pos? a) (str (long a) " degrees left")
         :else (str (long (- a)) " degrees right")))
 
+(def cell
+  "The side of a square of the map whose visit is kept (map units)."
+  128.0)
+
+(defonce ^:private visited
+  ;; The squares of the map the player has stood in since the game started: [column row].
+  (atom #{}))
+
+(defn squares-visited
+  "How many squares of the map the player has stood in."
+  []
+  (count @visited))
+
+(defn- square
+  "The square of the map point x, y is in."
+  [x y]
+  (let [down (fn [v] (let [q (long (/ v cell))] (if (and (neg? v) (not= (* q cell) v)) (dec q) q)))]
+    [(down x) (down y)]))
+
+(defn- visit!
+  "The squares on the way from state `before` to state `s` kept as visited."
+  [before s]
+  (let [dx (- (:x s) (:x before)) dy (- (:y s) (:y before))
+        n (inc (long (/ (cpp/play.sqrt (+ (* dx dx) (* dy dy))) 32.0)))]
+    (swap! visited into (for [i (range (inc n))]
+                          (square (+ (:x before) (* dx (/ i n))) (+ (:y before) (* dy (/ i n))))))))
+
+(defn- new-ground?
+  "Whether walking from `s` toward direction `a` (degrees, left positive) for `far` units
+  (at most 512) goes through a square the player hasn't stood in."
+  [s a far]
+  (let [th (* (+ (:angle s) a) (/ pi 180.0))
+        dx (cpp/play.cos th) dy (cpp/play.sin th)]
+    (boolean (some (fn [d] (not (contains? @visited (square (+ (:x s) (* dx d)) (+ (:y s) (* dy d))))))
+                   (range 48.0 (min (- far 16.0) 512.0) 32.0)))))
+
 (defn- turns
   "How many turns face direction `a` (degrees, left positive), as words: (2 turn-left)."
   [a]
@@ -83,13 +119,19 @@
 
 (defn- walls
   "How far the player can walk in each direction a whole number of turns away and behind
-  (cpp/play.doom_rays), as lines."
-  []
-  (str "Free way before a wall:\n"
+  (cpp/play.doom_rays), and whether that way is new ground, as lines."
+  [s]
+  (str "Free way before a wall (new ground: you haven't been that way):\n"
        (str/join "\n" (map (fn [r] (let [a (:angle r)]
                                      (str "- " (if (>= (max a (- a)) 179.0) "behind" (direction a))
                                           (when-let [t (turns a)] (str " " t)) ": " (long (:distance r))
-                                          (when (:door r) " (closed: a door or a pillar; use opens a door)"))))
+                                          (when (>= (:distance r) 64.0)
+                                            (if (new-ground? s a (:distance r)) ", new ground" ", been there"))
+                                          (case (:ends r)
+                                            :door " (a closed door: use opens it within 64 units)"
+                                            :exit " (the exit switch: use it within 64 units to finish the level)"
+                                            :switch " (a switch: use presses it within 64 units)"
+                                            nil))))
                            (cpp/play.doom_rays)))
        "\n"))
 
@@ -134,7 +176,7 @@
           "Health " (long (:health s)) ", armor " (long (:armor s)) ", ammo " (long (:ammo s))
           ", kills " (long (:kills s)) ", items " (long (:items s)) (when (pos? (:dead s 0)) ", dead") ".\n"
           "At (" (long (:x s)) ", " (long (:y s)) "), facing " (long (:angle s)) " degrees.\n"
-          (walls)
+          (walls s)
           (if (seq (:objects s))
             (str "In view:\n"
                  (str/join "\n"
@@ -165,7 +207,11 @@
   ([] (start! 1))
   ([seed]
    (or (cpp/play.doom_open engine wad "map01" seed 320)
-       (do (reset! st {:step 0 :told (told)}) nil))))
+       (let [s (state)]
+         (reset! visited #{})
+         (visit! s s)
+         (reset! st {:step 0 :told (told)})
+         nil))))
 
 (defn- aim!
   "Turned toward the nearest monster in view a tic at a time (each turn read back), until it
@@ -250,9 +296,12 @@
     :turn-left (turn! turn-degrees)
     :turn-right (turn! (- turn-degrees))
     :use (use!)
-    (let [aimed (if (= action :attack) (aim!) 0.0)
-          reward (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics)))]
-      (+ reward (if settle (settled!) 0.0)))))
+    (let [before (state)
+          aimed (if (= action :attack) (aim!) 0.0)
+          reward (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics)))
+          reward (+ reward (if settle (settled!) 0.0))]
+      (visit! before (state))
+      reward)))
 
 (defn act-v3!
   "An action as version 3 played it: forward-left and forward-right walked while turning."

@@ -87,6 +87,16 @@ namespace play
     return num(std::sqrt(rt::to_real(x)));
   }
 
+  inline object_ref cos(object_ref const x)
+  {
+    return num(std::cos(rt::to_real(x)));
+  }
+
+  inline object_ref sin(object_ref const x)
+  {
+    return num(std::sin(rt::to_real(x)));
+  }
+
   inline object_ref cwd()
   {
     return str(std::filesystem::current_path().string());
@@ -361,7 +371,12 @@ namespace play
       object_ref r{ rt::obj::persistent_array_map::empty() };
       r = rt::assoc(r, kw("angle"), num(v[3 * i]));
       r = rt::assoc(r, kw("distance"), num(v[3 * i + 1]));
-      r = rt::assoc(r, kw("door"), v[3 * i + 2] > 0.5 ? object_ref{ rt::jank_true } : object_ref{ rt::jank_false });
+      // What ends the way: a door, the exit, or something else to use (a switch).
+      int const kind{ static_cast<int>(v[3 * i + 2]) };
+      if(kind > 0)
+      {
+        r = rt::assoc(r, kw("ends"), kw(kind == 1 ? "door" : kind == 2 ? "exit" : "switch"));
+      }
       list = rt::conj(list, r);
     }
     return list;

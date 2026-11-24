@@ -1,0 +1,48 @@
+diff --git a/include/ViZDoomTypes.h b/include/ViZDoomTypes.h
+index 42a8a35..0910179 100644
+--- a/include/ViZDoomTypes.h
++++ b/include/ViZDoomTypes.h
+@@ -97,6 +97,7 @@ namespace vizdoom{
+         double x2;
+         double y2;
+         bool isBlocking;
++        int useSpecial; // the action special a player's use sets off (0: none): doors 10-14, 202, 249; exits 243, 244
+     };
+ 
+     struct Sector{
+diff --git a/src/lib/ViZDoomSharedMemory.h b/src/lib/ViZDoomSharedMemory.h
+index 663e5e0..206478b 100644
+--- a/src/lib/ViZDoomSharedMemory.h
++++ b/src/lib/ViZDoomSharedMemory.h
+@@ -98,6 +98,7 @@ namespace vizdoom {
+     struct SMLine{
+         double position[4];
+         bool isBlocking;
++        int useSpecial;
+     };
+ 
+     struct SMGameState {
+diff --git a/src/vizdoom/src/viz_game.cpp b/src/vizdoom/src/viz_game.cpp
+index b826e3b..206db65 100644
+--- a/src/vizdoom/src/viz_game.cpp
++++ b/src/vizdoom/src/viz_game.cpp
+@@ -620,6 +620,7 @@ void VIZ_GameStateUpdateSectors(){
+ 
+         lineIds.insert({line, i});
+         vizLine->isBlocking = (line->flags & (ML_BLOCKING|ML_BLOCKEVERYTHING|ML_BLOCK_PLAYERS));
++        vizLine->useSpecial = (line->activation & (SPAC_Use|SPAC_UseThrough|SPAC_UseBack)) ? line->special : 0;
+ 
+         VIZ_DebugMsg(4, VIZ_FUNC, "line: %d, position: (%f, %f), (%f, %f), isBlocking: %d",
+                 i, vizLine->position[0], vizLine->position[1], vizLine->position[2], vizLine->position[3], vizLine->isBlocking);
+diff --git a/src/vizdoom/src/viz_game.h b/src/vizdoom/src/viz_game.h
+index c4914fd..0cca9c5 100644
+--- a/src/vizdoom/src/viz_game.h
++++ b/src/vizdoom/src/viz_game.h
+@@ -115,6 +115,7 @@ struct VIZLine{
+     double position[4];
+     //int frontSector, backSector;
+     bool isBlocking;
++    int useSpecial; // the action special a player's use sets off (0: none)
+ };
+ 
+ struct VIZGameState{

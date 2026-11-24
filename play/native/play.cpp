@@ -131,7 +131,32 @@ namespace
   // Multiples of a turn (30 degrees: play.doom's turn-left and turn-right), and behind.
   std::array<double, 8> const doom_ray_angles{ 90, 60, 30, 0, -30, -60, -90, 180 };
   // Each direction's distance and whether a closed door ends it.
-  std::vector<std::pair<double, bool>> doom_rays;
+  // Each ray's distance and what ends it: 0 a wall, 1 a door, 2 the exit, 3 something else
+  // a player uses (a switch).
+  std::vector<std::pair<double, int>> doom_rays;
+
+  // What a line's use special (patches/vizdoom-use-specials.patch) makes it: doom_rays' kinds.
+  int use_kind(int const special)
+  {
+    switch(special)
+    {
+      case 0:
+        return 0;
+      case 10: // Door_Close
+      case 11: // Door_Open
+      case 12: // Door_Raise
+      case 13: // Door_LockedRaise
+      case 14: // Door_Animated
+      case 202: // Generic_Door
+      case 249: // Door_CloseWaitOpen
+        return 1;
+      case 243: // Exit_Normal
+      case 244: // Exit_Secret
+        return 2;
+      default:
+        return 3;
+    }
+  }
 
   void doom_cast(vizdoom::GameState const &state, double const px, double const py, double const angle)
   {
@@ -140,7 +165,7 @@ namespace
       double x1, y1, x2, y2;
       bool blocking;
       double ceiling, floor;
-      bool door;
+      int kind;
     };
     // A line is in each of its sectors' lists: keyed by its ends, either way round.
     std::map<std::array<long long, 4>, wall> walls;
@@ -153,11 +178,11 @@ namespace
         {
           key = { key[2], key[3], key[0], key[1] };
         }
-        bool const closed{ sector.ceilingHeight - sector.floorHeight < 8.0 };
+        int const kind{ use_kind(l.useSpecial) };
         auto const at(walls.find(key));
         if(at == walls.end())
         {
-          walls.emplace(key, wall{ l.x1, l.y1, l.x2, l.y2, l.isBlocking, sector.ceilingHeight, sector.floorHeight, closed });
+          walls.emplace(key, wall{ l.x1, l.y1, l.x2, l.y2, l.isBlocking, sector.ceilingHeight, sector.floorHeight, kind });
         }
         else
         {
@@ -165,7 +190,7 @@ namespace
           w.blocking = w.blocking || l.isBlocking;
           w.ceiling = std::min(w.ceiling, sector.ceilingHeight);
           w.floor = std::max(w.floor, sector.floorHeight);
-          w.door = w.door || closed;
+          w.kind = std::max(w.kind, kind);
         }
       }
     }
@@ -175,7 +200,7 @@ namespace
       double const th{ (angle + a) * M_PI / 180.0 };
       double const dx{ std::cos(th) }, dy{ std::sin(th) };
       double best{ 2048.0 };
-      bool door{};
+      int kind{};
       for(auto const &[_, w] : walls)
       {
         if(!w.blocking && w.ceiling - w.floor >= 56.0)
@@ -195,10 +220,10 @@ namespace
         if(t > 0.0 && u >= 0.0 && u <= 1.0 && t < best)
         {
           best = t;
-          door = w.door;
+          kind = w.kind;
         }
       }
-      doom_rays.emplace_back(best, door);
+      doom_rays.emplace_back(best, kind);
     }
   }
 
@@ -695,7 +720,7 @@ extern "C"
   }
 
   // How far the player can walk in each of doom_ray_angles' directions: angle, distance and
-  // 1 when a closed door ends it, three numbers a direction; the count of directions.
+  // what ends it (doom_rays' kinds), three numbers a direction; the count of directions.
   int play_doom_rays(double *out, int max)
   {
     int n{};
@@ -703,7 +728,7 @@ extern "C"
     {
       out[3 * n] = doom_ray_angles[i];
       out[3 * n + 1] = doom_rays[i].first;
-      out[3 * n + 2] = doom_rays[i].second ? 1.0 : 0.0;
+      out[3 * n + 2] = doom_rays[i].second;
     }
     return n;
   }
