@@ -77,8 +77,18 @@
                            (cpp/play.doom_rays)))
        ".\n"))
 
+(defonce ^:private note
+  ;; What the last action did that the state doesn't say (use: whether something opened).
+  (atom nil))
+
+(defn- fallen
+  "How many monsters' bodies are in view (ViZDoom names them Dead...)."
+  [s]
+  (count (filter (fn [o] (str/starts-with? (str (:name o)) "Dead")) (:objects s))))
+
 (defn- moved
-  "How the player moved from `before` to `s`, as a sentence."
+  "How the player moved from `before` to `s`, as a sentence (and what the last action did:
+  a monster that fell, a door that opened)."
   [before s]
   (let [dx (- (:x s) (:x before)) dy (- (:y s) (:y before))
         far (cpp/play.sqrt (+ (* dx dx) (* dy dy)))
@@ -88,7 +98,11 @@
          (if (< far 2.0) "didn't move" (str "moved " (long far)))
          (when (>= (max turn (- turn)) 1.0) (str " and turned " (direction turn)))
          (when (< (- (:health s) (:health before)) 0) (str ", and lost " (long (- (:health before) (:health s))) " health"))
-         ".\n")))
+         "."
+         (let [n (- (long (fallen s)) (long (fallen before)))]
+           (when (pos? n) (str " " n (if (= 1 n) " monster fell" " monsters fell") " (dead).")))
+         (when-let [said @note] (reset! note nil) (str " " said))
+         "\n")))
 
 (defn told
   "What a model is told: the player's numbers (and how it moved since `before`, the state a
@@ -146,12 +160,46 @@
         (recur (inc i) (+ reward (cpp/play.doom_act (get buttons (if (pos? a) :turn-left :turn-right)) 1)))
         reward))))
 
+(def turn-degrees
+  "How far turn-left and turn-right turn."
+  30.0)
+
+(defn- turn!
+  "Turned `degrees` (left positive) a tic at a time, the angle read back each tic (Doom's
+  turning speeds up as the key is held, so tics alone don't say how far): the reward."
+  [degrees]
+  (let [start (:angle (state))
+        turned (fn [] (let [r (- (:angle (state)) start)]
+                        (loop [r r] (cond (> r 180.0) (recur (- r 360.0)) (< r -180.0) (recur (+ r 360.0)) :else r))))]
+    (loop [i 0 reward 0.0]
+      (let [left (- degrees (turned))]
+        (if (and (>= (max left (- left)) 3.0) (< i 40) (not (cpp/play.doom_finished)))
+          (recur (inc i) (+ reward (cpp/play.doom_act (get buttons (if (pos? left) :turn-left :turn-right)) 1)))
+          reward)))))
+
+(defn- use!
+  "Use pressed, then a moment for a door to move: what opened ahead said in the next turn."
+  []
+  (let [ahead (fn [] (:distance (first (filter (fn [r] (zero? (long (:angle r)))) (cpp/play.doom_rays)))))
+        before (ahead)
+        reward (+ (cpp/play.doom_act (get buttons :use) 4) (cpp/play.doom_act 0 30))
+        after (ahead)]
+    (reset! note (if (and before after (> after (+ before 32.0)))
+                   (str "The way ahead opened (" (long before) " to " (long after) ").")
+                   (str "Nothing opened ahead: use works on a door within 64 units straight ahead.")))
+    reward))
+
 (defn act!
-  "One step: the action's buttons held for its tics (attack: turned to the nearest monster in
-  view first, if there is one); the reward."
+  "One step: the action's buttons held for its tics; turn-left and turn-right turn
+  turn-degrees, attack turns to the nearest monster in view first (if there is one), use
+  says what opened; the reward."
   [action]
-  (let [aimed (if (= action :attack) (aim!) 0.0)]
-    (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) (get action-tics action step-tics)))))
+  (case action
+    :turn-left (turn! turn-degrees)
+    :turn-right (turn! (- turn-degrees))
+    :use (use!)
+    (let [aimed (if (= action :attack) (aim!) 0.0)]
+      (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get actions action []))) (get action-tics action step-tics))))))
 
 ;; A scripted player.
 
@@ -206,10 +254,10 @@
   "What a model playing Doom is told of the game."
   (str "You play Doom (Freedoom's first map), seen from the player's eyes. Find the way to the "
        "exit, and shoot the monsters that attack you. Each action holds the keys for a moment: "
-       "forward and back walk (about 50 units), turn-left and turn-right turn about 30 degrees, forward-left and "
+       "forward and back walk (about 50 units), turn-left and turn-right turn 30 degrees, forward-left and "
        "forward-right walk while turning, strafe-left and strafe-right step sideways, attack "
        "turns to the nearest monster in view and shoots it (with none in view, it shoots "
-       "straight ahead), use opens a door or "
+       "straight ahead), use opens a door within 64 units straight ahead or "
        "presses a switch right in front of you, wait does nothing. Distances are in map units: "
        "the player is 32 wide, a corridor about 128."))
 
