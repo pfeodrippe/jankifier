@@ -321,7 +321,14 @@
                                 :else ": walk to its edge, then jump-right, then right while in the air to carry over it."))))
            (some (fn [[_ dx dy]] (and (< 0 dx 3) (<= (max dy (- dy)) 1))) (dangers st))
            "On her right the ground goes on, but something that hurts is in the way."
-           :else "On her right the way is clear.")
+           ;; How far clear, and the wall after it: "clear" with a wall 5 blocks on read as a
+           ;; contradiction to an agent.
+           :else (if-let [d (first (filter (fn [dx] (solid? (at dx 0))) (range 2 13)))]
+                   (let [h (count (take-while (fn [dy] (solid? (at d (- dy)))) (range 0 8)))]
+                     (str "On her right the way is clear for " (dec d) (if (= 2 d) " block" " blocks") ", then a wall "
+                          h (if (= 1 h) " block" " blocks") " high"
+                          (if (<= h 2) " (jump-right gets over it)." " (too high to jump: look for another way).")))
+                   "On her right the way is clear."))
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right."))
          (when fall-left (str " On her left "
                               (if (= 1 fall-left)
