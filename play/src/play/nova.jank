@@ -272,6 +272,14 @@
        (when fall-behind ", and behind the top is a fall: from the top, jump-right over it, then right in the air")
        ". "))
 
+(defn- near-wall
+  "The first wall on Nova's row within 3 blocks ahead: [how many columns on, how high]."
+  [st]
+  (let [px (long (:x st)) py (feet-row st)
+        solid? (fn [dx dy] (contains? #{"#" "!" "L"} (block-char ((:map st) (+ px dx) (+ py dy)))))]
+    (when-let [d (first (filter (fn [dx] (solid? dx 0)) (range 1 4)))]
+      [d (count (take-while (fn [dy] (solid? d (- dy))) (range 0 6)))])))
+
 (defn- around
   "What is next to Nova, from the map and the objects: the dangers near her, the wall on her
   right and how high, a gap or spikes ahead on the ground, as sentences."
@@ -280,9 +288,7 @@
         at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
         solid? (fn [ch] (contains? #{"#" "!" "L"} ch))
         wall (count (take-while (fn [dy] (solid? (at 1 (- dy)))) (range 0 6)))
-        ;; The first wall on her row within 3 blocks ahead: [where, how high].
-        wall-near (when-let [d (first (filter (fn [dx] (solid? (at dx 0))) (range 1 4)))]
-                    [d (count (take-while (fn [dy] (solid? (at d (- dy)))) (range 0 6)))])
+        wall-near (near-wall st)
         gap (when (:on-ground st)
               (count (take-while (fn [dx] (= "." (at dx 1))) (range 1 6))))
         ;; A fall on her left within 4 blocks: where her ground stops (an agent backing away
@@ -391,6 +397,15 @@
                     ": it is on top of the wall ahead, coming her way, and walks off the wall's edge onto her if she waits below: high-jump-right onto the wall now, then right in the air"
                     (and (= "GOOMBA" t) (<= dy -2) wall-near (<= (second wall-near) 3) (<= 0 dx))
                     ": it is at the edge of the wall ahead, over her, about to come down onto her: step left 2 blocks, then high-jump-right onto the wall, then right in the air"
+                    ;; One walking on a 2-high wall ahead: an owl pacing one hurt agents climbing
+                    ;; onto it, and killed one. In replay, from 1 or 2 blocks back from the wall a
+                    ;; straight high-jump with a shot at its top was never hurt (18 tries) and
+                    ;; stunned it 12 times; from the wall's foot it was hurt 3 times in 9.
+                    (and (<= dy -2) wall-near (= 2 (second wall-near)) (<= 0 dx) (>= dx (dec (first wall-near)))
+                         (not (contains? unshootable t)))
+                    (str ": it is on top of the wall ahead (her shot from down here passes under it): "
+                         (when (= 1 (first wall-near)) "step left 1 block first (at the wall's foot it touches her as it comes to the edge); then, ")
+                         "facing it, high-jump (straight up), then attack: at the jump's top her shot is on its row. Again until it is stunned, then high-jump-right onto the wall")
                     ;; One walking on the wall ahead: up there it is on her row (an owl pacing a
                     ;; 2-high wall held agents for minutes; this play got past it in replay).
                     (and (<= dy -2) wall-near (pos? dx) (>= dx (first wall-near)))
@@ -405,6 +420,13 @@
                          (if (= "GOOMBA" t) ": jump onto it or over it" ": wait for it to move, or jump over it"))
                     (pos? dy) ": it is below her: don't drop onto it"
                     (every? (fn [[t]] (contains? unshootable t)) ds) ": jump over it or wait for it to pass"
+                    ;; On her row and shootable: by how far. An agent waited (eight waits) while a
+                    ;; GOOMBA 3 blocks away walked into her, as "wait for it to pass" allowed.
+                    (and (zero? dy) (= 3 (max dx (- dx))) (not (contains? unshootable t)))
+                    ": attack it now, facing it: from 3 blocks her shot stuns it (stunned, it can't hurt her and she walks through it); waiting, it may walk on into her"
+                    (and (zero? dy) (<= 1 (max dx (- dx)) 2) (not (contains? unshootable t)))
+                    (str ": too close to shoot (her shot starts past it), and waiting beside it, it may walk into her: jump over it now (jump-"
+                         (if (pos? dx) "right" "left") "), or step back to 3 blocks from it and shoot it")
                     :else ": jump over it, wait for it to pass, or attack it (a shot stuns it: stunned, it can't hurt her and she walks through it)"))
                 ;; Where the flames come from (src/enemy.s: a FIRE_WALK throws FLAMES and a
                 ;; FIRE_JUMP bounces in place making fire, each only while not stunned; FLAMES
@@ -425,7 +447,8 @@
                     (str " (her shot goes the way she faces, " (name (:facing st)) " now: face-"
                          (if (pos? dx) "right" "left") " turns her toward it where she stands)")))
                 ;; A shot starts about 2 blocks ahead of her: one closer is passed over.
-                (when (some (fn [[_ dx dy]] (and (<= 1 (max dx (- dx)) 2) (zero? dy))) ds)
+                (when (and (some (fn [[_ dx dy]] (and (<= 1 (max dx (- dx)) 2) (zero? dy))) ds)
+                           (let [[_ dx dy] (first ds)] (not (and (zero? dy) (<= 1 (max dx (- dx)) 2)))))
                   " (one 1 or 2 blocks from her on her row is too close to shoot: her shot starts past it; step back first, or jump over it)")
                 ". "))
          (cond
@@ -519,6 +542,22 @@
   she would fall in, or be hurt, which never helps. A drop to a floor is let be."
   [st action]
   (or
+   ;; A GOOMBA on the wall ahead walks off its edge onto her: an agent walked on in a planned
+   ;; list of rights after the text had said to high-jump onto the wall (see `around`).
+   (when (and (:on-ground st) (contains? #{:right :wait} action))
+     (when-let [[d h] (near-wall st)]
+       (when-let [[_ dx] (first (filter (fn [[t dx dy]] (and (= "GOOMBA" t) (<= dy -2) (<= 0 dx 3))) (dangers st)))]
+         (when (<= h 3)
+           (str "a GOOMBA on top of the wall ahead comes her way and walks off its edge onto her: "
+                (if (< dx d) "step left 2 blocks, then high-jump-right onto the wall" "high-jump-right onto the wall now")
+                ", then right in the air (landing on it flattens it).")))))
+   ;; Waiting beside one on her row (or at her head) that walks: an agent waited with a GOOMBA
+   ;; 1 block away and was hurt.
+   (when (and (= action :wait) (:on-ground st))
+     (when-let [[t dx] (first (filter (fn [[t dx dy]] (and (<= 1 (max dx (- dx)) 2) (<= -1 dy 0) (not= "FLAMES" t))) (dangers st)))]
+       (let [way (if (pos? dx) "right" "left") n (max dx (- dx))]
+         (str t " is " n (if (= 1 n) " block" " blocks") " on her " way ": waiting beside it, it walks into her and hurts her. "
+              "Jump over it now (jump-" way "), or step away from it."))))
    ;; In the air over a fall, an action that doesn't steer lets her drop in (an agent waited
    ;; after two steers and fell).
    (when (contains? #{:wait :attack :down :jump} action)
