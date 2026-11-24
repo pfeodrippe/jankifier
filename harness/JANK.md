@@ -45,6 +45,10 @@ the syntax, the data structures and most of `clojure.core` and
   ```
   `(catch :default e ...)` catches anything, but `e` is nil there: use it only
   when what was thrown doesn't matter.
+- **`first` of an empty sort ends the process**: `(first (sort []))` and
+  `(first (sort-by f []))` crash (a segmentation fault), though `(sort [])` is
+  `()`. Take `seq` first: `(first (seq (sort-by f xs)))` is nil when `xs` is
+  empty.
 - **Integer division by zero gives 0**: `(/ 1 0)` is 0, it doesn't throw.
 - **Sleeping**: `(cpp/usleep 250000)` (microseconds).
 - **`(deref f 2000 :late)` doesn't wait**: with a timeout, `deref` returns nil at
