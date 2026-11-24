@@ -192,6 +192,24 @@
 
 (defn- tenths [x] (/ (long (* 10 x)) 10.0))
 
+(defn- over-fall
+  "When Nova is in the air over a fall (nothing to land on below her column): the way to
+  ground she can steer to, [dir blocks] (dir :right or :left), or [nil nil] when none is within
+  5 columns; the way she is going first when ground is within 3 columns that way (the nearest
+  was the ledge she jumped from), else the nearest. nil when she isn't over a fall."
+  [st]
+  (when (and (not (:on-ground st)) (fall? st (long (:x st))))
+    (let [px (long (:x st))
+          going (cond (> (:vx st) 0.01) :right (< (:vx st) -0.01) :left :else (:facing st))
+          ground-at (fn [dir d] (not (fall? st (if (= dir :right) (+ px d) (- px d)))))
+          ahead (first (filter (fn [d] (ground-at going d)) (range 1 4)))
+          nearest (first (for [d (range 1 6) dir [going (if (= going :right) :left :right)]
+                               :when (ground-at dir d)]
+                           [dir d]))]
+      (cond ahead [going ahead]
+            nearest nearest
+            :else [nil nil]))))
+
 (defn- around
   "What is next to Nova, from the map and the objects: the dangers near her, the wall on her
   right and how high, a gap or spikes ahead on the ground, as sentences."
@@ -238,6 +256,12 @@
                   (if (= ch "H")
                     ": stand at it, then up climbs it. "
                     ": stand in it (its column), then up goes through it. "))))
+         ;; In the air over a fall: an agent waited after two steers and fell in.
+         (when-let [[dir d] (over-fall st)]
+           (if dir
+             (str "She is in the air over a fall (nothing below her): keep pressing " (name dir)
+                  " to reach the ground " d (if (= 1 d) " block " " blocks ") (name dir) "; waiting drops her in. ")
+             "She is in the air over a fall (nothing below her, no ground near): steer the way she was going. "))
          (when ledge "She stands on a ledge (=): down drops her through it. ")
          (when (and (:on-ground st) (= "-" (at 0 1))) "She stands on a platform (-): down doesn't drop through it. ")
          (when-let [ds (seq (dangers st))]
@@ -310,6 +334,14 @@
   map's bottom), or with a danger in her way within 3 blocks that way: she would fall in, or
   be hurt, which never helps. A drop to a floor is let be."
   [st action]
+  (or
+   ;; In the air over a fall, an action that doesn't steer lets her drop in (an agent waited
+   ;; after two steers and fell).
+   (when (contains? #{:wait :attack :down :jump} action)
+     (when-let [[dir d] (over-fall st)]
+       (when dir
+         (str "she is in the air over a fall (nothing below her): " (name action) " lets her drop into it. Press "
+              (name dir) " (ground " d (if (= 1 d) " block " " blocks ") (name dir) ") to carry over."))))
   ;; A fall's edge nearer than a step walks is walked into (an agent stepped off from a block
   ;; before the edge).
   (when-let [dir (and (:on-ground st) ({:right 1 :left -1} action))]
@@ -326,7 +358,7 @@
                  " walks into it, and it hurts her. "
                  (if (contains? unshootable t)
                    "Jump over it, or wait for it to pass."
-                   (str "Jump over it, or attack it (a shot stuns it" (when (<= n 2) "; this near, step back first: her shot starts past it") ")."))))))))
+                   (str "Jump over it, or attack it (a shot stuns it" (when (<= n 2) "; this near, step back first: her shot starts past it") ").")))))))))
 
 (defn- died?
   "Whether Nova died between `before` and `st`: her health back up while she went far back
