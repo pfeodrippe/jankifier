@@ -121,6 +121,17 @@ search of the map; no run has reached it since). The text's advice for each spot
 playing the recorded runs again from that spot with many plans of actions, and keeping the
 plan that worked across them.
 
+On NetHack (24 Nov 2026, seed 1, its Samurai; 30 minutes a run): one agent stayed on the
+first level in every run; four agents as a population reached the second level, all of
+them, in 14 to 28 minutes, and explored it for the rest of the run without finding its stairs
+down. The single agents were held by what they weren't told: the trap they had left and
+stepped back into, the stairs they stood on and lost (the map shows the @, not what it stands
+on), the columns they counted wrong, a door they tried to enter diagonally, messages they
+kept answering. The text now remembers traps and stairs, gives the way to the stairs down or
+to the nearest doorway or corridor end into the unexplored (a search of the map), tells an
+open door from a wall, and refuses a step onto a known trap or diagonally into a door. Its
+monsters are told by letter only: a fox and the pet dog are both d (the colours aren't read).
+
 How a game is told matters more than how the model is asked: a map of characters makes it
 count them, so the levels can also be told as runs of things with their positions
 (`(reset! wnw/telling {:map :runs})`, the same for Nova), with what each move from where the
