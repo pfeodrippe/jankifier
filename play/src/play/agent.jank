@@ -126,7 +126,7 @@
       (try
         (loop [i 0]
           (when (and @running (< (minutes-of) minutes) (not (and (:over g) ((:over g)))))
-            (h/ask! a (if (zero? i) first-ask "Go on playing."))
+            (h/ask! a (if (zero? i) first-ask "Go on playing: a new turn, with its own steps (the game is as you left it)."))
             ;; The turn, cut at the time, or once the game is over (a few seconds on, for the
             ;; model to read it).
             (loop [over-since nil]

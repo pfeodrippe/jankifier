@@ -117,8 +117,9 @@
 
 (defonce telling
   ;; How the level is told: :grid, a character a block; :runs, runs of the same thing with
-  ;; positions relative to Nova (no counting needed).
-  (atom {:map :grid}))
+  ;; positions relative to Nova (no counting needed: an agent counting a grid's characters
+  ;; spent a minute an action; with runs it went on at ten).
+  (atom {:map :runs}))
 
 (def harmless
   "Objects that don't hurt Nova (the others may: enemies, fire, shots)."
