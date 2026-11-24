@@ -310,15 +310,20 @@
   (contains? enemies (:name o)))
 
 (defn- threats
-  "The monsters alive that can see the player (nothing of the map between: anywhere around,
-  in view or not), within 1500: [object distance degrees], the nearest first."
+  "The monsters alive that can see the player, the nearest first: [object distance degrees].
+  Those on the screen (ViZDoom's labels: in view, so seen), and those anywhere around within
+  1500 that the line of sight reaches (to their middle, their feet and 28: one on a ledge is
+  seen over it)."
   [s]
-  (vec (sort-by second (for [o (cpp/play.doom_monsters)
-                             :when (alive? o)
-                             :let [[d a] (bearing s o)]
-                             ;; Seen at its middle (its feet and 28): one on a ledge is seen over it.
-                             :when (and (< d 1500.0) (cpp/play.doom_sees_at (:x o) (:y o) (+ (:z o) 28.0)))]
-                         [o d a]))))
+  (let [shown (for [o (:objects s) :when (alive? o) :let [[d a] (bearing s o)]] [o d a])
+        apart (fn [a b] (let [d (- a b)] (max d (- d))))
+        near (fn [o p] (< (+ (apart (:x o) (:x p)) (apart (:y o) (:y p))) 48.0))
+        sighted (for [o (cpp/play.doom_monsters)
+                      :when (and (alive? o) (not (some (fn [[p]] (near o p)) shown)))
+                      :let [[d a] (bearing s o)]
+                      :when (and (< d 1500.0) (cpp/play.doom_sees_at (:x o) (:y o) (+ (:z o) 28.0)))]
+                  [o d a])]
+    (vec (sort-by second (concat shown sighted)))))
 
 (defn- moved
   "How the player moved from `before` to `s`, as a sentence (and what the last action did:
