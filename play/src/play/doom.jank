@@ -382,6 +382,23 @@
         (neg? (:floor m)) "a floor went down (a lift or a way opening)"
         :else "a floor rose"))
 
+(defn- moved-near
+  "What moved since play.doom_mark (any sector of the map whose floor or ceiling moved: a
+  door, a lift), the nearest first: [[distance degrees change] ...]."
+  [s]
+  (vec (sort-by first (for [m (cpp/play.doom_moved)
+                            :let [[d a] (bearing s m)]]
+                        [d a m]))))
+
+(defn- moved-text
+  "What moved (moved-near's), as a sentence."
+  [moved]
+  (str "Something moved: "
+       (str/join "; " (for [[d a m] (take 3 moved)]
+                        (str (what-moved m) ", " (long d) " away, " (direction a)
+                             (when-let [t (turns a)] (str " " t)))))
+       "."))
+
 (defn- use!
   "Use pressed, then a moment for what it sets off to move (with `lift-wait`, a lift's start
   waited for: about 3 seconds): what moved (any sector of the map whose floor or ceiling
@@ -398,9 +415,7 @@
                              r
                              (recur (inc i) (+ r (cpp/play.doom_act 0 10))))))
         s (state)
-        moved (sort-by first (for [m (cpp/play.doom_moved)
-                                   :let [[d a] (bearing s m)]]
-                               [d a m]))
+        moved (moved-near s)
         door-ahead (and before (= :door (:ends before)) (< (:distance before) 64.0)
                         (some (fn [[d _ m]] (and (< d 192.0) (pos? (:ceiling m)))) moved))]
     (when (seq moved)
@@ -411,11 +426,8 @@
               "The door ahead opened."
 
               (seq moved)
-              (str "Something moved: "
-                   (str/join "; " (for [[d a m] (take 3 moved)]
-                                    (str (what-moved m) ", " (long d) " away, " (direction a)
-                                         (when-let [t (turns a)] (str " " t)))))
-                   ".")
+              (moved-text moved)
+
               (and before (:ends before) (< (:distance before) 64.0))
               (str "You pressed it, but nothing moved yet.")
               :else
@@ -474,9 +486,15 @@
       (do (reset! note (if around "No monster can see you: not fired." "No monster in view: not fired."))
           0.0)
     (let [before (state)
+          _ (cpp/play.doom_mark)
           aimed (if (= action :attack) (aim! around) 0.0)
           reward (+ aimed (cpp/play.doom_act (reduce + 0 (map buttons (get moves action []))) (get action-tics action step-tics)))
-          reward (+ reward (if settle (settled!) 0.0))]
+          reward (+ reward (if settle (settled!) 0.0))
+          moved (moved-near (state))]
+      ;; A line walked over, a shot switch: what it set off, said.
+      (when (seq moved)
+        (swap! changes inc)
+        (reset! note (moved-text moved)))
       (visit! before (state))
       reward))))
 
