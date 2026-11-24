@@ -211,6 +211,25 @@
             nearest nearest
             :else [nil nil]))))
 
+(defn- far-rise
+  "How many blocks higher than her own ground the ground across a gap on her right is: the gap
+  starting at column offset `from` (its first empty column), the ground being the first
+  column after it with something under her row's level or on it. 0 when level or lower.
+  A short jump fell short of a far side 1 higher (it rose to 3 just behind)."
+  [st from]
+  (let [px (long (:x st)) py (feet-row st)
+        at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))
+        land (first (filter (fn [dx] (not (contains? #{"." "o" "~"} (at dx 1)))) (range from (+ from 9))))]
+    (if land
+      (count (take-while (fn [dy] (not (contains? #{"." "o" "~"} (at land (- dy))))) (range 0 6)))
+      0)))
+
+(defn- jump-for
+  "The jump for a gap starting at offset `from`: high-jump-right when the ground across is
+  higher than hers, else jump-right."
+  [st from]
+  (if (pos? (far-rise st from)) "high-jump-right" "jump-right"))
+
 (defn- stairs
   "Steps up on Nova's right starting at column offset `d` (her row's solid there): the walls
   of the columns from d rise a block or two each, for 3 columns or more: [first-height
@@ -344,7 +363,9 @@
                   " (the ground at her own height is " gap (if (< gap 5) "" " or more") " blocks on: "
                   (cond (<= gap 2) "jump-right gets across" (<= gap 4) "high-jump-right gets across" :else "too far to jump across") ")."))
 
-           (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide: jump-right to cross it"
+           (and gap (pos? gap)) (str "On her right the ground stops: a gap " gap (if (= 1 gap) " block" " blocks") " wide"
+                                     (let [r (far-rise st 1)] (when (pos? r) (str ", the ground across " r (if (= 1 r) " block" " blocks") " higher than hers")))
+                                     ": " (jump-for st 1) " to cross it"
                                      (when (> gap 1) ", then right while in the air (a jump alone is short: wait in the air and she falls in)")
                                      ".")
            gap-ahead (let [[from width floor] gap-ahead]
@@ -354,9 +375,14 @@
                             (let [edge (when-not floor (fall-edge st 1))]
                               (cond
                                 (and edge (< edge (step-blocks st 1)))
-                                (str ": its edge is " (tenths edge) " blocks ahead: jump-right from here, then right while in the air (a step right would carry her over the edge).")
+                                (str ": its edge is " (tenths edge) " blocks ahead"
+                                     (let [r (far-rise st from)] (when (pos? r) (str ", and the ground across is " r (if (= 1 r) " block" " blocks") " higher than hers")))
+                                     ": " (jump-for st from) " from here, then right while in the air (a step right would carry her over the edge).")
                                 edge
-                                (str ": its edge is " (tenths edge) " blocks ahead: step right toward it (a step that would go over is not done, and said so), then jump-right from there, then right while in the air (jumping from further back falls short).")
+                                (str ": its edge is " (tenths edge) " blocks ahead"
+                                     (let [r (far-rise st from)] (when (pos? r) (str ", and the ground across is " r (if (= 1 r) " block" " blocks") " higher than hers")))
+                                     ": step right toward it (a step that would go over is not done, and said so), then " (jump-for st from)
+                                     " from there, then right while in the air (jumping from further back falls short; a jump straight up falls short too).")
                                 :else ": walk to its edge, then jump-right, then right while in the air to carry over it."))))
            (some (fn [[_ dx dy]] (and (< 0 dx 3) (<= (max dy (- dy)) 1))) (dangers st))
            "On her right the ground goes on, but something that hurts is in the way."
@@ -406,7 +432,10 @@
     (or (when-let [edge (fall-edge st dir)]
           (when (< edge (step-blocks st dir))
             (str "the ground stops " (tenths edge) " blocks on her " (name action)
-                 " over a fall (no floor below): a step " (name action) " carries her into it. Jump-" (name action)
+                 " over a fall (no floor below): a step " (name action) " carries her into it. "
+                 (if (and (= action :right) (pos? (far-rise st (inc (long edge)))))
+                   "High-jump-right (the ground across is higher)"
+                   (str "Jump-" (name action)))
                  " from here, then " (name action) " while in the air, to cross it.")))
         ;; A danger in her way (her row or her head's, within 3 blocks that way: enemies come
         ;; toward her): an agent at 1 health walked on into a GOOMBA 3 blocks away.
