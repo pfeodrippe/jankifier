@@ -132,6 +132,17 @@ to the nearest doorway or corridor end into the unexplored (a search of the map)
 open door from a wall, and refuses a step onto a known trap or diagonally into a door. Its
 monsters are told by letter only: a fox and the pet dog are both d (the colours aren't read).
 
+On Squirrel Domino (24 Nov 2026, two thinking decision players, 800 tokens each, against each
+other): told only where each placement of a pill lands, neither cleared a virus in 14 pills,
+and player 1's field filled to the top. Told also what the best placements do (the lines of a
+colour each makes, and which clear, with how many viruses), both cleared viruses from the
+seventh pill on, and player 1 won in 23 pills.
+
+On Witch n' Wiz again (24 Nov 2026), four agents as a population finished 3 rooms in 20
+minutes: one solved room 3, which held the others, and the cut spread it; a single agent had
+finished 4 in 10 minutes (23 Nov). A puzzle's room wants long thinking, and four agents share
+the model's speed.
+
 How a game is told matters more than how the model is asked: a map of characters makes it
 count them, so the levels can also be told as runs of things with their positions
 (`(reset! wnw/telling {:map :runs})`, the same for Nova), with what each move from where the
