@@ -136,6 +136,22 @@ A turn cut short (by `stop!`, `:max-tokens`, `:max-steps`, a full session)
 keeps what was made, and leaves the session well formed so that `ask!`
 continues it.
 
+When the session nears its end, the conversation's older part is replaced by a
+summary the model writes (`:compact`, `summarize` by default), the recent part
+(`:compact-keep` tokens) kept as it is. The summary is begun apart from the
+agent 4096 tokens before it is due (and once 2048 or more have been added
+since the last one): a
+session of its own writes it, and another is evaluated with it and the part
+kept, while the agent goes on (the engine batches their tokens; long
+evaluations go in pieces of 512 tokens, so that the agent's come between). At
+the start of a step, a summary that is ready takes the agent's place: what the
+agent did meanwhile is evaluated into the new session, which becomes the
+agent's. Only when the session reaches the reserve before one is ready does
+the agent wait for it. This follows Microsoft's APEC (summaries prepared in
+the background, appended rather than replacing what came after) and the
+advice to keep one compaction at a time; before, the agent stopped for a
+minute or two at each.
+
 ## A sandbox
 
 `./sandbox.sh` starts the same process inside a macOS sandbox (`sandbox-exec`,

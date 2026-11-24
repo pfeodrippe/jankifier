@@ -165,16 +165,30 @@
     (if (empty? path)
       "No new ground can be walked to from here: a lift or a switch may lead on.\n"
       (let [seen (take-while (fn [[x y]] (cpp/play.doom_sees x y)) path)
-            [x y] (if (seq seen) (last seen) (first path))
-            [_ a] (bearing s {:x x :y y})]
-        (str "Nearest new ground, walking the map: about "
-             (long (reduce + 0.0 (map (fn [[ax ay] [bx by]]
-                                        (cpp/play.sqrt (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
-                                      (cons [(:x s) (:y s)] path) path)))
-             " away; head "
-             (direction a) (when-let [t (turns a)] (str " " t))
-             (when (< (count seen) (count path)) ", then follow the way")
-             ".\n")))))
+            far (long (reduce + 0.0 (map (fn [[ax ay] [bx by]]
+                                           (cpp/play.sqrt (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
+                                         (cons [(:x s) (:y s)] path) path)))]
+        (if (seq seen)
+          (let [[x y] (last seen)
+                [_ a] (bearing s {:x x :y y})]
+            (str "Nearest new ground, walking the map: about " far " away; head "
+                 (direction a) (when-let [t (turns a)] (str " " t))
+                 (when (< (count seen) (count path)) ", then follow the way")
+                 ".\n"))
+          ;; The way's first point is round a corner: the open way (64 free or more) nearest
+          ;; its direction.
+          (let [[x y] (first path)
+                [_ a] (bearing s {:x x :y y})
+                gap (fn [r] (let [d (- (:angle r) a)
+                                  d (loop [d d] (cond (> d 180.0) (recur (- d 360.0)) (< d -180.0) (recur (+ d 360.0)) :else d))]
+                              (max d (- d))))
+                open (first (seq (sort-by gap (filter (fn [r] (>= (:distance r) 64.0)) (cpp/play.doom_rays)))))]
+            (str "Nearest new ground, walking the map: about " far " away, round a corner"
+                 (when open
+                   (let [b (:angle open)]
+                     (str "; head " (if (>= (max b (- b)) 179.0) "behind" (direction b))
+                          (when-let [t (turns b)] (str " " t)))))
+                 ", then follow the way.\n")))))))
 
 (defn- walls
   "How far the player can walk in each direction a whole number of turns away and behind

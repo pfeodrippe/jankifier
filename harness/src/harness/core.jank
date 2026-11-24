@@ -234,11 +234,16 @@
      (atom (assoc a :effort-said false :start start)))))
 
 (defn close!
-  "The agent's session freed. A turn in progress is stopped first."
+  "The agent's session freed (and a compaction's being made apart, once it is done). A turn
+  in progress is stopped first."
   [a]
   (swap! a assoc :stop true)
   (when-let [turn (:turn @a)]
     (deref turn))
+  (when-let [c (:compaction @a)]
+    (when-let [s (:session @c)]
+      (ink/free! s))
+    (swap! a assoc :compaction nil))
   (when (ink/session? (:session @a))
     (ink/free! (:session @a)))
   nil)
@@ -525,7 +530,7 @@
 
 ;; A turn.
 
-(declare compact! compaction-due?)
+(declare compact! compaction-due? compaction-soon? background! pending! fill!)
 
 (defn- steps-note
   "What the model is told of its steps, after the last call of a few of them (the turn's
@@ -543,9 +548,13 @@
   speaks again, until it ends a step without calling anything."
   [a]
   (loop [step 0]
-    ;; Near the session's end: the older part of the conversation summarized first.
-    (when (compaction-due? a 0)
-      (compact! a :threshold))
+    ;; A compaction begun apart and ready: put in place. Near the session's end: one is
+    ;; waited for (or made now); within twice the reserve, one is begun apart, the agent
+    ;; going on meanwhile.
+    (pending! a false)
+    (cond
+      (compaction-due? a 0) (compact! a :threshold)
+      (and (nil? (:compaction @a)) (compaction-soon? a)) (background! a))
     (swap! a (fn [v] (assoc v :state :thinking :step-count (inc (:step-count v)))))
     (let [[frames why] (speak! a)
           ;; (A call cut short is not run.)
@@ -647,7 +656,7 @@
                                              (frame v :system nil :text
                                                     (str "Thinking effort level: " (:effort v))))
                                            (frame v :user nil :text text)))]
-                     (ink/eval! (:session v) said)
+                     (fill! (:session v) said)
                      (swap! a assoc :effort-said true)
                      (turn! a))
                    (catch jank.runtime.object_ref e (failed! a (or (ex-message e) (str e))))
@@ -731,51 +740,63 @@
     (boolean (and (:compact v)
                   (> (+ (ink/position s) more) (- (:context (ink/info s)) (:compact-reserve v)))))))
 
+(defn- given-for
+  "Every token the model is given for `view`, from the session's start: the tools and system
+  text, the effort, then the view."
+  [v view]
+  (vec (concat (:start v)
+               (frame v :system nil :text (str "Thinking effort level: " (:effort v)))
+               (view-tokens v view))))
+
 (defn given
   "Every token the model is given for the agent's :view, from the session's start: the tools
-  and system text, the effort, then the view (what `compact!` makes the session again from)."
+  and system text, the effort, then the view (what a compaction makes the session again
+  from)."
   [a]
   (let [v @a]
-    (vec (concat (:start v)
-                 (frame v :system nil :text (str "Thinking effort level: " (:effort v)))
-                 (view-tokens v (:view v))))))
+    (given-for v (:view v))))
 
-(defn- rebuild!
-  "The session made again for :view (`given`)."
-  [a]
-  (let [v @a
-        s (:session v)
-        tokens (given a)]
-    (ink/reset! s)
-    (ink/eval! s tokens)
-    (count tokens)))
+(def ^:private fill-chunk
+  ;; Tokens evaluated at a time when filling a session: the model is one, and an evaluation
+  ;; holds it; in pieces, another session's tokens (the agent's, while a compaction is made
+  ;; beside it) come between.
+  512)
 
-(defn compact!
-  "The conversation's older part replaced by a summary (`reason` :threshold, :overflow or
-  :manual), the recent part (about :compact-keep tokens, whole steps) kept as it is. The
-  agent's :compact function is given {:entries (the part to summarize) :previous (the last
-  summary, or nil) :tokens-before :reason} and returns the summary's text, or nil to leave
-  the conversation as it is. Returns whether it compacted."
-  [a reason]
-  (let [v @a
-        f (:compact v)
+(defn fill!
+  "`tokens` evaluated into session `s`, in pieces of fill-chunk."
+  [s tokens]
+  (doseq [piece (partition-all fill-chunk tokens)]
+    (ink/eval! s (vec piece))))
+
+(defn- prepared
+  "A compaction of the agent's view as it is in `v` (`reason` :threshold, :soon, :overflow or
+  :manual), made apart from the agent's own session: the older part summarized by its
+  :compact function (given {:entries :previous :tokens-before :reason}), the recent part
+  (about :compact-keep tokens, whole steps; half as many when that would keep every step)
+  kept, and a new session evaluated with them.
+  {:entry :kept :session :upto (the view's length it was made from) :began} or {:failed
+  :began}, or nil when there is nothing to summarize."
+  [a v reason]
+  (let [f (:compact v)
         view (:view v)
         previous (when (= :compacted (:role (first view))) (first view))
         rest-view (if previous (vec (rest view)) view)
         steps (steps-of rest-view)
         sizes (mapv (fn [st] (count (view-tokens v st))) steps)
-        ;; The first step kept: walking back from the end until :compact-keep tokens.
-        kept-from (loop [i (count steps) total 0]
-                    (if (and (pos? i) (< (+ total (nth sizes (dec i))) (:compact-keep v)))
-                      (recur (dec i) (+ total (nth sizes (dec i))))
-                      i))
+        ;; The first step kept: walking back from the end until `keep` tokens; when that keeps
+        ;; every step, half as many (else nothing is summarized and the session fills up).
+        kept-from (loop [keep (:compact-keep v)]
+                    (let [from (loop [i (count steps) total 0]
+                                 (if (and (pos? i) (< (+ total (nth sizes (dec i))) keep))
+                                   (recur (dec i) (+ total (nth sizes (dec i))))
+                                   i))]
+                      (if (and (zero? from) (> keep 512))
+                        (recur (quot keep 2))
+                        from)))
         summarized (vec (apply concat (take kept-from steps)))
         kept (vec (apply concat (drop kept-from steps)))]
-    (if (or (nil? f) (empty? summarized))
-      false
-      (let [state (:state v)
-            _ (swap! a assoc :state :compacting :live {:kind :tool :name "compaction" :text ""})
-            began (clock a)
+    (when (and f (seq summarized))
+      (let [began (clock a)
             tokens-before (ink/position (:session v))
             said (try
                    (f a {:entries summarized :previous (:text previous) :tokens-before tokens-before :reason reason})
@@ -784,20 +805,87 @@
                    (catch cpp/std.exception e {:failed (str (cpp/.what e))})
                    (catch :default _ {:failed "the compaction threw something jank does not say"}))]
         (if-not (and (string? said) (seq (str/trim said)))
-          (do (recorded! a {:role :compacted :failed true :reason reason
-                            :text (if (map? said) (:failed said) "the compaction gave no summary")
-                            :began began :ended (clock a)})
-              (swap! a assoc :state state :live nil)
-              false)
+          {:failed (if (map? said) (:failed said) "the compaction gave no summary") :began began :reason reason}
           (let [e {:role :compacted :text (str/trim said) :reason reason
                    :summarized (count summarized) :kept (count kept) :tokens-before tokens-before
-                   :began began}]
-            (swap! a assoc :view (vec (cons e kept)))
-            (let [tokens-after (rebuild! a)
-                  e (assoc e :tokens-after tokens-after :ended (clock a))]
-              (swap! a (fn [v] (assoc v :view (vec (cons e kept)) :state state :live nil)))
-              (recorded! a e)
-              true)))))))
+                   :began began}
+                s (ink/session (:model v) (:context (ink/info (:session v))))]
+            (when-let [depth (:model (:draft v))]
+              (ink/draft-model! s depth))
+            (fill! s (given-for v (vec (cons e kept))))
+            {:entry e :kept kept :session s :upto (count view) :began began}))))))
+
+(defn- merge!
+  "Compaction `c` (prepared's) put in place: what the agent did since it was begun (whole
+  steps, after the view it was made from) evaluated into its session, which becomes the
+  agent's, the old one freed. Returns whether it compacted."
+  [a c]
+  (cond
+    (nil? c) false
+
+    (:failed c)
+    (do (recorded! a {:role :compacted :failed true :reason (:reason c) :text (:failed c)
+                      :began (:began c) :ended (clock a)})
+        false)
+
+    :else
+    (let [v @a
+          since (subvec (:view v) (min (:upto c) (count (:view v))))
+          s (:session c)]
+      (fill! s (view-tokens v since))
+      (let [old (:session v)
+            e (assoc (:entry c) :tokens-after (ink/position s) :ended (clock a))]
+        (swap! a assoc :session s :view (vec (concat [e] (:kept c) since)) :compacted-at (ink/position s))
+        (ink/free! old)
+        (recorded! a e)
+        true))))
+
+(def ^:private compact-early
+  ;; Tokens before a compaction is due that one is begun apart: the agent adds a few thousand
+  ;; while the summary is written (about a minute).
+  4096)
+
+(defn- compaction-soon?
+  "Whether a compaction should be begun apart from the agent, to be ready before it is due:
+  the session within compact-early of the reserve, and 2048 tokens or more added since the
+  last one (else a small session compacts again and again, each time for little)."
+  [a]
+  (let [v @a
+        s (:session v)
+        at (ink/position s)]
+    (boolean (and (:compact v)
+                  (> at (- (:context (ink/info s)) (:compact-reserve v) compact-early))
+                  (> at (+ (or (:compacted-at v) 0) 2048))))))
+
+(defn- background!
+  "A compaction begun apart from the agent, which goes on meanwhile (one at a time)."
+  [a]
+  (let [v @a]
+    (swap! a assoc :compaction (future (prepared a v :soon)))))
+
+(defn- pending!
+  "The compaction begun apart, put in place: waited for when `wait`, else only when it is
+  ready. Returns whether it compacted."
+  [a wait]
+  (when-let [c (:compaction @a)]
+    (when (or wait (realized? c))
+      (swap! a assoc :compaction nil)
+      (merge! a @c))))
+
+(defn compact!
+  "The conversation's older part replaced by a summary (`reason` :threshold, :overflow or
+  :manual), the recent part (about :compact-keep tokens, whole steps) kept as it is (see
+  `prepared`). One begun apart is waited for and put in place instead. The agent shows
+  :compacting meanwhile. Returns whether it compacted."
+  [a reason]
+  (let [state (:state @a)]
+    (swap! a assoc :state :compacting :live {:kind :tool :name "compaction" :text ""})
+    (try
+      (if (:compaction @a)
+        (pending! a true)
+        (merge! a (prepared a @a reason)))
+      (finally
+        (swap! a assoc :state state :live nil)))))
 
 ;; The default compaction: the model summarizes the older part, as pi and opencode have it
 ;; do, in a fixed form, from a transcript of it (each tool's output cut to 2000 characters).
@@ -956,7 +1044,9 @@
     (swap! a assoc :entries entries :view view :effort-said true :notes (:notes r)
            :generated (or (:generated r) 0) :seconds (or (:seconds r) 0.0)
            :step-count (count (filter (fn [e] (= :user (:role e))) entries)))
-    (rebuild! a)
+    (let [s (:session @a)]
+      (ink/reset! s)
+      (fill! s (given a)))
     a))
 
 (defn status
