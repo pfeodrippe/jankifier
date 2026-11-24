@@ -121,6 +121,7 @@ conversation.
 | `:max-tokens` | tokens a step may generate (4096) |
 | `:max-thinking` | tokens one stretch of thinking may take (1536): at that the harness closes the thinking, and the model goes on from what it has thought. Thinking that says a sentence (of 30 characters or more) three times is closed the same way |
 | `:max-steps` | steps a turn may take: a step is the model speaking, then its calls (24) |
+| `:summary-result-chars`, `:summary-thinking-chars` | how much of each tool result (2000) and each stretch of thinking (all) a compaction's summary is written from: less makes it sooner (a game's results are its state, soon old: the game agent uses 400 of each) |
 
 | | |
 |---|---|

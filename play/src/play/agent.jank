@@ -154,7 +154,10 @@
   [g m {:keys [effort context max-steps max-thinking temperature seed]}]
   (h/agent m {:tools (tools g) :system (str (:rules g) guidance) :effort effort :context context
               :max-steps max-steps :max-thinking max-thinking
-              :sampling {:temperature temperature :seed seed}}))
+              :sampling {:temperature temperature :seed seed}
+              ;; A game's results are its state, soon old: the summary is written from less
+              ;; of them, and of the thinking, so that it is ready before the session fills.
+              :summary-result-chars 400 :summary-thinking-chars 400}))
 
 (def ^:private defaults
   {:minutes 10 :effort :medium :context 32768 :max-steps 40 :max-thinking 1200 :temperature 1.0 :seed 1})

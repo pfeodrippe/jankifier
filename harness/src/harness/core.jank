@@ -185,6 +185,9 @@
                  16384, at most a quarter of it)
     :compact-keep    recent tokens kept as they are beside the summary (15000, at most 20%
                  of the context: the summary is ready only after the agent has added more)
+    :summary-result-chars, :summary-thinking-chars  how much of each tool result (2000) and
+                 of each stretch of thinking (all) the summary is written from: less is faster
+                 (a game's results are its state, soon old)
     :draft       drafting (inkling.core/speculate!): from the context, {:least 6 :most 15}
                  by default, nil off; with :model K also with the draft model, up to K
                  tokens a check (inkling.core/draft-model!). The tokens are the same either
@@ -194,7 +197,8 @@
   The tools and the system text are evaluated now, so the first question starts from them."
   ([m] (agent m {}))
   ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry
-              obligations max-checks compact-reserve compact-keep draft] :as opts}]
+              obligations max-checks compact-reserve compact-keep draft summary-result-chars
+              summary-thinking-chars] :as opts}]
    (let [tools (mapv tool tools)
          ids (into {} (map (fn [[k piece]] [k (ink/token-id m piece)]) pieces))
          size (or context 16384)
@@ -214,6 +218,8 @@
             :compact-reserve (or compact-reserve
                                  (long (min (* 0.25 size) (max 16384.0 (* 0.15 size)))))
             :compact-keep (or compact-keep (long (min 15000.0 (* 0.2 size))))
+            :summary-result-chars (or summary-result-chars 2000)
+            :summary-thinking-chars summary-thinking-chars
             ;; :entries is the whole conversation; :view what the model sees of it (the
             ;; same, until a compaction puts a summary in place of its older part).
             :entries [] :view [] :state :idle :live nil :stop false :turn nil
@@ -938,20 +944,22 @@
 
 (defn transcript
   "Entries as text for a summary: a line a kind, so that it reads as a record, not as a
-  conversation to go on with."
-  [entries]
+  conversation to go on with. A tool's result is cut to `result-chars` (2000), the model's
+  thinking to `thinking-chars` (when given)."
+  ([entries] (transcript entries {}))
+  ([entries {:keys [result-chars thinking-chars] :or {result-chars 2000}}]
   (str/join "\n\n"
             (keep (fn [e]
                     (case (:role e)
                       :user (str "[Person]: " (:text e))
-                      :thinking (str "[Model thinking]: " (:text e))
+                      :thinking (str "[Model thinking]: " (if thinking-chars (clipped (:text e) thinking-chars) (:text e)))
                       :model (str "[Model]: " (:text e))
                       :call (str "[Model called]: " (:name e) " " (json/write (:args e)))
-                      :result (str "[Tool result]: " (clipped (:text e) 2000))
+                      :result (str "[Tool result]: " (clipped (:text e) result-chars))
                       :check (when-not (:passed e) (str "[Harness]: " (:text e)))
                       :compacted (str "[Earlier summary]:\n" (:text e))
                       nil))
-                  entries)))
+                  entries))))
 
 (defn summarize
   "The default :compact: a summary of `entries` written by the agent's own model, in a
@@ -971,7 +979,8 @@
             (str (if previous
                    (str "An earlier summary of this work:\n\n" previous "\n\nWhat happened since:\n\n")
                    "The work so far:\n\n")
-                 (transcript entries)
+                 (transcript entries {:result-chars (or (:summary-result-chars v) 2000)
+                                      :thinking-chars (:summary-thinking-chars v)})
                  "\n\n"
                  (if previous
                    "Bring the earlier summary up to date with what happened since, into one summary. Newer events take precedence; keep what is still true."
