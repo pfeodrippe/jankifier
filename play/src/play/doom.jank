@@ -36,9 +36,10 @@
 
 (def action-tics
   "Actions held longer than step-tics (measured: walking builds up speed, 4 tics move 0 to 3
-  units and 8 about 34; turning too, 8 tics turn 16 degrees and 12 about 33)."
+  units and 8 about 34; turning too, 8 tics turn 16 degrees and 12 about 33; the pistol fires
+  once in 14 tics every time, in 8 half the time, in 16 sometimes twice)."
   {:forward 12 :back 12 :strafe-left 12 :strafe-right 12 :forward-left 12 :forward-right 12
-   :turn-left 10 :turn-right 10 :attack 8})
+   :turn-left 10 :turn-right 10 :attack 14})
 
 (defonce st (atom {}))
 
