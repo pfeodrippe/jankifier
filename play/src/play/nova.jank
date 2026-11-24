@@ -219,6 +219,15 @@
            :else "On her right the way is clear.")
          (when spikes (str " Spikes " spikes (if (= 1 spikes) " block" " blocks") " to her right.")))))
 
+(defn caution
+  "Why planned action `action` should not be done now (nil: it may be): a walk right on the
+  ground with the ground stopping right ahead (a gap: she would fall in)."
+  [st action]
+  (let [px (long (:x st)) py (feet-row st)
+        at (fn [dx dy] (block-char ((:map st) (+ px dx) (+ py dy))))]
+    (when (and (= action :right) (:on-ground st) (= "." (at 1 1)) (= "." (at 2 1)))
+      "the ground stops right ahead (a gap): jump-right, then right while in the air.")))
+
 (defn- moved
   "How far Nova went from `before` to `st`, as a sentence (or that she died and starts again)."
   [before st]

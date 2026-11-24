@@ -39,6 +39,8 @@
           :progress (fn [s] {:kills (long (:kills s)) :health (long (:health s)) :items (long (:items s))
                              :x (long (:x s)) :y (long (:y s))})}
    :nova {:start! #'nova/start! :state #'nova/state :told #'nova/told :act! #'nova/act! :version #'nova/version
+          ;; A planned walk right stops at the edge of a gap (agents walked off it mid-plan).
+          :caution #'nova/caution
           :actions nova/model-actions :rules nova/rules :st #'nova/st :watch! #'nova/watch!
           :same? (fn [a b] (and (= (:x a) (:x b)) (= (:y a) (:y b))))
           :progress (fn [s] {:x (/ (long (* 10 (:x s))) 10.0) :health (:health s)})}})
@@ -80,11 +82,21 @@
               (loop [left names said []]
                 (if (or (empty? left) (not @running))
                   (str (str/join "\n" said) "\n\nThe game now:\n" (told (state) nil))
-                  (let [k (keyword (str/trim (str (first left))))]
-                    (if-not (contains? allowed k)
+                  (let [k (keyword (str/trim (str (first left))))
+                        ;; A game's caution: a planned action not done, and why (an action
+                        ;; planned before the game said what it says now).
+                        wary (when (and (:caution g) (seq said)) ((:caution g) (state) k))]
+                    (cond
+                      wary
+                      (str (str/join "\n" (conj said (str (name k) ": not done: " wary " Stopped here.")))
+                           "\n\nThe game now:\n" (told (state) nil))
+
+                      (not (contains? allowed k))
                       (str (str/join "\n" (conj said (str (name k) ": not an action (the actions: "
                                                           (str/join ", " (map name actions)) "); stopped here.")))
                            "\n\nThe game now:\n" (told (state) nil))
+
+                      :else
                       (let [before (state)
                             seen (told before nil)
                             _ (act! k)
