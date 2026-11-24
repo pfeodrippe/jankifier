@@ -32,7 +32,7 @@
    :doom {:start! #'doom/start! :state #'doom/state :told #'doom/told :act! #'doom/act! :version #'doom/version
           ;; Why the game is over, or nil: the agent's run ends there.
           :over #'doom/over
-          :actions doom/model-actions :rules doom/rules :st #'doom/st :watch! #'doom/watch!
+          :actions doom/model-actions :rules #'doom/rules :st #'doom/st :watch! #'doom/watch!
           ;; A shot changes the ammo: only a step that changes none of these changed nothing.
           :same? (fn [a b] (= (select-keys a [:x :y :angle :health :ammo :kills :changes])
                               (select-keys b [:x :y :angle :health :ammo :kills :changes])))
@@ -152,7 +152,11 @@
 (defn- agent-of
   "A game agent on model `m` with `opts` (play!'s)."
   [g m {:keys [effort context max-steps max-thinking temperature seed]}]
-  (h/agent m {:tools (tools g) :system (str (:rules g) guidance) :effort effort :context context
+  (h/agent m {:tools (tools g)
+              ;; Rules as text, or a function of none (a game whose rules depend on where it is
+              ;; played: Doom's scenario).
+              :system (str (let [r (:rules g)] (if (string? r) r (r))) guidance)
+              :effort effort :context context
               :max-steps max-steps :max-thinking max-thinking
               :sampling {:temperature temperature :seed seed}
               ;; A game's results are its state, soon old: the summary is written from less

@@ -291,11 +291,13 @@ namespace play
 
   // Doom.
 
-  inline object_ref doom_open(object_ref const engine, object_ref const wad, object_ref const map,
+  inline object_ref doom_open(object_ref const engine, object_ref const wad, object_ref const scenario,
+                              object_ref const map, object_ref const skill, object_ref const timeout,
                               object_ref const seed, object_ref const width)
   {
     char error[1024]{};
-    return said(play_doom_open(to_std(engine).c_str(), to_std(wad).c_str(), to_std(map).c_str(),
+    return said(play_doom_open(to_std(engine).c_str(), to_std(wad).c_str(), to_std(scenario).c_str(),
+                               to_std(map).c_str(), static_cast<int>(to_int(skill)), static_cast<int>(to_int(timeout)),
                                static_cast<unsigned>(to_int(seed)), static_cast<int>(to_int(width)), error,
                                sizeof error),
                 error);
@@ -397,12 +399,21 @@ namespace play
     return play_doom_sees(rt::to_real(x), rt::to_real(y)) ? object_ref{ rt::jank_true } : object_ref{ rt::jank_false };
   }
 
-  // [[x y] ...]: the way to the nearest sector the player hasn't stood in, the middles of the
-  // lines it crosses; empty when there is none.
-  inline object_ref doom_frontier()
+  // [[x y] ...]: the way to the nearest sector the player hasn't stood in nor been near (the
+  // squares of `visited`, [column row] each), the middles of the lines it crosses; empty when
+  // there is none.
+  inline object_ref doom_frontier(object_ref const visited, object_ref const cell)
   {
+    std::vector<int> squares;
+    for(auto it(rt::seq(visited)); it != rt::jank_nil; it = rt::next(it))
+    {
+      auto const sq(rt::first(it));
+      squares.push_back(static_cast<int>(rt::to_int(rt::first(sq))));
+      squares.push_back(static_cast<int>(rt::to_int(rt::second(sq))));
+    }
     std::vector<double> out(2 * 512);
-    int const n(play_doom_frontier(out.data(), static_cast<int>(out.size())));
+    int const n(play_doom_frontier(squares.data(), static_cast<int>(squares.size() / 2), rt::to_real(cell), out.data(),
+                                   static_cast<int>(out.size())));
     object_ref list{ rt::obj::persistent_vector::empty() };
     for(int i{}; i < n; ++i)
     {

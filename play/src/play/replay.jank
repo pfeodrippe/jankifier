@@ -71,6 +71,8 @@ namespace play_replay_native
    :nethack {:title "NetHack" :start! #'nethack/start! :act! #'nethack/act! :stop! #'nethack/stop! :picture #'nethack/picture
              :play-model! #'nethack/play-model! :decisions #'nethack/decisions :saves false}
    :doom {:title "Doom" :start! #'doom/start! :act! #'doom/act! :stop! #'doom/stop! :picture #'doom/picture
+          ;; Where it was played (the scenario), kept and started from.
+          :setting #'doom/setting :start-with #'doom/start-with!
           :version #'doom/version :acts {1 #'doom/act-v1! 2 #'doom/act-v2! 3 #'doom/act-v3! 4 #'doom/act-v4! 5 #'doom/act-v5! 6 #'doom/act-v6! 7 #'doom/act-v7! 8 #'doom/act!}
           :play-model! #'doom/play-model! :decisions #'doom/decisions :conversation #'doom/conversation
           :saves false}
@@ -92,7 +94,9 @@ namespace play_replay_native
   ([game decisions about]
    (cpp/play_replay_native.make_dirs folder)
    (let [path (str folder "/" (name game) "-" (cpp/play_replay_native.stamp) ".edn")]
-     (spit path (pr-str {:game game :about (assoc about :version (deref-version game))
+     (spit path (pr-str {:game game
+                         :about (merge (when-let [f (get-in games [game :setting])] (f))
+                                       (assoc about :version (deref-version game)))
                          :steps (vec decisions)}))
      path)))
 
@@ -128,13 +132,19 @@ namespace play_replay_native
 
 (declare act-of)
 
+(defn- start-as!
+  "Recording `r`'s game started where it was played (the game's :start-with, given the
+  recording's :about), else from its start: nil, or what went wrong."
+  [r]
+  (let [{:keys [start! start-with]} (get games (:game r))]
+    (if start-with (start-with (:about r)) (start!))))
+
 (defn catch-up!
   "Recording `r` (or a file's path) played again from its start without being shown: each
   step's action with the version it was played with; the game left where it ended. r."
   [r]
-  (let [r (if (string? r) (read-string (slurp r)) r)
-        {:keys [start!]} (get games (:game r))]
-    (when-let [failed (start!)]
+  (let [r (if (string? r) (read-string (slurp r)) r)]
+    (when-let [failed (start-as! r)]
       (throw (ex-info (str "the game didn't start: " failed) {})))
     (doseq [step (:steps r)]
       ((act-of r step) (:action step)))
@@ -171,13 +181,12 @@ namespace play_replay_native
   "To step `i` (go!), the conversation moved there too when `push`."
   [i push]
   (let [{:keys [game steps saves at]} @replaying
-        {:keys [start!]} (get games game)
         act! (act-of @replaying)
         i (max 0 (min i (dec (count steps))))
         known (dec (count @saves))]
     (cond
       (false? (get-in games [game :saves]))
-      (let [from (if (< i at) (do (start!) 0) at)]
+      (let [from (if (< i at) (do (start-as! @replaying) 0) at)]
         (doseq [k (range from i)]
           ((act-of @replaying (get steps k)) (:action (get steps k)))))
 
@@ -209,8 +218,8 @@ namespace play_replay_native
   [path]
   (reset! running false)
   (let [r (read-string (slurp path))
-        {:keys [start! title]} (get games (:game r))]
-    (when-let [failed (start!)]
+        {:keys [title]} (get games (:game r))]
+    (when-let [failed (start-as! r)]
       (throw (ex-info (str "the game didn't start: " failed) {})))
     (let [conversation (str/replace path #"\.edn$" ".agent.edn")
           conversation (when (and (:agent (:about r)) (cpp/play_replay_native.exists conversation)) conversation)]

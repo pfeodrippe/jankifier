@@ -18,6 +18,36 @@
 (def engine (p/vendor "ViZDoom" "build" "bin" "vizdoom.app" "Contents" "MacOS" "vizdoom"))
 (def wad (p/vendor "ViZDoom" "src" "freedoom2.wad"))
 
+(def scenarios
+  "Where Doom is played: Freedoom's MAP01, or one of ViZDoom's scenarios (made to test players:
+  a goal and a time limit, in tics; picking up the goal ends the episode). Each with its skill
+  (0: ViZDoom's own) and its goal as the player is told it."
+  {:map01 {:map "map01" :skill 0 :timeout 0
+           :title "Freedoom's first map"
+           :goal "Find the way to the exit, and shoot the monsters that attack you."}
+   :my-way-home {:scenario (p/vendor "ViZDoom" "scenarios" "my_way_home.wad") :map "map01" :skill 5 :timeout 2100
+                 :title "a maze (ViZDoom's my_way_home)" :goal-item "GreenArmor"
+                 :goal (str "Find the green armor (GreenArmor) somewhere in this maze and walk onto it: "
+                            "picking it up wins. There are no monsters. You have 2100 tics (60 seconds of "
+                            "game time).")}
+   :deadly-corridor {:scenario (p/vendor "ViZDoom" "scenarios" "deadly_corridor.wad") :map "map01" :skill 5
+                     :timeout 2100 :title "a corridor (ViZDoom's deadly_corridor)" :goal-item "GreenArmor"
+                     :goal (str "Get to the green armor (GreenArmor) at the end of the corridor and walk onto "
+                                "it: picking it up wins. Monsters on both sides shoot at you; at the hardest "
+                                "skill a few hits kill you. You have 2100 tics (60 seconds of game time).")}})
+
+(defonce chosen
+  ;; The scenario start! plays (scenario! chooses it).
+  (atom :map01))
+
+(defn scenario!
+  "The scenario start! plays from now on (a key of `scenarios`)."
+  [k]
+  (when-not (contains? scenarios k)
+    (throw (ex-info (str "no Doom scenario " k) {:scenarios (keys scenarios)})))
+  (reset! chosen k))
+
+
 ;; The buttons, as play.h orders them.
 (def buttons {:forward 1 :back 2 :turn-left 4 :turn-right 8 :attack 16 :use 32 :strafe-left 64 :strafe-right 128
               :speed 256})
@@ -169,7 +199,7 @@
   "Which way the nearest part of the map (a sector) the player hasn't stood in is, walking the
   map (as an automap would show it), as a line."
   [s]
-  (let [path (cpp/play.doom_frontier)]
+  (let [path (cpp/play.doom_frontier (vec @visited) cell)]
     (if (empty? path)
       "No new ground can be walked to from here: a lift or a switch may lead on.\n"
       (let [seen (take-while (fn [[x y]] (cpp/play.doom_sees x y)) path)
@@ -279,8 +309,11 @@
   the level: in Freedoom's MAP01, one where the player stands with 10 health or less)."
   []
   (when (cpp/play.doom_finished)
-    (let [s (state)]
+    (let [s (state)
+          {:keys [goal-item timeout]} (get scenarios @chosen)]
       (cond (pos? (:dead s 0)) "You died."
+            (and (pos? timeout) (>= (:tic s 0) timeout)) "Time ran out."
+            goal-item (str "You won: you picked up the " goal-item ".")
             (some (fn [e] (< (first (bearing s e)) 96.0)) (cpp/play.doom_exits))
             "You finished the level: you reached the exit."
             :else "The level ended, but not at its exit: a floor ended it (some do when your health is 10 or less)."))))
@@ -336,17 +369,31 @@
                            [o d a])))))
 
 (defn start!
-  "Freedoom's MAP01 with `seed`: nil, or what went wrong."
+  "The chosen scenario (Freedoom's MAP01 unless scenario! said another) with `seed`: nil, or
+  what went wrong."
   ([] (start! 1))
   ([seed]
-   (or (cpp/play.doom_open engine wad "map01" seed 320)
+   (let [{:keys [scenario map skill timeout]} (get scenarios @chosen)]
+     (or (cpp/play.doom_open engine wad (or scenario "") map skill timeout seed 320)
        (let [s (state)]
          ;; Nothing said of a game before this one.
          (reset! note nil)
          (reset! visited #{})
          (visit! s s)
          (reset! st {:step 0 :told (told)})
-         nil))))
+         nil)))))
+
+(defn setting
+  "What a recording keeps of where it was played (the scenario)."
+  []
+  {:scenario @chosen})
+
+(defn start-with!
+  "The game started as a recording's `about` says (its scenario; MAP01 for those before
+  scenarios)."
+  [about]
+  (scenario! (:scenario about :map01))
+  (start!))
 
 (defn- aim!
   "Turned toward the nearest monster a tic at a time (each turn read back: the nearest in view,
@@ -589,10 +636,11 @@
 
 ;; A model playing.
 
-(def rules
-  "What a model playing Doom is told of the game."
-  (str "You play Doom (Freedoom's first map), seen from the player's eyes. Find the way to the "
-       "exit, and shoot the monsters that attack you. Each action holds the keys for a moment: "
+(defn rules
+  "What a model playing Doom is told of the game (the chosen scenario's)."
+  []
+  (str "You play Doom (" (:title (get scenarios @chosen)) "), seen from the player's eyes. "
+       (:goal (get scenarios @chosen)) " Each action holds the keys for a moment: "
        "forward and back walk (about 100 units: each move is waited out until you stop), turn-left and "
        "turn-right turn 30 degrees, forward-left and "
        "forward-right walk ahead and to the side at once, without turning, run runs ahead (about "

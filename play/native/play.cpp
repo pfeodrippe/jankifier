@@ -880,8 +880,8 @@ extern "C"
 
   // Doom.
 
-  int play_doom_open(char const *engine, char const *wad, char const *map, unsigned seed, int width, char *error,
-                     int size)
+  int play_doom_open(char const *engine, char const *wad, char const *scenario, char const *map, int skill,
+                     int timeout, unsigned seed, int width, char *error, int size)
   {
     try
     {
@@ -896,7 +896,15 @@ extern "C"
       auto game(std::make_unique<vizdoom::DoomGame>());
       game->setViZDoomPath(engine);
       game->setDoomGamePath(wad);
+      if(scenario && *scenario)
+      {
+        game->setDoomScenarioPath(scenario);
+      }
       game->setDoomMap(map);
+      if(skill > 0)
+      {
+        game->setDoomSkill(skill);
+      }
       game->setScreenResolution(width >= 640 ? vizdoom::RES_640X480 : vizdoom::RES_320X240);
       game->setScreenFormat(vizdoom::RGB24);
       game->setWindowVisible(false);
@@ -907,7 +915,7 @@ extern "C"
       game->setRenderHud(true);
       game->setAvailableButtons(doom_buttons);
       game->setAvailableGameVariables(doom_variables);
-      game->setEpisodeTimeout(0);
+      game->setEpisodeTimeout(static_cast<unsigned>(std::max(0, timeout)));
       game->setSeed(seed);
       game->setMode(vizdoom::PLAYER);
       game->init();
@@ -1034,39 +1042,40 @@ extern "C"
     return 1;
   }
 
-  int play_doom_frontier(double *out, int max)
+  int play_doom_frontier(int const *visited, int n, double const cell, double *out, int max)
   {
     if(!doom_last)
     {
       return 0;
     }
     auto const &sectors(doom_last->sectors);
-    // A sector worth going to: a room or a corridor (its box at least 64 a side and 32768 in
-    // area), not a lighting patch, a step or an alcove the player passes by.
+    std::set<std::pair<long long, long long>> near;
+    for(int i{}; i < n; ++i)
+    {
+      near.insert({ visited[2 * i], visited[2 * i + 1] });
+    }
+    // A sector worth going to: one the player hasn't stood in, nor been near (its middle in a
+    // square the player has been around), and big enough to walk into (its box at least 64 a
+    // side); or a teleporter's pad (it carries the player elsewhere).
     std::vector<bool> worth(sectors.size());
     for(size_t i{}; i < sectors.size(); ++i)
     {
       double x0{ 1e18 }, y0{ 1e18 }, x1{ -1e18 }, y1{ -1e18 };
+      bool pad{};
       for(auto const &l : sectors[i].lines)
       {
         x0 = std::min({ x0, l.x1, l.x2 });
         y0 = std::min({ y0, l.y1, l.y2 });
         x1 = std::max({ x1, l.x1, l.x2 });
         y1 = std::max({ y1, l.y1, l.y2 });
+        pad = pad || l.crossSpecial == 70 || l.crossSpecial == 71;
       }
-      worth[i] = x1 - x0 >= 64.0 && y1 - y0 >= 64.0 && (x1 - x0) * (y1 - y0) >= 32768.0;
+      auto const square([&](double const v) { return static_cast<long long>(std::floor(v / cell)); });
+      bool const been_near{ near.count({ square((x0 + x1) / 2.0), square((y0 + y1) / 2.0) }) > 0 };
+      worth[i] = !doom_sectors_been.count(static_cast<int>(i))
+                 && (pad || (!been_near && x1 - x0 >= 64.0 && y1 - y0 >= 64.0));
     }
-    // A teleporter's pad is worth going to too, small as it is (it carries the player
-    // elsewhere): a sector one of whose lines teleports.
-    std::vector<bool> pad(sectors.size());
-    for(size_t i{}; i < sectors.size(); ++i)
-    {
-      for(auto const &l : sectors[i].lines)
-      {
-        pad[i] = pad[i] || l.crossSpecial == 70 || l.crossSpecial == 71;
-      }
-    }
-    return doom_route([&](int const k) { return (worth[k] || pad[k]) && !doom_sectors_been.count(k); }, out, max);
+    return doom_route([&](int const k) { return worth[k]; }, out, max);
   }
 
   int play_doom_route(double const x, double const y, double *out, int max)

@@ -33,10 +33,11 @@ extern "C"
   int play_nethack_inventory(char *out, int max);
   void play_nethack_close(void);
 
-  /* Doom: ViZDoom's engine (a program), a game's data (.wad), a map, a seed, the picture's
-   * width (320 or 640). */
-  int play_doom_open(char const *engine, char const *wad, char const *map, unsigned seed, int width, char *error,
-                     int size);
+  /* Doom: ViZDoom's engine (a program), a game's data (.wad), a scenario's (.wad, "" for
+   * none: its maps and scripts over the game's), a map, the skill (1 to 5, 0: ViZDoom's), the
+   * episode's time limit in tics (0: none), a seed, the picture's width (320 or 640). */
+  int play_doom_open(char const *engine, char const *wad, char const *scenario, char const *map, int skill,
+                     int timeout, unsigned seed, int width, char *error, int size);
   double play_doom_act(unsigned buttons, int tics);
   int play_doom_finished(void);
   int play_doom_state(double *variables, int max, int *tic, char *objects, int size);
@@ -51,10 +52,12 @@ extern "C"
   // For checks: every line with a special a player sets off: its middle x, y, the special
   // used and the special walked over (0: none), four numbers a line; their count.
   int play_doom_specials(double *out, int max);
-  // The way to the nearest sector the player hasn't stood in, sector to sector across the
-  // lines they share that the player can cross (room to stand, a step up of at most 24, or a
-  // door): the middles of those lines, x and y each, into `out`; their count (0: none found).
-  int play_doom_frontier(double *out, int max);
+  // The way to the nearest sector the player hasn't stood in nor been near (`visited`: n
+  // squares of side `cell` the player has been around, column and row each), sector to sector
+  // across the lines they share that the player can cross (room to stand, a step up of at
+  // most 24, a door or a lift): the middles of those lines, x and y each, into `out`; their
+  // count (0: none found).
+  int play_doom_frontier(int const *visited, int n, double cell, double *out, int max);
   // The way from the player to the sector point x, y is in, as play_doom_frontier gives it (for
   // checks: whether a place can be walked to).
   int play_doom_route(double x, double y, double *out, int max);
