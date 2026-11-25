@@ -85,6 +85,36 @@
                                       r))))))))
           tools)))
 
+(defn elle-tool
+  "A tool asking the real Elle, through the oracle (elle-cp/oracle) answering in `dir`: a
+  request file written there, its result read back. The translator tests what it wrote against
+  Elle itself (in the last runs it wrote what Elle meant, not what it does, and couldn't check)."
+  [dir]
+  (let [counter (atom 0)]
+    {:name "elle"
+     :doc (str "Asks the real Elle (Jepsen's, as written, the code closed_predicate.clj is part of) and "
+               "gives its answer. The request is an EDN map: {:call \"elle.closed-predicate/version<\" "
+               ":args [{1 [0 :elle/dead]} 1 :elle/dead 0]} calls one of Elle's functions on those "
+               "arguments and gives its value; {:history [op ...] :opts {...}} runs closed-predicate's "
+               "check on a history (ELLE.md shows one) and gives its result.")
+     :params {:request {:type "string" :doc "the EDN map: a :call with its :args, or a :history with its :opts"}}
+     :fn (fn [{:keys [request]}]
+           (let [n (swap! counter inc)
+                 named (str "q" (long (* 1000.0 (cpp/harness.seconds))) "-" n)
+                 tmp (str dir "/" named ".req.tmp")
+                 req (str dir "/" named ".req.edn")
+                 res (str dir "/" named ".res.edn")]
+             (spit tmp (str request))
+             (cpp/harness.run (str "mv '" tmp "' '" req "'") 1000 5.0)
+             (loop [i 0]
+               (cond
+                 (cpp/harness.is_file res)
+                 (let [said (slurp res)]
+                   (cpp/harness.run (str "rm -f '" res "'") 1000 5.0)
+                   said)
+                 (> i 900) "Elle did not answer in 90 seconds."
+                 :else (do (cpp/harness.pause 0.1) (recur (inc i)))))))}))
+
 (defn- roles
   "The workers' and the coordinator's own parts of the system text."
   [{:keys [translation spec report]}]
@@ -121,12 +151,13 @@
 (defn team
   "A team on model `m`: {:coordinator :translator :specifier}, three agents. `opts`: :system
   (the text all three are told first), :agent (harness.core/agent's options for all three),
-  :worker-effort (the workers' effort, when it differs from :agent's),
+  :worker-effort (the workers' effort, when it differs from :agent's), :elle-dir (where an
+  oracle of the real Elle answers: the translator and the coordinator get the elle tool),
   :files ({:translation :spec :report :dir :code :spec-sources}, the paths ELLE.md names:
   :code the source translated, refused to the specifier with the translation), :worker-context (the
   workers' context, when it differs from :agent's), :coordinator-effort and :worker-max-tokens
   as harness.team takes them."
-  [m {:keys [system agent files coordinator-effort worker-max-tokens worker-context worker-effort]
+  [m {:keys [system agent files coordinator-effort worker-max-tokens worker-context worker-effort elle-dir]
       :or {coordinator-effort :medium worker-max-tokens 24576}}]
   (let [parts (roles files)
         base (merge agent {:draft nil})
@@ -169,7 +200,10 @@
         translator-self (atom nil)
         specifier-self (atom nil)
         watched (vec (remove nil? [(:translation files) (:spec files) (:report files)]))
-        translator (h/agent m (merge worker {:tools (gated worker-tools translator-self watched)
+        ;; The real Elle, when an oracle answers: for the translator and the coordinator, not the
+        ;; specifier (whose specification must come from the definitions, not from Elle).
+        oracle (when elle-dir [(elle-tool elle-dir)])
+        translator (h/agent m (merge worker {:tools (vec (concat (gated worker-tools translator-self watched) oracle))
                                              :system (str system (:translator parts))}))
         specifier (h/agent m (merge worker {:tools (gated spec-tools specifier-self watched)
                                             :system (str system (:specifier parts))}))
@@ -209,7 +243,8 @@
                                       {:effort coordinator-effort
                                        :tools (vec (concat asks
                                                            (keep pick ["read_file" "list_dir" "write_file"
-                                                                       "edit_file" "shell"])))
+                                                                       "edit_file" "shell"])
+                                                           oracle))
                                        :system (str system (:coordinator parts))
                                        :obligations (fn [_] (built (:dir files) (:report files)))}))]
     {:coordinator coordinator :translator translator :specifier specifier}))

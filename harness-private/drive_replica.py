@@ -38,6 +38,28 @@ TASKS = {
 }
 
 
+ORACLE = ELLE + '/oracle'
+
+
+def start_oracle():
+    """The real Elle answering in the run's temporary directory (outside the sandbox: this
+    driver's child), for the elle tool: the directory, once it says it is ready."""
+    d = drive.TMP + '/elle-oracle'
+    os.makedirs(d, exist_ok=True)
+    subprocess.Popen([ORACLE + '/oracle.sh', d], stdout=open(drive.OUT + '/oracle.log', 'w'),
+                     stderr=subprocess.STDOUT, start_new_session=True)
+    for _ in range(240):
+        if os.path.exists(d + '/ready'):
+            return d
+        time.sleep(0.5)
+    raise RuntimeError('the Elle oracle did not start (oracle.log)')
+
+
+def stop_oracle(d):
+    if d and os.path.isdir(d):
+        open(d + '/stop', 'w').close()
+
+
 def make_home(task):
     drive.make_home('plain')
     shutil.copytree(ELLE + '/stage/elle', drive.HOME + '/elle')
@@ -69,7 +91,8 @@ def run_form(task, seed):
                           (when-let [t @workers]
                             (doseq [k [:translator :specifier]]
                               (h/save! (get t k) (clojure.string/replace live #"\\.edn$" (str "-" (name k) ".edn")))))))}}
-      tm (replica/team m {{:system system :agent opts :worker-context 98304 :worker-effort :high :files {files}}})
+      tm (replica/team m {{:system system :agent opts :worker-context 98304 :worker-effort :high :files {files}
+                          :elle-dir {drive.jstr(drive.TMP + '/elle-oracle')}}})
       a (:coordinator tm)
       _ (reset! current a)
       _ (reset! workers tm)
@@ -143,8 +166,10 @@ def main():
                 time.sleep(5)
         t0 = time.time()
         port = proc = None
+        oracle = None
         try:
             make_home(task)
+            oracle = start_oracle()
             port, proc = drive.start(drive.OUT + '/process.log')
             # Before setup, whose sandbox refuses the harness's own sources from then on; its own
             # evaluation (a require and its alias in one form fail in jank).
@@ -174,6 +199,7 @@ def main():
                 print('STOPPING: a run failed at its start', flush=True)
                 return
         finally:
+            stop_oracle(oracle)
             if proc:
                 drive.stop(port, proc)
     print('ALL DONE', flush=True)

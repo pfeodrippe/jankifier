@@ -133,6 +133,34 @@ def example1 : History := #[
   { index := 5, type := .ok, process := 2, value := [⟨.r, 1, .int 0, .tru⟩, ⟨.rp, 0, .kmap [(2, .int 5)], .eq 5⟩] }]
 ```
 
+## Asking the real Elle
+
+The translator and the coordinator have the `elle` tool: it runs the real Elle, the code
+`closed_predicate.clj` is part of, and gives its answer. A translation is faithful when it gives
+what Elle gives, so test each translated function against it, above all where the Clojure looks
+odd: Elle's answer is what the translation must give, even when it looks wrong.
+
+- One function: `{:call "elle.closed-predicate/version<" :args [{1 [0 :elle/dead]} 1 :elle/dead 0]}`
+  calls `(version< {1 [0 :elle/dead]} 1 :elle/dead 0)` and gives its value. The arguments are
+  Clojure data: an all-versions map is `{key [version ...]}`, `:elle/unborn` and `:elle/dead`
+  are written so.
+- The whole check: `{:history [op ...] :opts {:consistency-models [:serializable]}}` gives
+  `check`'s result (validity, anomaly types, each cycle's op indices and steps). A history is
+  Elle's: each op a map, `:process`, `:type` (`:invoke`, `:ok`, `:info`, `:fail`), `:f` (`:init`
+  or `:txn`) and `:value`; an init's value is its map, a transaction's its mops:
+
+  ```clojure
+  [{:process 0 :type :invoke :f :init :value {0 0, 1 0}}
+   {:process 0 :type :ok :f :init :value {0 0, 1 0}}
+   {:process 1 :type :invoke :f :txn :value [[:w 1 1] [:insert 2 5]]}
+   {:process 1 :type :ok :f :txn :value [[:w 1 1] [:insert 2 5]]}
+   {:process 2 :type :invoke :f :txn :value [[:r 1 nil] [:rp [:= 5] nil]]}
+   {:process 2 :type :ok :f :txn :value [[:r 1 1] [:rp [:= 5] {2 5}]]}]
+  ```
+
+  The same history written in Lean (as in `Compare.lean`) lets the translation and Elle be
+  compared on it directly.
+
 ## Building
 
 ```sh
