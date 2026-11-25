@@ -146,7 +146,16 @@ def main():
             # Its own evaluation: a require and its alias in one form fail in jank.
             drive.ev(port, "(require '[harness.replica :as replica])", 300)
             print(f'START {task} seed {seed}: its directory has {sorted(os.listdir(drive.HOME))}', flush=True)
-            r = drive.unstr(drive.ev(port, run_form(task, seed), 12 * 3600))
+            answer = drive.ev(port, run_form(task, seed), 12 * 3600)
+            if answer is None:
+                # The process ended during the run (something the agents ran crashed it): its
+                # conversations so far are in the live files; what they wrote is kept and graded.
+                for k in ['', '-translator', '-specifier']:
+                    src = f'{drive.OUT}/live{k}.edn'
+                    if os.path.exists(src):
+                        shutil.copy(src, f'{drive.OUT}/{task}-team-{seed}{k}.edn')
+                answer = drive.jstr(f'{{:task :{task} :seed {seed} :state :crashed}}')
+            r = drive.unstr(answer)
             drive.stop(port, proc)
             port = proc = None
             kept = keep(task, seed)
