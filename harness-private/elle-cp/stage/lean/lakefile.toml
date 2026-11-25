@@ -1,0 +1,11 @@
+name = "elle-cp"
+version = "0.1.0"
+defaultTargets = ["Elle", "ElleCP"]
+
+[[lean_lib]]
+name = "Elle"
+globs = ["Elle.Basic", "Elle.Hash", "Elle.Graph", "Elle.Bfs", "Elle.Model", "Elle.Core", "Elle.Txn"]
+
+[[lean_lib]]
+name = "ElleCP"
+globs = ["ElleCP.+"]

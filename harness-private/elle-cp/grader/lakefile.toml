@@ -1,0 +1,28 @@
+name = "elle-cp-grader"
+version = "0.1.0"
+defaultTargets = ["Elle", "cases"]
+
+# The original base modules and the human translation of closed_predicate.clj.
+[[lean_lib]]
+name = "Elle"
+globs = ["Elle.Basic", "Elle.Hash", "Elle.Graph", "Elle.Bfs", "Elle.Model", "Elle.Core", "Elle.Txn",
+         "Elle.ClosedPredicate"]
+
+# The agents' translation: ElleCP/ClosedPredicate.lean (and any ElleCP module it imports).
+[[lean_lib]]
+name = "ElleCP"
+globs = ["ElleCP.+"]
+
+[[lean_lib]]
+name = "Grade"
+globs = ["Grade.Gen", "Grade.Show"]
+
+# Agents' ElleCP.check against Elle.ClosedPredicate.check on random histories.
+[[lean_exe]]
+name = "grade"
+root = "Grade.Main"
+
+# The D9 and D10 histories, Elle as written and with the closed-predicate fixes.
+[[lean_exe]]
+name = "cases"
+root = "Grade.Cases"
