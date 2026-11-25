@@ -337,6 +337,14 @@ regex_executor.tcc `_M_dfs` 510, `_M_rep_once_more` 178, `_M_handle_match` 321. 
 
 codegen 1894–1919 emits `GC_free`; bdwgc `GC_free` 824–850 reads the header of memory the collector never allocated.
 
+- [ ] **LU79**: `slurp` of a missing file ends the program: its native error can't be caught (`deviations_r4_test.jank`: `u79`; on main: an uncaught C++ exception "filesystem error: cannot get file size").
+
+```clojure
+(try (slurp "/no-such-dir/x.txt") (catch cpp/jank.runtime.object_ref _ :caught))   ; Clojure :caught   jank an uncaught C++ exception
+```
+
+core.jank `slurp`: `file_size` (7331) runs before `is_open`, and its `std::filesystem` error is no jank exception.
+
 ### Hangs
 
 - [ ] **R1**: a NUL in a string makes the reader loop forever (`deviations_reader_test.jank`: `a01`).
@@ -1239,6 +1247,14 @@ Lean theorems `jank_map_entry_any_pair`, `map_entry_agree`.
 
 walk.jank 3–12. Lean theorems `jank_walk_drops_list_meta`, `walk_vec_meta_agree`.
 
+- [ ] **LU81**: `zipmap` keeps the last of two equal keys (`deviations_r4_test.jank`: `u81`; on main: gave `(1)`).
+
+```clojure
+(first (keys (zipmap [[1] '(1)] [:a :b])))   ; Clojure [1]   jank (1)
+```
+
+core.jank 2411–2423 builds the map through a hash-map transient. Extends LS59.
+
 ### Wrong values, no error: the reader
 
 - [ ] **R4**: a leading `+` makes a symbol (`a04`).
@@ -1631,6 +1647,14 @@ json_native.cpp 69–72.
 ```
 
 jank's pprint.jank is `prn`; Clojure's dispatch.clj 92–101 breaks at the right margin, 72. Of `(vec (range n))` for n = 0..60, the 33 from n = 28 on differ. #147 (port clojure.pprint) is open.
+
+- [ ] **LU64**: a printed exception chain lacks its root cause and repeats the middle one (`deviations_r4_test.jank`: `u64`; on main: the printed text had no `"c"`).
+
+```clojure
+(pr-str (ex-info "a" {} (ex-info "b" {} (ex-info "c" {}))))   ; Clojure names "a", "b" and "c"   jank no "c", "b" twice
+```
+
+exception_info.cpp 80–83. Lean theorem `jank_printed_via_wrong`.
 
 ### Wrong values, no error: regex
 
@@ -2044,7 +2068,7 @@ core.jank `ns` 5633–5637. Extends R21.
 
 `integer_range.cpp` 186, 197; `next` (113).
 
-- [ ] **LS1**: `#'` followed by anything but a symbol is a read error (`deviations_r3_test.jank`: `s01`; on main: threw (its text wasn't recorded)).
+- [ ] **LS1**: `#'` followed by anything but a symbol is a read error (`deviations_r3_test.jank`: `s01`; on main: threw "Invalid var reader macro.").
 
 ```clojure
 (read-string "#'1")   ; Clojure (var 1)         jank "A value after `#'` must be a symbol."
@@ -2102,7 +2126,7 @@ regex_compiler.tcc 497.
 
 regex_compiler.tcc 243 → regex_automaton.h 33 (`_GLIBCXX_REGEX_STATE_LIMIT` 100000).
 
-- [ ] **LS36**: a local bound to a number, boolean or string literal cannot appear in call position, even where Clojure never makes the call (`deviations_r3_test.jank`: `s36`; on main: threw (its text wasn't recorded)).
+- [ ] **LS36**: a local bound to a number, boolean or string literal cannot appear in call position, even where Clojure never makes the call (`deviations_r3_test.jank`: `s36`; on main: threw "There is no call operator for `int`.").
 
 ```clojure
 (let [x 1] (if false (x) :ok))      ; Clojure :ok   jank analyze/invalid-cpp-call
@@ -2112,7 +2136,7 @@ regex_compiler.tcc 243 → regex_automaton.h 33 (`_GLIBCXX_REGEX_STATE_LIMIT` 10
 
 processor.cpp `analyze_let` 2377 (literal native type, cpp_util.cpp `literal_type` 603–720) → `analyze_call` 3607 → `analyze_cpp_call` 4055 → `build_indirect_cpp_call` 874/965 "There is no call operator for `int`".
 
-- [ ] **LS37**: `case` analyzes its default before its clauses (`deviations_r3_test.jank`: `s37`; on main: threw (its text wasn't recorded)).
+- [ ] **LS37**: `case` analyzes its default before its clauses (`deviations_r3_test.jank`: `s37`; on main: threw "The symbol `s37-h` could not be resolved.").
 
 ```clojure
 (case 1 1 (def h 1) (h))                  ; Clojure #'user/h              jank unresolved symbol h
@@ -2122,7 +2146,7 @@ processor.cpp `analyze_let` 2377 (literal native type, cpp_util.cpp `literal_typ
 
 processor.cpp `analyze_case` 1386: default at 1466, clauses at 1500. Clojure: CaseExpr.Parser 9577 (clauses), then 9589 (default).
 
-- [ ] **LS42**: more than 10 parameter symbols is rejected, and the `& rest` symbol counts as one (`deviations_r3_test.jank`: `s42`; on main: threw (its text wasn't recorded)).
+- [ ] **LS42**: more than 10 parameter symbols is rejected, and the `& rest` symbol counts as one (`deviations_r3_test.jank`: `s42`; on main: threw "This function has too many parameters. The max is 10. If you need more, use a variadic function.").
 
 ```clojure
 (fn [a b c d e f g h i j k] k)     ; Clojure ok   jank "too many parameters. The max is 10"
@@ -2230,6 +2254,117 @@ json_native.cpp 198–202.
 ```
 
 `clojure.pprint/pp` and others are missing too. Lean theorems `pprint_missing`, `stacktrace_missing`. #147 (port clojure.pprint) is open.
+
+- [ ] **LU5**: (LS50, now confirmed) a C++ function pointer with a `long const &` parameter can't be called with an integer (`deviations_r4_test.jank`: `u05`; on main: threw "argument 0 is not convertible from `int` to `const long &`").
+
+```clojure
+(cpp/raw "inline long twice(long const &x) { return 2 * x; } inline long (*twice_ptr)(long const &) = twice;")
+(cpp/twice_ptr 21)   ; C++ 42   jank throws "argument 0 is not convertible"
+```
+
+Round 3's LS50, withdrawn then for lack of evidence (its run recorded no error text), confirmed by this run.
+
+- [ ] **LU6**: (LS53, now confirmed) a built-in operator on a class that converts to `double` is refused (`deviations_r4_test.jank`: `u06`; on main: threw "The operator `+` is not supported for the type `u_b3_meters`").
+
+```clojure
+(cpp/raw "struct meters { double v; operator double() const { return v; } }; inline meters mk() { return {1.5}; }")
+(cpp/+ (cpp/mk) 1.0)   ; C++ 2.5   jank throws "The operator `+` is not supported"
+```
+
+Round 3's LS53, withdrawn then for lack of evidence, confirmed by this run.
+
+- [ ] **LU12**: `with-meta` on a defn'd fn not yet called throws (`deviations_r4_test.jank`: `u12`; on main: threw "… deferred_cpp_function … can't hold any metadata").
+
+```clojure
+(defn f [] 1)
+(meta (with-meta f {:k 1}))   ; Clojure {:k 1}   jank throws "can't hold any metadata"
+```
+
+deferred_cpp_function.hpp 32–35 has no `with_meta`.
+
+- [ ] **LU17**: `push-thread-bindings` refuses an array map (`deviations_r4_test.jank`: `u17`; on main: threw "invalid thread binding map (must be hash map)").
+
+```clojure
+(def ^:dynamic *x* 0)
+(push-thread-bindings (array-map #'*x* 1))   ; Clojure binds *x* to 1   jank throws "must be hash map"
+```
+
+context.cpp 694–703. Lean theorem `pushArray_rejected`.
+
+- [ ] **LU21**: a scoped enum's user `operator|` is refused (`deviations_r4_test.jank`: `u21`; on main: threw "The binary operator `|` is not supported for the types `u_b7_e` and `u_b7_e`").
+
+```clojure
+(cpp/raw "enum class e { a = 1, b = 2 };
+          inline e operator|(e l, e r) { return static_cast<e>(static_cast<int>(l) | static_cast<int>(r)); }")
+(cpp/| cpp/e.a cpp/e.b)   ; C++ e(3)   jank throws "not supported for the types"
+```
+
+Lean theorem `jank_primitive_operand_unary_builtin_only`.
+
+- [ ] **LU22**: a derived class's operator doesn't hide its base's: the call is called ambiguous (`deviations_r4_test.jank`: `u22`; on main: threw "This call is ambiguous between 2 different overloads").
+
+```clojure
+(cpp/raw "struct base { int operator*(int) const { return 3; } };
+          struct derived : base { int operator*(double) const { return 4; } }; inline derived d;")
+(cpp/* cpp/d 1)   ; C++ 4   jank throws "This call is ambiguous"
+```
+
+CppInterOp.cpp `GetOperator` 6977–7064 adds the operators of every associated class; Clang's member lookup hides the base's.
+
+- [ ] **LU48**: `load` of a resource path isn't found (`deviations_r4_test.jank`: `u48`; on main: threw "The module `/clojure/walk` could not be found").
+
+```clojure
+(load "/clojure/walk")   ; Clojure loads it   jank throws "could not be found"
+```
+
+core.jank `load` 4801.
+
+- [ ] **LU59**: `compile` at run time throws (`deviations_r4_test.jank`: `u59`; on main: threw "Unable to write module, given output target 'unspecified'").
+
+```clojure
+(compile 'clojure.set)   ; Clojure clojure.set   jank throws "Unable to write module"
+```
+
+core.cpp 1361 returns nil where it doesn't throw.
+
+- [ ] **LU72**: `areduce` throws: `unchecked-inc-int` is unported (`deviations_r4_test.jank`: `u72`; on main: threw "TODO: port unchecked-inc-int").
+
+```clojure
+(let [a (long-array [1 2 3])] (areduce a i ret 0 (+ ret (aget a i))))   ; Clojure 6   jank throws "TODO: port"
+```
+
+- [ ] **LU73**: `newline` throws: unported (`deviations_r4_test.jank`: `u73`; on main: threw "TODO: port newline").
+
+```clojure
+(with-out-str (newline))   ; Clojure "\n"   jank throws "TODO: port newline"
+```
+
+Round 4 predicts `flush` the same; this run stopped at `newline`.
+
+- [ ] **LU74**: `unchecked-*`, `reversible?` and other core functions are unported (the class of R113/R124, new names) (`deviations_r4_test.jank`: `u74`, `u74b`; on main: threw "TODO: port unchecked-add", "TODO: port reversible?").
+
+```clojure
+(unchecked-add (identity 1) 2)   ; Clojure 3      jank throws "TODO: port unchecked-add"
+(reversible? (identity []))      ; Clojure true   jank throws "TODO: port reversible?"
+```
+
+Also predicted unported: `into-array`, `indexed?`, `special-symbol?`, `instance?`, `class`, `with-open`, `line-seq`, the struct and stream functions, `reader-conditional`.
+
+- [ ] **LU80**: `reduce-kv` over a seq of map entries throws (`deviations_r4_test.jank`: `u80`; on main: threw "Objects of type `persistent_array_map_sequence` do not support `reduce-kv`").
+
+```clojure
+(reduce-kv (fn [acc k _] (conj acc k)) [] (seq {:a 1}))   ; Clojure [:a]   jank throws "do not support `reduce-kv`"
+```
+
+seq.cpp 923–972.
+
+- [ ] **LU82**: reading any `#inst` throws where the `en_US.UTF-8` locale isn't installed (`deviations_r4_test.jank`: `u82`; on main: threw "locale::facet::_S_create_c_locale name not valid").
+
+```clojure
+(read-string "#inst \"2020\"")   ; Clojure #inst "2020-01-01T00:00:00.000-00:00"   jank throws "name not valid"
+```
+
+inst.cpp 41 reads through `is.imbue(std::locale("en_US.utf-8"))`; Debian's and Ubuntu's base images ship only `C.UTF-8` (this run: Debian 13, `LANG=C.UTF-8`). Round 4's own prediction for this test (a year-only `#inst` read wrong, parse.cpp 948–975) waits for an image with that locale.
 
 ### Left out
 

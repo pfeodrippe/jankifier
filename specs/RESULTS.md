@@ -50,11 +50,14 @@ A second model, a Lean replica of jank written blind from its sources (determini
 x86-64 Linux) 108 were confirmed exactly (4 of them after a rerun: the test runner had dropped
 their reports) and 8 were refuted (3 of them fixed after 0.1). Round 3, which replicated the
 libraries jank runs on, predicted 76 more (LS1–LS76 here): of the 57 with a test, 48 were
-confirmed, 4 refuted, 3 failed in another way, and 2 (LS50, LS53) had tests that couldn't tell. Round 4
+confirmed, 4 refuted, 3 failed in another way, and 2 (LS50, LS53) had tests that couldn't tell until round 4's rerun confirmed them (LU5, LU6). Round 4
 (LU1–LU92 here) re-stated round 3's unclear items and covered the parts no round had touched; of
 its 87 tests, 66 confirmed by the value or error predicted (5 hangs and a segfault among them),
-11 more failed with an error where one was predicted (their text to be recorded on a rerun), and
-the rest wait for that rerun. Their minimal examples, code paths and upstream status are in
+and a rerun with the test runner fixed (24 tests, each failing in all three of its timelines)
+recorded every error's text: 16 more of round 4's tests confirmed their prediction, one (u82) found
+another bug instead (reading any `#inst` needs the `en_US.UTF-8` locale, LU82), three (u88–u90)
+couldn't load `jank.shell` in the test image and wait, and round 3's four errors without text (LS1,
+LS36, LS37, LS42) now have it. Their minimal examples, code paths and upstream status are in
 [unreported.md](unreported.md#found-by-a-lean-replica-of-jank); the replica and its tests are in
 determinismo-workloads' [jank-interop/lean](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean).
 
@@ -62,7 +65,8 @@ determinismo-workloads' [jank-interop/lean](https://github.com/determinismo-dst/
   SIGFPE), R47 (a parameter named like its fn), R119 (`first` of an infinite mapped real range),
   R97 (`(compare :a 1)`, the `catch` never runs), D24 (a throwing `catch` then a throwing
   `finally`, `std::terminate`), LS34 (a long input to a regex overflows the stack), LU26
-  (`cpp/delete` of a pointer from C++'s `new`).
+  (`cpp/delete` of a pointer from C++'s `new`), LU79 (`slurp` of a missing file: an uncatchable
+  native error).
 - **Hangs**: R1 (NUL in `read-string`), D16 (a watch removing itself), R116 (`range` past 2^31),
   R117 (`doseq` over a held cons), LS62–LS65 and LS67 (locks re-entered by validators,
   `alter-var-root`, `realized?`, `future-cancel`, lazy var metadata), LU13 (`alter-var-root`
@@ -76,16 +80,18 @@ determinismo-workloads' [jank-interop/lean](https://github.com/determinismo-dst/
     LU4, LU7–LU11, LU14 (lazily compiled fns: a var's root rebound at a fn's first call, losing
     `alter-var-root` wrappers and `with-redefs` stubs), LU20, LU23–LU25 (C++ operators and
     templates);
-  - collections: R105, R118, R120, R121, LS59, LS60, LU27, LU31–LU34, LU61, LU66, LU67, LU69;
+  - collections: R105, R118, R120, R121, LS59, LS60, LU27, LU31–LU34, LU61, LU66, LU67, LU69, LU81;
   - the reader: R4–R6, R10, R11, R13–R16, R19–R21, LU40, LU71;
-  - strings and printing: R53, R55–R61, R63, R68–R72, R76, LS73, LU16, LU39, LU63, LU65, LU70,
-    LU78, LU85, LU86, LU91;
+  - strings and printing: R53, R55–R61, R63, R68–R72, R76, LS73, LU16, LU39, LU63, LU64, LU65,
+    LU70, LU78, LU85, LU86, LU91;
   - regex: R79, R81, R82, R84, LS22, LS23, LS25, LS26, LS29–LS31, LS33, LU35–LU38;
   - nREPL and the REPL: LU41, LU44;
   - modules and the CLI: LU45, LU50, LU51, LU55.
 - **Errors where Clojure works**: D25, R2, R3, R7, R8, R12, R17, R18, R27, R28, R39–R41, R73,
   R74, R96, R98, R101, R104, R114, LS1, LS18, LS24, LS27, LS28, LS32, LS35–LS37, LS42, LS61,
-  LS71, LU29, LU30, LU49, LU62, LU68, LU76, LU77, LU87, LU92.
+  LS71, LU5, LU6, LU12, LU17, LU21, LU22 (C++ interop: a reference parameter, a converting class,
+  scoped enums, a hidden base operator), LU29, LU30, LU48, LU49, LU59, LU62, LU68, LU72–LU74,
+  LU76, LU77, LU80, LU82 (`#inst` needs the `en_US.UTF-8` locale), LU87, LU92.
 - **Upstream**: D1, R25 and D4 are #1208; D15 is A2 here, R100 is A3, D21 is S3, R80 is S6, D22
   is C3 (which also happens on Linux). LS60 is #1235's map case.
   The rest: no issue found (keyword search, 2026-11-25).
