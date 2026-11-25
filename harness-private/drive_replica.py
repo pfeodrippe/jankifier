@@ -28,6 +28,8 @@ TASKS = {
         'spec': 'lean/ElleCP/Spec.lean',
         'report': 'REPORT.md',
         'dir': 'lean',
+        'code': 'elle/closed_predicate.clj',
+        'spec-sources': 'elle/DOCSTRING.md',
         'ask': ("ELLE.md describes the work: Elle's closed-predicate checker "
                 "(elle/closed_predicate.clj) translated into Lean as it is written, a specification "
                 "written apart from the definitions, the two compared on many small histories, and "
@@ -47,7 +49,7 @@ def run_form(task, seed):
     t = TASKS[task]
     rec = f'{drive.OUT}/{task}-team-{seed}.edn'
     live = drive.OUT + '/live.edn'
-    files = '{' + ' '.join(f':{k} {drive.jstr(t[k])}' for k in ['translation', 'spec', 'report', 'dir']) + '}'
+    files = '{' + ' '.join(f':{k} {drive.jstr(t[k])}' for k in ['translation', 'spec', 'report', 'dir', 'code', 'spec-sources']) + '}'
     return f'''
 (let [live (str {drive.jstr(live)})
       current (atom nil)

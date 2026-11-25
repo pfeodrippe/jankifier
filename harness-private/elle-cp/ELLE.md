@@ -23,7 +23,8 @@ In `lean/`, a Lean 4 project:
    The generators after line 716 are not needed.
 
 2. **The specification**, `lean/ElleCP/Spec.lean`: what the checker should report, written from
-   the definitions and not from the translation: the namespace docstring, and Adya's dependency
+   the definitions and not from the code: the namespace docstring (`elle/DOCSTRING.md`, the
+   only part of Elle's file the specifier reads), the base's types, and Adya's dependency
    graphs (Adya, *Weak Consistency*, 1999):
    - each key's versions in history order: the `:init` op's value first, then each committed
      transaction's writes; a key that does not exist yet has an unborn version before its first

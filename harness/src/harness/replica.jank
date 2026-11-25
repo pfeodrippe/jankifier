@@ -31,8 +31,8 @@
                     "with what you did and what the coordinator should know.")
    :specifier (str "\n\nYou are the specifier of a team of three agents on one task. You write the "
                    "specification in " spec ", from the definitions the guide gives, not from the "
-                   "code: do not read " translation " (a specification that follows the translation "
-                   "can't find where the code goes wrong). Build it often. The coordinator tells you "
+                   "code: your tools refuse the source and its translation (a specification that "
+                   "follows the code can't find where the code goes wrong). Build it often. The coordinator tells you "
                    "what to do. Answer with what you did and what the coordinator should know.")
    :coordinator (str "\n\nYou coordinate a team of two agents on this task: the translator writes "
                      translation " and the specifier writes " spec ". Hand the work out at once: ask "
@@ -57,7 +57,8 @@
 (defn team
   "A team on model `m`: {:coordinator :translator :specifier}, three agents. `opts`: :system
   (the text all three are told first), :agent (harness.core/agent's options for all three),
-  :files ({:translation :spec :report :dir}, the paths ELLE.md names), :worker-context (the
+  :files ({:translation :spec :report :dir :code :spec-sources}, the paths ELLE.md names:
+  :code the source translated, refused to the specifier with the translation), :worker-context (the
   workers' context, when it differs from :agent's), :coordinator-effort and :worker-max-tokens
   as harness.team takes them."
   [m {:keys [system agent files coordinator-effort worker-max-tokens worker-context]
@@ -68,8 +69,27 @@
         ;; was compacted twice in thirty steps.
         worker (merge base {:max-tokens worker-max-tokens} (when worker-context {:context worker-context}))
         worker-tools (tools/defaults)
+        ;; The specifier's tools refuse the code (the Clojure source and the translation): a
+        ;; specification read off the code repeats its mistakes. Its own copy of what it may
+        ;; read is (:spec-sources files).
+        hidden (vec (remove nil? [(:code files) (:translation files)]))
+        code-dir (when (:code files) (str (first (str/split (:code files) #"/")) "/"))
+        mentions (fn [args] (let [text (pr-str args)]
+                              (or (some (fn [h] (str/includes? text (last (str/split h #"/")))) hidden)
+                                  ;; The source's directory (globs, grep -r) but for what it may read.
+                                  (and code-dir (str/includes? text code-dir)
+                                       (not (and (:spec-sources files) (str/includes? text (:spec-sources files))))))))
+        spec-tools (mapv (fn [t]
+                           (update t :fn (fn [f]
+                                           (fn [args]
+                                             (if (mentions args)
+                                               (str "That is the code (" (str/join ", " hidden) "): the specifier works "
+                                                    "from the definitions, which the guide and " (:spec-sources files)
+                                                    " give, not from the code.")
+                                               (f args))))))
+                         worker-tools)
         translator (h/agent m (merge worker {:tools worker-tools :system (str system (:translator parts))}))
-        specifier (h/agent m (merge worker {:tools worker-tools :system (str system (:specifier parts))}))
+        specifier (h/agent m (merge worker {:tools spec-tools :system (str system (:specifier parts))}))
         defaults (tools/defaults)
         ;; The coordinator's own tools work once it has handed the work out: with the shell and
         ;; the files it read Elle's code itself for fourteen steps while both workers waited.
