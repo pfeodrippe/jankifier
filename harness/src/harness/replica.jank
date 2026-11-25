@@ -33,9 +33,12 @@
   three refusals in a row the worker's turn ends (`self`, an atom holding the worker once it
   exists): the specifier sent the same refused read four times, and its coordinator can ask
   again with what to write."
-  [tools self]
+  [tools self watched]
   (let [since (atom 0)
-        refused (atom 0)]
+        refused (atom 0)
+        ;; What a shell command wrote is seen in the files it changed: guessing from its text
+        ;; took awk's `>` comparisons for writes.
+        snap (fn [] (mapv (fn [p] (when (cpp/harness.is_file (str p)) (slurp (str p)))) watched))]
     (mapv (fn [t]
             (cond
               (contains? #{"write_file" "edit_file"} (:name t))
@@ -50,17 +53,15 @@
                                       shell? (= "shell" (:name t))
                                       building (and shell?
                                                     (or (str/includes? command "lake") (str/includes? command "LAKE")))
-                                      ;; A shell command that writes a file (a redirect other than to
-                                      ;; /dev/null or 2>&1, or tee): the translator wrote its first part
-                                      ;; with `cat > file <<EOF`, and the gate took it for a read.
+                                      ;; Over the limit, a shell command still runs when it may write (a
+                                      ;; redirect or tee): whether it did is seen afterwards.
                                       bare (-> command
                                                (str/replace "2>/dev/null" "") (str/replace ">/dev/null" "")
                                                (str/replace "2>&1" "") (str/replace ">&2" ""))
-                                      writing (and shell? (or (str/includes? bare ">") (str/includes? bare "tee ")))]
+                                      may-write (and shell? (or (str/includes? bare ">") (str/includes? bare "tee ")))]
                                   (cond
-                                    writing (do (reset! since 0) (reset! refused 0) (f args))
                                     building (do (reset! refused 0) (f args))
-                                    (>= @since reads-between-writes)
+                                    (and (>= @since reads-between-writes) (not may-write))
                                     (do (swap! refused inc)
                                         (when (>= @refused 3)
                                           (when-let [a @self] (swap! a assoc :stop true)))
@@ -68,7 +69,20 @@
                                              "must be write_file (or edit_file) with what you have: reading is refused "
                                              "until you write, and after three refused reads your turn ends. Building "
                                              "($LAKE build) works now."))
-                                    :else (do (reset! refused 0) (swap! since inc) (f args)))))))))
+                                    :else
+                                    (let [over (>= @since reads-between-writes)
+                                          before (when shell? (snap))
+                                          r (f args)
+                                          wrote (and shell? (not= before (snap)))]
+                                      (cond
+                                        wrote (do (reset! since 0) (reset! refused 0))
+                                        ;; Past the limit, a command that might have written but didn't
+                                        ;; is a read: it counts towards ending the turn.
+                                        over (do (swap! refused inc)
+                                                 (when (>= @refused 3)
+                                                   (when-let [a @self] (swap! a assoc :stop true))))
+                                        :else (do (reset! refused 0) (swap! since inc)))
+                                      r))))))))
           tools)))
 
 (defn- roles
@@ -154,9 +168,10 @@
                          worker-tools)
         translator-self (atom nil)
         specifier-self (atom nil)
-        translator (h/agent m (merge worker {:tools (gated worker-tools translator-self)
+        watched (vec (remove nil? [(:translation files) (:spec files) (:report files)]))
+        translator (h/agent m (merge worker {:tools (gated worker-tools translator-self watched)
                                              :system (str system (:translator parts))}))
-        specifier (h/agent m (merge worker {:tools (gated spec-tools specifier-self)
+        specifier (h/agent m (merge worker {:tools (gated spec-tools specifier-self watched)
                                             :system (str system (:specifier parts))}))
         _ (reset! translator-self translator)
         _ (reset! specifier-self specifier)
