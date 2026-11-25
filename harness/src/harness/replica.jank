@@ -43,9 +43,18 @@
               (update t :fn (fn [f]
                               (fn [args]
                                 (let [command (str (:command args))
-                                      building (and (= "shell" (:name t))
-                                                    (or (str/includes? command "lake") (str/includes? command "LAKE")))]
+                                      shell? (= "shell" (:name t))
+                                      building (and shell?
+                                                    (or (str/includes? command "lake") (str/includes? command "LAKE")))
+                                      ;; A shell command that writes a file (a redirect other than to
+                                      ;; /dev/null or 2>&1, or tee): the translator wrote its first part
+                                      ;; with `cat > file <<EOF`, and the gate took it for a read.
+                                      bare (-> command
+                                               (str/replace "2>/dev/null" "") (str/replace ">/dev/null" "")
+                                               (str/replace "2>&1" "") (str/replace ">&2" ""))
+                                      writing (and shell? (or (str/includes? bare ">") (str/includes? bare "tee ")))]
                                   (cond
+                                    writing (do (reset! since 0) (f args))
                                     building (f args)
                                     (>= @since reads-between-writes)
                                     (str reads-between-writes " reading calls since you last wrote: write what you have "
