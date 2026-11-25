@@ -142,9 +142,10 @@ def main():
         try:
             make_home(task)
             port, proc = drive.start(drive.OUT + '/process.log')
-            drive.setup(port)
-            # Its own evaluation: a require and its alias in one form fail in jank.
+            # Before setup, whose sandbox refuses the harness's own sources from then on; its own
+            # evaluation (a require and its alias in one form fail in jank).
             drive.ev(port, "(require '[harness.replica :as replica])", 300)
+            drive.setup(port)
             print(f'START {task} seed {seed}: its directory has {sorted(os.listdir(drive.HOME))}', flush=True)
             answer = drive.ev(port, run_form(task, seed), 12 * 3600)
             if answer is None:
