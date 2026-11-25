@@ -72,6 +72,22 @@ function it calls from `elle.txn` or `elle.core` does, read its translation in `
   `addCases`, `resultMap`, `Outcome`. `closed_predicate.clj`'s `check` calls the same functions
   of `elle.txn` and `elle.core`.
 
+What `closed_predicate.clj` calls from outside, and where it is in Lean:
+
+| Clojure | Lean | What it does here |
+|---|---|---|
+| `h/client-ops` | (none needed) | keeps the ops whose process is a number: every op of these histories |
+| `h/possible` | `Elle.possible` | the `:ok` and `:info` ops |
+| `h/oks` | `Elle.oks` | the `:ok` ops |
+| `h/filter-f` | `List.filter` on `Op.f` | the ops with that `:f` (`.init`, `.txn`) |
+| `g/op-digraph` | `({} : Graph)` | an empty graph |
+| `g/link` | `link g a b r` | adds the edge a → b of kind `r` (op indices) |
+| `b/linear`, `b/forked` | (none needed) | Bifurcan's mutable and persistent modes: no difference in Lean |
+| `elle/combine` | `combine` | `Core.lean` |
+| `ct/additional-graphs` | `additionalGraphs`, `extraAnalysesOf` | `Txn.lean` |
+| `ct/cycles!` | `cyclesE an {}` (an `Except`) | `Txn.lean`; `{}` is the default order of the graph's vertices |
+| `ct/result-map` | `resultMap` | `Txn.lean` |
+
 A history in Lean, for example: an init creating keys 0 and 1, then a transaction that inserts
 key 2 and one that reads key 1 and every key whose value is 5:
 
