@@ -598,6 +598,107 @@ namespace harness
    * one that closes another kind, one left open, a string left open. Strings, comments and
    * character literals are skipped; a form of other things (a symbol, 'quoted, #"regex")
    * ends at white space. */
+  /* Lines `from` to `to` of `s` (1-based), each with the bracket depth at its end: what agents
+     otherwise wrote scripts for, after a bracket error. At most 45 lines (the last ones). */
+  inline std::string depth_listing(std::string const &s, size_t const from, size_t to)
+  {
+    if(to < from)
+    {
+      to = from;
+    }
+    size_t const first{ to - from >= 45 ? to - 44 : from };
+    std::vector<long> depth_at_end;
+    std::vector<std::string> lines;
+    long depth{};
+    std::string current;
+    size_t i{};
+    auto const end_line([&]() {
+      depth_at_end.push_back(depth);
+      lines.push_back(current);
+      current.clear();
+    });
+    while(i < s.size())
+    {
+      char const c{ s[i] };
+      if(c == '"')
+      {
+        current += c;
+        ++i;
+        while(i < s.size() && s[i] != '"')
+        {
+          if(s[i] == '\\' && i + 1 < s.size())
+          {
+            current += s[i];
+            ++i;
+          }
+          if(s[i] == '\n')
+          {
+            end_line();
+          }
+          else
+          {
+            current += s[i];
+          }
+          ++i;
+        }
+        if(i < s.size())
+        {
+          current += '"';
+          ++i;
+        }
+        continue;
+      }
+      if(c == ';')
+      {
+        while(i < s.size() && s[i] != '\n')
+        {
+          current += s[i];
+          ++i;
+        }
+        continue;
+      }
+      if(c == '\\' && i + 1 < s.size())
+      {
+        current += c;
+        current += s[i + 1];
+        i += 2;
+        continue;
+      }
+      if(c == '(' || c == '[' || c == '{')
+      {
+        ++depth;
+      }
+      else if(c == ')' || c == ']' || c == '}')
+      {
+        --depth;
+      }
+      if(c == '\n')
+      {
+        end_line();
+      }
+      else
+      {
+        current += c;
+      }
+      ++i;
+    }
+    end_line();
+    std::string out{ "\nEach line with the depth of brackets open at its end (0: everything opened is closed):" };
+    for(size_t l{ first }; l <= to && l <= lines.size(); ++l)
+    {
+      auto text(lines[l - 1]);
+      if(text.size() > 100)
+      {
+        text = text.substr(0, 97) + "...";
+      }
+      auto num(std::to_string(l));
+      auto d(std::to_string(depth_at_end[l - 1]));
+      out += "\n" + std::string(num.size() < 4 ? 4 - num.size() : 0, ' ') + num + " | "
+             + std::string(d.size() < 2 ? 2 - d.size() : 0, ' ') + d + " | " + text;
+    }
+    return out;
+  }
+
   inline object_ref top_forms(object_ref const text)
   {
     auto const s(to_std(text));
@@ -705,13 +806,15 @@ namespace harness
             return fail("line " + std::to_string(line) + " has one '" + b + "' too many: the form that starts at line "
                         + std::to_string(closed_from) + " already ends on that line, and the next '" + b
                         + "' closes nothing. Remove one '" + b + "' at the end of line " + std::to_string(line)
-                        + " (or, if that form ends too soon, the one that closes it early)");
+                        + " (or, if that form ends too soon, the one that closes it early)"
+                        + depth_listing(s, closed_from, line));
           }
           return fail("line " + std::to_string(line) + ": a '" + b + "' that closes nothing"
                       + (closed_at
                            ? "; the form before it, from line " + std::to_string(closed_from) + ", ends at line "
                                + std::to_string(closed_at) + ". If it should go on to line " + std::to_string(line)
                                + ", remove a '" + b + "' at line " + std::to_string(closed_at)
+                               + depth_listing(s, closed_from, line)
                            : std::string{}));
         }
         auto const o(stack.back());
@@ -759,7 +862,7 @@ namespace harness
     {
       return fail("the form that starts at line " + std::to_string(start_line) + " isn't closed: the '"
                   + std::string(1, stack.back().c) + "' opened at line " + std::to_string(stack.back().line)
-                  + " is still open");
+                  + " is still open" + depth_listing(s, start_line, line));
     }
     if(atom)
     {

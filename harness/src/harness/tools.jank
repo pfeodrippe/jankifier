@@ -107,7 +107,7 @@
   (let [lines (str/split-lines (str (cpp/harness.top_forms (str code))))]
     (if (= "ok" (first lines))
       {:spans (mapv (fn [l] (mapv parse-long (str/split l #" "))) (rest lines))}
-      {:error (str/join " " (rest lines))})))
+      {:error (str/join "\n" (rest lines))})))
 
 (defonce ^:private cpp-accepted
   ;; The C++ source (cpp/raw) this process has compiled: a change to it is checked with them.
