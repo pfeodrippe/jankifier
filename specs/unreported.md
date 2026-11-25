@@ -2366,6 +2366,30 @@ seq.cpp 923–972.
 
 inst.cpp 41 reads through `is.imbue(std::locale("en_US.utf-8"))`; Debian's and Ubuntu's base images ship only `C.UTF-8` (this run: Debian 13, `LANG=C.UTF-8`). Round 4's own prediction for this test (a year-only `#inst` read wrong, parse.cpp 948–975) waits for an image with that locale.
 
+- [ ] **LU88**: `jank.shell/sh` splits an argument at a space that follows an odd number of `"` (`deviations_r4_test.jank`: `u88`; on main: printed `a\ b"` for `a" b`).
+
+```clojure
+(:out (sh "echo" "a\" b"))   ; Clojure "a\" b\n"   jank "a\\ b\"\n"
+```
+
+shell.jank `shell-escape` 78–79 and the joined command line (98–103) go through boost-process v1 `build_args` (detail/posix/basic_cmd.hpp 55–100): every `"`, an escaped one included, toggles the quote state.
+
+- [ ] **LU89**: `sh` hangs when the child writes more than a pipe holds (`deviations_r4_hangs_test.jank`: `u89`; on main: still running after 120 s).
+
+```clojure
+(count (:out (sh "seq" "1" "100000")))   ; Clojure 588895   jank hangs
+```
+
+shell.jank 52–73 closes stdin and calls `process.wait()` before reading stdout: a child past the pipe's 65,536 bytes blocks for good. Clojure reads in futures before `waitFor` (java/shell.clj 118–130).
+
+- [ ] **LU90** (low: Clojure's behavior is its source, not its docs): `sh`'s `:env` takes only strings (`deviations_r4_test.jank`: `u90`; on main: threw "An object of type `persistent_string` was expected here, but a `small_integer` was provided instead").
+
+```clojure
+(:out (sh "printenv" "N" :env {"N" 1}))   ; Clojure "1\n"   jank throws
+```
+
+`cpp/cast std.string` of a non-string (convert/builtin.hpp 333–336).
+
 ### Left out
 
 - Refuted on main (jank behaves like Clojure): D3, D11, D14, D16b, D20, R45, R123 and one control.
@@ -2376,10 +2400,11 @@ inst.cpp 41 reads through `is.imbue(std::locale("en_US.utf-8"))`; Debian's and U
 - `b01`, `b11`, `b24`, `b29` (R52, R62, R78, R83) first had no result: their failure reports held
   invalid UTF-8 or a NUL, which the test runner's `grep` read as a binary file. Rerun with round 4,
   all four confirmed (rounds 1 and 2: 108 of 120).
-- Round 4, pending a rerun with the runner fixed: LU5, LU6, LU12, LU17, LU21, LU22, LU48, LU59
-  (an error was predicted and jank raised one, its text not recorded), LU72, LU73, LU74b (an
-  error, text cut), LU64, LU74, LU79-LU82 (results lost to the runner). LU88-LU90 (jank.shell)
-  failed with an error, none predicted.
+- Round 4's reruns (2026-11-25), the runner reporting jank's error text: LU5, LU6, LU12, LU17,
+  LU21, LU22, LU48, LU59, LU64, LU72, LU73, LU74, LU74b and LU79-LU81 confirmed; LU82 failed on
+  another bug first (the `#inst` locale, its entry above); LU88-LU90 (jank.shell) confirmed in a
+  second rerun once the test image had Boost's headers (jank's package depends on libboost-all-dev;
+  the coverage image lacked them, and `(require 'jank.shell)` failed to compile).
 - Round 3: refuted on main LS2 (BigDecimal division), LS9 (`bigdec` of a double), LS44 (`eval`
   of a quoted object's metadata), LS69 (an `ex-info` across a `finally`). The replica's round 4
   found LS2, LS9 and LS44's tests unable to see the prediction (jank's `=` on BigDecimals has
