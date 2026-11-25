@@ -47,6 +47,11 @@
            (and (str/includes? said "Unable to find `") (str/includes? said "within"))
            (str "\n(A C++ namespace whose source failed or was changed before is lost in this process, even "
                 "when the source is right now. Use a new namespace name for it.)")
+           ;; jank points into its own core.jank when the mistake is in the agent's forms
+           ;; inside one of its macros (an `if` with four forms inside `future`).
+           (re-find #"│ \S*/clojure/core\.jank" said)
+           (str "\n(The place shown is inside jank's own clojure/core.jank, in a macro your code used "
+                "(future, when, let, fn, ...): the mistake is in your forms inside that macro, not there.)")
            called
            (str "\n(" called " was called as a function"
                 (when called-n (str ", with " called-n " arguments"))
