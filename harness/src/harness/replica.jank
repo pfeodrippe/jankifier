@@ -57,13 +57,16 @@
 (defn team
   "A team on model `m`: {:coordinator :translator :specifier}, three agents. `opts`: :system
   (the text all three are told first), :agent (harness.core/agent's options for all three),
-  :files ({:translation :spec :report :dir}, the paths ELLE.md names), :coordinator-effort and
-  :worker-max-tokens as harness.team takes them."
-  [m {:keys [system agent files coordinator-effort worker-max-tokens]
+  :files ({:translation :spec :report :dir}, the paths ELLE.md names), :worker-context (the
+  workers' context, when it differs from :agent's), :coordinator-effort and :worker-max-tokens
+  as harness.team takes them."
+  [m {:keys [system agent files coordinator-effort worker-max-tokens worker-context]
       :or {coordinator-effort :medium worker-max-tokens 24576}}]
   (let [parts (roles files)
         base (merge agent {:draft nil})
-        worker (merge base {:max-tokens worker-max-tokens})
+        ;; A worker reads the whole Clojure file and the base: at 65536 tokens the translator
+        ;; was compacted twice in thirty steps.
+        worker (merge base {:max-tokens worker-max-tokens} (when worker-context {:context worker-context}))
         worker-tools (tools/defaults)
         translator (h/agent m (merge worker {:tools worker-tools :system (str system (:translator parts))}))
         specifier (h/agent m (merge worker {:tools worker-tools :system (str system (:specifier parts))}))
