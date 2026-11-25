@@ -456,7 +456,19 @@ def main():
                     print(f'START {task} {mode} seed {seed}: a new process, its directory has '
                           f'{sorted(os.listdir(HOME))}, the sandbox refuses the harness, the trials and the results',
                           flush=True)
-                    r = unstr(ev(port, run_form(task, mode, seed), 6 * 3600))
+                    answer = ev(port, run_form(task, mode, seed), 6 * 3600)
+                    if answer is None:
+                        # The process ended during the run (the agent's code crashed it: a
+                        # future's deep recursion is a SIGBUS). Its conversation so far is in
+                        # live.edn; its file is graded as it is.
+                        recording = f'{OUT}/{task}-{mode}-{seed}.edn'
+                        if os.path.exists(OUT + '/live.edn'):
+                            shutil.copy(OUT + '/live.edn', recording)
+                        stop(port, proc)
+                        port = proc = None
+                        answer = jstr(f'{{:recording "{recording}", :task :{task}, :file "{TASKS[task]["file"]}", '
+                                      f':mode :{mode}, :seed {seed}, :state :crashed}}')
+                    r = unstr(answer)
                     # The code as the run left it, kept beside its conversation: a run graded
                     # wrong for a jank error ("Failed to find symbol") couldn't be checked again
                     # once the next run had made its directory anew.
@@ -464,7 +476,8 @@ def main():
                     if os.path.exists(written):
                         shutil.copy(written, f'{OUT}/{task}-{mode}-{seed}.jank')
                     # The run's process ended before grading, which has a process of its own.
-                    stop(port, proc)
+                    if proc:
+                        stop(port, proc)
                     port = proc = None
                     right, g = grade_fresh(task, log.replace('.log', '-grade.log'))
                     r = r[:-1] + f' :right {right} :grade {g}}}'

@@ -66,6 +66,10 @@ the syntax, the data structures and most of `clojure.core` and
 - **A `future` must catch everything it can throw.** What escapes one ends the
   whole process (an abort), not just the future. Wrap its body in `try` with
   the three `catch`es above and `(catch :default _ ...)`.
+- **A `future` has a small stack.** A function calling itself a few thousand
+  times deep inside one (one call per item, not `recur`) ends the whole process
+  (SIGBUS), and no `try` catches it; the same recursion outside a future is fine.
+  In a future, repeat with `loop`/`recur`.
 - **A loop that never stops doesn't compile as a function's last form**:
   `(defn spin [] (loop [n 0] (recur (inc n))))` fails when called ("'break'
   statement not in loop"). Give the loop a way to stop: `(when (running?)
