@@ -332,7 +332,7 @@ def run_form(task, mode, seed):
                                 (str step " steps and no file written yet. As VERIFY.md says: write a first small "
                                      "version of both files now (the code and its model, a few operations), run "
                                      "verify on it, and grow both from there. Look things up in VEIL.md when "
-                                     "verify's messages need it.")))
+                                     "verify's messages need it; the harness's own source is not available.")))
                     :on-entry (fn [_]
                                 (when-let [x @current]
                                   (h/save! x live)

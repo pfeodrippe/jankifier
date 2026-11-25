@@ -7,7 +7,9 @@ it tells you what and you go on. Run `verify` yourself as you go.
 The work is two files: a jank namespace with the code and a map `verification`, and a Veil
 model of the code, a Lean file (`.lean`) that the map names. `examples/parking.jank` and
 `examples/parking.lean` are a complete pair that passes: read them first. VEIL.md is the
-guide to writing Veil, with more examples in `examples/veil/`.
+guide to writing Veil, with more examples in `examples/veil/`. The harness's own source is
+not available to you (looking for it finds nothing): this file says all that `verify` does,
+and its messages say what failed.
 
 ## What `verification` holds
 
