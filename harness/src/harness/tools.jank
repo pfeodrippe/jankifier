@@ -147,10 +147,34 @@
   [sources]
   (swap! cpp-accepted (fn [had] (into had (remove (set had) (distinct sources))))))
 
+(def eval-seconds
+  "How long one evaluation (an eval's form, a loaded file) may take."
+  120)
+
+(defn- limited
+  "What `f` returns, or nil when it takes longer than `eval-seconds`: a queue agent's test
+  waited forever on its own deadlock, and its run with it. `f` goes on in the background (a
+  thread can't be stopped)."
+  [f]
+  (let [running (future (f))
+        began (cpp/harness.seconds)]
+    (loop []
+      (cond
+        (realized? running) @running
+        (> (- (cpp/harness.seconds) began) eval-seconds) nil
+        :else (do (cpp/harness.pause 0.05) (recur))))))
+
+(def ^:private timed-out-text
+  (str "the evaluation did not end in " eval-seconds " seconds, so it was left running in the "
+       "background (a thread can't be stopped). Code that waits (@ of a future or promise, a "
+       "lock, a loop) may be waiting forever: give its waits an end, like a loop on realized? "
+       "that gives up after a while (JANK.md: deref with a timeout doesn't wait)."))
+
 (defn- eval-one
   "One piece of code evaluated as an editor would send it: {:out :err :failed :value :ns}."
   [code ns]
-  (let [answer (handler/handle-message {"op" "eval" "code" (str code) "ns" ns})
+  (let [answer (or (limited (fn [] (handler/handle-message {"op" "eval" "code" (str code) "ns" ns})))
+                   {:ex timed-out-text})
         parts (if (map? answer) [answer] (remove nil? answer))
         failed (some :ex parts)]
     {:out (apply str (keep :out parts))
@@ -234,7 +258,8 @@
       (str "error: " path " doesn't read: " (:error found))
       (if-let [bad (cpp-check (cpp-sources text (:spans found)))]
         (str/replace-first bad "error:" (str "error loading " path ":"))
-      (let [r (cards.repl/evaluate text "user" (str path) 1 1 false)]
+      (let [r (or (limited (fn [] (cards.repl/evaluate text "user" (str path) 1 1 false)))
+                  {:ok false :error timed-out-text})]
         ;; Its C++ compiled unless the error says otherwise (cpp/raw forms come first in a file).
         (when-not (and (not (:ok r)) (str/includes? (str (:error r)) "compile C++"))
           (cpp-accept! (cpp-sources text (:spans found))))
