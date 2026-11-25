@@ -468,12 +468,12 @@
                                :else "")))
                       (:params t))))
 
-(defn- same-before?
-  "Whether agent `a` made this call before (the same tool and arguments) and it gave exactly
-  `text`."
+(defn- same-before
+  "How many times agent `a` made this call before (the same tool and arguments) and it gave
+  exactly `text` (0: never)."
   [a named args text]
   (let [es (vec (:entries @a))]
-    (boolean (some (fn [i]
+    (count (filter (fn [i]
                      (let [e (nth es i)]
                        (and (= :call (:role e)) (= (str named) (:name e)) (= args (:args e))
                             (= text (:text (nth es (inc i)))))))
@@ -533,10 +533,19 @@
         ;; than give it again (a model going round in a loop re-reads what it already has). A
         ;; tool with effects gives it, and says it ran again: its effects may be new (loading
         ;; an edited file gives the same text, and loads the edit).
-        same (and (not (:error outcome)) (same-before? a named args text))
+        times (if (:error outcome) 0 (same-before a named args text))
+        same (pos? times)
         text (cond
                (and same (:reads-only found))
                "(This call gave exactly this result before: the result is earlier in this conversation.)"
+
+               ;; Said plainer once it repeats: an agent ran the same command seven times
+               ;; after this note, and the run ended as a loop.
+               ;; (The sentence after it last, as the trials' loop check reads the end.)
+               (>= times 2)
+               (str text "\n(This call has now given this result " (inc times) " times: running it again "
+                    "gives the same. Change the call, or do something else.)"
+                    "\n(It ran again and gave the same result as the last time it was called so.)")
 
                same
                (str text "\n(It ran again and gave the same result as the last time it was called so.)")

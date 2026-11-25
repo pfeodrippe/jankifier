@@ -253,6 +253,10 @@
   [command timeout]
   (let [ran (cpp/harness.run (str command) 200000 (double (or timeout 120)))
         said (str (:out ran)
+                  ;; A failing command with nothing to say (grep finding nothing exits 1, and an
+                  ;; && after it is skipped): "[exit 1]" alone had an agent run it seven times.
+                  (when (and (str/blank? (str (:out ran))) (not (:timed-out ran)) (not (zero? (:exit ran))))
+                    "(no output)")
                   (when (> (:bytes ran) (count (str (:out ran))))
                     (str "\n[output cut: " (:bytes ran) " bytes in all]"))
                   (when (:timed-out ran)
