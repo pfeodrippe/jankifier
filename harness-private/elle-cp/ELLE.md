@@ -88,6 +88,13 @@ What `closed_predicate.clj` calls from outside, and where it is in Lean:
 | `ct/cycles!` | `cyclesE an {}` (an `Except`) | `Txn.lean`; `{}` is the default order of the graph's vertices |
 | `ct/result-map` | `resultMap` | `Txn.lean` |
 
+The explainers (`RWExplainer`, `WRExplainer`, `WWExplainer`, records of `elle/DataExplainer`) are
+in Lean an analysis's `explain : Nat → Nat → Option Step` (op indices in, as
+`explain-pair-data`'s `a` and `b`): `none` for Clojure's `nil`, else a `Step` with `type` the
+map's `:type` as a string (`"rw"`, `"rwp"`, ...), `key` its `:key`, and `predicate` true when the
+map has `:predicate? true` (the cycle classification reads it). The map's other keys and
+`render-explanation` only make the text of an explanation: not needed.
+
 Two Clojure forms the file uses often:
 
 - `loopr` (from the dom-top library, `dt/loopr`): `(loopr [acc init ...] [x coll ...] body final?)`
