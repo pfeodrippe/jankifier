@@ -196,7 +196,7 @@
                    (sort-by (fn [[sym _]] (str sym)) (ns-publics found))))))
 
 (defn describe
-  "Describes one thing a namespace defines, by its full name (like inkling.core/routing):
+  "Describes one thing a namespace defines, by its full name (like clojure.string/split):
   its parameters and its documentation."
   [name]
   (let [sym (symbol (str name))
@@ -204,7 +204,7 @@
             (when-let [found (find-ns (symbol (namespace sym)))]
               (get (ns-publics found) (symbol (clojure.core/name sym)))))]
     (when-not v
-      (throw (ex-info (str "nothing is defined as " name ": give the full name, like inkling.core/routing") {})))
+      (throw (ex-info (str "nothing is defined as " name ": give the full name, like clojure.string/split") {})))
     (let [said (meta v)]
       (str name
            (when (:arglists said) (str "\nparameters: " (str/join " or " (map pr-str (:arglists said)))))
@@ -377,7 +377,7 @@
                         :limit 12000})
    (h/wrap #'functions {:reads-only true :params {:namespace "the namespace's name, like inkling.core"}
                         :limit 12000})
-   (h/wrap #'describe {:reads-only true :params {:name "the full name, like inkling.core/routing"}})
+   (h/wrap #'describe {:reads-only true :params {:name "the full name, like clojure.string/split"}})
    (h/wrap #'read-file {:name "read_file" :reads-only true
                         :params {:path "the file's path"
                                  :from {:type "integer" :doc "the first line wanted (optional)"}
