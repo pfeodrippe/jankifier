@@ -26,7 +26,16 @@
   for the whole process: kv agents lost dozens of steps to them, trying the same name again."
   [said]
   (let [said (str said)
-        missing (second (re-find #"Symbols not found: \[ ([^ \]]+)" said))]
+        missing (second (re-find #"Symbols not found: \[ ([^ \]]+)" said))
+        ;; jank's "Invalid call to `small_integer` with `0` args": a value called as a function.
+        ;; A kv agent met it 40 times without seeing that its (whole-end) called a number.
+        [_ called-type called-n] (re-find #"Invalid call to `(\w+)` with `(\d+)` args" said)
+        called (or (get {"small_integer" "a number" "integer" "a number" "big_integer" "a number" "real" "a number"
+                         "ratio" "a number" "persistent_string" "a string" "nil" "nil" "boolean" "true or false"
+                         "character" "a character"}
+                        called-type)
+                   ;; The same found when compiling: "There is no call operator for `int`".
+                   (when (re-find #"There is no call operator for `" said) "a value that is not a function"))]
     (str said
          (cond
            (and (str/includes? said "redefinition of") (str/includes? said "checked with clang"))
@@ -38,6 +47,11 @@
            (and (str/includes? said "Unable to find `") (str/includes? said "within"))
            (str "\n(A C++ namespace whose source failed or was changed before is lost in this process, even "
                 "when the source is right now. Use a new namespace name for it.)")
+           called
+           (str "\n(" called " was called as a function"
+                (when called-n (str ", with " called-n " arguments"))
+                ": something like (n) where n is not a function. Look for an extra pair of brackets around "
+                "a value, or a value where a function was meant.)")
            missing
            (str "\n(The C++ library function " (cpp/harness.demangle missing) " can't be linked in this "
                 "process any more: C++ source that failed to compile used it first, and jank's JIT doesn't "
