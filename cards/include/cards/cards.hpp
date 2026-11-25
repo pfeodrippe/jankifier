@@ -111,6 +111,13 @@ namespace cards
     {
       return true;
     }
+    /* Hidden (a test, a video, a trial's run): no menu bar, so GLFW leaves the process a
+       background one on macOS. Otherwise it makes every such process a regular app at start,
+       and the Mac brings it to the front, taking the person away from what they were doing. */
+    if(jank::runtime::truthy(hidden))
+    {
+      glfwInitHint(GLFW_COCOA_MENUBAR, GLFW_FALSE);
+    }
     if(!glfwInit())
     {
       return false;
