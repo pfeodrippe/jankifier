@@ -177,6 +177,9 @@
                  when the work is done, else what isn't (harness.verify/gate checks a file
                  against its model). Then that is said to the model and the turn goes on.
     :max-checks  times the obligations may send the model back in a turn (6)
+    :remind      (fn [agent step]) asked after each step: text added after the step's last
+                 result, as the steps left are, or nil (a verified run can be reminded to
+                 write its files early)
     :compact     (fn [agent preparation]) what the conversation's older part becomes when the
                  session nears its end: a summary's text, or nil to leave it as it is. By
                  default `summarize` (the model writes a summary); nil turns compaction off
@@ -198,7 +201,7 @@
   ([m] (agent m {}))
   ([m {:keys [tools system effort context sampling max-tokens max-thinking max-steps on-entry
               obligations max-checks compact-reserve compact-keep draft summary-result-chars
-              summary-thinking-chars] :as opts}]
+              summary-thinking-chars remind] :as opts}]
    (let [tools (mapv tool tools)
          ids (into {} (map (fn [[k piece]] [k (ink/token-id m piece)]) pieces))
          size (or context 16384)
@@ -213,6 +216,7 @@
             :on-entry on-entry
             :obligations obligations
             :max-checks (or max-checks 6)
+            :remind remind
             :compact (if (contains? opts :compact) (:compact opts) summarize)
             :draft (if (contains? opts :draft) draft {:least 6 :most 15})
             :compact-reserve (or compact-reserve
@@ -633,7 +637,10 @@
             (swap! a assoc :state :steps))
 
         :else
-        (let [note (steps-note step (:max-steps @a))
+        (let [note (let [n (str (steps-note step (:max-steps @a))
+                                (when-let [r (:remind @a)]
+                                  (when-let [said (r a (inc step))] (str "\n\n[the harness] " said))))]
+                     (when-not (= "" n) n))
               last-call (dec (count calls))
               full (reduce
                     (fn [full [i called]]
