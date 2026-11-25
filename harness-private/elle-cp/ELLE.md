@@ -53,7 +53,10 @@ In `lean/`, a Lean 4 project:
 
 ## What is given
 
-`lean/Elle/*.lean`: the rest of Elle, already translated. Do not change these files.
+`lean/Elle/*.lean`: the rest of Elle, already translated. Do not change these files. Of Elle's
+Clojure only `closed_predicate.clj` is here (looking for the rest finds nothing): to see what a
+function it calls from `elle.txn` or `elle.core` does, read its translation in `Txn.lean` or
+`Core.lean`, whose comments name the Clojure lines.
 
 - `Basic.lean`: histories. `Val` (nil, an integer, a map of keys to values, unborn, dead), `Mop`
   (a micro-op `[f k v]`; `f` is `.r .w .insert .delete .rp`; for `.rp`, `pred` holds the
