@@ -605,6 +605,9 @@ namespace harness
     };
     std::vector<opened> stack;
     size_t line{ 1 }, i{}, n{ s.size() }, start_line{};
+    /* The last top-level form closed: where it started and where its last bracket closed it
+       (a ')' that closes nothing is often one too many in it). */
+    size_t closed_from{}, closed_at{};
     long start{ -1 };
     bool atom{};
     auto const closer([](char const o) { return o == '(' ? ')' : (o == '[' ? ']' : '}'); });
@@ -687,7 +690,15 @@ namespace harness
       {
         if(stack.empty())
         {
-          return fail("line " + std::to_string(line) + ": a '" + std::string(1, c) + "' that closes nothing");
+          /* A form with one ')' too many closes early, and the error lands on a later line: say
+             where the form before it was closed (kv agents counted brackets by hand for dozens
+             of steps). */
+          return fail("line " + std::to_string(line) + ": a '" + std::string(1, c) + "' that closes nothing"
+                      + (closed_at
+                           ? "; the form before it, from line " + std::to_string(closed_from) + ", was closed at line "
+                               + std::to_string(closed_at)
+                               + ": if that is too early, a closing bracket there is one too many"
+                           : std::string{}));
         }
         auto const o(stack.back());
         if(closer(o.c) != c)
@@ -699,6 +710,8 @@ namespace harness
         ++i;
         if(stack.empty())
         {
+          closed_from = start_line;
+          closed_at = line;
           finish(i);
         }
         continue;
