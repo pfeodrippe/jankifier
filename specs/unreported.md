@@ -236,8 +236,8 @@ message. `jankifier.nrepl` works around it.
 These were predicted by a Lean replica of jank written blind from its sources (determinismo's
 `lean/jank`, rounds 1 and 2), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
 Linux, UTF-8 locale, each test in its own process with a 600 s limit, through determinismo-ci)
-and on Clojure 1.11.1. The tests are in [repro/lean-replica/](repro/lean-replica/): each asserts
-Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
+and on Clojure 1.11.1. The tests live with the replica, in determinismo-workloads'
+[jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests): each asserts Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
 issues and PRs were searched by keyword on 2026-11-25; none found unless said.
 
 Already elsewhere: A2 here (on main, `nth` after `persistent!` now refuses, but with a C++

@@ -49,8 +49,8 @@ A second model, a Lean replica of jank written blind from its sources (determini
 `lean/jank`), predicted 120 deviations from Clojure in rounds 1 and 2. On jank main (`7135b7708`,
 x86-64 Linux) 104 were confirmed exactly, 8 were refuted (3 of them fixed after 0.1) and 4 didn't
 run. Their minimal examples, code paths and upstream status are in
-[unreported.md](unreported.md#found-by-a-lean-replica-of-jank), the tests in
-[repro/lean-replica/](repro/lean-replica/).
+[unreported.md](unreported.md#found-by-a-lean-replica-of-jank); the replica and its tests are in
+determinismo-workloads' [jank-interop/lean](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean).
 
 - **Crashes**: D9 (NaN from `∞-∞` or `0.0/0.0`, SIGSEGV on x86-64), D2b (int32 minimum / -1,
   SIGFPE), R47 (a parameter named like its fn), R119 (`first` of an infinite mapped real range),

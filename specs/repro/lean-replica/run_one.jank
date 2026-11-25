@@ -1,9 +1,0 @@
-(ns run-one
-  (:require [clojure.test :as t]))
-
-;; One test of the replica's suites, by namespace and name:
-;; jank --module-path . run-main run-one jank-lean.deviations-test d02-integer-division-is-a-ratio
-(defn -main [ns-name test-name]
-  (let [ns-sym (symbol ns-name)]
-    (require ns-sym)
-    (t/test-vars [(ns-resolve ns-sym (symbol test-name))])))

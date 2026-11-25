@@ -104,13 +104,6 @@ memory in between.
   aren't ported): each fails as soon as it's used; determinismo has
   `locking` (§3.17).
 
-- `lean-replica/jank_lean/*.jank` are clojure.test namespaces, one `deftest` per prediction of
-  a Lean replica of jank (unreported.md, "Found by a Lean replica of jank"). Each asserts
-  Clojure's result, so each fails on jank. On Clojure they pass once
-  `cpp/jank.runtime.object_ref` becomes `Throwable` and `(thrown? (…))` becomes
-  `(thrown? Throwable (…))`. Run one test per process, since some crash or hang jank:
-
-  ```sh
-  cd specs/repro/lean-replica
-  jank --module-path . run-main run-one -- jank-lean.deviations-test d02-integer-division-is-a-ratio
-  ```
+- The Lean replica's tests (unreported.md, "Found by a Lean replica of jank") live with the
+  replica in determinismo-workloads' [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests), with how to run
+  one on jank.
