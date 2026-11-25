@@ -61,27 +61,31 @@ determinismo-workloads' [jank-interop/lean](https://github.com/determinismo-dst/
 - **Crashes**: D9 (NaN from `∞-∞` or `0.0/0.0`, SIGSEGV on x86-64), D2b (int32 minimum / -1,
   SIGFPE), R47 (a parameter named like its fn), R119 (`first` of an infinite mapped real range),
   R97 (`(compare :a 1)`, the `catch` never runs), D24 (a throwing `catch` then a throwing
-  `finally`, `std::terminate`).
+  `finally`, `std::terminate`), LS34 (a long input to a regex overflows the stack), LU26
+  (`cpp/delete` of a pointer from C++'s `new`).
 - **Hangs**: R1 (NUL in `read-string`), D16 (a watch removing itself), R116 (`range` past 2^31),
-  R117 (`doseq` over a held cons).
-- **Wrong values**: numbers (D2, D4b, D5–D8, D10, D12, D13, R23, R24, R26, R44, R99, R122),
-  concurrency (D18, D19), the compiler (R29, R30, R33, R34, R37, R38, R42, R103, R108, R110,
-  R112), collections (R105, R118, R120, R121), the reader (R4–R6, R10, R11, R13–R16, R19–R21),
-  strings and printing (R53, R55–R61, R63, R68–R72, R76), regex (R79, R81, R82, R84).
+  R117 (`doseq` over a held cons), LS62–LS65 and LS67 (locks re-entered by validators,
+  `alter-var-root`, `realized?`, `future-cancel`, lazy var metadata), LU13 (`alter-var-root`
+  first-calling its fn), LU19 (`defmethod` with a lazy dispatch value), LU28 (`with-meta` on
+  `iterate` or `(range)`).
+- **Wrong values**:
+  - numbers: D2, D4b, D5–D8, D10, D12, D13, R23, R24, R26, R44, R99, R122, LS3–LS8, LS10–LS12,
+    LS14–LS21, LS40, LU1, LU2, LU75, LU83, LU84;
+  - concurrency: D18, D19, LU15, LU18;
+  - the compiler: R29, R30, R33, R34, R37, R38, R42, R103, R108, R110, R112, LS38, LS41, LU3,
+    LU4, LU7–LU11, LU14 (lazily compiled fns: a var's root rebound at a fn's first call, losing
+    `alter-var-root` wrappers and `with-redefs` stubs), LU20, LU23–LU25 (C++ operators and
+    templates);
+  - collections: R105, R118, R120, R121, LS59, LS60, LU27, LU31–LU34, LU61, LU66, LU67, LU69;
+  - the reader: R4–R6, R10, R11, R13–R16, R19–R21, LU40, LU71;
+  - strings and printing: R53, R55–R61, R63, R68–R72, R76, LS73, LU16, LU39, LU63, LU65, LU70,
+    LU78, LU85, LU86, LU91;
+  - regex: R79, R81, R82, R84, LS22, LS23, LS25, LS26, LS29–LS31, LS33, LU35–LU38;
+  - nREPL and the REPL: LU41, LU44;
+  - modules and the CLI: LU45, LU50, LU51, LU55.
 - **Errors where Clojure works**: D25, R2, R3, R7, R8, R12, R17, R18, R27, R28, R39–R41, R73,
-  R74, R96, R98, R101, R104, R114.
-- **Round 3**: a crash (LS34: a long input to a regex overflows the stack), five hangs (LS62,
-  LS63, LS64, LS65, LS67: locks re-entered by validators, `alter-var-root`, `realized?`,
-  `future-cancel`, lazy var metadata), wrong values in BigDecimal and BigInt arithmetic (LS3–LS8,
-  LS10–LS12, LS14–LS21, LS40), regex (LS22, LS23, LS25, LS26, LS29–LS31, LS33), the compiler
-  (LS38, LS41), collections (LS59, LS60) and printing (LS73), and errors where Clojure works
-  (LS1, LS18, LS24, LS27, LS28, LS32, LS35–LS37, LS42, LS61, LS71).
-- **Round 4**: lazily compiled fns (LU8–LU11, LU14: a var's root rebound at a fn's first call,
-  which loses `alter-var-root` wrappers and `with-redefs` stubs), thread bindings (LU15, LU16,
-  LU18), hangs (LU13, LU19, LU28), C++ operators and templates (LU20, LU23–LU25, LU26's
-  segfault), collection objects (LU27, LU29–LU34), regex (LU35–LU39), nREPL and REPL (LU40,
-  LU41, LU44), modules and the CLI (LU45, LU49–LU51, LU55), and clojure.core and its bundled
-  namespaces (LU61–LU63, LU65–LU71, LU75–LU78, LU83–LU87, LU91, LU92).
+  R74, R96, R98, R101, R104, R114, LS1, LS18, LS24, LS27, LS28, LS32, LS35–LS37, LS42, LS61,
+  LS71, LU29, LU30, LU49, LU62, LU68, LU76, LU77, LU87, LU92.
 - **Upstream**: D1, R25 and D4 are #1208; D15 is A2 here, R100 is A3, D21 is S3, R80 is S6, D22
   is C3 (which also happens on Linux). LS60 is #1235's map case.
   The rest: no issue found (keyword search, 2026-11-25).
