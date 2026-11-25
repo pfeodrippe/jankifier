@@ -68,20 +68,31 @@
         translator (h/agent m (merge worker {:tools worker-tools :system (str system (:translator parts))}))
         specifier (h/agent m (merge worker {:tools worker-tools :system (str system (:specifier parts))}))
         defaults (tools/defaults)
-        pick (fn [n] (some (fn [t] (when (= (:name t) n) t)) defaults))
+        ;; The coordinator's own tools work once it has handed the work out: with the shell and
+        ;; the files it read Elle's code itself for fourteen steps while both workers waited.
+        handed (atom false)
+        pick (fn [n] (when-let [t (some (fn [t] (when (= (:name t) n) t)) defaults)]
+                       (update t :fn (fn [f]
+                                       (fn [args]
+                                         (if @handed
+                                           (f args)
+                                           (str "Hand the work out first, with ask_both: reading Elle's code "
+                                                "and writing the translation and the specification are the "
+                                                "workers' work. This tool works once they have it.")))))))
         asks [{:name "ask_translator"
                :doc "Asks the translator (it writes the translation) and gives its answer, once it has worked."
                :params {:text {:type "string" :doc "what the translator should do"}}
-               :fn (fn [{:keys [text]}] (asked translator text))}
+               :fn (fn [{:keys [text]}] (reset! handed true) (asked translator text))}
               {:name "ask_specifier"
                :doc "Asks the specifier (it writes the specification) and gives its answer, once it has worked."
                :params {:text {:type "string" :doc "what the specifier should do"}}
-               :fn (fn [{:keys [text]}] (asked specifier text))}
+               :fn (fn [{:keys [text]}] (reset! handed true) (asked specifier text))}
               {:name "ask_both"
                :doc "Asks the translator and the specifier at once (they work at the same time) and gives both answers."
                :params {:translator {:type "string" :doc "what the translator should do"}
                         :specifier {:type "string" :doc "what the specifier should do"}}
                :fn (fn [args]
+                     (reset! handed true)
                      (h/ask! translator (:translator args))
                      (h/ask! specifier (:specifier args))
                      (str "The translator answered:\n" (or (h/answer translator) "(nothing)")
