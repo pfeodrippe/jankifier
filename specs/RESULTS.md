@@ -58,7 +58,7 @@ recorded every error's text: 16 more of round 4's tests confirmed their predicti
 another bug instead (reading any `#inst` needs the `en_US.UTF-8` locale, LU82), three (u88–u90)
 couldn't load `jank.shell` in the test image and wait, and round 3's four errors without text (LS1,
 LS36, LS37, LS42) now have it. Their minimal examples, code paths and upstream status are in
-[unreported.md](unreported.md#found-by-a-lean-replica-of-jank); the replica and its tests are in
+[repros.md](repros.md#found-by-a-lean-replica-of-jank); the replica and its tests are in
 determinismo-workloads' [jank-interop/lean](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean).
 
 - **Crashes**: D9 (NaN from `∞-∞` or `0.0/0.0`, SIGSEGV on x86-64), D2b (int32 minimum / -1,

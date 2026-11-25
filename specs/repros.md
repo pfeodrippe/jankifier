@@ -1,7 +1,7 @@
-# Findings not reported upstream
+# jank repros
 
-Minimal examples of the findings in [RESULTS.md](RESULTS.md) for which no
-jank issue or PR was found. Each was checked on 2026-11-21 on jank 0.1
+Minimal examples of the findings in [RESULTS.md](RESULTS.md); each says whether jank's issues
+or PRs already have it (none found unless said). Each was checked on 2026-11-21 on jank 0.1
 (Homebrew), on jank main (the build published on 2026-11-20, `774d02f62`) and
 on Clojure 1.11.1. Unless noted, jank 0.1 and main give the same result. The
 longer reproductions are in [repro/](repro/).
@@ -234,7 +234,7 @@ message. `jankifier.nrepl` works around it.
 ## Found by a Lean replica of jank (checked on jank main)
 
 These were predicted by a Lean replica of jank written blind from its sources (determinismo's
-`lean/jank`, rounds 1 to 4; round 3's S items appear here as LS and round 4's U items as LU, since S and U name this file's own), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
+`lean/jank`, rounds 1 to 5; round 3's S items appear here as LS, round 4's U items as LU and round 5's V items as LV, since S and U name this file's own; round 5 was run on jank main directly, each test in its own process with a 120 s limit), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
 Linux, UTF-8 locale, each test in its own process with a 600 s limit, 120 s in round 3, through determinismo-ci)
 and on Clojure 1.11.1. The tests live with the replica, in determinismo-workloads'
 [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests): each asserts Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
@@ -344,6 +344,16 @@ codegen 1894–1919 emits `GC_free`; bdwgc `GC_free` 824–850 reads the header 
 ```
 
 core.jank `slurp`: `file_size` (7331) runs before `is_open`, and its `std::filesystem` error is no jank exception.
+
+- [ ] **LV12**: a future whose body raises a read error kills the process at deref (`deviations_r5_test.jank`: `v12`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(deref (future (read-string "(")))
+;; jank => terminate called after throwing an instance of 'jtl::ref<jank::error::base>' (SIGABRT)
+;; clj  => ExecutionException (cause: EOF while reading)
+```
+The future's thread rethrows the `error_ref` from a `catch(...)`, which reaches `std::terminate`.
 
 ### Hangs
 
@@ -856,6 +866,38 @@ context.cpp `get_thread_bindings` 765–775 returns the `var_thread_binding` box
 
 context.cpp 752–763. Lean theorem `future_pop`.
 
+- [ ] **LV10**: a failed delay throws a native error at the first deref and a string at the second (`deviations_r5_test.jank`: `v10`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(def d (delay (nth [1 2] 5)))
+(try @d (catch Exception e (type e)))   ; first deref
+(try @d (catch Exception e (type e)))   ; second deref
+;; jank => a native std::exception the first time (no object handler sees it), then a string object
+;; clj  => the same IndexOutOfBoundsException both times
+```
+
+- [ ] **LV11**: a delay whose body raises a read error runs its body again at every deref (`deviations_r5_test.jank`: `v11`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(def n (atom 0))
+(def d (delay (swap! n inc) (read-string "(")))
+(try @d (catch Throwable _)) (try @d (catch Throwable _))
+@n
+;; jank => 2
+;; clj  => 1
+```
+
+- [ ] **LV13**: a failed future's deref throws the native error's message as a string (`deviations_r5_test.jank`: `v13`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(try @(future (nth [1 2] 5)) (catch Exception e (string? e)))
+;; jank => true (the thrown object is a string)
+;; clj  => false (an ExecutionException)
+```
+
 ### Wrong values, no error: the compiler
 
 - [ ] **R29**: a named fn's name doesn't shadow a macro of the same name (`r29`).
@@ -1109,6 +1151,16 @@ CppInterOp `BestOverloadMatch` 2203 adds no built-in candidates.
 
 `build_cpp_value` 3738–3752 → `instantiate(scope, {})` → CppInterOp.cpp `CompleteTemplateArguments` 6644 fills in the defaults. Lean theorem `jank_ctor_specialization_is_defaults`. Related: #525 (default arguments in templates, closed).
 
+- [ ] **LV14**: a top-level `def` whose value throws still sets the def's metadata on the var (`deviations_r5_test.jank`: `v14`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(try (eval '(def ^{:vb8 1} x (throw (ex-info "boom" {})))) (catch Exception _))
+(:vb8 (meta #'x))
+;; jank => 1
+;; clj  => nil (DefExpr sets the metadata after the value)
+```
+
 ### Wrong values, no error: collections and sequences
 
 - [ ] **R105**: sorted `find` returns the queried key (`r105`).
@@ -1254,6 +1306,15 @@ walk.jank 3–12. Lean theorems `jank_walk_drops_list_meta`, `walk_vec_meta_agre
 ```
 
 core.jank 2411–2423 builds the map through a hash-map transient. Extends LS59.
+
+- [ ] **LV48**: a value jank finds unequal to itself is never found in a hash set or map, and is stored twice (`deviations_r5_test.jank`: `v48`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(let [x (seq "é")] [(contains? (hash-set x) x) (count (hash-set x x)) (get (hash-map x 1) x)])
+;; jank => [false 2 nil]
+;; clj  => [true 1 1]
+```
 
 ### Wrong values, no error: the reader
 
@@ -1416,6 +1477,55 @@ Positions only reach `{:jank/source …}` (core/meta.cpp 171–228), which `stri
 ```
 
 stduuid uuid.h 503–547.
+
+- [ ] **LV17**: `read-string` of a text with no form returns nil (`deviations_r5_test.jank`: `v17`, `v17b`, `v17c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(read-string "")
+(read-string "; only a comment")
+(read-string {} " ")
+;; jank => nil, nil, nil
+;; clj  => RuntimeException: EOF while reading (each)
+```
+
+- [ ] **LV41**: before 1970, a fraction below the millisecond moves the instant one millisecond toward 1970 (`deviations_r5_test.jank`: `v41`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(inst-ms #inst "1969-12-31T23:59:59.9995")
+;; jank => 0
+;; clj  => -1
+```
+
+- [ ] **LV42**: `=` on insts compares nanoseconds: an inst isn't `=` to the read of its own printed form (`deviations_r5_test.jank`: `v42`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(def x #inst "2020-01-01T00:00:00.0001")
+(= x (read-string (pr-str x)))
+;; jank => false (both print #inst "2020-01-01T00:00:00.000-00:00")
+;; clj  => true
+```
+
+- [ ] **LV44**: `*default-data-reader-fn*` takes `#inst` and `#uuid` before the built-in readers (`deviations_r5_test.jank`: `v44`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(binding [*default-data-reader-fn* tagged-literal]
+  [(inst? (read-string "#inst \"2020-01-01\"")) (uuid? (read-string "#uuid \"00000000-0000-0000-0000-000000000000\""))])
+;; jank => [false false] (tagged literals)
+;; clj  => [true true]
+```
+
+- [ ] **LV46**: `print` writes an inst without its `#inst` tag (low) (`deviations_r5_test.jank`: `v46`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(print-str #inst "2020-01-01")
+;; jank => "2020-01-01T00:00:00.000-00:00"
+;; clj  => "#inst \"2020-01-01T00:00:00.000-00:00\""
+```
 
 ### Wrong values, no error: strings and printing
 
@@ -1810,6 +1920,26 @@ Lean theorem `nth_without_match_nil`.
 
 re_pattern.cpp 6–11 uses `c_str()`. Lean theorem `jankEval4_pattern_nul`.
 
+- [ ] **LV35**: `\\b` falls between a letter and its combining mark (`deviations_r5_test.jank`: `v35`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(re-find #"e\b" "e\u0301")
+(re-seq #"\b\w+\b" "cafe\u0301 x")
+;; jank => "e", ("cafe" "x")
+;; clj  => nil, ("x")
+```
+
+- [ ] **LV36**: Java's line terminators U+0085, U+2028, U+2029: `.` matches them and `$` doesn't stop before a final one (`deviations_r5_test.jank`: `v36`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(re-matches #".*" "\u2028")
+(re-find #"a$" "a\u2028")
+;; jank => "\u2028", nil
+;; clj  => nil, "a"
+```
+
 ### Wrong values, no error: nREPL and the REPL
 
 - [ ] **LU41**: `completions` gives each var the searched namespace as its `:ns` (`deviations_r4_test.jank`: `u41`; on main: gave `"user"`).
@@ -1830,6 +1960,28 @@ completions.jank 54–64.
 ```
 
 evaluate.cpp `safe_eval` 750: the `exception_info` made from an `error_ref` gets no message.
+
+- [ ] **LV18**: after a compile error at the nREPL, `*e` has no data and no cause (`deviations_r5_test.jank`: `v18`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+;; at jank's nREPL:
+(undefined-fn)
+(some? (ex-data *e))
+(some? (ex-cause *e))
+;; jank => false, false
+;; clj  => true, true (the compiler's data; the "Unable to resolve symbol" exception as cause)
+```
+
+- [ ] **LV37**: `interrupt` is answered `unknown-op` (`deviations_r5_test.jank`: `v37`, `v37b`).
+  Tracker: related: PR #1175 (merged 2026-11-11, nREPL fixes from `proof`) says session bookkeeping isn't implemented yet; `interrupt` still answers unknown-op on 7135b7708. No issue for it (searched 2026-11-25).
+
+```clojure
+{"op" "interrupt" "session" <an idle session>}
+{"op" "interrupt" "interrupt-id" "e"}            ; no session
+;; jank => #{"error" "unknown-op" "done"} both
+;; nREPL 1.8.0 => #{"session-idle" "done"}, #{"error" "session-ephemeral" "done"}
+```
 
 ### Wrong values, no error: modules and the CLI
 
@@ -1864,6 +2016,17 @@ core.jank `load-lib` 4846.
 ```
 
 core.jank `ns` 5633–5637. Extends R21.
+
+- [ ] **LV8**: a require whose module fails leaves the namespace it created (`deviations_r5_test.jank`: `v08`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+;; a module whose top level throws after (ns a.b)
+(try (require 'a.b) (catch Throwable _))
+(find-ns 'a.b)
+;; jank => #namespace[a.b]
+;; clj  => nil (load-lib removes it)
+```
 
 ### Throws or doesn't compile where Clojure works
 
@@ -2389,6 +2552,240 @@ shell.jank 52–73 closes stdin and calls `process.wait()` before reading stdout
 ```
 
 `cpp/cast std.string` of a non-string (convert/builtin.hpp 333–336).
+
+- [ ] **LV7**: read, analysis and load errors are `jank::error_ref`, which no `(catch ... e)` of an object sees, so no `thrown?` does (`deviations_r5_test.jank`: `v07`, `v07b`, `v07c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(try (read-string "(") (catch Exception e :caught))
+(try (eval 'no-such-name) (catch Exception e :caught))
+(try (require 'no.such.namespace) (catch Exception e :caught))
+;; jank => none caught: only a `(catch cpp/jank.error_ref _)` handler sees them
+;; clj  => :caught, :caught, :caught
+```
+
+- [ ] **LV9**: an ex-info thrown while a module loads, or by a macro, loses its data (`deviations_r5_test.jank`: `v09`, `v09b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(defmacro m [] (throw (ex-info "m" {:k 1})))
+(try (eval '(m)) (catch Exception e (ex-data (ex-cause e))))
+;; jank => no object is raised (an error_ref holding the printed form)
+;; clj  => {:k 1}
+```
+
+- [ ] **LV15**: `ex-info` refuses a nil message (`deviations_r5_test.jank`: `v15`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(ex-message (ex-info nil {}))
+;; jank => "An object of type `persistent_string` was expected here, but a `nil` was provided instead."
+;; clj  => nil
+```
+
+- [ ] **LV16**: `ex-info` with nil data has nil data (low) (`deviations_r5_test.jank`: `v16`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(ex-data (ex-info "m" nil))
+;; jank => nil
+;; clj  => {} (1.12)
+```
+
+- [ ] **LV38**: an `#inst` with a `Z` offset is a read error (`deviations_r5_test.jank`: `v38`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+#inst "2020-01-01T00:00:00Z"
+;; jank => Unrecognized date/time syntax: 2020-01-01T00:00:00Z
+;; clj  => #inst "2020-01-01T00:00:00.000-00:00"
+```
+
+- [ ] **LV39**: an `#inst` leap second is a read error (`deviations_r5_test.jank`: `v39`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+#inst "2016-12-31T23:59:60"
+;; jank => Unrecognized date/time syntax: 2016-12-31T23:59:60
+;; clj  => #inst "2017-01-01T00:00:00.000-00:00"
+```
+
+- [ ] **LV40**: an `#inst` fraction of more than 9 digits is a read error, or moves the instant 12 hours (`deviations_r5_test.jank`: `v40`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(inst-ms #inst "2020-01-01T00:00:00.12345678912")
+#inst "2020-01-01T00:00:00.1234567891"
+;; jank => 1577793600123 (12 hours earlier); Unrecognized date/time syntax
+;; clj  => 1577836800123; #inst "2020-01-01T00:00:00.123-00:00"
+```
+
+- [ ] **LV43**: `compare` and `sort` of insts throw (`deviations_r5_test.jank`: `v43`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(compare #inst "2020-01-01" #inst "2021-01-01")
+;; jank => Objects of type 'inst' do not support the 'compare' behavior.
+;; clj  => -1
+```
+
+- [ ] **LV45**: an `#inst` offset after a date, or an hour alone, is a read error (`deviations_r5_test.jank`: `v45`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+#inst "2020-01-01-05:00"
+#inst "2020-01-01T10"
+;; jank => Unrecognized date/time syntax (each)
+;; clj  => #inst "2020-01-01T05:00:00.000-00:00", #inst "2020-01-01T10:00:00.000-00:00"
+```
+
+- [ ] **LV47**: there is no `clojure.instant` (low) (`deviations_r5_test.jank`: `v47`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(require 'clojure.instant)
+;; jank => The module `clojure.instant` could not be found.
+;; clj  => nil
+```
+
+- [ ] **LV24**: the bundled `jank.math` can't load (`deviations_r5_test.jank`: `v24`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(require 'jank.math)
+;; jank => The symbol `native/raw` could not be resolved. (removed as a special form in 529718a6)
+;; clj  => (jank only)
+```
+
+- [ ] **LV3**: loading a file that isn't a library raises no error (`llvm::cantFail`: undefined behavior in a release build) (`deviations_r5_test.jank`: `v03`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(spit "/tmp/x.so" "hello\n")
+;; (cpp/raw "inline void ld(jank::runtime::object_ref p) { jank::runtime::__rt_ctx->jit_prc.load_dynamic_library(p.to_string()); }")
+((fn [p] (cpp/ld p)) "/tmp/x.so")
+;; jank => nil, no error
+;; clj  => (System/load "/tmp/x.so"): UnsatisfiedLinkError
+```
+
+- [ ] **LV19**: `jank_call2` catches and prints what the fn throws and returns nil; `jank_call1` and `jank_call3`-`11` let it through (`deviations_r5_test.jank`: `v19 (control v19b passes)`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+;; through the C API, f throwing (ex-info "boom" {}):
+;; jank_call1(f, a)    => throws
+;; jank_call2(f, a, b) => prints the exception, returns nil
+;; IFn.invoke          => throws
+```
+
+- [ ] **LV21**: the C API's `jank_symbol_create(nil, "a")` is `nil/a` and `jank_keyword_intern(nil, "a")` is `:nil/a` (low) (`deviations_r5_test.jank`: `v21`, `v21b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+jank_symbol_create(nil, "a")  ; jank => nil/a   clj (Symbol/intern nil "a")  => a
+jank_keyword_intern(nil, "a") ; jank => :nil/a  clj (Keyword/intern nil "a") => :a
+```
+
+- [ ] **LV25**: assigning a temporary of a move-only class picks the deleted copy assignment (`deviations_r5_test.jank`: `v25`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "struct mo { int v{}; mo() = default; mo(int x) : v(x) {} mo(mo &&) = default; mo &operator=(mo &&) = default; }; inline mo g;")
+(cpp/= cpp/g (cpp/mo. 5))
+;; jank => No matching overload of the `=` function was found for this call.
+;; C++  => g.v is 5 (the move assignment)
+```
+
+- [ ] **LV26**: a forwarding operator template sees a temporary as an lvalue (`deviations_r5_test.jank`: `v26`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "template <typename T> struct isl { static constexpr int v = 2; }; template <typename T> struct isl<T &> { static constexpr int v = 1; }; struct V {}; struct W {}; template <typename T> int operator+(V const &, T &&) { return isl<T>::v; } inline V gv;")
+(cpp/+ cpp/gv (cpp/W.))
+;; jank => 1 (T = W&)
+;; C++  => 2 (T = W)
+```
+
+- [ ] **LV27**: a member operator taking `int&&`, given a literal, fails in the JIT (`deviations_r5_test.jank`: `v27`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "struct v3 { int operator*(int &&) const { return 1; } }; inline v3 g;")
+(cpp/* cpp/g 1)
+;; jank => Unable to compile C++ source.
+;; C++  => 1
+```
+
+- [ ] **LV28**: a member operator template with `T&&`, given a literal, deduces `T = int&` (`deviations_r5_test.jank`: `v28`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "template <typename T> struct isl { static constexpr int v = 2; }; template <typename T> struct isl<T &> { static constexpr int v = 1; }; struct R { template <typename T> int operator/(T &&) const { return isl<T>::v; } }; inline R g;")
+(cpp// cpp/g 1)
+;; jank => 1
+;; C++  => 2
+```
+
+- [ ] **LV29**: a `let`-bound builtin is a prvalue to overload resolution, and can't be an out-parameter (`deviations_r5_test.jank`: `v29`, `v29b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "struct V {}; inline int operator-(V const &, int const &) { return 1; } inline int operator-(V const &, int &&) { return 2; } inline V gv; inline void inc(int &i) { ++i; }")
+(let [x (cpp/int. 1)] (cpp/- cpp/gv x))
+(let [x (cpp/int. 1)] (cpp/inc x) x)
+;; jank => 2; No matching overload of the `inc` function was found for this call.
+;; C++  => 1; 2
+```
+
+- [ ] **LV30**: built-in `=`, `+=` and `++` accept a prvalue (low) (`deviations_r5_test.jank`: `v30`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/= 1 2)
+(cpp/+= 1 2)
+;; jank => 2, 3
+;; C++  => ill-formed (each)
+```
+
+- [ ] **LV31**: an operator brought into an argument's namespace by a using-declaration isn't found (`deviations_r5_test.jank`: `v31`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "namespace lib { struct P {}; } namespace ext { inline int operator+(lib::P const &, lib::P const &) { return 9; } } namespace lib { using ext::operator+; } inline lib::P p;")
+(cpp/+ cpp/p cpp/p)
+;; jank => The operator `+` is not supported for the type `lib::P`.
+;; C++  => 9
+```
+
+- [ ] **LV32**: a base `operator()` re-exported with `using`, beside the derived class's own, is ambiguous (`deviations_r5_test.jank`: `v32`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "struct b { int operator()(int) const { return 3; } }; struct d : b { using b::operator(); int operator()(long) const { return 4; } }; inline d g;")
+(cpp/g 1)
+;; jank => This call is ambiguous between 2 different overloads.
+;; C++  => 3
+```
+
+- [ ] **LV33**: an object converting to a function pointer can't be called (low) (`deviations_r5_test.jank`: `v33`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "inline int twice(int x) { return 2 * x; } struct sf { using fp = int (*)(int); operator fp() const { return &twice; } }; inline sf g;")
+(cpp/g 21)
+;; jank => The operator `()` is not supported for the type `sf`.
+;; C++  => 42
+```
+
+- [ ] **LV34**: `aget` on a class converting to `int*` is refused (`deviations_r5_test.jank`: `v34`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
+
+```clojure
+(cpp/raw "struct bf { int d[3]{ 1, 2, 3 }; operator int *() { return d; } }; inline bf g;")
+(cpp/aget cpp/g 1)
+;; jank => The operator `aget` is not supported for the type `bf`.
+;; C++  => 2
+```
 
 ### Left out
 

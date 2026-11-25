@@ -104,6 +104,6 @@ memory in between.
   aren't ported): each fails as soon as it's used; determinismo has
   `locking` (§3.17).
 
-- The Lean replica's tests (unreported.md, "Found by a Lean replica of jank") live with the
+- The Lean replica's tests (repros.md, "Found by a Lean replica of jank") live with the
   replica in determinismo-workloads' [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests), with how to run
   one on jank.
