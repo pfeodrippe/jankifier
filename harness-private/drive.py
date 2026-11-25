@@ -426,6 +426,12 @@ def main():
                           f'{sorted(os.listdir(HOME))}, the sandbox refuses the harness, the trials and the results',
                           flush=True)
                     r = unstr(ev(port, run_form(task, mode, seed), 3 * 3600))
+                    # The code as the run left it, kept beside its conversation: a run graded
+                    # wrong for a jank error ("Failed to find symbol") couldn't be checked again
+                    # once the next run had made its directory anew.
+                    written = HOME + '/' + TASKS[task]['file']
+                    if os.path.exists(written):
+                        shutil.copy(written, f'{OUT}/{task}-{mode}-{seed}.jank')
                     right, g = grade(port, task)
                     r = r[:-1] + f' :right {right} :grade {g}}}'
                     results.append(r)
