@@ -54,8 +54,9 @@ the syntax, the data structures and most of `clojure.core` and
 - **`(deref f 2000 :late)` doesn't wait**: with a timeout, `deref` returns nil at
   once (neither the value nor `:late`). Wait for a future with `@f`, or with a
   loop: `(loop [] (when-not (realized? f) (cpp/usleep 10000) (recur)))`.
-- **Files**: `spit` into a directory that doesn't exist writes nothing and
-  returns nil, without an error; `slurp` of a missing file throws C++'s error
+- **Files**: `(spit path text :append true)` adds to the end of a file. `spit`
+  into a directory that doesn't exist writes nothing and returns nil, without an
+  error; `slurp` of a missing file throws C++'s error
   (above). There is no function to make a directory or to ask whether a file
   exists: use C++'s (see [Files and directories](#files-and-directories)).
 - **The shell is macOS's**: `sed -i '' 's/a/b/' file` (BSD sed needs the `''`),
@@ -108,11 +109,12 @@ namespace mine
 - A compile error of the C++ comes back as the evaluation's error, with
   clang's message.
 - C++ names can't have `-` in them: `make-dir` is not a name there, `make_dir` is.
+- C++ given to `cpp/raw` is checked with clang before jank compiles it; when
+  it doesn't compile, clang's message comes back and nothing of it is run.
 - C++ does not allow defining the same thing twice. The same source evaluated
   again is fine (nothing happens); a changed function under the same name is
-  an error ("redefinition"), and after that error the namespace it was in is
-  no longer found at all. So give corrected or changed source a **new
-  namespace name** (`mine2`, `mine3`), and call that one.
+  refused ("redefinition"), and the earlier one stays. So give corrected or
+  changed source a **new namespace name** (`mine2`, `mine3`), and call that one.
 
 ### Files and directories
 

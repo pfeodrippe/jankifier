@@ -25,18 +25,24 @@
   "An eval's or a load's reply, with what to do when it holds one of jank's errors that last
   for the whole process: kv agents lost dozens of steps to them, trying the same name again."
   [said]
-  (let [said (str said)]
+  (let [said (str said)
+        missing (second (re-find #"Symbols not found: \[ ([^ \]]+)" said))]
     (str said
          (cond
+           (and (str/includes? said "redefinition of") (str/includes? said "checked with clang"))
+           (str "\n(C++ changed under a name this process already has. Give the changed source a new "
+                "namespace name (files2, files3) and call that one; the earlier one is still there.)")
            (str/includes? said "redefinition of")
            (str "\n(C++ source changed under a name already evaluated: that namespace is now lost in this "
                 "process. Put the changed source under a new namespace name (files2, files3) and call that one.)")
            (and (str/includes? said "Unable to find `") (str/includes? said "within"))
            (str "\n(A C++ namespace whose source failed or was changed before is lost in this process, even "
                 "when the source is right now. Use a new namespace name for it.)")
-           (str/includes? said "Failed to find symbol")
-           (str "\n(jank's compiled code for a name was lost after an earlier failure in this process. Define "
-                "the function again under a new name, or load the file under a new namespace.)")))))
+           missing
+           (str "\n(The C++ library function " (cpp/harness.demangle missing) " can't be linked in this "
+                "process any more: C++ source that failed to compile used it first, and jank's JIT doesn't "
+                "link it after that. A new name doesn't help. Write that part without it: file contents "
+                "can be read and written in jank (slurp, spit, spit with :append true).)")))))
 
 (defn- cause
   "What an evaluation's error says: its cause without the trace, or its lines without the
@@ -89,6 +95,44 @@
       {:spans (mapv (fn [l] (mapv parse-long (str/split l #" "))) (rest lines))}
       {:error (str/join " " (rest lines))})))
 
+(defonce ^:private cpp-accepted
+  ;; The C++ source (cpp/raw) this process has compiled: a change to it is checked with them.
+  (atom []))
+
+(defn- cpp-sources
+  "The C++ source of the code's top-level cpp/raw forms, in order."
+  [code spans]
+  (vec (keep (fn [[a b]]
+               (let [text (subs code a b)]
+                 (when (str/starts-with? text "(cpp/raw")
+                   (let [form (try (read-string text) (catch :default _ nil))]
+                     (when (string? (second form)) (second form))))))
+             spans)))
+
+(defn- cpp-check
+  "nil when the code's new C++ (cpp/raw) compiles, checked with clang the way jank's JIT
+  would compile it, after the C++ this process already has; else what clang says. Source
+  given to the JIT that fails to compile leaves the C++ library functions it used unlinkable
+  for the rest of the process (\"Symbols not found\"), so it doesn't go there."
+  [sources]
+  (let [new (vec (distinct (remove (set @cpp-accepted) sources)))]
+    (when (seq new)
+      (let [text (str (apply str (map (fn [src] (str "#line 1 \"cpp/raw evaluated before\"\n" src "\n")) @cpp-accepted))
+                      (apply str (map (fn [src] (str "#line 1 \"cpp/raw\"\n" src "\n")) new)))
+            command (str (cpp/harness.cpp_check_command text))]
+        (when-not (str/blank? command)
+          (let [ran (cpp/harness.run command 100000 60.0)
+                out (str/trim (str (:out ran)))]
+            (when (or (:timed-out ran) (not (zero? (:exit ran))))
+              (str "error: the C++ in cpp/raw doesn't compile. It was checked with clang before going to "
+                   "jank, and not run: the C++ this process has is as it was.\n"
+                   (str/join "\n" (remove (fn [l] (re-find #"^\d+ errors? generated" l)) (str/split-lines out)))))))))))
+
+(defn- cpp-accept!
+  "The sources recorded as compiled in this process."
+  [sources]
+  (swap! cpp-accepted (fn [had] (into had (remove (set had) (distinct sources))))))
+
 (defn- eval-one
   "One piece of code evaluated as an editor would send it: {:out :err :failed :value :ns}."
   [code ns]
@@ -118,13 +162,18 @@
   (prepare!)
   (let [code (str code)
         found (forms-of code)
-        spans (:spans found)]
+        spans (:spans found)
+        bad (when-not (:error found) (cpp-check (cpp-sources code spans)))]
     (cond
       (:error found)
       (str "error: the code doesn't read: " (:error found))
 
+      bad
+      bad
+
       (<= (count spans) 1)
       (let [r (eval-one code @evaluation-ns)]
+        (when-not (:failed r) (cpp-accept! (cpp-sources code spans)))
         (str (when (seq (:out r)) (ended (:out r)))
              (when (seq (str/trim (:err r))) (ended (:err r)))
              (if (:failed r)
@@ -140,6 +189,7 @@
           (let [[a b] (first spans)
                 text (subs code a b)
                 r (eval-one text ns)
+                _ (when-not (:failed r) (cpp-accept! (cpp-sources code [[a b]])))
                 said (str said
                           (when (seq (:out r)) (ended (:out r)))
                           (when (seq (str/trim (:err r))) (ended (:err r))))]
@@ -168,11 +218,18 @@
         found (forms-of text)]
     (if (:error found)
       (str "error: " path " doesn't read: " (:error found))
+      (if-let [bad (cpp-check (cpp-sources text (:spans found)))]
+        (str/replace-first bad "error:" (str "error loading " path ":"))
       (let [r (cards.repl/evaluate text "user" (str path) 1 1 false)]
+        ;; Its C++ compiled unless the error says otherwise (cpp/raw forms come first in a file).
+        (when-not (and (not (:ok r)) (str/includes? (str (:error r)) "compile C++"))
+          (cpp-accept! (cpp-sources text (:spans found))))
         (str (when (seq (:out r)) (ended (:out r)))
+             ;; A C++ compiler's messages are only on stderr (eval shows them the same way).
+             (when (seq (str/trim (str (:err r)))) (ended (:err r)))
              (if (:ok r)
                (str "loaded " path ": " (count (:spans found)) " forms, namespace " (:ns r))
-               (str "error loading " path ": " (cause (:error r)))))))))
+               (str "error loading " path ": " (cause (:error r))))))))))
 
 (defn load-file
   "Loads a jank file: its forms evaluated in order, as loading it would (its ns form first).

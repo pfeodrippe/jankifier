@@ -5,6 +5,7 @@
 #pragma once
 #include <sandbox.h>
 #include <climits>
+#include <cxxabi.h>
 
 #include <algorithm>
 #include <array>
@@ -28,6 +29,9 @@
 
 #include <jank/runtime/context.hpp>
 #include <jank/runtime/core.hpp>
+#include <jank/util/clang.hpp>
+#include <jank/util/cli.hpp>
+#include <jank/util/environment.hpp>
 #include <jank/runtime/core/make_box.hpp>
 #include <jank/runtime/core/seq.hpp>
 #include <jank/runtime/obj/keyword.hpp>
@@ -842,5 +846,100 @@ namespace harness
   {
     std::this_thread::sleep_for(std::chrono::duration<double>(rt::to_real(s)));
     return rt::jank_nil;
+  }
+
+  // The shell command that checks a C++ file the way jank's JIT would compile it (jank's own
+  // clang, its include paths and macros, the process's precompiled header), without running
+  // anything: `clang++ -fsyntax-only`. Source given to the JIT that fails to compile leaves the
+  // C++ library functions it used unlinkable for the rest of the process (a fault of jank's JIT:
+  // "JIT session error: Symbols not found"), so the harness checks source before it goes there.
+  // The source is written to the temporary directory first. "" when jank's clang or the
+  // header isn't found, or the file can't be written.
+  inline object_ref cpp_check_command(object_ref const source)
+  {
+    std::error_code ec;
+    auto const file((std::filesystem::temp_directory_path(ec) / "harness-cpp-check.cpp").string());
+    {
+      std::FILE *const f{ std::fopen(file.c_str(), "wb") };
+      if(!f)
+      {
+        return str("");
+      }
+      auto const text(to_std(source));
+      std::fwrite(text.data(), 1, text.size(), f);
+      std::fclose(f);
+    }
+    namespace u = jank::util;
+    auto const clang(u::find_clang());
+    auto const resources(u::find_clang_resource_dir());
+    auto const pch(u::find_pch(jank::runtime::__rt_ctx->binary_version));
+    if(clang.is_none() || resources.is_none() || pch.is_none())
+    {
+      return str("");
+    }
+    auto const q([](std::string const &a) {
+      std::string out{ "'" };
+      for(char const c : a)
+      {
+        if(c == '\'')
+        {
+          out += "'\\''";
+        }
+        else
+        {
+          out += c;
+        }
+      }
+      return out + "'";
+    });
+    std::filesystem::path const clang_path{ clang.unwrap().c_str() };
+    auto const dir(clang_path.parent_path());
+    std::string cmd{ q(clang_path.string()) + " -fsyntax-only -x c++ -std=gnu++20 -w -fno-color-diagnostics" };
+    cmd += " -nostdinc++ -I " + q((dir / "../include/c++/v1").string()) + " -I " + q((dir / "../include").string());
+    cmd += " -resource-dir " + q(resources.unwrap().c_str());
+    cmd += " -I " + q(std::string{ u::resource_dir().c_str() } + "/include") + " -I /opt/homebrew/include";
+    for(auto const &d : u::cli::opts.include_dirs)
+    {
+      cmd += " -I " + q(d.c_str());
+    }
+    for(auto const &m : u::cli::opts.define_macros)
+    {
+      cmd += " -D " + q(m.c_str());
+    }
+    cmd += " -femulated-tls -DGC_THREADS -DPOINTER_MASK=0x0000FFFFFFFFFFFF -DIMMER_HAS_LIBGC=1"
+           " -DIMMER_TAGGED_NODE=0 -DHAVE_CXX14=1 -DCPPINTEROP_USE_REPL -DFOLLY_HAVE_JEMALLOC=0"
+           " -DFOLLY_HAVE_TCMALLOC=0 -DFOLLY_ASSUME_NO_JEMALLOC=1 -DFOLLY_ASSUME_NO_TCMALLOC=1 -DNDEBUG"
+           " -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -fwrapv -fPIC";
+    // The system's headers (on macOS, the SDK's), as the JIT is given them.
+    {
+      std::vector<char const *> system;
+      u::add_system_flags(system);
+      for(auto const a : system)
+      {
+        cmd += " " + q(a);
+      }
+    }
+    cmd += " -Xclang -fno-validate-pch -include-pch " + q(pch.unwrap().c_str()) + " " + q(file) + " 2>&1";
+    return str(cmd);
+  }
+
+  // A C++ symbol's name as written (std::basic_ios<char>::operator!() const), from its linker
+  // name (with macOS's extra leading underscore); the name itself when it isn't one.
+  inline object_ref demangle(object_ref const symbol)
+  {
+    auto name(to_std(symbol));
+    if(name.rfind("__Z", 0) == 0)
+    {
+      name = name.substr(1);
+    }
+    int status{};
+    char *const said{ abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status) };
+    if(status != 0 || !said)
+    {
+      return str(to_std(symbol));
+    }
+    std::string const out{ said };
+    std::free(said);
+    return str(out);
   }
 }
