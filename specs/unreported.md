@@ -234,7 +234,7 @@ message. `jankifier.nrepl` works around it.
 ## Found by a Lean replica of jank (checked on jank main)
 
 These were predicted by a Lean replica of jank written blind from its sources (determinismo's
-`lean/jank`, rounds 1 to 3; round 3's S items appear here as LS, since S names this file's own), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
+`lean/jank`, rounds 1 to 4; round 3's S items appear here as LS and round 4's U items as LU, since S and U name this file's own), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
 Linux, UTF-8 locale, each test in its own process with a 600 s limit, 120 s in round 3, through determinismo-ci)
 and on Clojure 1.11.1. The tests live with the replica, in determinismo-workloads'
 [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests): each asserts Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
@@ -1682,6 +1682,322 @@ obj/detail/base_persistent_map.cpp `conj` 169 (throws at 182–186: only nil, a 
 
 context_dynamic.cpp `eval_string` 59–71 analyzes each read form whole; processor.cpp `analyze_def` 1303–1306 interns at analysis; `analyze_call` 3505; evaluate.cpp eval(do) 574. Clojure: Compiler.eval 7684–7691 evaluates each form of a top-level `do` in turn.
 
+
+### Round 4: re-stated round 3 items
+
+- [ ] **LU1**: (LS2) `(compare 2M (/ 6M 3M))`: Clojure 0, jank 1 (`deviations_r4_test.jank`: `u01`; on main: u01: `(zero? 1)` is false).
+
+  `(compare 2M (/ 6M 3M))`: Clojure 0, jank 1. `(= (str 2M) (str (/ 6M 3M)))`: Clojure true, jank false. `(compare 0.5M (/ 3 6M))`, `(compare 0.5M (/ 1.5M 3))`: 0 vs 1. Path as LS2.
+  Status in the replica's report: already LS2.
+
+- [ ] **LU2**: (LS9) `(compare 0.1M (bigdec 0.1))`: Clojure 0, jank -1 (`deviations_r4_test.jank`: `u02`; on main: u02: `(zero? -1)` is false).
+
+  `(compare 0.1M (bigdec 0.1))`: 0 vs -1. Path math.cpp 817 → `operator=(double)`.
+  Status in the replica's report: already LS9.
+
+- [ ] **LU3**: (LS44) `(eval (list 'quote v))` turns `v`'s `{}` metadata into nil (`deviations_r4_test.jank`: `u03`; on main: u03: `(= {} nil)` is false).
+
+  `(let [v (with-meta [1] {})] (eval (list 'quote v)) (meta v))`: `{}` vs nil. With `{:jank/source 1 :m 1}`, the `:jank/source` entry is removed.
+  Status in the replica's report: already LS44.
+
+- [ ] **LU4**: (LS49) `(#cpp (add double) 1 2)`: C++ 3.0, jank 3 (`deviations_r4_test.jank`: `u04`; on main: u04: `(double? 3)` is false).
+
+  With `template <typename T> T add(T,T)` declared in its own eval, `(#cpp (add double) 1 2)`: 3.0 vs 3.
+  Status in the replica's report: already LS49.
+
+- [ ] **LU7**: (LS57, narrowed) inside a fn, `(if c 1 cpp/gd)` gives 2 where Clojure gives 2.5. At the top level, jank gives Clojure's result (`deviations_r4_test.jank`: `u07`; on main: u07: `(= 2.5 2)` is false).
+
+  - `((fn [c] (if c 1 cpp/gd)) false)`: 2.5 vs 2 (cpp_util.cpp find_branch_common_type 1909–1995, compiled `if`).
+  - At the top level jank gives 2.5. C++ only. High.
+  Status in the replica's report: LS57, narrowed.
+  #1187 (closed 2026-11-17, in the checked commit) fixed other typed `if` branches; this case remains.
+
+### Round 4: lazily compiled fns and the runtime
+
+- [ ] **LU8**: an `alter-var-root` wrapper is lost at the wrapped fn's first call (`deviations_r4_test.jank`: `u08`; on main: u08: `(= 102 2)` is false).
+
+  `(defn twice [x] (* 2 x)) (alter-var-root #'twice (fn [o] (fn [x] (+ 100 (o x)))))`. `(twice 1)` twice: 102, 102 vs 102, 2.
+
+- [ ] **LU9**: `with-redefs`: the stub is replaced when the original first runs (`deviations_r4_test.jank`: `u09`; on main: u09: `(= :stub :orig)` is false).
+
+  `(defn greet [] :orig) (let [o greet] (with-redefs [greet (fn [] :stub)] [(o) (greet)]))`: `[:orig :stub]` vs `[:orig :orig]` (also core.jank with-redefs-fn 4549–4566).
+
+- [ ] **LU10**: calling an old fn value for the first time reverts its var's redefinition (`deviations_r4_test.jank`: `u10`; on main: u10: `(= :new :old)` is false).
+
+  `(defn v [] :old) (def s v) (defn v [] :new) (s) (v)`: `:new` vs `:old`.
+
+- [ ] **LU11**: a defn'd fn's identity changes at its first call (`deviations_r4_test.jank`: `u11`; on main: u11: `((not (identical? #object [jank-lean.deviations-r4-test/ua4-f deferred_cpp_function 0x7f0713f92e10] #object [jank-lean.deviations-r4-test/ua4)` is false).
+
+  `(defn f [] 1) (def h f) (f) (identical? h f)`: true vs false.
+
+- [ ] **LU13**: `alter-var-root` whose fn first-calls the var's fn hangs (a variant of LS63) (`deviations_r4_test.jank`: `u13`, `u13b`; on main: u13: u13 hangs (killed after 120 s); u13b: u13b hangs (killed after 120 s)).
+
+  - Program: `(defn inc1 [x] (inc x)) (alter-var-root #'inc1 (fn [g] (g 1) g))` returns in Clojure and hangs in jank. Also across threads via `@(future (g 1))`.
+  - Path: var.cpp alter_root 108 holds write_mutex; realize → bind_root 101 re-takes it.
+  - Tape: 10 steps on one thread, 12 on two (Mutexes.lean).
+
+- [ ] **LU14**: a defn'd fn gets `{:name "ns/f"}` metadata after its first call (`deviations_r4_test.jank`: `u14`; on main: u14: `(nil? {:name "jank-lean.deviations-r4-test/ua11-f"})` is false).
+
+  `(defn f [] 1) (f) (meta f)`: nil vs `{:name "user/f"}` (processor.cpp 2064–2067, realize 66).
+  Status in the replica's report: new, low.
+
+- [ ] **LU15**: `get-thread-bindings` maps each var to a box, not its value (`deviations_r4_test.jank`: `u15`; on main: u15: `(= 1 1)` is false).
+
+  `(binding [*x* 1] (= 1 (get (get-thread-bindings) #'*x*)))`: true vs false.
+  - Path: context.cpp get_thread_bindings 765–775 returns `var_thread_binding` boxes (push 706–750); a box has no `equal`.
+  - Theorem ★ `getTB_bound_differs`.
+
+- [ ] **LU16**: an unbound root prints `unbound@0x… for var #'x`, not `Unbound: #'x` (from LS70) (`deviations_r4_test.jank`: `u16`; on main: u16: `((not (= "Unbound: #'jank-lean.deviations-r4-test/ua8-x" "unbound@0x7f6c7869cde0 for var #'jank-lean.deviations-r4-test/ua)` is false).
+
+  `(def x) (str @#'x)`: `"Unbound: #'user/x"` vs `"unbound@0x… for var #'user/x"` (var.cpp 351–354). Theorem ★ `unbound_str_differs`.
+
+- [ ] **LU18**: `pop-thread-bindings` without a push returns nil instead of throwing (`deviations_r4_test.jank`: `u18`; on main: u18: `(thrown? (deref (future (pop-thread-bindings))))` threw nothing).
+
+  `@(future (pop-thread-bindings))`: throws vs nil (context.cpp 752–763). Theorem ★ `future_pop`.
+  Status in the replica's report: new, low.
+
+- [ ] **LU19**: `defmethod` with a lazy dispatch value realized by a thread calling the multimethod hangs (`deviations_r4_test.jank`: `u19`; on main: u19: u19 hangs (killed after 120 s)).
+
+  - Program: `(defmulti mm identity) (defmethod mm :a [_] 1) (let [l (lazy-seq (cons @(future (mm :a)) nil))] (defmethod mm l [_] 2) (mm l))`: 2 vs hangs.
+  - Path: multi_function.cpp add_method 145–153 holds the recursive mutex while hashing (realizing) `l`. get_method 248–260 takes the mutex on every call, because `cached_hierarchy` stores the var and is compared with its value, so the cache never matches.
+  - Tape: 7 steps.
+
+### Round 4: C++ interop
+
+- [ ] **LU20**: enum operands: jank's analysis ignores the user's operator, the JIT calls it, and the result is narrowed (0.5 becomes 0) (`deviations_r4_test.jank`: `u20`; on main: u20: `(= 0.5 0)` is false).
+
+  `enum ue {ua=1,ub=2}; double operator*(ue,ue){return 0.5;}`, then `(cpp/* cpp/ua cpp/ub)`: 0.5 vs 0.
+  - Path: processor.cpp build_cpp_call 367–410 (`is_primitive` counts enums) → built-in operator type int; codegen 1794–1821 calls the user operator and boxes as int.
+  - Theorem ★ `jank_primitive_operands_builtin_only`.
+
+- [ ] **LU23**: operator lookup follows using-directives (`deviations_r4_test.jank`: `u23`; on main: u23: `(thrown? (ev "(cpp/| cpp/u_b9_p cpp/u_b9_p)"))` threw nothing).
+
+  Operator lookup follows using-directives inside associated namespaces (GetOperator 7017–7030), so jank accepts code C++ rejects.
+  Status in the replica's report: new, low.
+
+- [ ] **LU24**: a user operator that C++ finds ambiguous with a built-in one is accepted (`deviations_r4_test.jank`: `u24`; on main: u24: `(thrown? (ev "(cpp/+ cpp/u_b10_g 1)"))` threw nothing).
+
+  A user operator that C++ finds ambiguous with a built-in candidate is accepted (BestOverloadMatch 2203 adds no built-ins).
+  Status in the replica's report: new, low.
+
+- [ ] **LU25**: `(cpp/wrap. 2.5)` uses the template's default arguments instead of deducing them: `.-v` is 2 (`deviations_r4_test.jank`: `u25`; on main: u25: `(= 2.5 2)` is false).
+
+  `template <typename T = int> struct wrap {T v; wrap(T x):v(x){}};`, then `(cpp/.-v (cpp/wrap. 2.5))`: 2.5 vs 2.
+  - Path: build_cpp_value 3738–3752 → `instantiate(scope, {})` → CompleteTemplateArguments (CppInterOp.cpp 6644) fills the defaults.
+  - Theorem ★ `jank_ctor_specialization_is_defaults`.
+  Related: #525 (default arguments in templates, closed).
+
+- [ ] **LU26**: `cpp/delete` of a pointer from C++'s own `new` crashes (`GC_free`) (`deviations_r4_test.jank`: `u26`; on main: u26: SIGSEGV).
+
+  `(cpp/delete (cpp/make))` with `make` returning `new int(5)`: freed vs SIGSEGV.
+  - Path: codegen 1894–1919 emits `GC_free`; bdwgc GC_free 824–850 reads the header of non-GC memory.
+  - Read and tabled, not searched.
+  Status in the replica's report: new, low-medium.
+
+### Round 4: collection objects
+
+- [ ] **LU27**: `with-meta` on an infinite `repeat` writes the metadata into the original object (`deviations_r4_test.jank`: `u27`; on main: u27: `(nil? {:a 1})` is false).
+
+  `(let [r (repeat 7)] (with-meta r {:a 1}) (meta r))`: nil vs `{:a 1}` (repeat.cpp with_meta 124–130 over fresh_seq 53–60, which returns `this` when infinite). Theorem `c1_repeat_meta_written`.
+
+- [ ] **LU28**: `with-meta` on `iterate` or `(range)` never returns (`deviations_r4_test.jank`: `u28`, `u28b`; on main: u28: u28 hangs (killed after 120 s); u28b: u28b hangs (killed after 120 s)).
+
+  `(meta (with-meta (iterate inc 0) {:a 1}))`, also `(range)`: `{:a 1}` vs never returns (iterator isn't metadatable; meta.cpp 50–53 builds the error text from the infinite seq). Theorem `c2_iterate_with_meta`.
+
+- [ ] **LU29**: `(nth [1 2 3] 1.0)` throws instead of giving 2 (`deviations_r4_test.jank`: `u29`; on main: u29: uncaught C++ exception: The `nth` operation on a `persistent_vector` requires an integer index, not a `small_real`.).
+
+  `(nth [1 2 3] 1.5)`: 2 vs throws (persistent_vector.cpp nth 322–348 with the original index; lists truncate). Theorem `c3_nth_double`.
+
+- [ ] **LU30**: `(realized? (iterate inc 0))` throws (`deviations_r4_test.jank`: `u30`; on main: u30: uncaught C++ exception: Objects of type `iterator` are not realizable.).
+
+  `(realized? (iterate inc 0))`: true vs throws (core.cpp is_realized 719–737).
+  Status in the replica's report: new, low.
+
+- [ ] **LU31**: `pop` of a one-element list drops the list's metadata (`deviations_r4_test.jank`: `u31`; on main: u31: `(= {:a 1} nil)` is false).
+
+  `(meta (pop (with-meta '(1) {:a 1})))`: `{:a 1}` vs nil (persistent_list.cpp pop 180–189).
+  Status in the replica's report: new, low.
+
+- [ ] **LU32**: `seq` of a list drops the list's metadata (`deviations_r4_test.jank`: `u32`; on main: u32: `(= {:a 1} nil)` is false).
+
+  `(meta (seq (with-meta '(1 2) {:a 1})))`: `{:a 1}` vs nil (persistent_list.cpp 100–112).
+  Status in the replica's report: new, low.
+
+- [ ] **LU33**: `transient` of a sorted map is accepted (`deviations_r4_test.jank`: `u33`; on main: u33: `(thrown? (transient (sorted-map 1 2)))` threw nothing).
+
+  `(transient (sorted-map 1 2))`: throws vs a transient.
+  Status in the replica's report: new, low.
+
+- [ ] **LU34**: `array-map` with more than 8 pairs keeps only the first 8 keys (`deviations_r4_test.jank`: `u34`; on main: u34: `(= 9 8)` is false).
+
+  `(count (array-map 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8))`: 9 vs 8. An update after 8 entries is also lost.
+  - Path: persistent_array_map.cpp create_from_seq 36–55 discards `assoc_in_place`'s promoted map (transient_array_map.cpp 67–89).
+  - Theorem `jank_array_map_at_most_8`; contradicts round 3's IMA7 for jank's own code.
+
+### Round 4: regex
+
+- [ ] **LU35**: a capture made inside a lookahead at an earlier start position: Clojure keeps it (`["b" "a"]`), jank loses it (`["b" ""]`) (`deviations_r4_test.jank`: `u35`; on main: u35: `(= ["b" "a"] ["b" ""])` is false).
+
+  `(re-find #"(?=(a))x|b" "ab")`: `["b" "a"]` vs `["b" ""]`. Also `(re-find #"(?!(a))$" "a")`, and replace with `$1`.
+  - Mechanism: Java clears its groups once per `find`; libstdc++ restarts each position from `_M_results` (regex_executor.tcc 41–57, 84–92).
+  - Censuses: 13,144 of 1,717,065 (≤3 tokens), 178,668 of 39,495,600 (≤4).
+  -
+
+- [ ] **LU36**: `nth` on a matcher without groups indexes the match string's bytes (`deviations_r4_test.jank`: `u36`; on main: u36: `(= "ab" \a)` is false).
+
+  `(let [m (re-matcher #"ab" "xaby")] (re-find m) (nth m 0))`: `"ab"` vs `\a` (re_matcher.cpp 14–22 → string nth). Theorem ★ `nth_no_groups_never_the_match`.
+
+- [ ] **LU37**: `nth` on a matcher with no current match gives nil instead of throwing (`deviations_r4_test.jank`: `u37`; on main: u37: `(thrown? (nth m 0))` threw nothing).
+
+  `(nth (re-matcher #"(a)" "a") 0)`: throws vs nil. Theorem ★ `nth_without_match_nil`.
+
+- [ ] **LU38**: `re-pattern` stops at the first NUL (`deviations_r4_test.jank`: `u38`; on main: u38: `(nil? "x")` is false).
+
+  `(re-find (re-pattern (str "x" (char 0) "y")) "xz")`: nil vs `"x"` (re_pattern.cpp 6–11 uses `c_str()`). Theorem ★ `jankEval4_pattern_nul`.
+
+- [ ] **LU39**: `print` writes a pattern as its bare text (`deviations_r4_test.jank`: `u39`; on main: u39: `(= "#\"a\"" "a")` is false).
+
+  `(print-str #"a")`: `"#\"a\""` vs `"a"`. Theorem ★ `print_pattern_differs`.
+  Status in the replica's report: new, low.
+
+### Round 4: nREPL and REPL
+
+- [ ] **LU40**: no `:line`, `:column`, `:file`, `:name` or `:ns` metadata on read lists and defined vars; the nREPL's line/column fields never reach it. u40, u40b, u40c (`deviations_r4_test.jank`: `u40`, `u40b`, `u40c`; on main: u40: `(integer? nil)` is false; u40b: `(= ue1-f nil)` is false).
+
+  - Program: `(meta '(a b))` gives `{:line … :column …}` in Clojure and nil in jank. `(:name (meta #'f))`, `:ns`, `:line`, `:file`: present vs nil. An eval request with line 7 and code `(:line (meta '(a)))` returns "7" vs "nil".
+  - Path: positions only reach `{:jank/source …}` (core/meta.cpp 171–228), which strip_source_meta then removes; var.cpp set_meta 307–311 adds nothing.
+  - Theorems `jank_has_no_line_meta`, ★ `jankPos_eq_cljPos`.
+
+- [ ] **LU41**: `completions` gives each var the searched namespace as its `:ns` (`deviations_r4_test.jank`: `u41`; on main: u41: `(= "clojure.core" "user")` is false).
+
+  `completions` prefix "mapv" from ns user: `:ns "clojure.core"` vs `:ns "user"` (completions.jank 54–64).
+
+- [ ] **LU44**: after a read or analysis error, `(ex-message *e)` is `""` (`deviations_r4_test.jank`: `u44`; on main: u44: `(not true)` is false).
+
+  At the nREPL, `(ue5-undefined)` then `(ex-message *e)`: the compiler message vs `""` (evaluate.cpp safe_eval 750; exception_info(error_ref) sets no message).
+
+### Round 4: modules, AOT and the CLI
+
+- [ ] **LU45**: `run-main` calls `-main` with `*ns*` = clojure.core (Clojure: user) (`deviations_r4_test.jank`: `u45`; on main: u45: `(= user clojure.core)` is false).
+
+  Under `run-main`, `-main` sees `*ns*` = clojure.core (`read-string "::k"`, `eval`, `resolve` act there); `clojure -M -m` uses user.
+  - Path: main.cpp run_main 83–115; context.cpp 107–113.
+  - Corroborated by round 3's LS73/LS71 evidence.
+
+- [ ] **LU49**: `load-string`, `requiring-resolve`, `ns-aliases`, `ns-refers` and others are unported, and `load-file` doesn't exist (the class of R113/R124, new names) (`deviations_r4_test.jank`: `u49`; on main: u49: `(some? nil)` is false).
+
+  `load-string`, `load-reader`, `requiring-resolve`, `ns-aliases`, `ns-refers`, `ns-imports` throw "TODO: port"; `load-file` doesn't exist.
+  Status in the replica's report: R113/R124 class, new names.
+
+- [ ] **LU50**: `refer :only` accepts a set (`deviations_r4_test.jank`: `u50`; on main: u50: `(thrown? (binding [*ns* (create-ns (quote jank-lean.uf6-scratch))] (refer (quote clojure.string) :only #{(quote join)}))` threw nothing).
+
+  `(refer 'clojure.string :only #{'join})`: throws vs accepted.
+  Status in the replica's report: new, low.
+
+- [ ] **LU51**: `:verbose` prints nothing (`deviations_r4_test.jank`: `u51`; on main: u51: `(string/includes? "" "clojure.core/load")` is false).
+
+  `(require … :reload :verbose)` prints nothing (load-lib 4846).
+  Status in the replica's report: new, low.
+
+- [ ] **LU55**: `(ns x)` gives the namespace `:jank/source` metadata (`deviations_r4_test.jank`: `u55`; on main: u55: `((not (nil? {:jank/source {:module "clojure.core", :file "nil", :start {:offset 4, :line 1, :col 5}, :end {:offset 24, :line 1, :)` is false).
+
+  `(meta (find-ns 'x))` after `(ns x)`: nil vs `{:jank/source …}` (core.jank ns 5633–5637).
+  Status in the replica's report: extends R21.
+
+### Round 4: clojure.core and bundled namespaces
+
+- [ ] **LU61**: `clojure.data/diff` never subdiffs maps, vectors or sets (`deviations_r4_test.jank`: `u61`; on main: u61: `(= [{:b 2} {:b 3} {:a 1}] [{:a 1, :b 2} {:a 1, :b 3} nil])` is false).
+
+  `(clojure.data/diff {:a 1 :b 2} {:a 1 :b 3})`: `({:b 2} {:b 3} {:a 1})` vs `[{:a 1 :b 2} {:a 1 :b 3} nil]` (data.jank 66: equality-partition is always `:atom`). Theorem ★ `jankDiff_is_atomDiff`.
+
+- [ ] **LU62**: `ex-message`, `ex-data`, `ex-cause` of a non-exception throw instead of returning nil (`deviations_r4_test.jank`: `u62`; on main: u62: uncaught C++ exception: An object of type `exception_info` was expected here, but a `persistent_string` was provided instead.).
+
+  `(ex-message "boom")`: nil vs a native error (core.cpp 1338–1352).
+
+- [ ] **LU63**: `Throwable->map` gives the outer exception's `:cause` and `:data`, not the root's (`deviations_r4_test.jank`: `u63`; on main: u63: `(= "b" "a")` is false).
+
+  `(:cause (Throwable->map (ex-info "a" {} (ex-info "b" {}))))`: "b" vs "a" (exception_info.cpp 116–148). Theorem ★ `jank_cause_not_root`.
+
+- [ ] **LU65**: `format` follows std::format: `(format "%d" 5)` is `"%d"` (`deviations_r4_test.jank`: `u65`; on main: u65: `(= "5" "%d")` is false).
+
+  `(format "%d" 5)`: "5" vs "%d"; `(format "{}" 5)`: "{}" vs "5" (core.cpp 237–378; jank's docstring says std::format, but the book's differences page doesn't list it). Theorem ★ `scan_no_braces`.
+
+- [ ] **LU66**: `counted?` is true for strings, arrays and map seqs; `(bounded-count 1 "abc")` is 3 (`deviations_r4_test.jank`: `u66`; on main: u66: `(false? true)` is false).
+
+  `(bounded-count 1 "abc")`: 1 vs 3; `counted?` true on strings, arrays and map seqs (seq.cpp 131–141). Theorem ★ `bounded_count_agree`.
+
+- [ ] **LU67**: `map-entry?` is true for any 2-vector (`deviations_r4_test.jank`: `u67`; on main: u67: `(false? true)` is false).
+
+  `(map-entry? [1 2])`: false vs true. Theorems ★ `jank_map_entry_any_pair`, ★ `map_entry_agree`.
+
+- [ ] **LU68**: `shuffle` throws on `cons`, `repeat` and `sort` results (`deviations_r4_test.jank`: `u68`; on main: u68: uncaught C++ exception: Objects of type `cons` cannot be shuffled.).
+
+  `(shuffle (repeat 3 :x))`: works vs throws (seq.cpp 1178–1201).
+  Status in the replica's report: extends R120.
+
+- [ ] **LU69**: `clojure.walk` drops list metadata (a Clojure 1.12 behavior) (`deviations_r4_test.jank`: `u69`; on main: u69: `(= {:m 1} nil)` is false).
+
+  `(meta (postwalk identity (with-meta '(1 2) {:m 1})))`: `{:m 1}` vs nil (walk.jank 3–12). Theorems ★ `jank_walk_drops_list_meta`, ★ `walk_vec_meta_agree`.12.0, not 1.11.1).
+
+- [ ] **LU70**: a tagged literal prints its form with `str` (`deviations_r4_test.jank`: `u70`; on main: u70: `(= "#foo \"bar\"" "#foo bar")` is false).
+
+  `(pr-str (tagged-literal 'foo "bar"))`: `#foo "bar"` vs `#foo bar`.
+
+- [ ] **LU71**: `parse-uuid` accepts undashed and braced text (`deviations_r4_test.jank`: `u71`; on main: u71: `(nil? #uuid "00000000-0000-0000-0000-000000000000")` is false).
+
+  `(parse-uuid "000…0")` (32 hex digits) and the braced form: nil vs a uuid (stduuid uuid.h 503–547).
+  Status in the replica's report: new, low.
+
+- [ ] **LU75**: bit operations accept BigInts (`deviations_r4_test.jank`: `u75`; on main: u75: `(thrown? (bit-not (identity 5N)))` threw nothing).
+
+  `(bit-not 5N)`: throws vs -6 (math.cpp to_i64 22–25).
+  Status in the replica's report: new, low.
+
+- [ ] **LU76**: `(spit f 42)` throws (`deviations_r4_test.jank`: `u76`; on main: u76: uncaught C++ exception: An object of type `persistent_string` was expected here, but a `small_integer` was provided instead.).
+
+  `(spit f 42) (slurp f)`: "42" vs throws (core.jank 7350).
+
+- [ ] **LU77**: `slurp` takes no options (`deviations_r4_test.jank`: `u77`; on main: u77: uncaught C++ exception: Invalid call to `#object [unknown jit_function 0x7f424c82c840]` with `3` args provided.).
+
+  `(slurp f :encoding "UTF-8")`: the text vs an arity error.
+
+- [ ] **LU78**: `spit` to a path it can't open returns nil (`deviations_r4_test.jank`: `u78`; on main: u78: `(thrown? (spit "/jank-lean-no-such-dir/x.txt" "a"))` threw nothing).
+
+  `(spit "/no-dir/x" "a")`: throws vs nil.
+
+- [ ] **LU83**: `json/read-str` wraps integers in [2⁶³, 2⁶⁴) (`deviations_r4_test.jank`: `u83`; on main: u83: `(= 18446744073709551615N -1)` is false).
+
+  `(json/read-str "18446744073709551615")`: the BigInt vs -1 (json_native.cpp 142). Theorem ★ `jank_reads_u64_wrapped`.
+
+- [ ] **LU84**: `:bigdec` reads through a double (`deviations_r4_test.jank`: `u84`; on main: u84: `(zero? -1)` is false).
+
+  `(compare 0.1M (json/read-str "0.1" :bigdec true))`: 0 vs nonzero (json_native.cpp 147).
+  Status in the replica's report: extends LS9.
+
+- [ ] **LU85**: `write-str` writes BigInts and BigDecimals as strings (`deviations_r4_test.jank`: `u85`; on main: u85: `(= "123" "\"123\"")` is false).
+
+  `(json/write-str 123N)`: `"123"` vs `"\"123\""` (json_native.cpp 69–72).
+
+- [ ] **LU86**: `write-str` writes NaN as null (`deviations_r4_test.jank`: `u86`; on main: u86: `(thrown? (json-write-str (identity ##NaN)))` threw nothing).
+
+  `(json/write-str ##NaN)`: throws vs `"null"`.
+  Status in the replica's report: new, low.
+
+- [ ] **LU87**: `:eof-error? false` throws on empty input (`deviations_r4_test.jank`: `u87`; on main: u87: uncaught C++ exception: [json.exception.parse_error.101] parse error at line 1, column 1: attempting to parse an empty input; check that your input st).
+
+  `(json/read-str "" :eof-error? false :eof-value :none)`: `:none` vs a native parse error (json_native.cpp 198–202).
+
+- [ ] **LU91**: `clojure.pprint/pprint` is `prn`: no line breaking at the right margin (`deviations_r4_test.jank`: `u91`; on main: u91: `((not (= "[0\n 1\n 2\n 3\n 4\n 5\n 6\n 7\n 8\n 9\n 10\n 11\n 12\n 13\n 14\n 15\n 16\n 17\n 18\n 1)` is false).
+
+  `(with-out-str (pprint (vec (range 30))))`: 30 lines vs 1 (pprint.jank is `prn`; dispatch.clj 92–101, right margin 72). Census: n = 0..60, 33 differ from n = 28.
+  #147 (port clojure.pprint) is open.
+
+- [ ] **LU92**: `clojure.pprint` and `clojure.stacktrace` lack most of their documented functions (`deviations_r4_test.jank`: `u92`; on main: u92: `(some? nil)` is false).
+
+  `clojure.pprint/print-table`, `cl-format`, `pp`, … and `clojure.stacktrace/root-cause`, `print-stack-trace`, … are missing. Theorems `pprint_missing`, `stacktrace_missing`.
+  Status in the replica's report: new names.
+  #147 (port clojure.pprint) is open.
+
 ### Left out
 
 - Refuted on main (jank behaves like Clojure): D3, D11, D14, D16b, D20, R45, R123 and one control.
@@ -1689,8 +2005,13 @@ context_dynamic.cpp `eval_string` 59–71 analyzes each read form whole; process
 - Failed in another way than predicted: D15 (A2 here), D23, R89 (a C++ enum; no Clojure
   equivalent). Unclear: R54 (`b03`, "Invalid UTF-8 string." where reading past the end was
   predicted).
-- No result: `b01`, `b11`, `b24`, `b29`. Their failure reports hold invalid UTF-8 or a NUL, which
-  the test runner's `grep` read as a binary file and dropped (fixed since); to rerun.
+- `b01`, `b11`, `b24`, `b29` (R52, R62, R78, R83) first had no result: their failure reports held
+  invalid UTF-8 or a NUL, which the test runner's `grep` read as a binary file. Rerun with round 4,
+  all four confirmed (rounds 1 and 2: 108 of 120).
+- Round 4, pending a rerun with the runner fixed: LU5, LU6, LU12, LU17, LU21, LU22, LU48, LU59
+  (an error was predicted and jank raised one, its text not recorded), LU72, LU73, LU74b (an
+  error, text cut), LU64, LU74, LU79-LU82 (results lost to the runner). LU88-LU90 (jank.shell)
+  failed with an error, none predicted.
 - Round 3: refuted on main LS2 (BigDecimal division), LS9 (`bigdec` of a double), LS44 (`eval`
   of a quoted object's metadata), LS69 (an `ex-info` across a `finally`). The replica's round 4
   found LS2, LS9 and LS44's tests unable to see the prediction (jank's `=` on BigDecimals has
