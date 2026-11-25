@@ -20,7 +20,17 @@ In `lean/`, a Lean 4 project:
    def check (opts : Elle.Opts) (h : Elle.History) : Elle.Outcome
    ```
 
-   The generators after line 716 are not needed.
+   The generators after line 716 are not needed. Translate it in four parts, in this order,
+   writing each part to the file and building it before reading the next (a part only read
+   is lost when a long conversation is compacted):
+   1. lines 113-320: `xor`, the external writes, `write-mop-index`, the versions
+      (`all-versions`, `version-before`, `version-after`, `versions-after`, `version<`,
+      `resolve-version`);
+   2. lines 321-420: the predicates (`eval-pred`, `pred-mop?`, `pred-read-miss-cases`) and the
+      version sets (`version-set`, `version-sets`);
+   3. lines 423-688: the three graphs and their explainers (`rw-graph`, `wr-graph`, `ww-graph`,
+      `graph`);
+   4. lines 689-716: `check`.
 
 2. **The specification**, `lean/ElleCP/Spec.lean`: what the checker should report, written from
    the definitions and not from the code: the namespace docstring (`elle/DOCSTRING.md`, the
