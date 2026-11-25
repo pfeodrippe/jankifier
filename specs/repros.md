@@ -481,6 +481,27 @@ An `iterator` isn't metadatable, and meta.cpp 50–53 builds the error's text fr
 
 ### Wrong values, no error: numbers
 
+- [ ] **LG1**: `<`, `>`, `min` and `max` compare `count`'s result with a negative number as unsigned (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; S9's root, in comparisons).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
+
+```clojure
+(max (count [1]) -1)          ; jank => -1     clj => 1
+(min (count [1 2 3]) -1)      ; jank => 3      clj => -1
+(< -1 (count [1]))            ; jank => false  clj => true
+(< -1 (long (count [1])))     ; jank => true   clj => true
+```
+
+- [ ] **LG2**: long overflow wraps silently in `*` with literals, or returns a BigInt in `-`, `dec` and `*` on a `let`-bound value; Clojure throws, and so does jank's own `inc` (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
+
+```clojure
+(* -3 9223372036854775807)                  ; jank => -9223372036854775805 (wrapped)   clj => ArithmeticException: integer overflow
+(let [x -9223372036854775808] (* x -1))     ; jank => 9223372036854775808N             clj => ArithmeticException
+(dec -9223372036854775808)                  ; jank => -9223372036854775809N            clj => ArithmeticException
+(- -9223372036854775808 128)                ; jank => -9223372036854775936N            clj => ArithmeticException
+(inc 9223372036854775807)                   ; jank throws "Overflow on increment."     clj => ArithmeticException
+```
+
 - [ ] **D2**: `/` on two integers is C++ integer division (`d02`).
 
 ```clojure
@@ -1528,6 +1549,15 @@ stduuid uuid.h 503–547.
 ```
 
 ### Wrong values, no error: strings and printing
+
+- [ ] **LG3**: `subs` indexes bytes, not characters (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; R58's class, in `subs`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
+
+```clojure
+(subs "é-è" 2)
+;; jank => "-è"
+;; clj  => "è"
+```
 
 jank's strings are UTF-8; Clojure's are UTF-16. Several of these follow from that; R55 and R56
 break `=` and `hash` themselves.
