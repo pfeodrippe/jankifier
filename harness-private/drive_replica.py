@@ -58,7 +58,9 @@ def run_form(task, seed):
       opts {{:context 65536
             :max-steps 160
             :effort :max
-            :max-thinking 8192
+            ;; Shorter stretches than the trials' 8192: two workers sharing the model at about 22
+            ;; tokens a second each took up to six minutes a step, and wrote nothing in 26 minutes.
+            :max-thinking 4096
             :max-tokens 12288
             :sampling {{:temperature 1.0 :seed {int(seed)}}}
             :on-entry (fn [_]
@@ -67,7 +69,7 @@ def run_form(task, seed):
                           (when-let [t @workers]
                             (doseq [k [:translator :specifier]]
                               (h/save! (get t k) (clojure.string/replace live #"\\.edn$" (str "-" (name k) ".edn")))))))}}
-      tm (replica/team m {{:system system :agent opts :worker-context 98304 :files {files}}})
+      tm (replica/team m {{:system system :agent opts :worker-context 98304 :worker-effort :high :files {files}}})
       a (:coordinator tm)
       _ (reset! current a)
       _ (reset! workers tm)

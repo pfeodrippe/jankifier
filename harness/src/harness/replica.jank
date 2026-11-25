@@ -90,11 +90,12 @@
 (defn team
   "A team on model `m`: {:coordinator :translator :specifier}, three agents. `opts`: :system
   (the text all three are told first), :agent (harness.core/agent's options for all three),
+  :worker-effort (the workers' effort, when it differs from :agent's),
   :files ({:translation :spec :report :dir :code :spec-sources}, the paths ELLE.md names:
   :code the source translated, refused to the specifier with the translation), :worker-context (the
   workers' context, when it differs from :agent's), :coordinator-effort and :worker-max-tokens
   as harness.team takes them."
-  [m {:keys [system agent files coordinator-effort worker-max-tokens worker-context]
+  [m {:keys [system agent files coordinator-effort worker-max-tokens worker-context worker-effort]
       :or {coordinator-effort :medium worker-max-tokens 24576}}]
   (let [parts (roles files)
         base (merge agent {:draft nil})
@@ -112,7 +113,8 @@
                         "is written stays; what is only read is lost when the conversation is "
                         "compacted.")))
         worker (merge base {:max-tokens worker-max-tokens :remind remind}
-                      (when worker-context {:context worker-context}))
+                      (when worker-context {:context worker-context})
+                      (when worker-effort {:effort worker-effort}))
         worker-tools (tools/defaults)
         ;; The specifier's tools refuse the code (the Clojure source and the translation): a
         ;; specification read off the code repeats its mistakes. Its own copy of what it may
