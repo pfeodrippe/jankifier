@@ -1667,24 +1667,6 @@ processor.cpp `analyze_case` 1386: default at 1466, clauses at 1500. Clojure: Ca
 
 processor.cpp 1866–1872; `max_params` is 10 (core/call.hpp 18). - A fixed-arity fn called with N ≥ 11 arguments reports 11 in its arity error.
 
-- [ ] **LS50**: calls through function pointers and pointers to members reject arguments that a reference parameter would bind after a conversion (`deviations_r3_test.jank`: `s50`; on main: jank raised an error (its text isn't in the report)).
-
-```clojure
-(cpp/raw "long twice(long const &x) { return 2 * x; } long (*twice_ptr)(long const &) = twice;")
-(cpp/twice_ptr 21)   ; C++ 42   jank "argument 0 is not convertible from `int` to `const long &`"
-```
-
-`build_indirect_cpp_call` 989 → cpp_util.cpp 927 → CppInterOp.cpp 639 (TryImplicitConversion to a reference type; SemaOverload.cpp 2663–2668).
-
-- [ ] **LS53**: built-in operators are unavailable for class operands that convert to arithmetic types (`deviations_r3_test.jank`: `s53`; on main: jank raised an error (its text isn't in the report)).
-
-```clojure
-(cpp/raw "struct meters { double v; operator double() const { return v; } }; meters mk() { return {1.5}; }")
-(cpp/+ (cpp/mk) 1.0)   ; C++ 2.5   jank "operator `+` is not supported"
-```
-
-processor.cpp 367–511 → `GetOperator` 6977 returns only declared operators. #1195 (closed by #1197, which the checked commit includes) fixed other operator cases; this one remains.
-
 - [ ] **LS61**: a map's `conj` rejects a seq of entries, including an empty list (`deviations_r3_test.jank`: `s61`; on main: threw: invalid map entry: 'persistent_list').
 
 ```clojure
@@ -1710,7 +1692,13 @@ context_dynamic.cpp `eval_string` 59–71 analyzes each read form whole; process
 - No result: `b01`, `b11`, `b24`, `b29`. Their failure reports hold invalid UTF-8 or a NUL, which
   the test runner's `grep` read as a binary file and dropped (fixed since); to rerun.
 - Round 3: refuted on main LS2 (BigDecimal division), LS9 (`bigdec` of a double), LS44 (`eval`
-  of a quoted object's metadata), LS69 (an `ex-info` across a `finally`). Failed in another way
+  of a quoted object's metadata), LS69 (an `ex-info` across a `finally`). The replica's round 4
+  found LS2, LS9 and LS44's tests unable to see the prediction (jank's `=` on BigDecimals has
+  D8's tolerance; LS44's metadata is one the strip pass keeps) and re-tests them with `compare`
+  and `str`.
+- LS50 (calls through function pointers) and LS53 (built-in operators on class operands), first
+  listed as confirmed: their tests ran a `cpp/raw` and its use as one form, which jank analyzes
+  whole (LS71), so jank's error says nothing about them. Re-tested by the replica's round 4. Failed in another way
   than predicted: LS49 and LS57 (C++ interop: jank errors where a wrong value was predicted), LS70
   (an unbound root prints jank's own way; no freed memory seen). Not checked yet: the items
   without a test (LS13, LS39, LS43, LS45-LS48, LS51, LS52, LS54-LS56, LS58, LS66, LS68, LS72,

@@ -49,8 +49,8 @@ A second model, a Lean replica of jank written blind from its sources (determini
 `lean/jank`), predicted 120 deviations from Clojure in rounds 1 and 2. On jank main (`7135b7708`,
 x86-64 Linux) 104 were confirmed exactly, 8 were refuted (3 of them fixed after 0.1) and 4 left
 no result (the test runner dropped their reports; to rerun). Round 3, which replicated the
-libraries jank runs on, predicted 76 more (LS1–LS76 here): of the 57 with a test, 50 were
-confirmed, 4 refuted and 3 failed in another way. Their minimal examples, code paths and upstream status are in
+libraries jank runs on, predicted 76 more (LS1–LS76 here): of the 57 with a test, 48 were
+confirmed, 4 refuted, 3 failed in another way, and 2 (LS50, LS53) had tests that couldn't tell. Their minimal examples, code paths and upstream status are in
 [unreported.md](unreported.md#found-by-a-lean-replica-of-jank); the replica and its tests are in
 determinismo-workloads' [jank-interop/lean](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean).
 
@@ -71,9 +71,9 @@ determinismo-workloads' [jank-interop/lean](https://github.com/determinismo-dst/
   `future-cancel`, lazy var metadata), wrong values in BigDecimal and BigInt arithmetic (LS3–LS8,
   LS10–LS12, LS14–LS21, LS40), regex (LS22, LS23, LS25, LS26, LS29–LS31, LS33), the compiler
   (LS38, LS41), collections (LS59, LS60) and printing (LS73), and errors where Clojure works
-  (LS1, LS18, LS24, LS27, LS28, LS32, LS35–LS37, LS42, LS50, LS53, LS61, LS71).
+  (LS1, LS18, LS24, LS27, LS28, LS32, LS35–LS37, LS42, LS61, LS71).
 - **Upstream**: D1, R25 and D4 are #1208; D15 is A2 here, R100 is A3, D21 is S3, R80 is S6, D22
-  is C3 (which also happens on Linux). LS53 remains after #1195's fix; LS60 is #1235's map case.
+  is C3 (which also happens on Linux). LS60 is #1235's map case.
   The rest: no issue found (keyword search, 2026-11-25).
 
 An earlier version listed "W": watch notifications of concurrent `swap!`s
