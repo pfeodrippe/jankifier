@@ -14,7 +14,8 @@ another run (its conversation, the namespaces it loaded, results) is there:
    the home directory, beyond what compiling needs; that is checked before the run;
 4. the task asked, in the mode, sampled with the seed: the task's text is sent with the run,
    nothing else about the trials is loaded;
-5. the code graded: graders.jank (this folder) sent only now, and the result appended to
+5. the code graded in a new process of its own (the same sandbox, no model): graders.jank (this
+   folder) sent only now, and the result appended to
    OUT/results.edn;
 6. the process ended.
 
@@ -382,6 +383,24 @@ def grade(port, task):
     return ('true' if g == 'nil' else 'false'), g
 
 
+def grade_fresh(task, log):
+    """The run's code graded in a process of its own, started for it: in the run's process, the
+    agent's earlier evaluations had left jank's compiled code in a state that failed the file
+    (a C++ namespace redefined and then not found, "Failed to find symbol"), and two kv runs
+    were graded wrong for it. The same sandbox, from the run's directory; no model."""
+    port, proc = start(log)
+    try:
+        ev(port, "(require '[harness.tools :as tools] '[harness.verify :as verify])")
+        failed = ev(port, f'(str (cpp/harness.change_dir {jstr(HOME)}))')
+        if failed != '""':
+            raise RuntimeError('moving to the run\'s directory: ' + failed)
+        ev(port, f'(reset! tools/hidden-paths [{jstr(PROJECT)}])')
+        ev(port, confine_form())
+        return grade(port, task)
+    finally:
+        stop(port, proc)
+
+
 def main():
     # One driver at a time: two would share the run's directory. (Stop one with SIGTERM: a
     # background job ignores SIGINT.)
@@ -432,7 +451,10 @@ def main():
                     written = HOME + '/' + TASKS[task]['file']
                     if os.path.exists(written):
                         shutil.copy(written, f'{OUT}/{task}-{mode}-{seed}.jank')
-                    right, g = grade(port, task)
+                    # The run's process ended before grading, which has a process of its own.
+                    stop(port, proc)
+                    port = proc = None
+                    right, g = grade_fresh(task, log.replace('.log', '-grade.log'))
                     r = r[:-1] + f' :right {right} :grade {g}}}'
                     results.append(r)
                     with open(results_path, 'w') as f:

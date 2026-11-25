@@ -21,6 +21,23 @@
   [text]
   (str/replace (str text) (re-pattern (str (char 27) "\\[[0-9;]*m")) ""))
 
+(defn- hinted
+  "An eval's or a load's reply, with what to do when it holds one of jank's errors that last
+  for the whole process: kv agents lost dozens of steps to them, trying the same name again."
+  [said]
+  (let [said (str said)]
+    (str said
+         (cond
+           (str/includes? said "redefinition of")
+           (str "\n(C++ source changed under a name already evaluated: that namespace is now lost in this "
+                "process. Put the changed source under a new namespace name (files2, files3) and call that one.)")
+           (and (str/includes? said "Unable to find `") (str/includes? said "within"))
+           (str "\n(A C++ namespace whose source failed or was changed before is lost in this process, even "
+                "when the source is right now. Use a new namespace name for it.)")
+           (str/includes? said "Failed to find symbol")
+           (str "\n(jank's compiled code for a name was lost after an earlier failure in this process. Define "
+                "the function again under a new name, or load the file under a new namespace.)")))))
+
 (defn- cause
   "What an evaluation's error says: its cause without the trace, or its lines without the
   rule above them and the link below."
@@ -95,12 +112,8 @@
   (let [line (first (str/split-lines (str/trim text)))]
     (if (> (count line) 60) (str (subs line 0 57) "...") line)))
 
-(defn evaluate
-  "Evaluates jank code (a Clojure dialect) in the running process: what it printed and
-  each top-level form's value, as a REPL shows them, form by form (an error stops there).
-  Definitions stay for later calls. clojure.core is there, clojure.string as str and
-  clojure.set as set; inkling.core is the engine this model runs on, and
-  (harness.core/me) gives this conversation's {:model :session :agent}."
+(defn- evaluate-raw
+  "evaluate without the hints."
   [code]
   (prepare!)
   (let [code (str code)
@@ -135,9 +148,17 @@
                    (when (seq (rest spans)) (str "\n(the " (count (rest spans)) " forms after it were not evaluated)")))
               (recur (rest spans) (:ns r) (str said (head-of text) " => " (:value r) "\n")))))))))
 
-(defn load-file
-  "Loads a jank file: its forms evaluated in order, as loading it would (its ns form first).
-  Says what it printed and the namespace it is in, or what failed, with its line."
+(defn evaluate
+  "Evaluates jank code (a Clojure dialect) in the running process: what it printed and
+  each top-level form's value, as a REPL shows them, form by form (an error stops there).
+  Definitions stay for later calls. clojure.core is there, clojure.string as str and
+  clojure.set as set; inkling.core is the engine this model runs on, and
+  (harness.core/me) gives this conversation's {:model :session :agent}."
+  [code]
+  (hinted (evaluate-raw code)))
+
+(defn- load-file-raw
+  "load-file without the hints."
   [path]
   (prepare!)
   (check-path! path)
@@ -152,6 +173,12 @@
              (if (:ok r)
                (str "loaded " path ": " (count (:spans found)) " forms, namespace " (:ns r))
                (str "error loading " path ": " (cause (:error r)))))))))
+
+(defn load-file
+  "Loads a jank file: its forms evaluated in order, as loading it would (its ns form first).
+  Says what it printed and the namespace it is in, or what failed, with its line."
+  [path]
+  (hinted (load-file-raw path)))
 
 (defn functions
   "Lists what a namespace of the running process defines: a line a name, with the start of
