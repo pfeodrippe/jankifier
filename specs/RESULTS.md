@@ -43,6 +43,30 @@ are unchanged since 0.1).
 | N5 | Overlapping captures restore stdout in the wrong order and can leave the server's file descriptor 1 pointing at a deleted temp file: everything printed outside an eval afterwards (e.g. from a future) is lost. | `capture.jank` | two connections evaluating at once, then a future which prints | none found (#1022, as N4); on main: still there |
 | N6 | Sessions aren't tracked: `*1` belongs to the connection, so an eval of `*1` in one session returns another session's last value. | `handler/clone.jank`, `evaluate.cpp` | eval in session A, then `*1` in session B on the same connection | known: PR #1175 says sessions aren't tracked (`proof`'s `session.isolated` fails); no issue; on main: still there |
 
+## Findings from a Lean replica of jank
+
+A second model, a Lean replica of jank written blind from its sources (determinismo's
+`lean/jank`), predicted 120 deviations from Clojure in rounds 1 and 2. On jank main (`7135b7708`,
+x86-64 Linux) 104 were confirmed exactly, 8 were refuted (3 of them fixed after 0.1) and 4 didn't
+run. Their minimal examples, code paths and upstream status are in
+[unreported.md](unreported.md#found-by-a-lean-replica-of-jank), the tests in
+[repro/lean-replica/](repro/lean-replica/).
+
+- **Crashes**: D9 (NaN from `∞-∞` or `0.0/0.0`, SIGSEGV on x86-64), D2b (int32 minimum / -1,
+  SIGFPE), R47 (a parameter named like its fn), R119 (`first` of an infinite mapped real range),
+  R97 (`(compare :a 1)`, the `catch` never runs), D24 (a throwing `catch` then a throwing
+  `finally`, `std::terminate`).
+- **Hangs**: R1 (NUL in `read-string`), D16 (a watch removing itself), R116 (`range` past 2^31),
+  R117 (`doseq` over a held cons).
+- **Wrong values**: numbers (D2, D4b, D5–D8, D10, D12, D13, R23, R24, R26, R44, R99, R122),
+  concurrency (D18, D19), the compiler (R29, R30, R33, R34, R37, R38, R42, R103, R108, R110,
+  R112), collections (R105, R118, R120, R121), the reader (R4–R6, R10, R11, R13–R16, R19–R21),
+  strings and printing (R53, R55–R61, R63, R68–R72, R76), regex (R79, R81, R82, R84).
+- **Errors where Clojure works**: D25, R2, R3, R7, R8, R12, R17, R18, R27, R28, R39–R41, R73,
+  R74, R96, R98, R101, R104, R114.
+- **Upstream**: D1, R25 and D4 are #1208; D15 is A2 here, R100 is A3, D21 is S3, R80 is S6, D22
+  is C3 (which also happens on Linux). The rest: no issue found (keyword search, 2026-11-25).
+
 An earlier version listed "W": watch notifications of concurrent `swap!`s
 arriving out of order. It isn't a finding: `add-watch`'s docstring allows it,
 and Clojure does the same.
