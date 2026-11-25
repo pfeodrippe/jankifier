@@ -234,8 +234,8 @@ message. `jankifier.nrepl` works around it.
 ## Found by a Lean replica of jank (checked on jank main)
 
 These were predicted by a Lean replica of jank written blind from its sources (determinismo's
-`lean/jank`, rounds 1 and 2), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
-Linux, UTF-8 locale, each test in its own process with a 600 s limit, through determinismo-ci)
+`lean/jank`, rounds 1 to 3; round 3's S items appear here as LS, since S names this file's own), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
+Linux, UTF-8 locale, each test in its own process with a 600 s limit, 120 s in round 3, through determinismo-ci)
 and on Clojure 1.11.1. The tests live with the replica, in determinismo-workloads'
 [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests): each asserts Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
 issues and PRs were searched by keyword on 2026-11-25; none found unless said.
@@ -320,6 +320,14 @@ Likely since #772 (NaN boxing).
 The generated code puts `finally` in a `scope_exit` guard (`cpp_processor.cpp` 1054–1138, at
 1137), which throws while the catch's exception is unwinding.
 
+- [ ] **LS34**: matching recurses per character, so long inputs overflow the stack (`deviations_r3_test.jank`: `s34`; on main: SIGSEGV).
+
+```clojure
+(re-find #"a*" (apply str (repeat 3000000 \a)))   ; Clojure "aaa…"   jank SIGSEGV
+```
+
+regex_executor.tcc `_M_dfs` 510, `_M_rep_once_more` 178, `_M_handle_match` 321. Nearly every frame is a non-tail call.
+
 ### Hangs
 
 - [ ] **R1**: a NUL in a string makes the reader loop forever (`deviations_reader_test.jank`: `a01`).
@@ -364,6 +372,53 @@ The generated code puts `finally` in a `scope_exit` guard (`cpp_processor.cpp` 1
 ```
 
 `doseq` steps with `fresh-seq` / `next-in-place` (`core.jank` 2742, 2750).
+
+- [ ] **LS62**: a validator that calls `set-validator!` on its own atom hangs, and so does one that reads or updates its atom beside a concurrent `set-validator!` (`deviations_r3_hangs_test.jank`: `s62`; on main: still running after 120 s (killed)).
+
+```clojure
+(def a (atom 0))
+(set-validator! a (fn [v] (when (= v 1) (set-validator! a (fn [_] true))) true))
+(swap! a inc)   ; Clojure 1   jank hangs
+```
+
+atom.cpp `validate` 261–265 holds `validator.rlock()` (263) across the call; `set_validator` 236–241 takes `wlock()` (239). folly SharedMutex.h `lockExclusiveImpl` 1047–1110 sets kHasE, then waits for S (1086–1088).
+
+- [ ] **LS63**: `alter-var-root` whose fn re-enters the var hangs (`deviations_r3_hangs_test.jank`: `s63`; on main: still running after 120 s (killed)).
+
+```clojure
+(def v 0)
+(alter-var-root #'v (fn [x] (alter-var-root #'v inc) (+ x 10)))   ; Clojure 10   jank hangs
+(alter-var-root #'v (fn [_] (def v 5) 6))                         ; Clojure 6    jank hangs
+```
+
+var.cpp `alter_root` 106–112 holds `write_mutex` (108) across `apply_to`; `bind_root` 101 takes it again. Clojure's methods are synchronized (reentrant).
+
+- [ ] **LS64**: a delay whose body asks `(realized? d)` or derefs `d` hangs (`deviations_r3_hangs_test.jank`: `s64`; on main: still running after 120 s (killed)).
+
+```clojure
+(def d (delay (realized? d))) @d                ; Clojure false                jank hangs
+(def e (delay @(future (realized? e)))) @e      ; Clojure false                jank hangs
+(def s (delay @s)) @s                           ; Clojure StackOverflowError   jank hangs
+```
+
+delay.cpp `deref` 19–46 holds a non-recursive `std::mutex` (21) across the body (34); `is_realized` 51 takes it again.
+
+- [ ] **LS65**: `future-cancel` of a future that another thread is dereferencing hangs all three threads (`deviations_r3_hangs_test.jank`: `s65`; on main: still running after 120 s (killed)).
+
+```clojure
+(def f (future (cpp/jank.runtime.sleep 100) 1)) (def g (future @f)) (cpp/jank.runtime.sleep 10)
+(future-cancel f)   ; Clojure true (@g throws CancellationException)   jank: caller, g and f hang
+```
+
+future.cpp `deref` 17 holds the thread lock across `join()`. core.cpp `cancel_future` 1178 holds state S while taking the thread lock (1181). The future's completion needs state E (1132).
+
+- [ ] **LS67**: reading pending lazy var metadata evaluates it under the var's exclusive lock, so a meta expression that reads the var's meta hangs (`deviations_r3_hangs_test.jank`: `s67`; on main: still running after 120 s (killed)).
+
+```clojure
+(defn mk [] (def ^{:doc "v" :m (meta #'v)} v 1)) (mk) (meta #'v)   ; Clojure the map   jank hangs
+```
+
+cpp_processor.cpp gen(def) 527–557 → var.cpp 296–302 → lazy_meta.cpp `get` 30–46 holds `state.wlock()` (32) across `_jank_eval_str`. - Needs a def compiled through codegen; the top-level interpreter sets meta eagerly.
 
 ### Wrong values, no error: numbers
 
@@ -528,6 +583,142 @@ interpreted.
 
 `big_decimal.cpp` 182; `number.cpp` 460.
 
+- [ ] **LS3**: non-terminating quotients return a value (`deviations_r3_test.jank`: `s03`; on main: `(/ 1.0M 3)` returned, no exception).
+
+```clojure
+(/ 1M 3)      ; Clojure throws "Non-terminating decimal expansion"   jank 0.333…M (128 digits)
+(< 0M 1/3)    ; Clojure throws                                       jank true
+```
+
+- core/math.hpp `div` 299–340 → no_et_ops.hpp 139–166; - default_ops.hpp 569–574 (a long divisor is first converted to a decimal); - cpp_dec_float.hpp `operator/=` 1016–1045 → `calculate_inv` 1222–1286 (Newton iteration from a double estimate) → `operator*=` 951–1012, which keeps the top limbs and never rounds. `with-precision` is unported (core.jank 6487–6503).
+
+- [ ] **LS4**: BigDecimals keep 128 significant digits (`deviations_r3_test.jank`: `s04`; on main: `(- 1.0M 1e-130.0M)` gave `1.0M`).
+
+```clojure
+(- 1M 1E-130M)   ; Clojure exact   jank 1.0M
+(+ 1 1E130M)     ; Clojure exact   jank 1E+130
+```
+
+cpp_dec_float.hpp `rd_string` 2296–2318 and `operator+=` 759–937. A literal with 133 digits is truncated when read.
+
+- [ ] **LS5**: BigDecimals below 1e-4 or from 1e128 print in boost's scientific form plus ".0" (`deviations_r3_test.jank`: `s05`; on main: `(str 1e-05.0M)` gave `"1e-05.0"`).
+
+```clojure
+(str 0.00001M)                    ; Clojure "0.00001"   jank "1e-05.0"
+(pr-str 1E130M)                   ; Clojure "1E+130M"   jank "1e+130.0M"
+(read-string (pr-str 0.00001M))   ; Clojure 0.00001M    jank lexer error
+```
+
+big_decimal.cpp 157–175 → string_builder.cpp 240–249 (appends ".0") → cpp_dec_float.hpp `str` 1913–2081; number_base.hpp 1394 picks the notation.
+
+- [ ] **LS6**: a BigDecimal combined with a double gives a BigDecimal (`deviations_r3_test.jank`: `s06`; on main: `(+ 1.0M 0.5)` gave `1.5M`).
+
+```clojure
+(+ 1M 0.5)   ; Clojure 1.5                  jank 1.5M
+(* 6M 0.1)   ; Clojure 0.6000000000000001   jank 0.600000000000000033306690738754696212708950042724609375M
+```
+
+math.hpp `add` 71–112 → boost `operator+(number, double)`, which converts the double exactly (cpp_dec_float.hpp 2461–2516) → make_box.hpp 36. Clojure uses `DOUBLE_OPS` (Numbers.java 976).
+
+- [ ] **LS7**: `rem` of BigDecimals runs a 128-digit fmod (`deviations_r3_test.jank`: `s07`; on main: `(rem 1e+130.0M 3)` gave `99999997.0M`).
+
+```clojure
+(rem 1E130M 3)   ; Clojure 1M   jank 99999997.0M
+```
+
+math.cpp 269–289 → default_ops.hpp 1260–1321.
+
+- [ ] **LS8**: `rem` of a ratio and a BigDecimal truncates the decimal first (`deviations_r3_test.jank`: `s08`; on main: `(rem 1.75M 1/2)` gave `0N`).
+
+```clojure
+(rem 1/2 0.1M)    ; Clojure 0.0M    jank throws "Division by zero is not permitted."
+(rem 1.75M 1/2)   ; Clojure 0.25M   jank 0N
+```
+
+math.cpp 250–268 → generic_interconvert.hpp 533–563.
+
+- [ ] **LS10**: BigDecimals that jank calls `=` hash differently (`deviations_r3_test.jank`: `s10`; on main: `(or (not= a b) (= (hash a) (hash b)))` was `false`).
+
+```clojure
+(count (hash-set 1M 1.0000000000000000001M))   ; jank 2, though jank's = says they are equal (D8)
+```
+
+big_decimal.cpp 177–180 → cpp_dec_float.hpp 259–266. The hashes are 3307139568 and 575929905.
+
+- [ ] **LS11**: `(double x)` of a BigDecimal rounds twice and flushes subnormals to 0 (`deviations_r3_test.jank`: `s11`; on main: `(double 1e-310.0M)` gave `0.0`).
+
+```clojure
+(double 9007199254740993.00000000000000000001M)   ; Clojure 9.007199254740994E15   jank …992E15
+(double 1E-310M)                                  ; Clojure 1.0E-310               jank 0.0
+```
+
+big_decimal.cpp 197–200 → `extract_double` 1570–1610 (rounds to 19 digits, then `strtod`).
+
+- [ ] **LS12**: `(long x)` of a BigDecimal truncates exactly and saturates (`deviations_r3_test.jank`: `s12`; on main: `(long 1e+130.0M)` returned, no exception).
+
+```clojure
+(long 1E130M)   ; Clojure throws "Value out of range for long"   jank 9223372036854775807
+```
+
+big_decimal.cpp 192–195 → `extract_signed_long_long` 1664–1720.
+
+- [ ] **LS14**: `(bigdec s)` follows boost's grammar (`deviations_r3_test.jank`: `s14`; on main: `(bigdec "inf")` returned, no exception).
+
+```clojure
+(bigdec "inf")   ; Clojure throws   jank inf
+(bigdec "1e")    ; Clojure throws   jank 1.0M
+(bigdec ".")     ; Clojure throws   jank 0.0M
+```
+
+math.cpp 823 → `rd_string` 2133–2147, 2104–2112, 2200.
+
+- [ ] **LS15**: `(bigint s)` follows `cpp_int`'s grammar (`deviations_r3_test.jank`: `s15`; on main: `(bigint "010")` gave `8N`).
+
+```clojure
+(bigint "010")    ; Clojure 10N      jank 8N
+(bigint "+5")     ; Clojure 5N       jank throws
+(bigint "0x10")   ; Clojure throws   jank 16N
+(bigint "-")      ; Clojure throws   jank 0N
+```
+
+math.cpp 765 → big_integer.cpp 33–58 (drops one trailing N) → cpp_int.hpp 1752–1922. A NUL ends the string.
+
+- [ ] **LS19**: integer `/` with a BigInt operand truncates (`deviations_r3_test.jank`: `s19`; on main: `(/ 7N 2)` gave `3N`).
+
+```clojure
+(/ 7N 2)   ; Clojure 7/2   jank 3N
+```
+
+math.hpp `div` 299–340, using cpp_int's `/`.
+
+- [ ] **LS20**: ratio arithmetic with a BigInt returns a long for an integral result (`deviations_r3_test.jank`: `s20`; on main: `(pr-str (* 0N 1/2))` gave `"0"`).
+
+```clojure
+(* 0N 1/2)   ; Clojure 0N   jank 0
+(/ 3N 1/2)   ; Clojure 6N   jank 6
+```
+
+ratio.cpp 87–101.
+
+- [ ] **LS21**: `(double -7/3)` divides two doubles (`deviations_r3_test.jank`: `s21`; on main: `(double -7/3)` gave `-2.3333333333333335`).
+
+```clojure
+(double -7/3)   ; Clojure -2.333333333333333   jank -2.3333333333333335
+```
+
+ratio.cpp 108–111. Not reported: dividing a BigDecimal by zero gives `inf.0M`/`nan.0M`; the book documents this behavior (68 questions). Also noted: `numerator`, `denominator` and `biginteger` print as `1N`, and `rationalize` is unported.
+
+- [ ] **LS40**: float-to-integer conversions in emitted code have no range check (`deviations_r3_test.jank`: `s40`; on main: `(int 2147483648)` returned, no exception).
+
+```clojure
+(loop [x 0 n 0] (if (< n 1) (recur 1e10 (+ n 1)) x))   ; Clojure 1.0E10   jank -O0 -2147483648; -O1+ UB
+(int 1e20)                                             ; Clojure throws   jank -O0 -9223372036854775808; -O1+ UB
+(int 2147483648)                                       ; Clojure throws   jank 2147483648
+((fn [^cpp/long p] p) 1e20)                            ; Clojure throws   jank UB inside libjank
+```
+
+(a) cpp_processor.cpp 1708–1716 (`static_cast<int>`); (b, c) math.hpp `to_int` 1410–1420; (d) `from_object` → `to_integer`; analyze_recur 2183–2214 → apply_implicit_conversion 1088–1118.
+
 ### Wrong values, no error: concurrency
 
 - [ ] **D18**: `alter-meta!` loses updates (`d18`).
@@ -674,6 +865,26 @@ interpreted.
 
 `core.cpp` 840; `context.cpp` 420.
 
+- [ ] **LS38**: a macro expansion headed by a local's name is expanded again as a macro (`deviations_r3_test.jank`: `s38`; on main: `(let [comment (fn [x] (str "// " x))] (-> "hi" comment))` gave `nil`).
+
+```clojure
+(let [when 0] (and 1 (when true 7)))                       ; Clojure throws (0 is not a fn)   jank 7
+(let [comment (fn [x] (str "// " x))] (-> "hi" comment))   ; Clojure "// hi"                  jank nil
+(defn f [time] (-> 5 time)) (f inc)                        ; Clojure 6                        jank prints "Elapsed time…", 5
+```
+
+processor.cpp `analyze_call` 3501–3533 → context.cpp `macroexpand` 639–661 recurses at 657 → `macroexpand1` 604–637, which never checks locals. Clojure: `analyzeSeq` 7616–7618 and `isMacro` 7427–7430.
+
+- [ ] **LS41**: a map or set expression whose keys collide at run time does not throw (`deviations_r3_test.jank`: `s41`; on main: `(let [a 1 b 1] {a :x, b :y})` returned, no exception).
+
+```clojure
+(let [a 1 b 1] {a :x b :y})          ; Clojure throws "Duplicate key"   jank {1 :y}
+(let [a 1 b 1] #{a b})               ; Clojure throws                   jank #{1}
+{(identity 1) :x (identity 1) :y}    ; top level: Clojure throws        jank {1 :x, 1 :y}, count 2
+```
+
+codegen/api.cpp 213–449 (`assoc_in_place`, `conj_in_place`); evaluate.cpp eval(map) 447–491 (`in_place_unique` 463/469) and eval(set) 493–509. Clojure: `RT.map`/`RT.set` → `createWithCheck`.
+
 ### Wrong values, no error: collections and sequences
 
 - [ ] **R105**: sorted `find` returns the queried key (`r105`).
@@ -717,6 +928,28 @@ interpreted.
 ```
 
 `seq.cpp` 475/486/494/509.
+
+- [ ] **LS59**: a key or set element `=` to a stored one replaces the stored one in hash maps and hash sets (`deviations_r3_test.jank`: `s59`; on main: `(first (keys (assoc (hash-map (quote (1)) :a) [1] :b)))` gave `[1]`).
+
+```clojure
+(first (keys (assoc (hash-map '(1) :a) [1] :b)))   ; Clojure (1)   jank [1]
+(first (conj #{'(1)} [1]))                         ; Clojure (1)   jank [1]
+(first (conj #{0.0} -0.0))                         ; Clojure 0.0   jank -0.0
+(let [m (into {} [[0 0] [1 1] [2 2] [3 3] [4 4] [5 5] [6 6] ['(1) 0]])]
+  (some vector? (keys (assoc m [1] 1))))           ; Clojure nil   jank true (8 entries promote)
+```
+
+- persistent_hash_map.cpp 110 → immer map.hpp 400 → champ.hpp 604–606 (`copy_inner_replace_value`, the whole pair) and 577–581 (collision nodes); - transient paths: champ.hpp 697–699, 654; - sets: persistent_hash_set.cpp 151 → set.hpp 220; transient_hash_set.cpp 46. - Below 8 entries the array map keeps the stored key (native_array_map.cpp 139–162). - Clojure keeps the stored key: BitmapIndexedNode.assoc 704; PersistentHashSet.cons 98–101.
+
+- [ ] **LS60**: an array-map transient can still be read after `persistent!` (`deviations_r3_test.jank`: `s60`; on main: `(let [t (transient {:a 1})] (persistent! t) (get t :a :nf))` returned, no exception).
+
+```clojure
+(let [t (transient {:a 1})] (persistent! t) (get t :a :nf))     ; Clojure throws   jank 1
+(let [t (transient {:a 1})] (persistent! t) (contains? t :a))   ; Clojure throws   jank true
+(let [t (transient {:a 1})] (persistent! t) (find t :a))        ; Clojure throws   jank [:a 1]
+```
+
+transient_array_map.cpp 47, 52, 62, 146 lack `assert_active()`; `to_persistent` 126–131 moves `data` with the defaulted move constructor (native_array_map.hpp 34), so the dead transient keeps the same array. #1235 (closed) is the vector case; array maps still answer after `persistent!`.
 
 ### Wrong values, no error: the reader
 
@@ -837,6 +1070,27 @@ The duplicate check (`parse.cpp` 722–743) compares hashes, and `1`/`1N` hash d
 ```
 
 `parse.cpp` 387–418, 487–507; `core/meta.cpp` `source_to_meta` (171–228).
+
+- [ ] **LS16**: ratio parts that reach boost with a leading 0 are read as octal (`deviations_r3_test.jank`: `s16`; on main: `(read-string "0010/3")` gave `8/3`).
+
+```clojure
+0010/3                    ; Clojure 10/3                     jank 8/3
+00017/1                   ; Clojure 17                       jank 15
+1/0100000000000000000000  ; Clojure 1/100000000000000000000  jank 1/1152921504606846976
+008/3                     ; Clojure 8/3                      jank throws
+```
+
+lex.cpp 905–915 (a radix-8 numerator drops only its first 0) and 916–935 (a denominator past i64 goes whole to boost).
+
+- [ ] **LS17**: BigDecimal literal exponents and hex-looking literals (`deviations_r3_test.jank`: `s17`; on main: `(read-string "1e4294967296M")` returned, no exception).
+
+```clojure
+1e4294967296M   ; Clojure throws "Exponent overflow"   jank 1.0M (atoll, then an int32 wrap)
+0x1e5M          ; Clojure invalid number               jank 100000.0M
+1e67108872M     ; jank inf, printed "inf.0M"
+```
+
+lex.cpp 1123–1132 → `rd_string` 2104–2112, 2351–2375.
 
 ### Wrong values, no error: strings and printing
 
@@ -993,6 +1247,14 @@ break `=` and `hash` themselves.
 
 `persistent_string_sequence.cpp` 39–56.
 
+- [ ] **LS73**: `pr-str` of a namespace is its bare name (`deviations_r3_test.jank`: `s73`; on main: `"#object["` gave `"#object["`).
+
+```clojure
+(pr-str *ns*)   ; Clojure "#object[clojure.lang.Namespace 0x… \"user\"]"   jank "user"
+```
+
+ns.cpp `to_code_string` 223.
+
 ### Wrong values, no error: regex
 
 jank's regexes are `std::regex` (ECMAScript); Clojure's are `java.util.regex`.
@@ -1034,6 +1296,86 @@ jank's regexes are `std::regex` (ECMAScript); Clojure's are `java.util.regex`.
 ```
 
 `string_native.cpp` 224, 247.
+
+- [ ] **LS22**: a quantifier after a non-ASCII character repeats only its last byte, and `\u00e9` and `\xe9` are the byte 0xE9 (`deviations_r3_test.jank`: `s22`; on main: `(re-matches (re-pattern "é*") "")` gave `nil`).
+
+```clojure
+(re-matches #"é*" "")    ; Clojure ""     jank nil
+(re-find #"é+" "éé")     ; Clojure "éé"   jank "é"
+(re-find #"\u00e9" "é")  ; Clojure "é"    jank nil
+```
+
+regex_scanner.tcc `_M_scan_normal` 96; regex_compiler.tcc `_M_quantifier` 179 (pops the last atom) and `_M_try_char` 563.
+
+- [ ] **LS23**: `\uHHHH` above 0xFF is cut to its low byte (`deviations_r3_test.jank`: `s23`; on main: `(re-find (re-pattern "\\u0141") "A")` gave `"A"`).
+
+```clojure
+(re-find #"\u0141" "A")   ; Clojure nil (the pattern is Ł)   jank "A"
+```
+
+regex_scanner.tcc 353 → regex_compiler.tcc 563 (`assign(1, int)` narrows to `char`).
+
+- [ ] **LS25**: possessive quantifiers compile, as nested greedy repeats (`deviations_r3_test.jank`: `s25`; on main: `(re-find (re-pattern "a++a") "aaa")` gave `"aaa"`).
+
+```clojure
+(re-find #"a++a" "aaa")       ; Clojure nil    jank "aaa"
+(re-matches #"\d*+\d" "12")   ; Clojure nil    jank "12"
+```
+
+regex_compiler.tcc `_M_term` 138 (`while (_M_quantifier())`).
+
+- [ ] **LS26**: a `{n}` after a quantifier repeats it; a `{n}` with nothing before it is a read error (`deviations_r3_test.jank`: `s26`; on main: `(re-find (re-pattern "a{2}{3}") "aaaaaa")` gave `"aaaaaa"`).
+
+```clojure
+(re-find #"a{2}{3}" "aaaaaa")   ; Clojure "aa"          jank "aaaaaa"
+#"{2}"                          ; Clojure matches ""    jank read error
+```
+
+regex_compiler.tcc 138 and 80.
+
+- [ ] **LS29**: POSIX bracket syntax and nested classes mean other things (`deviations_r3_test.jank`: `s29`; on main: `(re-find (re-pattern "[[:alpha:]]") "x")` gave `"x"`).
+
+```clojure
+(re-find #"[[:alpha:]]" "x")   ; Clojure nil   jank "x"
+(re-find #"[[a]]" "a")         ; Clojure "a"   jank nil
+(re-find #"[a-z&&[^b]]" "c")   ; Clojure "c"   jank nil
+#"[[:foo:]]"                   ; Clojure valid   jank read error
+```
+
+regex_scanner.tcc 217–240; regex_compiler.tcc `_M_expression_term` 436; regex.tcc `lookup_classname` 279.
+
+- [ ] **LS30**: `]` first in a class closes it (`deviations_r3_test.jank`: `s30`; on main: `(re-find (re-pattern "[]a]") "a")` gave `nil`).
+
+```clojure
+(re-find #"[]a]" "a")   ; Clojure "a"      jank nil
+#"[^]"                  ; Clojure error    jank matches any byte, newline included
+```
+
+regex_scanner.tcc 248.
+
+- [ ] **LS31**: Java escapes with another meaning (`deviations_r3_test.jank`: `s31`; on main: `(re-find (re-pattern "\\cJ") "\n")` gave `nil`).
+
+```clojure
+(re-find #"\cJ" "\n")      ; Clojure "\n"       jank nil (\cX is X)
+(re-find #"\v" "\n")       ; Clojure "\n"       jank nil (VT only)
+(re-find #"\Aa" "a")       ; Clojure "a"        jank nil (\A \z \Z \G are letters)
+(re-find #"\Q.\E" ".")     ; Clojure "."        jank nil
+(re-find #"\e" "e")        ; Clojure nil        jank "e"
+(re-find #"\01" "\u0001")  ; Clojure "\u0001"   jank nil
+#"\p{L}"  #"\x{41}"        ; Clojure valid      jank read errors
+```
+
+regex_scanner.tcc `_M_eat_escape_ecma` 310 (only `0 b f n r t v`; `\c` 344; `\x`/`\u` 353; any other letter is an identity escape).
+
+- [ ] **LS33**: a lookahead at a search's first position sees a new input (`deviations_r3_test.jank`: `s33`; on main: `(re-find (re-pattern "a(?=\\b)") "ab")` gave `"a"`).
+
+```clojure
+(re-find #"a(?=\b)" "ab")            ; Clojure nil     jank "a"
+(re-find #"foo(?=\bbar)" "foobar")   ; Clojure nil     jank "foo"
+(re-seq #"b(?!^)" "b")               ; Clojure ("b")   jank nil
+```
+
+regex_executor.tcc `_M_lookahead` 151/157 builds the sub-executor with `_M_begin` at the current position. `_M_at_begin` (executor.h 167) and `_M_word_boundary` (552/560) look left only under `match_prev_avail`, which `_M_search` (42) sets only after the first start position.
 
 ### Throws or doesn't compile where Clojure works
 
@@ -1238,6 +1580,126 @@ jank's regexes are `std::regex` (ECMAScript); Clojure's are `java.util.regex`.
 
 `integer_range.cpp` 186, 197; `next` (113).
 
+- [ ] **LS1**: `#'` followed by anything but a symbol is a read error (`deviations_r3_test.jank`: `s01`; on main: jank raised an error (its text isn't in the report)).
+
+```clojure
+(read-string "#'1")   ; Clojure (var 1)         jank "A value after `#'` must be a symbol."
+'[#'(f x)]            ; Clojure [(var (f x))]   jank: the file does not read
+```
+
+read/parse.cpp `parse_reader_macro_var_quote` 807 (check at 821–826). Clojure: LispReader VarReader 805–816.
+
+- [ ] **LS18**: `bigint` of a ratio goes through i64 (`deviations_r3_test.jank`: `s18`; on main: threw: The value `33333333333333333333` is out of range for `i64` conversion.).
+
+```clojure
+(bigint 100000000000000000000/3)   ; Clojure 33333333333333333333N   jank throws "out of range for i64"
+```
+
+math.cpp 774–777 → ratio.cpp 113–116 → big_integer.cpp 200–208.
+
+- [ ] **LS24**: a bracket range from ASCII to a non-ASCII byte is a read error (`deviations_r3_test.jank`: `s24`; on main: threw: Invalid range in bracket expression.).
+
+```clojure
+#"[a-é]"   ; Clojure valid   jank read error "Invalid range in bracket expression."
+```
+
+regex_compiler.h `_M_make_range` 500 compares signed `char`.
+
+- [ ] **LS27**: a quantifier on an assertion is a read error (`deviations_r3_test.jank`: `s27`; on main: threw: Mismatched '(' and ')' in regular expression).
+
+```clojure
+#"^*a"  #"\b+a"  #"(?=a)*a"  #"a$?"   ; Clojure compile   jank read error
+```
+
+regex_compiler.tcc `_M_term` 134 returns after `_M_assertion`.
+
+- [ ] **LS28**: backreferences that Java accepts are read errors (`deviations_r3_test.jank`: `s28`; on main: threw: Back-reference referred to an opened sub-expression.).
+
+```clojure
+#"\1"   #"\1(a)"   #"(a\1)"      ; Clojure compile               jank read errors
+(re-find #"(a)\10" "aa0")        ; Clojure ["aa0" "a"] (\1 then "0")   jank read error (backref 10)
+```
+
+regex_scanner.tcc 372; regex_compiler.tcc 317 → regex_automaton.tcc 165/173.
+
+- [ ] **LS32**: a class escape before `-` in a bracket is a read error (`deviations_r3_test.jank`: `s32`; on main: threw: Invalid start of '[x-x]' range in regular expression).
+
+```clojure
+#"[\w-a]"   ; Clojure \w, '-', 'a'   jank read error "Invalid start of '[x-x]' range"
+```
+
+regex_compiler.tcc 497.
+
+- [ ] **LS35**: counted repeats past the NFA state limit are read errors (`deviations_r3_test.jank`: `s35`; on main: threw: Number of NFA states exceeds limit. Please use shorter regex string, or use smaller brace expression, or make _GLIBCXX_REGEX_STATE_LIMIT larger.).
+
+```clojure
+#"a{99999}"   #"\d{0,50000}"   ; Clojure valid   jank "Number of NFA states exceeds limit"
+```
+
+regex_compiler.tcc 243 → regex_automaton.h 33 (`_GLIBCXX_REGEX_STATE_LIMIT` 100000).
+
+- [ ] **LS36**: a local bound to a number, boolean or string literal cannot appear in call position, even where Clojure never makes the call (`deviations_r3_test.jank`: `s36`; on main: jank raised an error (its text isn't in the report)).
+
+```clojure
+(let [x 1] (if false (x) :ok))      ; Clojure :ok   jank analyze/invalid-cpp-call
+(let [x true] (if false (x) :ok))   ; Clojure :ok   jank compile error
+(loop [f 2147483647 k 0] (if (= k 1) (f 2147483647) (recur :k 1)))   ; Clojure nil   jank compile error
+```
+
+processor.cpp `analyze_let` 2377 (literal native type, cpp_util.cpp `literal_type` 603–720) → `analyze_call` 3607 → `analyze_cpp_call` 4055 → `build_indirect_cpp_call` 874/965 "There is no call operator for `int`".
+
+- [ ] **LS37**: `case` analyzes its default before its clauses (`deviations_r3_test.jank`: `s37`; on main: jank raised an error (its text isn't in the report)).
+
+```clojure
+(case 1 1 (def h 1) (h))                  ; Clojure #'user/h              jank unresolved symbol h
+(case 2 1 (do (def inc 5) inc) (inc 1))   ; Clojure throws (unbound)      jank 2
+(case 1 1 (var when) (do (def when 1) 2)) ; Clojure #'clojure.core/when   jank #'user/when
+```
+
+processor.cpp `analyze_case` 1386: default at 1466, clauses at 1500. Clojure: CaseExpr.Parser 9577 (clauses), then 9589 (default).
+
+- [ ] **LS42**: more than 10 parameter symbols is rejected, and the `& rest` symbol counts as one (`deviations_r3_test.jank`: `s42`; on main: jank raised an error (its text isn't in the report)).
+
+```clojure
+(fn [a b c d e f g h i j k] k)     ; Clojure ok   jank "too many parameters. The max is 10"
+(fn [a b c d e f g h i j & r] r)   ; Clojure ok   jank the same error
+```
+
+processor.cpp 1866–1872; `max_params` is 10 (core/call.hpp 18). - A fixed-arity fn called with N ≥ 11 arguments reports 11 in its arity error.
+
+- [ ] **LS50**: calls through function pointers and pointers to members reject arguments that a reference parameter would bind after a conversion (`deviations_r3_test.jank`: `s50`; on main: jank raised an error (its text isn't in the report)).
+
+```clojure
+(cpp/raw "long twice(long const &x) { return 2 * x; } long (*twice_ptr)(long const &) = twice;")
+(cpp/twice_ptr 21)   ; C++ 42   jank "argument 0 is not convertible from `int` to `const long &`"
+```
+
+`build_indirect_cpp_call` 989 → cpp_util.cpp 927 → CppInterOp.cpp 639 (TryImplicitConversion to a reference type; SemaOverload.cpp 2663–2668).
+
+- [ ] **LS53**: built-in operators are unavailable for class operands that convert to arithmetic types (`deviations_r3_test.jank`: `s53`; on main: jank raised an error (its text isn't in the report)).
+
+```clojure
+(cpp/raw "struct meters { double v; operator double() const { return v; } }; meters mk() { return {1.5}; }")
+(cpp/+ (cpp/mk) 1.0)   ; C++ 2.5   jank "operator `+` is not supported"
+```
+
+processor.cpp 367–511 → `GetOperator` 6977 returns only declared operators. #1195 (closed by #1197, which the checked commit includes) fixed other operator cases; this one remains.
+
+- [ ] **LS61**: a map's `conj` rejects a seq of entries, including an empty list (`deviations_r3_test.jank`: `s61`; on main: threw: invalid map entry: 'persistent_list').
+
+```clojure
+(conj {} ())                    ; Clojure {}        jank throws "invalid map entry"
+(merge {:a 1} ())               ; Clojure {:a 1}    jank throws
+(into {} [()])                  ; Clojure {}        jank throws
+((fn [& {:as m}] m) :a 1 ())    ; Clojure {:a 1}    jank throws
+```
+
+obj/detail/base_persistent_map.cpp `conj` 169 (throws at 182–186: only nil, a map or a 2-vector); transient_array_map.cpp 98 (112–115); transient_hash_map.cpp 110 (124–129); core.jank destructure 3427–3436. Clojure: APersistentMap.cons 27–49 and ATransientMap.conj 25–47 walk any seqable.
+
+- [ ] **LS71**: a top-level `(do …)` is analyzed as one form (`deviations_r3_test.jank`: `s71`; on main: threw: Invalid call to `#object [clojure.core/s71-m jit_function 0x7f607d4156e0]` with `0` args provided.).
+
+context_dynamic.cpp `eval_string` 59–71 analyzes each read form whole; processor.cpp `analyze_def` 1303–1306 interns at analysis; `analyze_call` 3505; evaluate.cpp eval(do) 574. Clojure: Compiler.eval 7684–7691 evaluates each form of a top-level `do` in turn.
+
 ### Left out
 
 - Refuted on main (jank behaves like Clojure): D3, D11, D14, D16b, D20, R45, R123 and one control.
@@ -1245,5 +1707,12 @@ jank's regexes are `std::regex` (ECMAScript); Clojure's are `java.util.regex`.
 - Failed in another way than predicted: D15 (A2 here), D23, R89 (a C++ enum; no Clojure
   equivalent). Unclear: R54 (`b03`, "Invalid UTF-8 string." where reading past the end was
   predicted).
-- Not run (their shard's time went to the hangs above): `b01`, `b11`, `b24`, `b29`.
+- No result: `b01`, `b11`, `b24`, `b29`. Their failure reports hold invalid UTF-8 or a NUL, which
+  the test runner's `grep` read as a binary file and dropped (fixed since); to rerun.
+- Round 3: refuted on main LS2 (BigDecimal division), LS9 (`bigdec` of a double), LS44 (`eval`
+  of a quoted object's metadata), LS69 (an `ex-info` across a `finally`). Failed in another way
+  than predicted: LS49 and LS57 (C++ interop: jank errors where a wrong value was predicted), LS70
+  (an unbound root prints jank's own way; no freed memory seen). Not checked yet: the items
+  without a test (LS13, LS39, LS43, LS45-LS48, LS51, LS52, LS54-LS56, LS58, LS66, LS68, LS72,
+  LS74-LS76).
 - In #1208: D1 and R25 (32-bit arithmetic), D4 (`quot` of a BigInt).
