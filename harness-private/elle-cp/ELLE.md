@@ -88,6 +88,19 @@ What `closed_predicate.clj` calls from outside, and where it is in Lean:
 | `ct/cycles!` | `cyclesE an {}` (an `Except`) | `Txn.lean`; `{}` is the default order of the graph's vertices |
 | `ct/result-map` | `resultMap` | `Txn.lean` |
 
+Two Clojure forms the file uses often:
+
+- `loopr` (from the dom-top library, `dt/loopr`): `(loopr [acc init ...] [x coll ...] body final?)`
+  goes through the elements of the collections (several bindings nest, as in `for`), with the
+  accumulators bound. In the body, `(recur new-acc ...)` goes on to the next element with new
+  accumulator values; **any other value in tail position returns at once** from the whole
+  `loopr`. When the elements run out, it returns `final` if there is one (it can use the
+  accumulators), else: nothing for no accumulator, the accumulator itself for one, a vector of
+  them for several. So `(loopr [found false] [v vs] (if (= v x) true (recur found)))` is true
+  when `x` is in `vs`, and when it isn't, returns `found`, false.
+- `transient`, `conj!`, `assoc!`, `persistent!`: Clojure's in-place building of a collection.
+  In Lean they are the ordinary immutable operations.
+
 A history in Lean, for example: an init creating keys 0 and 1, then a transaction that inserts
 key 2 and one that reads key 1 and every key whose value is 5:
 
