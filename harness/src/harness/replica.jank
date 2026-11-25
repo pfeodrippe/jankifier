@@ -67,7 +67,19 @@
         base (merge agent {:draft nil})
         ;; A worker reads the whole Clojure file and the base: at 65536 tokens the translator
         ;; was compacted twice in thirty steps.
-        worker (merge base {:max-tokens worker-max-tokens} (when worker-context {:context worker-context}))
+        ;; Reminded to write as it goes when it has written nothing after 12, 24 and 36 steps: the
+        ;; translator read for forty steps, compactions making it read the same parts again.
+        remind (fn [x step]
+                 (when (and (contains? #{12 24 36} step)
+                            (not (some (fn [e] (and (= :call (:role e))
+                                                    (contains? #{"write_file" "edit_file"} (:name e))))
+                                       (h/entries x))))
+                   (str step " steps and nothing written yet. Write your file now, in parts: what you "
+                        "have read so far, then the next part as you read it, building as you go. What "
+                        "is written stays; what is only read is lost when the conversation is "
+                        "compacted.")))
+        worker (merge base {:max-tokens worker-max-tokens :remind remind}
+                      (when worker-context {:context worker-context}))
         worker-tools (tools/defaults)
         ;; The specifier's tools refuse the code (the Clojure source and the translation): a
         ;; specification read off the code repeats its mistakes. Its own copy of what it may
