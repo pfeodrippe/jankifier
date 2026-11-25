@@ -697,11 +697,21 @@ namespace harness
           /* A form with one ')' too many closes early, and the error lands on a later line: say
              where the form before it was closed (kv agents counted brackets by hand for dozens
              of steps). */
-          return fail("line " + std::to_string(line) + ": a '" + std::string(1, c) + "' that closes nothing"
+          std::string const b(1, c);
+          if(closed_at == line)
+          {
+            /* Said plainly: an agent told "the form before it was closed at line N" still
+               counted brackets with scripts for ten steps. */
+            return fail("line " + std::to_string(line) + " has one '" + b + "' too many: the form that starts at line "
+                        + std::to_string(closed_from) + " already ends on that line, and the next '" + b
+                        + "' closes nothing. Remove one '" + b + "' at the end of line " + std::to_string(line)
+                        + " (or, if that form ends too soon, the one that closes it early)");
+          }
+          return fail("line " + std::to_string(line) + ": a '" + b + "' that closes nothing"
                       + (closed_at
-                           ? "; the form before it, from line " + std::to_string(closed_from) + ", was closed at line "
-                               + std::to_string(closed_at)
-                               + ": if that is too early, a closing bracket there is one too many"
+                           ? "; the form before it, from line " + std::to_string(closed_from) + ", ends at line "
+                               + std::to_string(closed_at) + ". If it should go on to line " + std::to_string(line)
+                               + ", remove a '" + b + "' at line " + std::to_string(closed_at)
                            : std::string{}));
         }
         auto const o(stack.back());

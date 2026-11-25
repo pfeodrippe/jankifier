@@ -257,13 +257,18 @@
   its parameters and its documentation."
   [name]
   (let [sym (symbol (str name))
-        v (when (namespace sym)
-            (when-let [found (find-ns (symbol (namespace sym)))]
-              (get (ns-publics found) (symbol (clojure.core/name sym)))))]
+        in (fn [n s] (when-let [found (find-ns n)] (get (ns-publics found) s)))
+        ;; A short name is looked up in clojure.core, then clojure.string (an agent asked
+        ;; for slurp and lost a step to "give the full name").
+        [full v] (if (namespace sym)
+                   [(str name) (in (symbol (namespace sym)) (symbol (clojure.core/name sym)))]
+                   (or (some (fn [n] (when-let [v (in n sym)] [(str n "/" sym) v]))
+                             ['clojure.core 'clojure.string])
+                       [(str name) nil]))]
     (when-not v
       (throw (ex-info (str "nothing is defined as " name ": give the full name, like clojure.string/split") {})))
     (let [said (meta v)]
-      (str name
+      (str full
            (when (:arglists said) (str "\nparameters: " (str/join " or " (map pr-str (:arglists said)))))
            "\n" (or (:doc said) "(no documentation)")))))
 

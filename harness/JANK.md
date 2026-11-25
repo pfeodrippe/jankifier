@@ -54,7 +54,9 @@ the syntax, the data structures and most of `clojure.core` and
 - **`(deref f 2000 :late)` doesn't wait**: with a timeout, `deref` returns nil at
   once (neither the value nor `:late`). Wait for a future with `@f`, or with a
   loop: `(loop [] (when-not (realized? f) (cpp/usleep 10000) (recur)))`.
-- **Files**: `(spit path text :append true)` adds to the end of a file. `spit`
+- **Files**: this process can write only in its own directory (and the
+  directory in `$TMPDIR`); a `spit` anywhere else writes nothing, without an
+  error. `(spit path text :append true)` adds to the end of a file. `spit`
   into a directory that doesn't exist writes nothing and returns nil, without an
   error; `slurp` of a missing file throws C++'s error
   (above). There is no function to make a directory or to ask whether a file
