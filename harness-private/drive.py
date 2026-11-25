@@ -316,7 +316,9 @@ def run_form(task, mode, seed):
              ;; three agents). There is no compaction, and the long thinking of effort 0.99
              ;; fills a context quickly.
                     :context {65536 if team else 131072}
-                    :max-steps 80
+                    ;; A verified run writes the code and its model: kv's runs ran out of 80 steps
+                    ;; with the two half done, so verified runs have twice a plain run's steps.
+                    :max-steps {160 if verified else 80}
                     ;; As the publisher evaluates Inkling (temperature 1, top-p off, effort
                     ;; 0.99), with room for the thinking that effort asks for.
                     :effort :max
@@ -454,7 +456,7 @@ def main():
                     print(f'START {task} {mode} seed {seed}: a new process, its directory has '
                           f'{sorted(os.listdir(HOME))}, the sandbox refuses the harness, the trials and the results',
                           flush=True)
-                    r = unstr(ev(port, run_form(task, mode, seed), 3 * 3600))
+                    r = unstr(ev(port, run_form(task, mode, seed), 6 * 3600))
                     # The code as the run left it, kept beside its conversation: a run graded
                     # wrong for a jank error ("Failed to find symbol") couldn't be checked again
                     # once the next run had made its directory anew.
