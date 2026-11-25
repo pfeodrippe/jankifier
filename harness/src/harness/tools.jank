@@ -58,6 +58,18 @@
                 "link it after that. A new name doesn't help. Write that part without it: file contents "
                 "can be read and written in jank (slurp, spit, spit with :append true).)")))))
 
+(defn- deref-calls
+  "When `said` is the error of a value called as a function and `code` holds forms like
+  (@done), a sentence naming them: a queue agent took (@done) for a read of the atom and
+  met the error ten times without seeing it."
+  [said code]
+  (when (str/includes? (str said) "was called as a function")
+    (let [found (distinct (re-seq #"\(@[^\s()\[\]{}]+\)" (str code)))]
+      (when (seq found)
+        (str "\n(In this code " (str/join ", " (take 3 found)) " calls the value it reads: "
+             "write " (str/join ", " (map (fn [f] (subs f 1 (dec (count f)))) (take 3 found)))
+             " to read it.)")))))
+
 (defn- cause
   "What an evaluation's error says: its cause without the trace, or its lines without the
   rule above them and the link below."
@@ -243,7 +255,8 @@
   clojure.set as set; inkling.core is the engine this model runs on, and
   (harness.core/me) gives this conversation's {:model :session :agent}."
   [code]
-  (hinted (evaluate-raw code)))
+  (let [said (hinted (evaluate-raw code))]
+    (str said (deref-calls said code))))
 
 (defn- load-file-raw
   "load-file without the hints."
@@ -274,7 +287,8 @@
   "Loads a jank file: its forms evaluated in order, as loading it would (its ns form first).
   Says what it printed and the namespace it is in, or what failed, with its line."
   [path]
-  (hinted (load-file-raw path)))
+  (let [said (hinted (load-file-raw path))]
+    (str said (when (cpp/harness.is_file (str path)) (deref-calls said (slurp (str path)))))))
 
 (defn functions
   "Lists what a namespace of the running process defines: a line a name, with the start of
