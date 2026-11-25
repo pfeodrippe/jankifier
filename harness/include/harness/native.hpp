@@ -821,7 +821,8 @@ namespace harness
         if(closer(o.c) != c)
         {
           return fail("line " + std::to_string(line) + ": a '" + std::string(1, c) + "' closes the '"
-                      + std::string(1, o.c) + "' opened at line " + std::to_string(o.line));
+                      + std::string(1, o.c) + "' opened at line " + std::to_string(o.line)
+                      + depth_listing(s, start_line, line));
         }
         stack.pop_back();
         ++i;
