@@ -323,6 +323,16 @@ def run_form(task, mode, seed):
                     :max-thinking 8192
                     :max-tokens 12288
                     :sampling {{:temperature 1.0 :seed {int(seed)}}}
+                    ;; A verified run reminded of VERIFY.md's way of working when it has written
+                    ;; nothing after 8, 16 and 24 steps: two kv runs read the guides and every
+                    ;; example for 40 steps first, then ran out of steps.
+                    :remind (fn [x step]
+                              (when (and verified (contains? #{{8 16 24}} step)
+                                         (not (some (fn [e] (and (= :call (:role e)) (= "write_file" (:name e)))) (h/entries x))))
+                                (str step " steps and no file written yet. As VERIFY.md says: write a first small "
+                                     "version of both files now (the code and its model, a few operations), run "
+                                     "verify on it, and grow both from there. Look things up in VEIL.md when "
+                                     "verify's messages need it.")))
                     :on-entry (fn [_]
                                 (when-let [x @current]
                                   (h/save! x live)
