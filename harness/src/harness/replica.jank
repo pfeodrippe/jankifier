@@ -21,6 +21,39 @@
   (or (h/answer a)
       (str "(It ended its turn without an answer: " (name (:state @a)) ".)")))
 
+(def reads-between-writes
+  "Reading calls a worker may make without writing: then its reading tools refuse until it
+  writes. The translator, reminded three times, read for thirty-four steps without writing
+  anything, compactions taking what it had read."
+  20)
+
+(defn- gated
+  "`tools` with the reading ones refusing after `reads-between-writes` of them since the last
+  write (write_file, edit_file). A build (a shell command running lake) is never refused."
+  [tools]
+  (let [since (atom 0)]
+    (mapv (fn [t]
+            (cond
+              (contains? #{"write_file" "edit_file"} (:name t))
+              (update t :fn (fn [f] (fn [args] (reset! since 0) (f args))))
+
+              (= "notes" (:name t)) t
+
+              :else
+              (update t :fn (fn [f]
+                              (fn [args]
+                                (let [command (str (:command args))
+                                      building (and (= "shell" (:name t))
+                                                    (or (str/includes? command "lake") (str/includes? command "LAKE")))]
+                                  (cond
+                                    building (f args)
+                                    (>= @since reads-between-writes)
+                                    (str reads-between-writes " reading calls since you last wrote: write what you have "
+                                         "now (write_file, or edit_file to add the next part). Reading works again once "
+                                         "you have written; building ($LAKE build) works now.")
+                                    :else (do (swap! since inc) (f args)))))))))
+          tools)))
+
 (defn- roles
   "The workers' and the coordinator's own parts of the system text."
   [{:keys [translation spec report]}]
@@ -100,8 +133,8 @@
                                                     " give, not from the code.")
                                                (f args))))))
                          worker-tools)
-        translator (h/agent m (merge worker {:tools worker-tools :system (str system (:translator parts))}))
-        specifier (h/agent m (merge worker {:tools spec-tools :system (str system (:specifier parts))}))
+        translator (h/agent m (merge worker {:tools (gated worker-tools) :system (str system (:translator parts))}))
+        specifier (h/agent m (merge worker {:tools (gated spec-tools) :system (str system (:specifier parts))}))
         defaults (tools/defaults)
         ;; The coordinator's own tools work once it has handed the work out: with the shell and
         ;; the files it read Elle's code itself for fourteen steps while both workers waited.
