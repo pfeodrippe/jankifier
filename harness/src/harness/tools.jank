@@ -365,8 +365,15 @@
                   (when (:timed-out ran)
                     (str "\n[killed: it did not end in " (or timeout 120) " seconds]"))
                   (when (and (not (:timed-out ran)) (not (zero? (:exit ran))))
-                    (str "\n[exit " (:exit ran) "]")))]
-    (if (= "" said) "(no output)" said)))
+                    (str "\n[exit " (:exit ran) "]")))
+        ;; A command that only ends in `true` or `:`, with nothing printed: a kv agent made ten such
+        ;; calls between stretches of thinking, and the run was ended as going round in a loop.
+        idle (and (= "" said) (re-find #"(?:^|&&|;|\|\|)\s*(?:true|:)\s*$" (str/trim (str command))))]
+    (cond
+      idle (str "(no output: this command does nothing. Each call takes one of your steps; think without "
+                "calling anything, and call a tool when you need what it gives.)")
+      (= "" said) "(no output)"
+      :else said)))
 
 (def situation
   "What an agent with the default tools can be told first (its :system): where it is, and
