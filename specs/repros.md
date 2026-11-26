@@ -2114,6 +2114,22 @@ core.jank `slurp`: `file_size` (7331) runs before `is_open`, and its `std::files
 ```
 The future's thread rethrows the `error_ref` from a `catch(...)`, which reaches `std::terminate`.
 
+- [ ] **LG4**: `compare` with a keyword first and a number, BigInt or vector second crashes jank (SIGSEGV), and so do `sort` and a sorted map or set holding a keyword and a number; with a string or symbol second it returns -1 (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 4: grammar 3's sorted map of `merge-with` over keyword and integer keys, whose test died; minimized by hand on main 7135b7708).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26: compare, sorted-map, comparable).
+  Proposed fix: `keyword::compare(object const &)` checks the other's type as `symbol::compare` does (`dyn_cast<obj::keyword>`, then "The value for comparison must be a `keyword`, not a ..."); to build and run.
+  - [ ] reported
+
+```clojure
+(compare :a 1)               ; jank => SIGSEGV        clj => ClassCastException
+(compare :a 1.5)             ; jank => SIGSEGV        clj => ClassCastException
+(compare :a [1])             ; jank => SIGSEGV        clj => ClassCastException
+(sorted-map :a 1 1 2)        ; jank => SIGSEGV        clj => ClassCastException
+(sort [1 :a])                ; jank => SIGSEGV        clj => ClassCastException
+(compare :a "a")             ; jank => -1             clj => ClassCastException
+(compare 1 :a)               ; jank throws "Objects of type `keyword` are not comparable to `small_integer`."
+```
+obj/keyword.cpp `keyword::compare(object const &)` (50-53) takes `*expect_object<keyword>(untagged(&o))` with no type check: an inline integer's tagged value is read as a keyword (the crash), a string or symbol as another keyword's fields. `symbol::compare` checks with `dyn_cast` and throws.
+
 ## Hangs
 
 - [ ] **A5**: `alter-var-root` inside `alter-var-root` of the same var (`repro/alter-var-root-nested-deadlocks.cljc`).
