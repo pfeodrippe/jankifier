@@ -537,6 +537,18 @@ ratio support in `/`).
 
 `core/math.cpp` `quot` (321) casts the double quotient to `i64` (338).
 
+- [ ] **LG5**: `quot` of two longs past 2^53 loses precision: it divides as doubles (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 5; minimized by hand on main 7135b7708).
+  Tracker: related: #1208 (open) lists `quot` of BigInts losing precision the same way; plain longs aren't in it.
+  Proposed fix: `quot` of two integers divides them as integers (C++'s `/` truncates toward zero, as Clojure's `quot` does), and of BigInts as BigInts; only a double operand goes through `to_real`. To build and run.
+  - [ ] reported
+
+```clojure
+(quot 9223372036854775807 3)   ; jank => 3074457345618258432   clj => 3074457345618258602
+(quot 9223372036854775806 7)   ; jank => 1317624576693539328   clj => 1317624576693539400
+```
+
+`core/math.cpp` `quot` (321-345): both operands through `to_real`, then `static_cast<i64>` of the double quotient (the same line as D4b).
+
 - [ ] **D5**: `==` compares longs as doubles (`d05`).
   - [ ] reported
 
