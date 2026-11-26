@@ -38,7 +38,7 @@ issue isn't enough), with its number.
 All of them were run again on 2026-11-25 on the build of main published on 2026-11-24
 (`381be61e5`; `7135b7708` and main today differ from it only in docs and lein-jank), on macOS
 15.1, Apple Silicon: the files in [repro/](repro/) with `repro/run_all.py`, the Lean replica's
-tests with `repro/run_replica_tests.py`, and LG1–LG3 by hand. None is fixed there; A2 is in part (the vector case, after #1235). D9 and five regex findings (LS24, LS28, LS31, LS34, LS35) don't show on this Mac. Where a test passes on
+tests with `repro/run_replica_tests.py`, and LG1–LG3 by hand. A2 (the vector case, #1235) is fixed there; none of the others is. D9 and five regex findings (LS24, LS28, LS31, LS34, LS35) don't show on this Mac. Where a test passes on
 this Mac although it fails on Linux x86-64, the item says so. How to run them on another jank:
 [README.md](README.md#testing-against-jank).
 
@@ -852,22 +852,23 @@ json_native.cpp 147. Extends LS9.
 
 ### Collections and sequences
 
-- [ ] **A2**: a transient can be read after `persistent!` (`repro/transient-read-after-persistent.cljc`).
-  On main (build of 2026-11-24): the vector reads now throw (#1235); the array map reads still answer, except `get` without a fallback (LS60 is the array map case).
-  - [x] reported: #1235 (closed 2026-11-24; the vector case)
+- [x] **A2**: a vector transient can be read after `persistent!` (`repro/transient-read-after-persistent.cljc`).
+  Fixed on main (build of 2026-11-24): every read of the vector throws, as in Clojure (with jank's native error, which `thrown?` doesn't catch). The array map's reads still answer: that's LS60.
+  - [x] reported: #1235 (closed 2026-11-24)
 
 ```clojure
 (let [t (transient [1])]
   (persistent! t)
   (nth t 0))
-;; jank => 1
-;; clj  => IllegalAccessError: Transient used after persistent! call
+;; jank 0.1  => 1
+;; jank main => throws
+;; clj       => IllegalAccessError: Transient used after persistent! call
 ```
 
-Not the same as #1190 (A1, the persistent map changing). The other reads that
-don't check: `contains?`, `find` on a vector; `get` with a fallback,
-`contains?`, `find`, calling it with a fallback on an array map. None of them
-calls `assert_active`.
+Not the same as #1190 (A1, the persistent map changing). On jank 0.1 the other
+reads didn't check either: `contains?`, `find` on a vector; `get` with a
+fallback, `contains?`, `find`, calling it with a fallback on an array map. None
+of them called `assert_active`.
 
 - [ ] **R105**: sorted `find` returns the queried key (`r105`).
   - [ ] reported
