@@ -487,6 +487,7 @@ CppInterOp `BestOverloadMatch` 2203 adds no built-in candidates.
 
 - [ ] **LG1**: `<`, `>`, `min` and `max` compare `count`'s result with a negative number as unsigned (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; S9's root, in comparisons).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
+  Proposed fix, verified on a build of main 7135b7708: `count` returns an `i64` (`cpp/cast cpp/jtl.i64` around `sequence_length`, its fn and its `:inline`), so comparisons and arithmetic see a signed number (determinismo-workloads `jank-interop/fixes/LG1.diff`).
   - [ ] reported
 
 ```clojure
@@ -539,12 +540,13 @@ ratio support in `/`).
 
 - [ ] **LG5**: `quot` of two longs past 2^53 loses precision: it divides as doubles (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 5; minimized by hand on main 7135b7708).
   Tracker: related: #1208 (open) lists `quot` of BigInts losing precision the same way; plain longs aren't in it.
-  Proposed fix: `quot` of two integers divides them as integers (C++'s `/` truncates toward zero, as Clojure's `quot` does), and of BigInts as BigInts; only a double operand goes through `to_real`. To build and run.
+  Proposed fix, verified on a build of main 7135b7708: `quot` of two integers (a long or a small integer each) divides them as integers (C++'s `/` truncates toward zero, as `quot` does); a double operand goes through `to_real` as before (determinismo-workloads `jank-interop/fixes/LG5.diff`). The BigInt cases (#1208) are left to it.
   - [ ] reported
 
 ```clojure
 (quot 9223372036854775807 3)   ; jank => 3074457345618258432   clj => 3074457345618258602
 (quot 9223372036854775806 7)   ; jank => 1317624576693539328   clj => 1317624576693539400
+(quot 9223372036854775807 1)   ; jank => -9223372036854775808  clj => 9223372036854775807   (seed 9: 2^63 as a double, cast back)
 ```
 
 `core/math.cpp` `quot` (321-345): both operands through `to_real`, then `static_cast<i64>` of the double quotient (the same line as D4b).
