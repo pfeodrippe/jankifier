@@ -496,17 +496,21 @@ CppInterOp `BestOverloadMatch` 2203 adds no built-in candidates.
 (< -1 (long (count [1])))     ; jank => true   clj => true
 ```
 
-- [ ] **LG2**: long overflow wraps silently in `*` with literals, or returns a BigInt in `-`, `dec` and `*` on a `let`-bound value; Clojure throws, and so does jank's own `inc` (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`).
+- [ ] **LG2**: long overflow wraps silently in `*` and `+`; Clojure throws (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`).
+  Corrected 2026-11-26 (seed 3): the first report's BigInt results on Long/MIN_VALUE (`dec`, `-`,
+  a let-bound `*`) come from R5, the literal `-9223372036854775808` read as a BigInt; on a long
+  minimum computed as `(- -9223372036854775807 1)`, `dec` throws "Overflow on increment." (Clojure:
+  ArithmeticException; jank's message names the other operation).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
-  Related: #1208 (open) has `(+ 9223372036854775807 1)` wrapping; not these cases.
+  Related: #1208 (open) has `(+ 9223372036854775807 1)` wrapping; `*` is not there.
   - [ ] reported
 
 ```clojure
 (* -3 9223372036854775807)                  ; jank => -9223372036854775805 (wrapped)   clj => ArithmeticException: integer overflow
-(let [x -9223372036854775808] (* x -1))     ; jank => 9223372036854775808N             clj => ArithmeticException
-(dec -9223372036854775808)                  ; jank => -9223372036854775809N            clj => ArithmeticException
-(- -9223372036854775808 128)                ; jank => -9223372036854775936N            clj => ArithmeticException
+(+ 1000 (dec 9223372036854775807))          ; jank => -9223372036854774810 (wrapped)   clj => ArithmeticException: integer overflow
 (inc 9223372036854775807)                   ; jank throws "Overflow on increment."     clj => ArithmeticException
+(dec (- -9223372036854775807 1))            ; jank throws "Overflow on increment."     clj => ArithmeticException
+;; R5, not LG2: (dec -9223372036854775808)  ; jank => -9223372036854775809N (the literal is a BigInt)
 ```
 
 - [ ] **D2**: `/` on two integers is C++ integer division (`d02`).
