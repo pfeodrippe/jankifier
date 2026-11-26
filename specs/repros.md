@@ -161,6 +161,42 @@ clients evaluating at once, not this.
 Related, closed: #1187 (`if` with a typed object branch), #1025 (`case`
 default returning an unboxed value).
 
+- [ ] **R23**: an `if` whose branches are a long and a double literal returns a double (`r23`).
+  - [ ] reported
+
+```clojure
+(if true 1 2.5)
+;; jank => 1.0
+;; clj  => 1
+```
+
+Literals are native (`cpp_util.cpp` `literal_type` 615/653; `processor.cpp`
+`analyze_primitive_literal` 3241), and the `if` takes their common C++ type. Related: S7/S8 here
+and #1187 (closed); here the branches widen. Compiled code only: the REPL's top level is
+interpreted.
+
+- [ ] **R26**: a `case` gets one C++ type, from its last branch (`r26`).
+  - [ ] reported
+
+```clojure
+(case 5 1 1.5 0)
+;; jank => 0.0
+;; clj  => 0
+```
+
+`processor.cpp` `analyze_case` (1483–1581) with `cpp_util.cpp` 1908. Related: S7/S8 here.
+
+- [ ] **LU7**: (LS57, narrowed) inside a fn, `(if c 1 cpp/gd)` gives 2 where Clojure gives 2.5. At the top level, jank gives Clojure's result (`deviations_r4_test.jank`: `u07`; on main: gave 2).
+  - [ ] reported
+
+```clojure
+(cpp/raw "inline double gd = 2.5;")
+((fn [c] (if c 1 cpp/gd)) false)   ; Clojure 2.5   jank 2
+(if false 1 cpp/gd)                ; Clojure 2.5   jank 2.5 (top level)
+```
+
+cpp_util.cpp `find_branch_common_type` 1909–1995, for a compiled `if`. #1187 (closed 2026-11-17, in the checked commit) fixed other typed `if` branches; this case remains.
+
 - [ ] **A3**: a multimethod preference declared on an ancestor is ignored (`repro/multimethod-ancestor-preference-ignored.cljc`).
   - [ ] reported
 
@@ -339,17 +375,6 @@ codegen/api.cpp 213–449 (`assoc_in_place`, `conj_in_place`); evaluate.cpp eval
 ```
 
 The same as LS44.
-
-- [ ] **LU7**: (LS57, narrowed) inside a fn, `(if c 1 cpp/gd)` gives 2 where Clojure gives 2.5. At the top level, jank gives Clojure's result (`deviations_r4_test.jank`: `u07`; on main: gave 2).
-  - [ ] reported
-
-```clojure
-(cpp/raw "inline double gd = 2.5;")
-((fn [c] (if c 1 cpp/gd)) false)   ; Clojure 2.5   jank 2
-(if false 1 cpp/gd)                ; Clojure 2.5   jank 2.5 (top level)
-```
-
-cpp_util.cpp `find_branch_common_type` 1909–1995, for a compiled `if`. #1187 (closed 2026-11-17, in the checked commit) fixed other typed `if` branches; this case remains.
 
 - [ ] **LU10**: calling an old fn value for the first time reverts its var's redefinition (`deviations_r4_test.jank`: `u10`; on main: gave `:old`).
   - [ ] reported
@@ -590,20 +615,6 @@ ratio support in `/`).
 
 `core.jank` (6574) → `core.cpp` `hash_unordered` (1369) → `hash.cpp` `unordered(object_ref)` (181).
 
-- [ ] **R23**: an `if` whose branches are a long and a double literal returns a double (`r23`).
-  - [ ] reported
-
-```clojure
-(if true 1 2.5)
-;; jank => 1.0
-;; clj  => 1
-```
-
-Literals are native (`cpp_util.cpp` `literal_type` 615/653; `processor.cpp`
-`analyze_primitive_literal` 3241), and the `if` takes their common C++ type. Related: S7/S8 here
-and #1187 (closed); here the branches widen. Compiled code only: the REPL's top level is
-interpreted.
-
 - [ ] **R24**: a `loop` local keeps its first value's native type (`r24`).
   - [ ] reported
 
@@ -615,17 +626,6 @@ interpreted.
 
 `processor.cpp` `analyze_let` (2397–2400), `analyze_recur` (2183–2219),
 `apply_implicit_conversion` (1074/1088).
-
-- [ ] **R26**: a `case` gets one C++ type, from its last branch (`r26`).
-  - [ ] reported
-
-```clojure
-(case 5 1 1.5 0)
-;; jank => 0.0
-;; clj  => 0
-```
-
-`processor.cpp` `analyze_case` (1483–1581) with `cpp_util.cpp` 1908. Related: S7/S8 here.
 
 - [ ] **R44**: `case` misses a long outside the int32 range (`r44`).
   - [ ] reported
@@ -879,6 +879,17 @@ reads didn't check either: `contains?`, `find` on a vector; `get` with a
 fallback, `contains?`, `find`, calling it with a fallback on an array map. None
 of them called `assert_active`.
 
+- [ ] **LS60**: an array-map transient can still be read after `persistent!` (`deviations_r3_test.jank`: `s60`; on main: `(let [t (transient {:a 1})] (persistent! t) (get t :a :nf))` returned, no exception).
+  - [ ] reported
+
+```clojure
+(let [t (transient {:a 1})] (persistent! t) (get t :a :nf))     ; Clojure throws   jank 1
+(let [t (transient {:a 1})] (persistent! t) (contains? t :a))   ; Clojure throws   jank true
+(let [t (transient {:a 1})] (persistent! t) (find t :a))        ; Clojure throws   jank [:a 1]
+```
+
+transient_array_map.cpp 47, 52, 62, 146 lack `assert_active()`; `to_persistent` 126–131 moves `data` with the defaulted move constructor (native_array_map.hpp 34), so the dead transient keeps the same array. #1235 (closed) is the vector case; array maps still answer after `persistent!`.
+
 - [ ] **R105**: sorted `find` returns the queried key (`r105`).
   - [ ] reported
 
@@ -938,16 +949,14 @@ of them called `assert_active`.
 
 - persistent_hash_map.cpp 110 → immer map.hpp 400 → champ.hpp 604–606 (`copy_inner_replace_value`, the whole pair) and 577–581 (collision nodes); - transient paths: champ.hpp 697–699, 654; - sets: persistent_hash_set.cpp 151 → set.hpp 220; transient_hash_set.cpp 46. - Below 8 entries the array map keeps the stored key (native_array_map.cpp 139–162). - Clojure keeps the stored key: BitmapIndexedNode.assoc 704; PersistentHashSet.cons 98–101.
 
-- [ ] **LS60**: an array-map transient can still be read after `persistent!` (`deviations_r3_test.jank`: `s60`; on main: `(let [t (transient {:a 1})] (persistent! t) (get t :a :nf))` returned, no exception).
+- [ ] **LU81**: `zipmap` keeps the last of two equal keys (`deviations_r4_test.jank`: `u81`; on main: gave `(1)`).
   - [ ] reported
 
 ```clojure
-(let [t (transient {:a 1})] (persistent! t) (get t :a :nf))     ; Clojure throws   jank 1
-(let [t (transient {:a 1})] (persistent! t) (contains? t :a))   ; Clojure throws   jank true
-(let [t (transient {:a 1})] (persistent! t) (find t :a))        ; Clojure throws   jank [:a 1]
+(first (keys (zipmap [[1] '(1)] [:a :b])))   ; Clojure [1]   jank (1)
 ```
 
-transient_array_map.cpp 47, 52, 62, 146 lack `assert_active()`; `to_persistent` 126–131 moves `data` with the defaulted move constructor (native_array_map.hpp 34), so the dead transient keeps the same array. #1235 (closed) is the vector case; array maps still answer after `persistent!`.
+core.jank 2411–2423 builds the map through a hash-map transient. Extends LS59.
 
 - [ ] **LU31**: `pop` of a one-element list drops the list's metadata (`deviations_r4_test.jank`: `u31`; on main: gave nil).
   - [ ] reported
@@ -1011,15 +1020,6 @@ Lean theorems `jank_map_entry_any_pair`, `map_entry_agree`.
 ```
 
 walk.jank 3–12. Lean theorems `jank_walk_drops_list_meta`, `walk_vec_meta_agree`.
-
-- [ ] **LU81**: `zipmap` keeps the last of two equal keys (`deviations_r4_test.jank`: `u81`; on main: gave `(1)`).
-  - [ ] reported
-
-```clojure
-(first (keys (zipmap [[1] '(1)] [:a :b])))   ; Clojure [1]   jank (1)
-```
-
-core.jank 2411–2423 builds the map through a hash-map transient. Extends LS59.
 
 - [ ] **LV48**: a value jank finds unequal to itself is never found in a hash set or map, and is stored twice (`deviations_r5_test.jank`: `v48`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
@@ -1197,16 +1197,6 @@ the new object file.
 
 core.jank `load-lib` 4846.
 
-- [ ] **LU55**: `(ns x)` gives the namespace `:jank/source` metadata (`deviations_r4_test.jank`: `u55`; on main: gave `{:jank/source …}`).
-  - [ ] reported
-
-```clojure
-(ns x)
-(meta (find-ns 'x))   ; Clojure nil   jank {:jank/source …}
-```
-
-core.jank `ns` 5633–5637. Extends R21.
-
 - [ ] **LV8**: a require whose module fails leaves the namespace it created (`deviations_r5_test.jank`: `v08`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
   - [ ] reported
@@ -1223,16 +1213,6 @@ core.jank `ns` 5633–5637. Extends R21.
 
 jank's strings are UTF-8; Clojure's are UTF-16. Several of these follow from that; R55 and R56
 break `=` and `hash` themselves.
-
-- [ ] **LG3**: `subs` indexes bytes, not characters (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; R58's class, in `subs`).
-  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
-  - [ ] reported
-
-```clojure
-(subs "é-è" 2)
-;; jank => "-è"
-;; clj  => "è"
-```
 
 - [ ] **R55**: a string seq isn't `=` to itself (`b04`).
   - [ ] reported
@@ -1288,6 +1268,16 @@ break `=` and `hash` themselves.
 ```
 
 `string.jank` 227/240 → `string_native.cpp` 257/264.
+
+- [ ] **LG3**: `subs` indexes bytes, not characters (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; R58's class, in `subs`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
+  - [ ] reported
+
+```clojure
+(subs "é-è" 2)
+;; jank => "-è"
+;; clj  => "è"
+```
 
 - [ ] **R59**: `trim` keeps Unicode whitespace (`b08`).
   - [ ] reported
@@ -1625,6 +1615,16 @@ The duplicate check (`parse.cpp` 722–743) compares hashes, and `1`/`1N` hash d
 ```
 
 `parse.cpp` 387–418, 487–507; `core/meta.cpp` `source_to_meta` (171–228).
+
+- [ ] **LU55**: `(ns x)` gives the namespace `:jank/source` metadata (`deviations_r4_test.jank`: `u55`; on main: gave `{:jank/source …}`).
+  - [ ] reported
+
+```clojure
+(ns x)
+(meta (find-ns 'x))   ; Clojure nil   jank {:jank/source …}
+```
+
+core.jank `ns` 5633–5637. Extends R21.
 
 - [ ] **LS16**: ratio parts that reach boost with a leading 0 are read as octal (`deviations_r3_test.jank`: `s16`; on main: `(read-string "0010/3")` gave `8/3`).
   - [ ] reported
@@ -2125,6 +2125,29 @@ The future's thread rethrows the `error_ref` from a `catch(...)`, which reaches 
 `alter_root` holds `write_mutex`, which isn't recursive, while calling the
 function (`runtime/var.cpp`).
 
+- [ ] **LS63**: `alter-var-root` whose fn re-enters the var hangs (`deviations_r3_hangs_test.jank`: `s63`; on main: still running after 120 s (killed)).
+  - [ ] reported
+
+```clojure
+(def v 0)
+(alter-var-root #'v (fn [x] (alter-var-root #'v inc) (+ x 10)))   ; Clojure 10   jank hangs
+(alter-var-root #'v (fn [_] (def v 5) 6))                         ; Clojure 6    jank hangs
+```
+
+var.cpp `alter_root` 106–112 holds `write_mutex` (108) across `apply_to`; `bind_root` 101 takes it again. Clojure's methods are synchronized (reentrant).
+
+- [ ] **LU13**: `alter-var-root` whose fn first-calls the var's fn hangs (a variant of LS63) (`deviations_r4_test.jank`: `u13`, `u13b`; on main: both hang (killed after 120 s)).
+  - [ ] reported
+
+```clojure
+(defn inc1 [x] (inc x))
+(alter-var-root #'inc1 (fn [g] (g 1) g))             ; Clojure returns   jank hangs
+(defn inc2 [x] (inc x))
+(alter-var-root #'inc2 (fn [g] @(future (g 1)) g))   ; Clojure returns   jank hangs
+```
+
+var.cpp `alter_root` 108 holds `write_mutex`; the fn's first call realizes it, and `bind_root` 101 takes the mutex again. The Lean replica's tape: 10 steps on one thread, 12 on two (Mutexes.lean).
+
 - [ ] **C5**: a delay whose body derefs itself (`repro/delay-deref-self-deadlocks.cljc`). Less important: Clojure fails too.
   - [ ] reported
 
@@ -2134,6 +2157,17 @@ function (`runtime/var.cpp`).
 ;; jank => hangs
 ;; clj  => StackOverflowError
 ```
+
+- [ ] **LS64**: a delay whose body asks `(realized? d)` or derefs `d` hangs (`deviations_r3_hangs_test.jank`: `s64`; on main: still running after 120 s (killed)).
+  - [ ] reported
+
+```clojure
+(def d (delay (realized? d))) @d                ; Clojure false                jank hangs
+(def e (delay @(future (realized? e)))) @e      ; Clojure false                jank hangs
+(def s (delay @s)) @s                           ; Clojure StackOverflowError   jank hangs
+```
+
+delay.cpp `deref` 19–46 holds a non-recursive `std::mutex` (21) across the body (34); `is_realized` 51 takes it again.
 
 - [ ] **R1**: a NUL in a string makes the reader loop forever (`deviations_reader_test.jank`: `a01`).
   - [ ] reported
@@ -2182,28 +2216,6 @@ function (`runtime/var.cpp`).
 
 atom.cpp `validate` 261–265 holds `validator.rlock()` (263) across the call; `set_validator` 236–241 takes `wlock()` (239). folly SharedMutex.h `lockExclusiveImpl` 1047–1110 sets kHasE, then waits for S (1086–1088).
 
-- [ ] **LS63**: `alter-var-root` whose fn re-enters the var hangs (`deviations_r3_hangs_test.jank`: `s63`; on main: still running after 120 s (killed)).
-  - [ ] reported
-
-```clojure
-(def v 0)
-(alter-var-root #'v (fn [x] (alter-var-root #'v inc) (+ x 10)))   ; Clojure 10   jank hangs
-(alter-var-root #'v (fn [_] (def v 5) 6))                         ; Clojure 6    jank hangs
-```
-
-var.cpp `alter_root` 106–112 holds `write_mutex` (108) across `apply_to`; `bind_root` 101 takes it again. Clojure's methods are synchronized (reentrant).
-
-- [ ] **LS64**: a delay whose body asks `(realized? d)` or derefs `d` hangs (`deviations_r3_hangs_test.jank`: `s64`; on main: still running after 120 s (killed)).
-  - [ ] reported
-
-```clojure
-(def d (delay (realized? d))) @d                ; Clojure false                jank hangs
-(def e (delay @(future (realized? e)))) @e      ; Clojure false                jank hangs
-(def s (delay @s)) @s                           ; Clojure StackOverflowError   jank hangs
-```
-
-delay.cpp `deref` 19–46 holds a non-recursive `std::mutex` (21) across the body (34); `is_realized` 51 takes it again.
-
 - [ ] **LS65**: `future-cancel` of a future that another thread is dereferencing hangs all three threads (`deviations_r3_hangs_test.jank`: `s65`; on main: still running after 120 s (killed)).
   - [ ] reported
 
@@ -2222,18 +2234,6 @@ future.cpp `deref` 17 holds the thread lock across `join()`. core.cpp `cancel_fu
 ```
 
 cpp_processor.cpp gen(def) 527–557 → var.cpp 296–302 → lazy_meta.cpp `get` 30–46 holds `state.wlock()` (32) across `_jank_eval_str`. - Needs a def compiled through codegen; the top-level interpreter sets meta eagerly.
-
-- [ ] **LU13**: `alter-var-root` whose fn first-calls the var's fn hangs (a variant of LS63) (`deviations_r4_test.jank`: `u13`, `u13b`; on main: both hang (killed after 120 s)).
-  - [ ] reported
-
-```clojure
-(defn inc1 [x] (inc x))
-(alter-var-root #'inc1 (fn [g] (g 1) g))             ; Clojure returns   jank hangs
-(defn inc2 [x] (inc x))
-(alter-var-root #'inc2 (fn [g] @(future (g 1)) g))   ; Clojure returns   jank hangs
-```
-
-var.cpp `alter_root` 108 holds `write_mutex`; the fn's first call realizes it, and `bind_root` 101 takes the mutex again. The Lean replica's tape: 10 steps on one thread, 12 on two (Mutexes.lean).
 
 - [ ] **LU19**: `defmethod` with a lazy dispatch value realized by a thread calling the multimethod hangs (`deviations_r4_test.jank`: `u19`; on main: hangs (killed after 120 s)).
   - [ ] reported
