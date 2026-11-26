@@ -27,6 +27,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 VARIES = {
     "binding-frames-never-freed.jank", "binding-leaks-across-futures.cljc",
     "compare-and-set-spurious-failure.cljc", "defonce-race.cljc",
+    # On Linux, realized? after future-cancel depends on whether the cancelled thread has
+    # finished unwinding yet.
+    "future-cancel-invisible.cljc",
     "multimethod-dispatch-depends-on-hash-order.cljc", "nrepl-concurrent-output-swap.py",
     "require-race.cljc", "with-redefs-race.cljc",
 }

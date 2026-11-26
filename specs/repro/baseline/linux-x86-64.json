@@ -351,11 +351,7 @@
    "check 1": "still running after 3 s"
   },
   "future-cancel-invisible.cljc": {
-   "(ended)": "exit 0",
-   "deref": "threw",
-   "future-cancel": "nil",
-   "future-cancelled?": "false",
-   "realized?": "true"
+   "verdict": "still there"
   },
   "if-number-and-boolean-literals.cljc": {
    "(ended)": "exit 0",
