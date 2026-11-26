@@ -72,9 +72,10 @@ jobs:
         run: |
           # The build doesn't say its commit: the last successful build of main on jank's CI
           # is very likely the one published.
-          last=$(gh run list --repo jank-lang/jank --workflow "Build compiler+runtime" --branch main \
-                   --status success --limit 1 --json headSha,updatedAt \
-                   --jq '.[0] | "\(.headSha[0:9]), built \(.updatedAt)"' || echo "unknown")
+          # (Two of its workflow files are named so: the runs are picked by name.)
+          last=$(curl -s "https://api.github.com/repos/jank-lang/jank/actions/runs?branch=main&status=success&per_page=50" \
+                 | python3 -c 'import json, sys; r = [x for x in json.load(sys.stdin).get("workflow_runs", []) if x["name"] == "Build compiler+runtime"]; print(r[0]["head_sha"][:9] + ", built " + r[0]["updated_at"] if r else "unknown")' \
+                 || echo "unknown")
           echo "JANK_BUILD_INFO=published $JANK_PUBLISHED; jank's last build of main: $last" >> "$GITHUB_ENV"
           "$JANK" check-health || true
 
