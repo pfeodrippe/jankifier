@@ -21,11 +21,13 @@ They come from two places:
   published on 2026-11-20, `774d02f62`) and on Clojure 1.11.1. Unless noted, jank 0.1 and
   main give the same result.
 - The findings named D, R, LS, LU and LV were predicted by a Lean replica of jank written blind from its sources (determinismo's
-  `lean/jank`, rounds 1 to 7; round 3's S items appear here as LS, round 4's U items as LU and rounds 5 and 6's V items as LV and round 7's X items as LX, since S and U name this file's own; rounds 5 and 6 were run on jank main directly, each test in its own process with a 120 s limit; round 6 (LV51 to LV85, and new tests of S9, LG1–LG3, R5 and LS40) on 2026-11-26, its expected values checked on Clojure 1.12.3), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
+  `lean/jank`, rounds 1 to 8; round 3's S items appear here as LS, round 4's U items as LU and rounds 5 and 6's V items as LV round 7's X items as LX and round 8's Y items as LY (its H8-1, DEC8-1, Q1 and Q2 as LH8-1, LDEC8-1, LQ1 and LQ2), since S and U name this file's own; rounds 5 and 6 were run on jank main directly, each test in its own process with a 120 s limit; round 6 (LV51 to LV85, and new tests of S9, LG1–LG3, R5 and LS40) on 2026-11-26, its expected values checked on Clojure 1.12.3), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
   Linux, UTF-8 locale, each test in its own process with a 600 s limit, 120 s in round 3, through determinismo-ci)
   and on Clojure 1.11.1. The tests live with the replica, in determinismo-workloads'
   [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests): each asserts Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
-  issues and PRs were searched by keyword on 2026-11-25; none found unless said.
+  issues and PRs were searched by keyword on 2026-11-25; none found unless said. Round 8 ran on 2026-11-26 on jank main
+  94d32623 (`7135b7708`'s compiler+runtime, x86-64 Linux, each test in its own process with a 120 s limit), its Clojure
+  values checked on Clojure 1.11.1.
 
 The replica also predicted findings listed elsewhere: A2 here (on main, `nth` after `persistent!` now refuses, but with a C++
 exception that `thrown?` can't catch), A3 (the same on main), C3 (also on Linux x86-64), S3 and
@@ -261,7 +263,7 @@ cpp_util.cpp `find_branch_common_type` 1909–1995, for a compiled `if`. #1187 (
 
 `cpp_util.cpp` `literal_type` (615): booleans are C++ `bool`.
 
-- [ ] **LV64**: arithmetic on a predicate's result or a char array's element doesn't throw (`deviations_r6_test.jank`: `v64`; `deviations_r7_test.jank`: `x15`, `x15b`, `x24`, `x24b`, `x24c`).
+- [ ] **LV64**: arithmetic on a predicate's result or a char array's element doesn't throw (`deviations_r6_test.jank`: `v64`; `deviations_r7_test.jank`: `x15`, `x15b`, `x24`, `x24b`, `x24c`; `deviations_r8_test.jank`: `y7`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
   - [ ] reported
 
@@ -554,7 +556,7 @@ CppInterOp `BestOverloadMatch` 2203 adds no built-in candidates.
 ((fn [a b] (min a b)) ##NaN 1)   ; jank => 1     clj => ##NaN
 ```
 
-- [ ] **LV57**: on a tie, `max` returns its first operand; Clojure's returns its second (`deviations_r6_test.jank`: `v57`, `v57b`).
+- [ ] **LV57**: on a tie, `max` returns its first operand; Clojure's returns its second (`deviations_r6_test.jank`: `v57`, `v57b`; `deviations_r8_test.jank`: `y4`, `y4b`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
   - [ ] reported
 
@@ -684,6 +686,17 @@ ratio support in `/`).
 
 `core/math.hpp` `abs`, object branch (1016): `data < 0ll` is false for -0.0.
 
+- [ ] **LDEC8-1**: unary minus is `(- 0 x)`: `(- 0.0)` is 0.0 and a BigDecimal loses its scale (`deviations_r8_test.jank`: `y37`, `y37b`, `y38`, `y38b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(str (- 0.0))      ; Clojure "-0.0"    jank "0.0"
+(str (- 1E+2M))    ; Clojure "-1E+2"   jank "-100.0"
+```
+
+core.jank 1393-1394; Clojure's `Numbers.minus(x)` negates.
+
 - [ ] **D7**: `bigdec` of a long goes through a double (`d07`; `deviations_r7_test.jank`: `x23`).
   - [ ] reported
 
@@ -801,7 +814,7 @@ are Clojure's read as unsigned (2277397642 = -2017569654 + 2^32).
 
 `core/array.cpp` 275; `builtin.hpp` 227.
 
-- [ ] **R99**: a BigDecimal compares exactly with a double (`c04`).
+- [ ] **R99**: a BigDecimal or a BigInt compares exactly with a double (`c04`; `deviations_r8_test.jank`: `y3`, `y3b`, `y3c`).
   - [ ] reported
 
 ```clojure
@@ -812,7 +825,7 @@ are Clojure's read as unsigned (2277397642 = -2017569654 + 2^32).
 
 `big_decimal.cpp` 182; `number.cpp` 460.
 
-- [ ] **LS3**: non-terminating quotients return a value (`deviations_r3_test.jank`: `s03`; on main: `(/ 1.0M 3)` returned, no exception).
+- [ ] **LS3**: non-terminating quotients return a value (`deviations_r3_test.jank`: `s03`; `deviations_r8_test.jank`: `y2`, `y2b`; on main: `(/ 1.0M 3)` returned, no exception).
   - [ ] reported
 
 ```clojure
@@ -871,6 +884,19 @@ math.cpp 269–289 → default_ops.hpp 1260–1321.
 ```
 
 math.cpp 250–268 → generic_interconvert.hpp 533–563.
+
+- [ ] **LY1**: `rem` of doubles isn't Clojure's: a large quotient gives another remainder, a negative dividend's zero remainder is -0.0, and an infinite quotient returns a value (`deviations_r8_test.jank`: `y1`, `y1b`, `y1c`, `y1d`).
+  Tracker: related: #1019 (`mod` and `rem` return reals for integer arguments), a different case; nothing else found (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(rem 1e18 3.0)          ; Clojure 0.0     jank 1.0
+(str (rem -4.0 2.0))    ; Clojure "0.0"   jank "-0.0"
+(rem 1e300 1e-300)      ; Clojure throws NumberFormatException "Infinite or NaN"   jank returns a value
+```
+
+math.cpp `rem(f64, f64)` 178-202 is C's exact `std::fmod`; Clojure's `Numbers.remainder` is n − (long)(n/d)·d in
+doubles (past the long range through `new BigDecimal(q)`, which throws for a NaN or infinite quotient).
 
 - [ ] **LS10**: BigDecimals that jank calls `=` hash differently (`deviations_r3_test.jank`: `s10`; on main: `(or (not= a b) (= (hash a) (hash b)))` was `false`).
   - [ ] reported
@@ -1197,6 +1223,23 @@ transient_array_map.cpp 47, 52, 62, 146 lack `assert_active()`; `to_persistent` 
 ```
 
 - persistent_hash_map.cpp 110 → immer map.hpp 400 → champ.hpp 604–606 (`copy_inner_replace_value`, the whole pair) and 577–581 (collision nodes); - transient paths: champ.hpp 697–699, 654; - sets: persistent_hash_set.cpp 151 → set.hpp 220; transient_hash_set.cpp 46. - Below 8 entries the array map keeps the stored key (native_array_map.cpp 139–162). - Clojure keeps the stored key: BitmapIndexedNode.assoc 704; PersistentHashSet.cons 98–101.
+
+- [ ] **LH8-1**: `assoc` or `conj` of a present key reorders a hash map's or set's seq when the key shares its full hash with one stored before it (`deviations_r8_test.jank`: `y22`, `y22b`, `y22c`, `y22d`, `y22e`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(hash 1) (hash 7676047846)                       ; both 1392991556, in jank and Clojure
+(let [m (hash-map 1 :a 7676047846 :a)]
+  [(keys m) (keys (assoc m 1 :b))])              ; Clojure [(1 7676047846) (1 7676047846)]
+                                                 ; jank    [(7676047846 1) (1 7676047846)]
+(let [s (hash-set 1 7676047846)]
+  [(seq s) (seq (conj s 1))])                    ; Clojure the same order; jank reordered
+```
+
+Two keys of one hash share a collision node, newest first; immer's `do_add` → `copy_collision_replace`
+(champ.hpp 575-581, node.hpp 495-523) writes the replaced entry first. Clojure's HashCollisionNode replaces in
+place, and `PersistentHashSet.cons` returns the set itself. The same with `assoc!` on a new transient.
 
 - [ ] **LV84**: after an unrelated element is added, a hash set no longer finds -0.0 when it holds 0.0 (`deviations_r6_test.jank`: `v84`, `v84b`; `deviations_r7_test.jank`: `x21b`, `x21c`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
@@ -2371,6 +2414,19 @@ re_pattern.cpp 6–11 uses `c_str()`. Lean theorem `jankEval4_pattern_nul`.
 CIDER 2.1 leaves the request pending (its spinner keeps going) on the combined
 message. `jankifier.nrepl` works around it.
 
+- [ ] **LQ2**: an eval that prints nothing sends two extra messages holding only the id and the session (`deviations_r8_test.jank`: `y52`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+{"op" "eval" "id" "e" "code" "1" "ns" "user"}
+;; jank  => 4 messages: the value, {:id "e" :session s}, {:id "e" :session s}, done
+;; nREPL => 2 messages: the value, then done
+```
+
+handler/eval.jank 57-64 returns nil for a blank :out and :err; `response-for` merges each nil with the id and
+the session (core.jank 33-45), and handle-client 87-90 writes all of them. A failing eval sends two too.
+
 - [ ] **LU41**: `completions` gives each var the searched namespace as its `:ns` (`deviations_r4_test.jank`: `u41`; on main: gave `"user"`).
   - [ ] reported
 
@@ -2415,6 +2471,19 @@ evaluate.cpp `safe_eval` 750: the `exception_info` made from an `error_ref` gets
 ;; jank => #{"error" "unknown-op" "done"} both
 ;; nREPL 1.8.0 => #{"session-idle" "done"}, #{"error" "session-ephemeral" "done"}
 ```
+
+- [ ] **LQ1**: the `stdin` op is answered `unknown-op`, and `describe` doesn't list it (`deviations_r8_test.jank`: `y51`, `y51b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+{"op" "stdin" "session" <a cloned session> "stdin" "hi\n"}
+;; jank => #{"error" "unknown-op" "done"}; describe's :ops have no :stdin
+;; nREPL 1.8.0 => #{"done"} (the text appended to the session's *in*); describe lists "stdin"
+```
+
+handler.jank 5-8 (the default method), describe.jank 5-17. An eval of `(read-line)` ends with `eval-error`
+(read-line is unported); nREPL would send `need-input` and wait for stdin.
 
 ## Crashes
 
