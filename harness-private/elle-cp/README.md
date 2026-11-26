@@ -37,6 +37,8 @@ elle-cp/
     Grade/Show.lean              EDN printing of histories, printing and comparison keys of outcomes
     Grade/Main.lean              exe grade: ElleCP.check against Elle.ClosedPredicate.check
     Grade/Cases.lean             exe cases: the D9 and D10 histories, Elle as written and fixed
+  oracle/                        the real Elle answering requests through files: one function's
+                                 value or a whole check (oracle/README.md); the agents' elle tool
 ```
 
 `lake-manifest.json` files are written by Lake on the first build. Sources: base modules and
@@ -138,6 +140,55 @@ about one history in ten is all garbage.
   are valid as written and G-single-item / G-single fixed, as REPORT.md says. Under the default
   options both histories are already invalid as written (D9 through a real-time cycle-exists
   anomaly, D10 through its predicate read miss), and only the anomaly types change.
+
+## The team's runs (2026-11-25)
+
+The team (`harness.replica`: a coordinator, a translator and a specifier) ran on Inkling 2 Mini,
+the local model, from 13:21 to 18:55, in 12 attempts. Each attempt was stopped when its recording
+showed a problem in the setup, and the problem was fixed before the next one. The fixes, in order:
+
+1. `harness.replica` is loaded before the sandbox, which refuses the harness's sources afterwards.
+2. The coordinator's own tools refuse until it has handed out the work; it had read Elle's code
+   itself for fourteen steps while the workers waited.
+3. `ELLE.md` says that only `closed_predicate.clj` is given, and where each function it calls from
+   outside is in Lean; the translator had searched the machine for the rest of Elle.
+4. `ELLE.md` says what `loopr`, transients and the explainers are.
+5. The specifier's tools refuse the source and the translation; it reads `elle/DOCSTRING.md` (the
+   namespace docstring) alone. It had read Elle's explainers.
+6. The workers have 98,304 tokens of context; at 65,536 the translator was compacted twice in
+   thirty steps.
+7. A worker that has written nothing is reminded at steps 12, 24 and 36.
+8. A worker's reading tools refuse after 20 reads without a write. A shell call counts as a write
+   when a watched file (the translation, the specification, the report) changed. After three
+   refused reads in a row, the worker's turn ends.
+9. The workers think at `:high` with 4,096-token stretches; at `:max`, steps took up to six
+   minutes.
+
+No attempt produced a translation that builds, so nothing was graded and no `REPORT.md` was
+written. The last attempts' recordings and drafts are in `trials-out/stopped-elle/`.
+
+What the recordings show about the model:
+
+- It notices the known bugs while reasoning. In attempt 10 the translator called the end of
+  `version<` (the `loopr` returning `found-a?`, D11) "a bug — OR a deliberate decision", and noted
+  the `:write` and `:w` keywords (D9). Attempt 11's translator said of the same function "that
+  can't be right".
+- What it writes varies. Attempt 9's translator wrote `versions-after` and `version<` with D10 and
+  D11 corrected, and so did attempt 11's first write. Attempt 11's translator then reread the
+  `loopr` rules and rewrote the file with both as Elle has them: `version<` returns `found-a?`
+  when the versions run out, and `versions-after` discards the unborn branch's value (its comment
+  says so). That last file (`trials-out/stopped-elle/r11-ClosedPredicate.lean`) is the first part
+  only, 211 lines, and does not build: `let mut` outside a `do` block, functions used before they
+  are defined, and names Lean 4.35 doesn't have (`Nat.toInt`, `List.get?`). A translation's
+  faithfulness can't be read from one write; testing it against Elle settles it.
+- It is slow for this size of work. With two workers at about 22 tokens a second each, a step
+  took one to six minutes, and attempt 11's translator first wrote a part of the file 30 minutes
+  after the start. A whole translation, a specification and a comparison would take many hours.
+
+The oracle (`oracle/`) was added for the twelfth attempt, so that the translator could test each
+function against Elle itself: `(version< {1 [0 :elle/dead]} 1 :elle/dead 0)` is true in Elle, and
+a corrected translation says false. That attempt was stopped at step 11, before any call to it,
+when the runs on the local model were stopped as too slow to be useful.
 
 ## Sanitization of the stage base modules
 

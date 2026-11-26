@@ -384,6 +384,26 @@ ended after it, driven from outside over its REPL:
 The run in progress is kept in `../trials-out/live.edn` as it goes; another
 window follows it: `(hc/follow-file! "../trials-out/live.edn" "live")`.
 
+### Results so far (24 and 25 Nov 2026)
+
+Inkling 2 Mini, one run at a time. The harness changed between runs, each fix made when a
+recording showed a problem, so this is not a controlled comparison. A run in `plain` mode
+has the task alone; one in `verified` mode also has the gate. Verified runs had 80 steps,
+then 160 from 25 Nov 11:00.
+
+| Task | Mode | Right | Not right |
+|---|---|---|---|
+| lru | plain | seeds 1, 2 (343 s, 225 s) | |
+| lru | verified | seed 1, verified (1,761 s) | |
+| queue | plain | seeds 1, 2, 3 (3,124 s, 1,494 s, 1,262 s) | |
+| queue | verified | seeds 1, 2, verified (2,354 s, 4,099 s) | seed 3: the process crashed (deep recursion in a future) |
+| kv | plain | seeds 1, 2 (2,324 s, 2,759 s) | seed 3: its store is a value, `put!` returns a new one |
+| kv | verified | | seed 1 (80 steps): `del!` of an absent key throws; seed 2: stopped, nothing written in 45 minutes |
+
+Not run: lru seed 3 in both modes, lru verified seed 2, queue verified seed 3 again, and kv
+verified at 160 steps. The runs were stopped on 25 Nov: at about 22 to 44 tokens a second,
+a run takes from four minutes to over an hour.
+
 ## A team
 
 `harness.team` puts three agents on one model for verified work: a coordinator, who has
@@ -403,6 +423,20 @@ its own thinking and never handed it out), and a worker's step may take 24,576 t
 trials' driver runs a team as the mode `team`; its workers' conversations are kept beside
 the coordinator's (`live-coder.edn`, `live-modeler.edn`). On lru, a team passed the check
 and the grader in 45 minutes and 93,000 tokens (23 Nov 2026, before the last two fixes).
+
+## A replica team
+
+`harness.replica` puts three agents on one model to replicate code in Lean: a translator
+writes the translation as the code is written, a specifier writes a specification from the
+code's documentation without reading the code or the translation, and a coordinator hands
+out the work with `ask_both` (its own tools refuse until it has) and compares the two. A
+worker's reading tools refuse after 20 reads without a write, and its turn ends after three
+refusals in a row. With `:elle-dir`, the translator and the coordinator also get the `elle`
+tool, which asks the real Elle about one function's value or a whole check.
+
+It was tried on Elle's closed-predicate checker (`../harness-private/elle-cp`, whose README
+has the runs): in 12 attempts on 25 Nov no translation built. The model noticed Elle's known
+bugs while reasoning, but its translations sometimes corrected them.
 
 ## What went wrong, across runs
 
