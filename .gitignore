@@ -3,4 +3,4 @@
 .clj-kondo/.cache
 .docs
 /trials-out
-/harness-private/classes
+/harness-private/**/classes/
