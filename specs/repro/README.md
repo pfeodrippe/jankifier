@@ -24,6 +24,38 @@ showed up.
   (`jank_harness.py`), start jank in scratch directories under
   `conformance/out/`, and print the same way: `python3 <file>.py`.
 
+All of them on one jank, what each printed kept per build in
+`conformance/out/repro-runs/BUILD/`:
+
+```sh
+python3 run_all.py                                  # jank from the PATH
+JANK=~/.local/bin/jank-main python3 run_all.py      # a build from ../install-jank-main.sh
+```
+
+The Lean replica's tests (repros.md's D, R, LS, LU and LV), each in its own
+process, from determinismo-workloads; it says which pass and keeps their output
+in `conformance/out/replica-runs/`:
+
+```sh
+JANK=~/.local/bin/jank-main python3 run_replica_tests.py \
+  ~/dev/determinismo-workloads/workloads/jank-interop/lean/tests    # or some: ... d09 v12
+```
+
+`check_runs.py` sums up both per repros.md item (which look fixed) and
+compares them with the run recorded for the platform in `baseline/`, saying
+what changed; `--write-baseline` records the run instead.
+
+```sh
+python3 check_runs.py --platform macos-arm64 \
+  --repro ../conformance/out/repro-runs/2026-11-24.json \
+  --replica ../conformance/out/replica-runs/2026-11-24.json
+```
+
+The workflow `.github/workflows/jank-repros.yml` does all of this every day on
+the latest build of jank's main, on Linux x86-64 (jank's apt package) and
+macOS on Apple Silicon (the tarball). A job fails when its run differs from
+the recorded one; its artifacts hold the run, and `new-baseline/` to record it.
+
 Checked on 2026-11-21 with jank 0.1 (Homebrew, `f3d82d654`) on macOS 15.1,
 Apple Silicon, and Clojure 1.11.1; and on the build of jank's main published
 on 2026-11-20 (`774d02f62`), where each prints the same, except N1 and S5
