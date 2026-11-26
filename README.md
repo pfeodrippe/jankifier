@@ -19,8 +19,6 @@ concatenate strings for cpp/raw usage.
 
 Git submodule it into your project (on your own peril) and use it.
 
-I will publish to clojars soon.
-
 ## TODOs
 
 I also own todo.md for some jank improvements or for what I want next o/

@@ -97,6 +97,28 @@ Give that jank its own `XDG_CACHE_HOME` (a wrapper script): builds of the same
 version share a cache key, and so a precompiled header, with the installed
 jank. The reproductions' Python scripts read `$JANK` too.
 
+`./install-jank-main.sh` does this: it downloads the build published there and
+installs it beside the installed jank, named by the date it was published
+(`~/.local/share/jank/2026-11-24/`, with where it came from in `SOURCE`). The
+build doesn't say which commit it is (`check-health` says `jank-0.1-alpha`),
+so results on it are labelled by that date. It makes, in `~/.local/bin`:
+
+- `jank-2026-11-24`: that build, with its own cache; for `JANK=...` and for
+  running files (`jank-2026-11-24 run --module-path . file.cljc`);
+- `lein-jank-2026-11-24`: `lein` with that build as `jank` on the `PATH`
+  (lein-jank runs `jank` from the `PATH`), and lein-jank's compile folder moved
+  from `target/...` to `target/jank-2026-11-24/...`, since jank loads a
+  module's `.o` file without checking which jank compiled it;
+- `jank-main` and `lein-jank-main`: the same for the newest one installed.
+
+To jack in from Emacs on it: `C-u M-x cider-jack-in` and replace the `lein` at
+the start of the command with `lein-jank-main`, or, for every jack-in in a
+directory, a `.dir-locals.el` there:
+
+```elisp
+((nil . ((cider-lein-command . "/Users/you/.local/bin/lein-jank-main"))))
+```
+
 Each returns `{:harness ... :ok? ... :results [...]}`, with the scratch
 directory of its programs (`:work`, under `conformance/out/`, ignored by
 git). Several harnesses also run their programs on Clojure (`clojure` on the
