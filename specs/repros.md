@@ -21,13 +21,13 @@ They come from two places:
   published on 2026-11-20, `774d02f62`) and on Clojure 1.11.1. Unless noted, jank 0.1 and
   main give the same result.
 - The findings named D, R, LS, LU and LV were predicted by a Lean replica of jank written blind from its sources (determinismo's
-  `lean/jank`, rounds 1 to 8; round 3's S items appear here as LS, round 4's U items as LU and rounds 5 and 6's V items as LV round 7's X items as LX and round 8's Y items as LY (its H8-1, DEC8-1, Q1 and Q2 as LH8-1, LDEC8-1, LQ1 and LQ2), since S and U name this file's own; rounds 5 and 6 were run on jank main directly, each test in its own process with a 120 s limit; round 6 (LV51 to LV85, and new tests of S9, LG1–LG3, R5 and LS40) on 2026-11-26, its expected values checked on Clojure 1.12.3), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
+  `lean/jank`, rounds 1 to 8; round 3's S items appear here as LS, round 4's U items as LU and rounds 5 and 6's V items as LV round 7's X items as LX and round 8's Y items as LY (its H8-1, DEC8-1, Q1 and Q2 as LH8-1, LDEC8-1, LQ1 and LQ2), round 9's T9, M9, H9, Q9, E9 and W9 items as LT9, LM9, LH9, LQ9, LE9 and LW9, since S and U name this file's own; rounds 5 and 6 were run on jank main directly, each test in its own process with a 120 s limit; round 6 (LV51 to LV85, and new tests of S9, LG1–LG3, R5 and LS40) on 2026-11-26, its expected values checked on Clojure 1.12.3), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
   Linux, UTF-8 locale, each test in its own process with a 600 s limit, 120 s in round 3, through determinismo-ci)
   and on Clojure 1.11.1. The tests live with the replica, in determinismo-workloads'
   [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests): each asserts Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
   issues and PRs were searched by keyword on 2026-11-25; none found unless said. Round 8 ran on 2026-11-26 on jank main
   94d32623 (`7135b7708`'s compiler+runtime, x86-64 Linux, each test in its own process with a 120 s limit), its Clojure
-  values checked on Clojure 1.11.1.
+  values checked on Clojure 1.11.1. Round 9 ran on 2026-11-26 the same way, its Clojure values checked on Clojure 1.12.3.
 
 The replica also predicted findings listed elsewhere: A2 here (on main, `nth` after `persistent!` now refuses, but with a C++
 exception that `thrown?` can't catch), A3 (the same on main), C3 (also on Linux x86-64), S3 and
@@ -1345,6 +1345,242 @@ walk.jank 3–12. Lean theorems `jank_walk_drops_list_meta`, `walk_vec_meta_agre
 ;; clj  => [true 1 1]
 ```
 
+- [ ] **LT9-1**: `sort` of a vector holding `##NaN` orders it another way than Clojure (`deviations_r9_test.jank`: `z39`, `z39b`, `z39c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(sort [3 ##NaN 1 2])                             ; Clojure (3 ##NaN 1 2)   jank (1 2 3 ##NaN)
+```
+
+jank sorts with std::stable_sort, Clojure with TimSort (`Arrays.sort`): a compare that isn't a total preorder (NaN, a boolean comparator) gives each its own order.
+
+- [ ] **LT9-2**: a comparator's numeric result past the int range is read whole (`deviations_r9_test.jank`: `z40`, `z40b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(sort (fn [a b] (- a b)) [4294967296 0])         ; Clojure (4294967296 0)   jank (0 4294967296)
+```
+
+Clojure's `AFunction.compare` takes the result's `intValue` (4294967296 is 0 there); jank compares the long.
+
+- [ ] **LT9-3**: vector seqs and `(range n)` aren't chunked: `map`'s first element calls f once (`deviations_r9_test.jank`: `z41`, `z41b`, `z41c`, `z41d`, `z41e`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [n (atom 0)] (first (map #(do (swap! n inc) %) (range 100))) @n)  ; Clojure 32   jank 1
+```
+
+Code that relies on side effects of a chunk (or on their absence) behaves differently; the same through `filter`, `for` and `into`/`take`.
+
+- [ ] **LT9-4**: `take` of `iterate` calls f once more than Clojure (`deviations_r9_test.jank`: `z42`, `z42b`, `z42c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [n (atom 0)] (doall (take 3 (iterate #(do (swap! n inc) (inc %)) 0))) @n)  ; Clojure 2   jank 3
+(vec (take 3 (iterate #(if (< % 2) (inc %) (throw (ex-info "boom" {}))) 0)))
+;; Clojure [0 1 2]   jank throws "boom"
+```
+
+jank's iterate computes the next value with each element; Clojure's `Iterate` computes it when the next one is asked for.
+
+- [ ] **LT9-5**: `apply` realizes up to 12 arguments of a lazy seq (`deviations_r9_test.jank`: `z43`, `z43b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [n (atom 0)] (first (mapcat #(do (swap! n inc) [%]) (list 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))) @n)
+;; Clojure 4   jank 12
+```
+
+Clojure's `applyTo` spreads only the arguments the fn's arity needs (`RT.boundedLength`).
+
+- [ ] **LT9-6**: `dedupe`'s first element realizes 2 elements where Clojure realizes the whole input (`deviations_r9_test.jank`: `z44`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [n (atom 0)] (first (dedupe (map #(do (swap! n inc) %) (list 1 2 3 4 5)))) @n)  ; Clojure 5   jank 2
+```
+
+
+
+- [ ] **LT9-7**: `(realized? (cycle [1 2]))` is false (`deviations_r9_test.jank`: `z45`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(realized? (cycle [1 2]))                        ; Clojure true   jank false
+```
+
+Clojure's `Cycle` is realized from the start.
+
+- [ ] **LT9-8**: `drop` past the int range returns `()` where Clojure throws (`deviations_r9_test.jank`: `z46`, `z46b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(drop 3000000000 [1 2 3])                        ; Clojure throws (integer overflow)   jank ()
+(nthnext [1 2 3] 3000000000)                     ; the same
+```
+
+Clojure casts n with `RT.intCast`; jank walks with the long.
+
+- [ ] **LT9-9**: `partition-all`'s transducer with a double size, or a negative one (`deviations_r9_test.jank`: `z47`, `z47b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(into [] (partition-all 2.0) [1 2 3 4 5])         ; Clojure [[1 2] [3 4] [5]]   jank [[1 2 3 4 5]]
+(into [] (partition-all -1) [1 2])               ; Clojure throws   jank doesn't
+```
+
+
+
+- [ ] **LT9-10**: sorted collections and `##NaN`: `get` finds another key, `dissoc` and `disj` empty them (`deviations_r9_test.jank`: `z48`, `z48b`, `z48c`, `z48d`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(get (sorted-map 1 :a 2 :b 3 :c) ##NaN)          ; Clojure :b   jank :a
+(dissoc (sorted-map 1 :a 2 :b) ##NaN)            ; Clojure {2 :b}   jank {}
+```
+
+Both trees search with the comparator, where NaN compares 0 against everything; they walk it differently.
+
+- [ ] **LT9-11**: an inner lazy seq unwrapped by an outer one reads as realized (`deviations_r9_test.jank`: `z49`, `z49b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [inner (lazy-seq [1]) outer (lazy-seq inner)] (seq outer) (realized? inner))
+;; Clojure false   jank true
+```
+
+
+
+- [ ] **LT9-12**: a lazy-seq body that threw runs again with its locals (`deviations_r9_test.jank`: `z50`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [n (atom 0) x (lazy-seq (swap! n inc) (throw (ex-info "boom" {})))]
+  (try (seq x) (catch Exception _)) (try (seq x) (catch Exception _)) @n)
+;; Clojure 1 (the body's locals cleared after the first throw)   jank 2
+```
+
+
+
+- [ ] **LM9-1**: `get`, `contains?` and `assoc` of a vector with an index past 32 bits (`deviations_r9_test.jank`: `z55`, `z55b`, `z55c`, `z55d`, `z55e`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(get [1 2 3] 4294967297)                         ; Clojure 2 (the key's intValue)   jank nil
+(contains? [1 2 3] 4294967297)                   ; Clojure true   jank false
+(assoc [1 2 3] 4294967297 :x)                    ; Clojure [1 :x 3]   jank throws (out of bounds)
+(get "abc" 4294967297)                           ; Clojure \b   jank nil
+```
+
+
+
+- [ ] **LM9-2**: `get` of a string with a double index returns nil, and `contains?` and `nth` with it throw (`deviations_r9_test.jank`: `z56`, `z56b`, `z56c`, `z56d`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(get "abc" 1.5)                                  ; Clojure \b   jank nil
+(contains? "abc" 1.5)                            ; Clojure true   jank throws (requires an integer index)
+(nth "abc" 1.5)                                  ; Clojure \b   jank throws
+```
+
+Clojure takes the index's `intValue`; U29's class (vectors), on strings.
+
+- [ ] **LM9-3**: `contains?` of a list returns false where Clojure throws (`deviations_r9_test.jank`: `z57`, `z57b`, `z57c`, `z57d`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(contains? '(1 2) 0)                             ; Clojure throws (not supported on PersistentList)   jank false
+```
+
+
+
+- [ ] **LM9-4**: `select-keys` drops the map's metadata (`deviations_r9_test.jank`: `z59`, `z59b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(meta (select-keys (with-meta {:a 1} {:m 1}) [:a]))  ; Clojure {:m 1}   jank nil
+```
+
+
+
+- [ ] **LM9-5**: `assoc` of a present key promotes an 8-entry array map to a hash map, so the key order changes (`deviations_r9_test.jank`: `z61`, `z61b`, `z61c`, `z61d`, `z31`, `z31b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [m (apply array-map (interleave (range 8) (range 8)))]
+  (keys (assoc m 0 :x)))                          ; Clojure (0 1 2 3 4 5 6 7)   jank (0 7 1 4 6 3 2 5)
+```
+
+Clojure's `PersistentArrayMap.assoc` replaces a present key's value in place; only a new key past 8 entries promotes.
+
+- [ ] **LM9-6**: the keyword-arguments map is a hash map: its keys come out in another order (`deviations_r9_test.jank`: `z62`, `z62b`, `z62c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+((fn [& {:as m}] (keys m)) 2 :b 1 :a)            ; Clojure (2 1)   jank (1 2)
+```
+
+Shares R107's code (destructuring builds a hash map); with an equal key twice jank keeps the first, Clojure the last.
+
+- [ ] **LM9-9**: `update-vals` of a sorted map stays sorted (`deviations_r9_test.jank`: `z65`, `z65b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(sorted? (update-vals (sorted-map 1 1) inc))       ; Clojure false   jank true
+```
+
+
+
+- [ ] **LM9-10**: `empty` of a seq keeps its metadata (`deviations_r9_test.jank`: `z66`, `z66b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(meta (empty (with-meta (seq [1 2 3]) {:m 1})))    ; Clojure nil   jank {:m 1}
+```
+
+
+
+- [ ] **LM9-11**: hash sets, and hash maps past 8 entries, seq in another order than Clojure's (`deviations_r9_test.jank`: `z70`, `z70b`, `z70c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(vec (hash-set 5 9 8))                           ; Clojure [9 5 8]   jank [8 9 5]
+```
+
+jank's CHAMP stores a node's entries before its subnodes; Clojure's HAMT interleaves them by position.
+
+- [ ] **LH9-2**: `assoc` of the value a key already holds, and `conj` of a member, return a new collection (`deviations_r9_test.jank`: `z30`, `z30b`, `z30c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [m (hash-map :k :v)] (identical? m (assoc m :k :v)))  ; Clojure true   jank false
+(let [s (hash-set 1)] (identical? s (conj s 1)))           ; Clojure true   jank false
+```
+
+Code that tests `identical?` to skip work (caches, watches) does the work every time.
+
 ### Concurrency
 
 - [ ] **S3**: `deref` with a timeout returns `nil` at once (`repro/timed-deref-is-a-stub.cljc`; "TODO: Blocking" in `clojure/core.jank`).
@@ -1933,6 +2169,47 @@ jank's pprint.jank is `prn`; Clojure's dispatch.clj 92–101 breaks at the right
 
 exception_info.cpp 80–83. Lean theorem `jank_printed_via_wrong`.
 
+- [ ] **LT9-13**: `str` of a lazy seq prints its elements (`deviations_r9_test.jank`: `z54`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(str (map inc [1 2]))                            ; Clojure "clojure.lang.LazySeq@402"   jank "(2 3)"
+```
+
+Clojure's text is the JVM's object name (its hash in hex); kept as Clojure states it.
+
+- [ ] **LM9-7**: `assert`'s message doesn't name the form, and its error carries data (`deviations_r9_test.jank`: `z63`, `z63b`, `z63c`, `z63d`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(try (assert (= 1 2)) (catch Throwable e (ex-message e)))
+;; Clojure "Assert failed: (= 1 2)" (an AssertionError, no data)   jank "assertion failed" (with data)
+```
+
+
+
+- [ ] **LM9-8**: `prewalk-demo` and `postwalk-demo` print with `println`, not `prn` (`deviations_r9_test.jank`: `z64`, `z64b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(with-out-str (clojure.walk/prewalk-demo "a"))   ; Clojure "Walked: \"a\"\n"   jank "Walked: a\n"
+```
+
+
+
+- [ ] **LW9-1**: `char-array` of a non-ASCII string counts its UTF-16 units differently (`deviations_r9_test.jank`: `z15`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(alength (char-array "\u00e9"))                 ; Clojure 1   jank 2 (bytes)
+```
+
+
+
 ### The reader
 
 - [ ] **R4**: a leading `+` makes a symbol (`a04`).
@@ -2484,6 +2761,42 @@ evaluate.cpp `safe_eval` 750: the `exception_info` made from an `error_ref` gets
 
 handler.jank 5-8 (the default method), describe.jank 5-17. An eval of `(read-line)` ends with `eval-error`
 (read-line is unported); nREPL would send `need-input` and wait for stdin.
+
+- [ ] **LQ9-1**: an `eval` of empty code answers `no-code` (`deviations_r9_test.jank`: `z33`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+{"op" "eval" "code" ""}
+;; jank => #{"no-code" "done"}
+;; nREPL 1.8.0 => #{"done"}
+```
+
+
+
+- [ ] **LQ9-2**: an `eval` with no code lacks `error` (`deviations_r9_test.jank`: `z34`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+{"op" "eval"}
+;; jank => #{"no-code" "done"}
+;; nREPL 1.8.0 => #{"error" "no-code" "done"}
+```
+
+
+
+- [ ] **LQ9-3**: an `eval` in a missing namespace lacks `error` (`deviations_r9_test.jank`: `z35`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+{"op" "eval" "code" "1" "ns" "no.such.ns"}
+;; jank => no "error" in its status
+;; nREPL 1.8.0 => #{"error" "namespace-not-found" "done"}
+```
+
+
 
 ## Crashes
 
@@ -3697,6 +4010,16 @@ jank_keyword_intern(nil, "a") ; jank => :nil/a  clj (Keyword/intern nil "a") => 
 ;; jank => The operator `aget` is not supported for the type `bf`.
 ;; C++  => 2
 ```
+
+- [ ] **LE9-1**: `ex-message` of the runtime's own errors throws: they are strings, not exceptions (`deviations_r9_test.jank`: `z6`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(try (inc Long/MAX_VALUE) (catch Throwable e (ex-message e)))
+;; Clojure "long overflow"   jank throws (exception_info expected, a persistent_string provided)
+```
+
 
 ## Left out
 
