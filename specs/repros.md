@@ -64,6 +64,15 @@ An update after 8 entries is also lost. persistent_array_map.cpp `create_from_se
 
 `doseq` steps with `fresh-seq` / `next-in-place` (`core.jank` 2742, 2750).
 
+- [ ] **LU27**: `with-meta` on an infinite `repeat` writes the metadata into the original object (`deviations_r4_test.jank`: `u27`; on main: gave `{:a 1}`).
+  - [ ] reported
+
+```clojure
+(let [r (repeat 7)] (with-meta r {:a 1}) (meta r))   ; Clojure nil   jank {:a 1}
+```
+
+repeat.cpp `with_meta` 124–130 over `fresh_seq` 53–60, which returns `this` when infinite. Lean theorem `c1_repeat_meta_written`.
+
 - [ ] **LU8**: an `alter-var-root` wrapper is lost at the wrapped fn's first call (`deviations_r4_test.jank`: `u08`; on main: the second call gave 2).
   - [ ] reported
 
@@ -939,15 +948,6 @@ of them called `assert_active`.
 ```
 
 transient_array_map.cpp 47, 52, 62, 146 lack `assert_active()`; `to_persistent` 126–131 moves `data` with the defaulted move constructor (native_array_map.hpp 34), so the dead transient keeps the same array. #1235 (closed) is the vector case; array maps still answer after `persistent!`.
-
-- [ ] **LU27**: `with-meta` on an infinite `repeat` writes the metadata into the original object (`deviations_r4_test.jank`: `u27`; on main: gave `{:a 1}`).
-  - [ ] reported
-
-```clojure
-(let [r (repeat 7)] (with-meta r {:a 1}) (meta r))   ; Clojure nil   jank {:a 1}
-```
-
-repeat.cpp `with_meta` 124–130 over `fresh_seq` 53–60, which returns `this` when infinite. Lean theorem `c1_repeat_meta_written`.
 
 - [ ] **LU31**: `pop` of a one-element list drops the list's metadata (`deviations_r4_test.jank`: `u31`; on main: gave nil).
   - [ ] reported
