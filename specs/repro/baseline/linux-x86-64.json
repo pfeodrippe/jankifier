@@ -321,13 +321,10 @@
    "root 1": "still running after 3 s"
   },
   "binding-frames-never-freed.jank": {
-   "(ended)": "exit 0",
-   "binding frames after 1000 futures finished": false,
-   "binding frames after 1000 more": false
+   "verdict": "still there"
   },
   "binding-leaks-across-futures.cljc": {
-   "(ended)": "exit 0",
-   "futures created outside the binding that saw it, of 200": false
+   "verdict": "still there"
   },
   "case-literal-default-does-not-compile.cljc": {
    "(ended)": "exit 0",
@@ -338,8 +335,7 @@
    "(ended)": "exit 2"
   },
   "compare-and-set-spurious-failure.cljc": {
-   "(ended)": "exit 0",
-   "compare-and-set! failures with the expected value in place, of 200000": true
+   "verdict": "like Clojure"
   },
   "count-arithmetic-unsigned.cljc": {
    "(- (count \"abc\") 3000)": "-2997",
@@ -348,8 +344,7 @@
    "(max 0 (- (count \"abc\") 3000))": "-2997"
   },
   "defonce-race.cljc": {
-   "(ended)": "exit 0",
-   "times the expression ran, per run": false
+   "verdict": "still there"
   },
   "delay-deref-self-deadlocks.cljc": {
    "(ended)": "exit 0",
@@ -399,8 +394,7 @@
    "preferred through its parent": "threw"
   },
   "multimethod-dispatch-depends-on-hash-order.cljc": {
-   "(ended)": "exit 0",
-   "results of 40 dispatches": false
+   "verdict": "still there"
   },
   "nrepl-bad-argument-ends-connection.py": {
    "(ended)": "exit 0",
@@ -409,9 +403,7 @@
    "to the request with a bad line": "[{'err': \"An exception was thrown from the nREPL handler:Objects of type 'persistent_string' do not support the 'number_like' behavior.\", 'id': '1', 'status': ['error', 'done']}]"
   },
   "nrepl-concurrent-output-swap.py": {
-   "(ended)": "exit 0",
-   "a future's print after the rounds, on the server's stdout": false,
-   "of 20": false
+   "verdict": "still there"
   },
   "nrepl-done-with-eval-error.py": {
    "(ended)": "exit 0",
@@ -431,8 +423,7 @@
    "(re-matches #\"a(b)?\" \"a\")": "[\"a\" \"\"]"
   },
   "require-race.cljc": {
-   "(ended)": "exit 0",
-   "times the lib's body ran, per run": false
+   "verdict": "still there"
   },
   "small-integer-arithmetic-wraps.cljc": {
    "(* 1000000000 1000000000)": "-1486618624",
@@ -477,8 +468,7 @@
    "vector nth": "threw"
   },
   "with-redefs-race.cljc": {
-   "(ended)": "exit 0",
-   "the root after both, per run": false
+   "verdict": "still there"
   }
  }
 }

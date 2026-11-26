@@ -1,9 +1,9 @@
 # The reproductions of specs/repros.md and the Lean replica's tests, on the latest build of
 # jank's main, on Linux x86-64 (jank's apt package) and macOS on Apple Silicon (the tarball
 # Homebrew installs). Each job sums up its run per repros.md item (specs/repro/check_runs.py)
-# and compares it with the run recorded in specs/repro/baseline/PLATFORM.json: it fails when
-# something changed (a test that starts passing is likely a fix), and keeps this run, ready to
-# be recorded, among its artifacts.
+# and compares it with the run recorded in specs/repro/baseline/PLATFORM.json: what differs is
+# run a second time, and the job fails when it still differs (a test that starts passing is
+# likely a fix). It keeps this run, ready to be recorded, among its artifacts.
 name: jank repros
 
 on:
@@ -17,6 +17,11 @@ on:
       - "specs/repros.md"
       - "specs/install-jank-main.sh"
       - ".github/workflows/jank-repros.yml"
+
+# A newer run (a push during the daily one) replaces the one in progress.
+concurrency:
+  group: jank-repros
+  cancel-in-progress: true
 
 jobs:
   repros:
@@ -90,10 +95,23 @@ jobs:
       - name: Sum up and compare with the recorded run
         run: |
           args="--platform $JANK_BUILD --repro specs/conformance/out/repro-runs/$JANK_BUILD.json --replica specs/conformance/out/replica-runs/$JANK_BUILD.json"
-          python3 specs/repro/check_runs.py $args --baseline new-baseline --write-baseline > /dev/null
           set +e
+          # What differs from the recorded run is run once more first: a race or a timeout
+          # that went the other way this time isn't a change.
+          python3 specs/repro/check_runs.py $args --changed-out changed.txt > /dev/null
+          if [ -s changed.txt ]; then
+            echo "Differs from the recorded run; running it again:"; cat changed.txt
+            files=$(sed -n 's/^repro //p' changed.txt)
+            tests=$(sed -n 's/^replica //p' changed.txt)
+            [ -n "$files" ] && python3 -u specs/repro/run_all.py $files
+            [ -n "$tests" ] && python3 -u specs/repro/run_replica_tests.py determinismo-workloads/workloads/jank-interop/lean/tests $tests
+          fi
+          python3 specs/repro/check_runs.py $args --baseline new-baseline --write-baseline > /dev/null
           python3 specs/repro/check_runs.py $args > summary.md
           status=$?
+          if [ -s changed.txt ]; then
+            printf '\nRun a second time before this comparison: %s\n' "$(sed 's/^[a-z]* //' changed.txt | tr '\n' ' ')" >> summary.md
+          fi
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
           exit $status
 

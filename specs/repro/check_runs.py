@@ -11,8 +11,9 @@ It exits 1 when something changed, so a scheduled job fails and says so; with no
 it only reports.
 
 What counts as a change: for a reproduction, what any of its checks got (temporary paths
-aside), or for the ones whose counts vary from run to run (VARIES), whether each check got what
-it expected; for a replica test, its outcome (pass, fail, exit N, timeout).
+aside), or for the ones whose counts vary from run to run or that show only sometimes (VARIES),
+its verdict; for a replica test, its outcome (pass, fail, exit N, timeout). --changed-out lists
+what changed, for the CI job to run it a second time before it compares again.
 """
 import argparse
 import json
@@ -42,9 +43,11 @@ def shape(repro):
         key = {}
         for i, c in enumerate(r.get("checks", [])):
             what = c["what"] or f"check {i + 1}"
-            key[what] = c["same"] if name in VARIES else norm_got(c["got"])
+            key[what] = norm_got(c["got"])
         key["(ended)"] = r["ended"] if not r["ended"].startswith("still running") else "still running"
-        out[name] = key
+        # Counts that vary from run to run, and findings that show only sometimes (N5): the
+        # verdict alone.
+        out[name] = {"verdict": r["verdict"]} if name in VARIES else key
     return out
 
 
@@ -79,6 +82,8 @@ def main():
     ap.add_argument("--baseline", default=os.path.join(HERE, "baseline"))
     ap.add_argument("--build", default=os.environ.get("JANK_BUILD_INFO", ""))
     ap.add_argument("--write-baseline", action="store_true")
+    ap.add_argument("--changed-out", help="write what changed here, to run it again: "
+                    "a line `repro FILE` or `replica TEST-ID` each")
     a = ap.parse_args()
 
     repro = json.load(open(a.repro))
@@ -113,7 +118,7 @@ def main():
     p("")
 
     path = os.path.join(a.baseline, a.platform + ".json")
-    changed = []
+    changed, again = [], []
     if os.path.exists(path):
         base = json.load(open(path))
         for name in sorted(set(base["repro"]) | set(now["repro"])):
@@ -123,15 +128,20 @@ def main():
                          for w in sorted(set(b or {}) | set(n or {}))
                          if (b or {}).get(w) != (n or {}).get(w)]
                 changed.append(f"- `{name}`: " + "; ".join(diffs[:4]))
+                again.append(f"repro {name}")
         for t in sorted(set(base["replica"]) | set(now["replica"])):
             b, n = base["replica"].get(t), now["replica"].get(t)
             if b != n:
                 changed.append(f"- `{t}`: {b} → {n}")
+                again.append(f"replica {t.split('-')[0]}")
         p(f"### Changes since the recorded run ({base.get('build') or 'build not recorded'})\n")
         p("\n".join(changed) if changed else "None.")
     else:
         p(f"### No recorded run for {a.platform}\n")
         p("This run can be recorded with `--write-baseline`.")
+    if a.changed_out:
+        with open(a.changed_out, "w") as f:
+            f.write("".join(x + "\n" for x in again))
     if a.write_baseline:
         os.makedirs(a.baseline, exist_ok=True)
         json.dump(now, open(path, "w"), indent=1, sort_keys=True, ensure_ascii=False)

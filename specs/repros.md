@@ -3133,7 +3133,10 @@ From the first round:
 From the Lean replica:
 
 - Refuted on main (jank behaves like Clojure): D3, D11, D14, D16b, D20, R45, R123 and one control.
-  D11, D14 and D20 were fixed after jank 0.1.
+  D11, D14 and D20 were fixed after jank 0.1. But D16b (a watch that `swap!`s its atom while
+  another thread adds a watch, 50 times) hangs on a 16-core Mac (macOS 15.1, the build of
+  2026-11-24: 2 runs of 2, stopped at 180 s), and passes on GitHub's Linux and macOS runners
+  (3 and 4 cores): a deadlock that needs more threads at once, not yet looked into.
 - Failed in another way than predicted: D15 (A2 here), D23, R89 (a C++ enum; no Clojure
   equivalent). Unclear: R54 (`b03`, "Invalid UTF-8 string." where reading past the end was
   predicted).
