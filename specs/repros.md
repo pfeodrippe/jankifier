@@ -2112,6 +2112,7 @@ The generated code puts `finally` in a `scope_exit` guard (`cpp_processor.cpp` 1
 
 - [ ] **LG6**: an exception thrown while a set hashes a lazy element ends the process (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 8: `(set (split-with (fn [x] (< x 3)) (partition-by identity [0 1 2 3 4])))`; minimized by hand on main 7135b7708).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26: terminate, hash, lazy).
+  Proposed fix, verified on a build of main 7135b7708: `std::hash` and `std::equal_to` of jank objects (object.hpp 667-686, object.cpp 367-392) drop `noexcept`, so the exception reaches the `catch`; the set case and a hash map's key then give `:caught`, and jank's 551 pass tests give the same 549 passes as without it (determinismo-workloads `jank-interop/fixes/LG6.diff`). The `NOLINTNEXTLINE(bugprone-exception-escape): TODO` on `equal_to` marks the same spot.
   - [ ] reported
 
 ```clojure
