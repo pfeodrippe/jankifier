@@ -21,7 +21,7 @@ They come from two places:
   published on 2026-11-20, `774d02f62`) and on Clojure 1.11.1. Unless noted, jank 0.1 and
   main give the same result.
 - The findings named D, R, LS, LU and LV were predicted by a Lean replica of jank written blind from its sources (determinismo's
-  `lean/jank`, rounds 1 to 6; round 3's S items appear here as LS, round 4's U items as LU and rounds 5 and 6's V items as LV, since S and U name this file's own; rounds 5 and 6 were run on jank main directly, each test in its own process with a 120 s limit; round 6 (LV51 to LV85, and new tests of S9, LG1–LG3, R5 and LS40) on 2026-11-26, its expected values checked on Clojure 1.12.3), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
+  `lean/jank`, rounds 1 to 7; round 3's S items appear here as LS, round 4's U items as LU and rounds 5 and 6's V items as LV and round 7's X items as LX, since S and U name this file's own; rounds 5 and 6 were run on jank main directly, each test in its own process with a 120 s limit; round 6 (LV51 to LV85, and new tests of S9, LG1–LG3, R5 and LS40) on 2026-11-26, its expected values checked on Clojure 1.12.3), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
   Linux, UTF-8 locale, each test in its own process with a 600 s limit, 120 s in round 3, through determinismo-ci)
   and on Clojure 1.11.1. The tests live with the replica, in determinismo-workloads'
   [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests): each asserts Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
@@ -161,7 +161,7 @@ clients evaluating at once, not this.
 Related, closed: #1187 (`if` with a typed object branch), #1025 (`case`
 default returning an unboxed value).
 
-- [ ] **R23**: an `if` whose branches are a long and a double literal returns a double (`r23`).
+- [ ] **R23**: an `if` whose branches are a long and a double literal returns a double (`r23`; `deviations_r7_test.jank`: `x3`).
   - [ ] reported
 
 ```clojure
@@ -261,7 +261,7 @@ cpp_util.cpp `find_branch_common_type` 1909–1995, for a compiled `if`. #1187 (
 
 `cpp_util.cpp` `literal_type` (615): booleans are C++ `bool`.
 
-- [ ] **LV64**: arithmetic on a predicate's result or a char array's element doesn't throw (`deviations_r6_test.jank`: `v64`).
+- [ ] **LV64**: arithmetic on a predicate's result or a char array's element doesn't throw (`deviations_r6_test.jank`: `v64`; `deviations_r7_test.jank`: `x15`, `x15b`, `x24`, `x24b`, `x24c`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
   - [ ] reported
 
@@ -384,6 +384,19 @@ processor.cpp `analyze_call` 3501–3533 → context.cpp `macroexpand` 639–661
 ```
 
 codegen/api.cpp 213–449 (`assoc_in_place`, `conj_in_place`); evaluate.cpp eval(map) 447–491 (`in_place_unique` 463/469) and eval(set) 493–509. Clojure: `RT.map`/`RT.set` → `createWithCheck`.
+
+- [ ] **LX1**: a `case` whose test constants share a hash (`{}` and `#{}`) finds neither, and with such a collision it takes a value equal to another test's hash for that test (`deviations_r7_test.jank`: `x1`, `x1b`, `x1c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+((fn [x] (case x {} :map #{} :set :none)) {})
+((fn [x] (case x {} :map #{} :set 4294967296 :big :none)) 987256456)
+;; jank => :none
+;;         :big
+;; clj  => :map
+;;         :none
+```
 
 - [ ] **LU3**: (LS44) `(eval (list 'quote v))` turns `v`'s `{}` metadata into nil (`deviations_r4_test.jank`: `u03`; on main: gave nil).
   - [ ] reported
@@ -625,6 +638,16 @@ ratio support in `/`).
 
 `core/math.cpp` `quot` (321) casts the double quotient to `i64` (338).
 
+- [ ] **LX9**: `quot` of a BigDecimal returns a long (`deviations_r7_test.jank`: `x9`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(quot 7.5M 2)
+;; jank => 3
+;; clj  => 3.0M
+```
+
 - [ ] **LG5**: `quot` of two longs past 2^53 loses precision: it divides as doubles (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 5; minimized by hand on main 7135b7708).
   Tracker: related: #1208 (open) lists `quot` of BigInts losing precision the same way; plain longs aren't in it.
   Proposed fix, verified on a build of main 7135b7708: `quot` of two integers (a long or a small integer each) divides them as integers (C++'s `/` truncates toward zero, as `quot` does); a double operand goes through `to_real` as before (determinismo-workloads `jank-interop/fixes/LG5.diff`). The BigInt cases (#1208) are left to it.
@@ -661,7 +684,7 @@ ratio support in `/`).
 
 `core/math.hpp` `abs`, object branch (1016): `data < 0ll` is false for -0.0.
 
-- [ ] **D7**: `bigdec` of a long goes through a double (`d07`).
+- [ ] **D7**: `bigdec` of a long goes through a double (`d07`; `deviations_r7_test.jank`: `x23`).
   - [ ] reported
 
 ```clojure
@@ -672,7 +695,7 @@ ratio support in `/`).
 
 `core/math.cpp` `to_big_decimal` (803) builds it from `to_real()`.
 
-- [ ] **D8**: BigDecimal `=` uses a double's epsilon (`d08`).
+- [ ] **D8**: BigDecimal `=` uses a double's epsilon (`d08`; `deviations_r7_test.jank`: `x22b`, `x22c`).
   - [ ] reported
 
 ```clojure
@@ -744,7 +767,7 @@ ratio support in `/`).
 (non-empty ones hash alike: `(hash (take 2 [1 2 3]))` equals `(hash '(1 2))`). Aside: jank's hashes
 are Clojure's read as unsigned (2277397642 = -2017569654 + 2^32).
 
-- [ ] **R24**: a `loop` local keeps its first value's native type (`r24`).
+- [ ] **R24**: a `loop` local keeps its first value's native type (`r24`; `deviations_r7_test.jank`: `x4`).
   - [ ] reported
 
 ```clojure
@@ -992,6 +1015,63 @@ ratio.cpp 108–111. Not reported: dividing a BigDecimal by zero gives `inf.0M`/
 
 The same path as LS2.
 
+- [ ] **LS2**: BigDecimal division isn't exact: boost divides by a Newton-iterated inverse, so `(/ 6.0M 3.0M)` is 1.99…9 (120 nines); round 3 called it refuted because jank's `=` on BigDecimals (D8) hid it (`deviations_r7_test.jank`: `x7`; `deviations_r3_test.jank`: `s02`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(str (/ 6.0M 3.0M))
+;; jank => "1.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999"
+;; clj  => "2"
+```
+
+- [ ] **LX2**: BigDecimal division by zero returns `inf.0M` or `nan.0M` instead of throwing (`deviations_r7_test.jank`: `x2`, `x2b`, `x2c`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(/ 1.0M 0.0M)
+((fn [a b] (/ a b)) 0.0M 0.0M)
+(/ 1.5M 0)
+;; jank => inf.0M
+;;         nan.0M
+;;         inf.0M
+;; clj  => throws ArithmeticException "Divide by zero" (each)
+```
+
+- [ ] **LX11**: a BigDecimal divided by a ratio whose quotient doesn't terminate returns a value instead of throwing (`deviations_r7_test.jank`: `x11`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(/ 1.0M 1/3)
+;; jank => 3.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001M
+;; clj  => throws ArithmeticException "Non-terminating decimal expansion; no exact representable decimal result."
+```
+
+- [ ] **LX12**: a BigDecimal divided by a double is a BigDecimal (LS6's path for division) (`deviations_r7_test.jank`: `x12`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(/ 1.0M 0.1)
+;; jank => 9.999999999999999444888487687421760603063276150361782076232622353718522343744992480012315564097820085747405410968586495099M
+;; clj  => 10.0
+```
+
+- [ ] **LX5**: a BigDecimal's hash isn't Clojure's (`deviations_r7_test.jank`: `x5`, `x5b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(hash 1.5M)
+(apply hash [1.0M])
+;; jank => 154574889
+;;         3307139568
+;; clj  => 466
+;;         31
+```
+
 - [ ] **LU2**: (LS9) `(compare 0.1M (bigdec 0.1))`: Clojure 0, jank -1 (`deviations_r4_test.jank`: `u02`; on main: gave -1).
   - [ ] reported
 
@@ -1118,7 +1198,7 @@ transient_array_map.cpp 47, 52, 62, 146 lack `assert_active()`; `to_persistent` 
 
 - persistent_hash_map.cpp 110 → immer map.hpp 400 → champ.hpp 604–606 (`copy_inner_replace_value`, the whole pair) and 577–581 (collision nodes); - transient paths: champ.hpp 697–699, 654; - sets: persistent_hash_set.cpp 151 → set.hpp 220; transient_hash_set.cpp 46. - Below 8 entries the array map keeps the stored key (native_array_map.cpp 139–162). - Clojure keeps the stored key: BitmapIndexedNode.assoc 704; PersistentHashSet.cons 98–101.
 
-- [ ] **LV84**: after an unrelated element is added, a hash set no longer finds -0.0 when it holds 0.0 (`deviations_r6_test.jank`: `v84`, `v84b`).
+- [ ] **LV84**: after an unrelated element is added, a hash set no longer finds -0.0 when it holds 0.0 (`deviations_r6_test.jank`: `v84`, `v84b`; `deviations_r7_test.jank`: `x21b`, `x21c`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
   - [ ] reported
 
@@ -1447,7 +1527,7 @@ break `=` and `hash` themselves.
 ;; clj  => -1107437598
 ```
 
-- [ ] **LV83**: keywords and symbols hash differently from Clojure (`deviations_r6_test.jank`: `v83`).
+- [ ] **LV83**: keywords and symbols hash differently from Clojure (`deviations_r6_test.jank`: `v83`; `deviations_r7_test.jank`: `x26`, `x26b`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
   - [ ] reported
 
@@ -1497,7 +1577,7 @@ break `=` and `hash` themselves.
 ;; clj  => 55357
 ```
 
-- [ ] **LV79**: `char` of a number past a char's range returns a character (`deviations_r6_test.jank`: `v79`).
+- [ ] **LV79**: `char` of a number past a char's range returns a character (`deviations_r6_test.jank`: `v79`; `deviations_r7_test.jank`: `x25`, `x25b`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
   - [ ] reported
 
@@ -1557,7 +1637,7 @@ break `=` and `hash` themselves.
 (clojure.string/index-of "a" "" 5)          ; jank => nil   clj => 1
 ```
 
-- [ ] **LV75**: `split` on an empty pattern splits a non-ASCII character into its bytes (`deviations_r6_test.jank`: `v75`).
+- [ ] **LV75**: `split` on an empty pattern splits a non-ASCII character into its bytes (`deviations_r6_test.jank`: `v75`; `deviations_r7_test.jank`: `x19`, `x19b`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
   - [ ] reported
 
@@ -1616,7 +1696,7 @@ break `=` and `hash` themselves.
 
 `string_native.cpp` 271, 304: C `isspace` on bytes.
 
-- [ ] **R60**: case mapping is one code point at a time (`b09`).
+- [ ] **R60**: case mapping is one code point at a time (`b09`; `deviations_r7_test.jank`: `x18`, `x18b`, `x18c`, `x18d`, `x18e`, `x18f`, `x18g`, `x18h`).
   - [ ] reported
 
 ```clojure
@@ -1693,7 +1773,7 @@ break `=` and `hash` themselves.
 
 `re_pattern.cpp` 23.
 
-- [ ] **R72**: BigDecimals lose their scale and gain `.0` (`b19`).
+- [ ] **R72**: BigDecimals lose their scale and gain `.0` (`b19`; `deviations_r7_test.jank`: `x7b`, `x7c`, `x7d`).
   - [ ] reported
 
 ```clojure
@@ -1987,6 +2067,16 @@ lex.cpp 905–915 (a radix-8 numerator drops only its first 0) and 916–935 (a 
 ```
 
 lex.cpp 1123–1132 → `rd_string` 2104–2112, 2351–2375.
+
+- [ ] **LX27**: a ratio with a negative denominator is read (`deviations_r7_test.jank`: `x27`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(read-string "1/-2")
+;; jank => -1/2
+;; clj  => throws NumberFormatException "Invalid number: 1/-2"
+```
 
 - [ ] **LU40**: no `:line`, `:column`, `:file`, `:name` or `:ns` metadata on read lists and defined vars; the nREPL's line/column fields never reach it (`deviations_r4_test.jank`: `u40`, `u40b`, `u40c`; on main: gave nil).
   - [ ] reported
@@ -2328,7 +2418,7 @@ evaluate.cpp `safe_eval` 750: the `exception_info` made from an `error_ref` gets
 
 ## Crashes
 
-- [ ] **D9**: on x86-64 the hardware's default NaN crashes jank (`deviations_test.jank`: `d09`, `d09b`).
+- [ ] **D9**: on x86-64 the hardware's default NaN crashes jank (`deviations_test.jank`: `d09`, `d09b`; `deviations_r7_test.jank`: `x16`, `x16b`, `x16c`, `x16d`).
   On macOS arm64 (build of 2026-11-24) its tests pass: AArch64's default NaN is a real NaN, as said above.
   - [ ] reported
 
@@ -2617,6 +2707,19 @@ multi_function.cpp `add_method` 145–153 holds the recursive mutex while hashin
 ```
 
 An `iterator` isn't metadatable, and meta.cpp 50–53 builds the error's text from the infinite seq. Lean theorem `c2_iterate_with_meta`.
+
+- [ ] **LX17**: `dotimes` and a `loop` counter past 2^31 wrap to -2147483648 and never end (the counter is a native int; `recur` stores the long back into it) (`deviations_r7_hangs_test.jank`: `x17`, `x17b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(dotimes [i 2147483649] (when (neg? i) (throw (ex-info "wrapped" {:i i}))))
+(loop [i 0] (cond (neg? i) i (< i 2147483649) (recur (inc i)) :else :done))
+;; jank => throws, :i -2147483648 (without the guard: never ends)
+;;         -2147483648
+;; clj  => nil (ends)
+;;         :done
+```
 
 ## Throws or doesn't compile where Clojure works
 
@@ -3210,6 +3313,19 @@ Round 4 predicts `flush` the same; this run stopped at `newline`.
 
 Also predicted unported: `into-array`, `indexed?`, `special-symbol?`, `instance?`, `class`, `with-open`, `line-seq`, the struct and stream functions, `reader-conditional`.
 
+- [ ] **LX6**: `with-precision` throws "TODO: port with-precision" and `*math-context*` is undefined (`deviations_r7_test.jank`: `x6`, `x6b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(with-precision 10 (/ 1M 3))
+*math-context*
+;; jank => throws "TODO: port with-precision"
+;;         "The symbol `*math-context*` could not be resolved"
+;; clj  => 0.3333333333M
+;;         nil
+```
+
 - [ ] **LU80**: `reduce-kv` over a seq of map entries throws (`deviations_r4_test.jank`: `u80`; on main: threw "Objects of type `persistent_array_map_sequence` do not support `reduce-kv`").
   - [ ] reported
 
@@ -3255,7 +3371,7 @@ shell.jank 52–73 closes stdin and calls `process.wait()` before reading stdout
 
 `cpp/cast std.string` of a non-string (convert/builtin.hpp 333–336).
 
-- [ ] **LV7**: read, analysis and load errors are `jank::error_ref`, which no `(catch ... e)` of an object sees, so no `thrown?` does (`deviations_r5_test.jank`: `v07`, `v07b`, `v07c`).
+- [ ] **LV7**: read, analysis and load errors are `jank::error_ref`, which no `(catch ... e)` of an object sees, so no `thrown?` does (`deviations_r5_test.jank`: `v07`, `v07b`, `v07c`; `deviations_r7_test.jank`: `x20`, `x20b`, `x20c`, `x20d`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25 by mechanism and error text).
   - [ ] reported
 
@@ -3544,7 +3660,7 @@ From the Lean replica:
   another bug first (the `#inst` locale, its entry above); LU88-LU90 (jank.shell) confirmed in a
   second rerun once the test image had Boost's headers (jank's package depends on libboost-all-dev;
   the coverage image lacked them, and `(require 'jank.shell)` failed to compile).
-- Round 3: refuted on main LS2 (BigDecimal division), LS9 (`bigdec` of a double), LS44 (`eval`
+- Round 3: refuted on main LS2 (BigDecimal division; confirmed in round 7, its entry above), LS9 (`bigdec` of a double), LS44 (`eval`
   of a quoted object's metadata), LS69 (an `ex-info` across a `finally`). The replica's round 4
   found LS2, LS9 and LS44's tests unable to see the prediction (jank's `=` on BigDecimals has
   D8's tolerance; LS44's metadata is one the strip pass keeps) and re-tests them with `compare`
