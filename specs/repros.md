@@ -21,7 +21,7 @@ They come from two places:
   published on 2026-11-20, `774d02f62`) and on Clojure 1.11.1. Unless noted, jank 0.1 and
   main give the same result.
 - The findings named D, R, LS, LU and LV were predicted by a Lean replica of jank written blind from its sources (determinismo's
-  `lean/jank`, rounds 1 to 5; round 3's S items appear here as LS, round 4's U items as LU and round 5's V items as LV, since S and U name this file's own; round 5 was run on jank main directly, each test in its own process with a 120 s limit), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
+  `lean/jank`, rounds 1 to 6; round 3's S items appear here as LS, round 4's U items as LU and rounds 5 and 6's V items as LV, since S and U name this file's own; rounds 5 and 6 were run on jank main directly, each test in its own process with a 120 s limit; round 6 (LV51 to LV85, and new tests of S9, LG1–LG3, R5 and LS40) on 2026-11-26, its expected values checked on Clojure 1.12.3), then checked on 2026-11-25 on jank main (`7135b7708`, x86-64
   Linux, UTF-8 locale, each test in its own process with a 600 s limit, 120 s in round 3, through determinismo-ci)
   and on Clojure 1.11.1. The tests live with the replica, in determinismo-workloads'
   [jank-interop/lean/tests](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/jank-interop/lean/tests): each asserts Clojure's result, so each fails on jank, and all pass on Clojure 1.11.1 except where noted. jank's
@@ -186,6 +186,16 @@ interpreted.
 
 `processor.cpp` `analyze_case` (1483–1581) with `cpp_util.cpp` 1908. Related: S7/S8 here.
 
+- [ ] **LV52**: an `if` or `case` whose branches are a hash and a negative number converts the number to unsigned (`deviations_r6_test.jank`: `v52`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+((fn [c] (if c (hash 1) -1)) false)
+;; jank => 4294967295
+;; clj  => -1
+```
+
 - [ ] **LU7**: (LS57, narrowed) inside a fn, `(if c 1 cpp/gd)` gives 2 where Clojure gives 2.5. At the top level, jank gives Clojure's result (`deviations_r4_test.jank`: `u07`; on main: gave 2).
   - [ ] reported
 
@@ -250,6 +260,15 @@ cpp_util.cpp `find_branch_common_type` 1909–1995, for a compiled `if`. #1187 (
 ```
 
 `cpp_util.cpp` `literal_type` (615): booleans are C++ `bool`.
+
+- [ ] **LV64**: arithmetic on a predicate's result or a char array's element doesn't throw (`deviations_r6_test.jank`: `v64`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(+ (nil? nil) 1)                   ; jank => 2    clj => ClassCastException
+(+ (aget (char-array "a") 0) 1)    ; jank => 98   clj => ClassCastException
+```
 
 - [ ] **R34**: `(:k)` doesn't throw (`r34`).
   - [ ] reported
@@ -476,16 +495,19 @@ CppInterOp `BestOverloadMatch` 2203 adds no built-in candidates.
 
 ### Numbers
 
-- [ ] **S9**: arithmetic on `count`'s result is unsigned (`repro/count-arithmetic-unsigned.cljc`).
+- [ ] **S9**: arithmetic on `count`'s result is unsigned (`repro/count-arithmetic-unsigned.cljc`; `deviations_r6_test.jank`: `v49`, `v50`).
   - [ ] reported
 
 ```clojure
 (< (- (count "abc") 4) 0)
 ;; jank => false
 ;; clj  => true
+(inc (- (count []) 1))      ; jank throws "Overflow on increment."   clj => 0
+(/ (count [1 2 3]) -1)      ; jank => 0                      clj => -3
+(/ -6 (count [1 2]))        ; jank => 9223372036854775805    clj => -3
 ```
 
-- [ ] **LG1**: `<`, `>`, `min` and `max` compare `count`'s result with a negative number as unsigned (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; S9's root, in comparisons).
+- [ ] **LG1**: `<`, `>`, `min` and `max` compare `count`'s result with a negative number as unsigned (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; S9's root, in comparisons; `deviations_r6_test.jank`: `lg1`, `lg1b`, `lg1c`, `lg1d`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
   Proposed fix, verified on a build of main 7135b7708: `count` returns an `i64` (`cpp/cast cpp/jtl.i64` around `sequence_length`, its fn and its `:inline`), so comparisons and arithmetic see a signed number (determinismo-workloads `jank-interop/fixes/LG1.diff`).
   - [ ] reported
@@ -495,9 +517,40 @@ CppInterOp `BestOverloadMatch` 2203 adds no built-in candidates.
 (min (count [1 2 3]) -1)      ; jank => 3      clj => -1
 (< -1 (count [1]))            ; jank => false  clj => true
 (< -1 (long (count [1])))     ; jank => true   clj => true
+((fn [x] (< x (count [1]))) -1)     ; jank => false  clj => true   (a parameter, too)
+(< (int -1) (count [1]))            ; jank => false  clj => true
+(< -1 (alength (long-array 2)))     ; jank => false  clj => true   (alength, too)
+((fn [x] (max (count [1]) x)) -1)   ; jank => -1     clj => 1
 ```
 
-- [ ] **LG2**: long overflow wraps silently in `*` and `+`; Clojure throws (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`).
+- [ ] **LV58**: `min` and `max` of two numbers of different types return their common C++ type, not the chosen operand (`deviations_r6_test.jank`: `v58`, `v58b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(min 1 2.5)      ; jank => 1.0    clj => 1
+(min 0.0 -0.0)   ; jank => 0.0    clj => -0.0
+```
+
+- [ ] **LV56**: `min` and `max` drop a NaN operand (`deviations_r6_test.jank`: `v56`, `v56b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(min 1.0 ##NaN)                  ; jank => 1.0   clj => ##NaN
+((fn [a b] (min a b)) ##NaN 1)   ; jank => 1     clj => ##NaN
+```
+
+- [ ] **LV57**: on a tie, `max` returns its first operand; Clojure's returns its second (`deviations_r6_test.jank`: `v57`, `v57b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+((fn [a b] (max a b)) 1 1.0)   ; jank => 1   clj => 1.0
+(apply max [1 1.0])            ; jank => 1   clj => 1.0
+```
+
+- [ ] **LG2**: long overflow wraps silently in `*` and `+`; Clojure throws (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; `deviations_r6_test.jank`: `lg2`, `lg2b`, `lg2c`, `lg2d`, `lg2e`).
   Corrected 2026-11-26 (seed 3): the first report's BigInt results on Long/MIN_VALUE (`dec`, `-`,
   a let-bound `*`) come from R5, the literal `-9223372036854775808` read as a BigInt; on a long
   minimum computed as `(- -9223372036854775807 1)`, `dec` throws "Overflow on increment." (Clojure:
@@ -512,6 +565,40 @@ CppInterOp `BestOverloadMatch` 2203 adds no built-in candidates.
 (inc 9223372036854775807)                   ; jank throws "Overflow on increment."     clj => ArithmeticException
 (dec (- -9223372036854775807 1))            ; jank throws "Overflow on increment."     clj => ArithmeticException
 ;; R5, not LG2: (dec -9223372036854775808)  ; jank => -9223372036854775809N (the literal is a BigInt)
+(let [a 9223372036854775807 b 2] (* a b))       ; jank => -2                     clj => ArithmeticException
+((fn [a b] (* a b)) 3037000500 3037000500)      ; jank => -9223372036709301616   clj => ArithmeticException (objects too)
+((fn [x] (- x)) (dec' -9223372036854775807))    ; jank => -9223372036854775808   clj => ArithmeticException
+```
+
+- [ ] **LV53**: two `let`-bound integers multiply as C++ `int`s and wrap at 32 bits (`deviations_r6_test.jank`: `v53`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [a 65536] (* a a))
+;; jank => 0
+;; clj  => 4294967296
+```
+
+- [ ] **LV54**: `-'` past the long minimum wraps instead of promoting (`deviations_r6_test.jank`: `v54`).
+  Round 1's test of this (D3) couldn't reach it and called it refuted.
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(-' (dec' -9223372036854775807) 1)
+;; jank => 9223372036854775807N
+;; clj  => -9223372036854775809N
+```
+
+- [ ] **LV55**: subtracting the long minimum through a fn returns the exact difference where Clojure throws, and `-'` returns a long where Clojure returns a BigInt (`deviations_r6_test.jank`: `v55`).
+  Low harm: Clojure's own `-` on objects negates its second operand first.
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+((fn [a b] (- a b)) -1 (dec' -9223372036854775807))    ; jank => 9223372036854775807    clj => ArithmeticException
+((fn [a b] (-' a b)) -1 (dec' -9223372036854775807))   ; jank => 9223372036854775807    clj => 9223372036854775807N
 ```
 
 - [ ] **D2**: `/` on two integers is C++ integer division (`d02`).
@@ -621,6 +708,15 @@ ratio support in `/`).
 ```
 
 `big_integer::to_hash` (155) combines boost's limbs instead of hashing as a long.
+
+- [ ] **LV51**: `hash` is never negative: it is an unsigned 32-bit value, and arithmetic on it is unsigned (`deviations_r6_test.jank`: `v51`, `v51b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(hash 2)         ; jank => 3323962100   clj => -971005196
+(- (hash 0) 1)   ; jank => 4294967295   clj => -1
+```
 
 - [ ] **D13**: `hash-unordered-coll` is never the hash of the set of the same elements (`d13`).
   - [ ] reported
@@ -823,6 +919,15 @@ math.hpp `div` 299–340, using cpp_int's `/`.
 
 ratio.cpp 87–101.
 
+- [ ] **LV59**: ratio arithmetic with a whole-number result returns a long; Clojure returns a BigInt (`deviations_r6_test.jank`: `v59`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(+ 1/2 1/2)          ; jank => 1   clj => 1N
+(apply - [3/2 1/2])  ; jank => 1   clj => 1N
+```
+
 - [ ] **LS21**: `(double -7/3)` divides two doubles (`deviations_r3_test.jank`: `s21`; on main: `(double -7/3)` gave `-2.3333333333333335`).
   - [ ] reported
 
@@ -832,7 +937,17 @@ ratio.cpp 87–101.
 
 ratio.cpp 108–111. Not reported: dividing a BigDecimal by zero gives `inf.0M`/`nan.0M`; the book documents this behavior (68 questions). Also noted: `numerator`, `denominator` and `biginteger` print as `1N`, and `rationalize` is unported.
 
-- [ ] **LS40**: float-to-integer conversions in emitted code have no range check (`deviations_r3_test.jank`: `s40`; on main: `(int 2147483648)` returned, no exception).
+- [ ] **LV61**: `numerator` and `denominator` print as BigInts (`deviations_r6_test.jank`: `v61`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+((fn [x] (numerator x)) 1/2)
+;; jank => 1N
+;; clj  => 1
+```
+
+- [ ] **LS40**: float-to-integer conversions in emitted code have no range check (`deviations_r3_test.jank`: `s40`; `deviations_r6_test.jank`: `v60`; on main: `(int 2147483648)` returned, no exception).
   - [ ] reported
 
 ```clojure
@@ -840,9 +955,30 @@ ratio.cpp 108–111. Not reported: dividing a BigDecimal by zero gives `inf.0M`/
 (int 1e20)                                             ; Clojure throws   jank -O0 -9223372036854775808; -O1+ UB
 (int 2147483648)                                       ; Clojure throws   jank 2147483648
 ((fn [^cpp/long p] p) 1e20)                            ; Clojure throws   jank UB inside libjank
+((fn [x] (long x)) 1e20)                               ; Clojure throws   jank -9223372036854775808 (x86-64)
+((fn [x] (long x)) ##Inf)                              ; Clojure throws   jank -9223372036854775808 (x86-64)
 ```
 
 (a) cpp_processor.cpp 1708–1716 (`static_cast<int>`); (b, c) math.hpp `to_int` 1410–1420; (d) `from_object` → `to_integer`; analyze_recur 2183–2214 → apply_implicit_conversion 1088–1118.
+
+- [ ] **LV62**: `float` returns a double: no single-precision rounding, no range check (`deviations_r6_test.jank`: `v62`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(== (float 0.1) 0.1)   ; jank => true    clj => false
+(float 1e40)           ; jank => 1e+40   clj => IllegalArgumentException: Value out of range for float
+```
+
+- [ ] **LV63**: arithmetic on a float array's element stays in single precision; Clojure widens it to a double (`deviations_r6_test.jank`: `v63`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(+ (aget (float-array [0.1]) 0) 1)
+;; jank => 1.100000023841858
+;; clj  => 1.1000000014901161
+```
 
 - [ ] **LU1**: (LS2) `(compare 2M (/ 6M 3M))`: Clojure 0, jank 1 (`deviations_r4_test.jank`: `u01`; on main: gave 1).
   - [ ] reported
@@ -982,6 +1118,17 @@ transient_array_map.cpp 47, 52, 62, 146 lack `assert_active()`; `to_persistent` 
 
 - persistent_hash_map.cpp 110 → immer map.hpp 400 → champ.hpp 604–606 (`copy_inner_replace_value`, the whole pair) and 577–581 (collision nodes); - transient paths: champ.hpp 697–699, 654; - sets: persistent_hash_set.cpp 151 → set.hpp 220; transient_hash_set.cpp 46. - Below 8 entries the array map keeps the stored key (native_array_map.cpp 139–162). - Clojure keeps the stored key: BitmapIndexedNode.assoc 704; PersistentHashSet.cons 98–101.
 
+- [ ] **LV84**: after an unrelated element is added, a hash set no longer finds -0.0 when it holds 0.0 (`deviations_r6_test.jank`: `v84`, `v84b`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [s1 (hash-set 0.0) s2 (conj s1 2.0)]
+  [(contains? s1 -0.0) (contains? s2 -0.0) (contains? (disj s2 2.0) -0.0)])
+;; jank => [true false true]
+;; clj  => [true true true]
+```
+
 - [ ] **LU81**: `zipmap` keeps the last of two equal keys (`deviations_r4_test.jank`: `u81`; on main: gave `(1)`).
   - [ ] reported
 
@@ -1060,6 +1207,17 @@ walk.jank 3–12. Lean theorems `jank_walk_drops_list_meta`, `walk_vec_meta_agre
 
 ```clojure
 (let [x (seq "é")] [(contains? (hash-set x) x) (count (hash-set x x)) (get (hash-map x 1) x)])
+;; jank => [false 2 nil]
+;; clj  => [true 1 1]
+```
+
+- [ ] **LV85**: a hash set or map doesn't find the very NaN object it holds (`deviations_r6_test.jank`: `v85`).
+  LV48's other cause: Clojure finds an identical object before comparing values.
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [x ##NaN] [(contains? (hash-set x) x) (count (hash-set x x)) (get (hash-map x 1) x)])
 ;; jank => [false 2 nil]
 ;; clj  => [true 1 1]
 ```
@@ -1269,6 +1427,55 @@ break `=` and `hash` themselves.
 
 `persistent_string_sequence.cpp` 72.
 
+- [ ] **LV70**: a character hashes differently from Clojure (Clojure: its code) (`deviations_r6_test.jank`: `v70`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(hash \a)
+;; jank => 1455541201
+;; clj  => 97
+```
+
+- [ ] **LV71**: a non-ASCII string hashes differently from Clojure (`deviations_r6_test.jank`: `v71`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(hash "\u00e9")
+;; jank => 958611385
+;; clj  => -1107437598
+```
+
+- [ ] **LV83**: keywords and symbols hash differently from Clojure (`deviations_r6_test.jank`: `v83`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(hash :c)        ; jank => 1458033393   clj => -1763192079
+(hash 'b/c)      ; jank => 1685731265   clj => -122660454
+```
+
+- [ ] **LV80**: `keyword` with a namespace holding `/` keeps only its first part (`deviations_r6_test.jank`: `v80`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(namespace (keyword "a/b" "c"))
+;; jank => "a"
+;; clj  => "a/b"
+```
+
+- [ ] **LV81**: `symbol` with a nil namespace splits its name at `/` (`deviations_r6_test.jank`: `v81`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(namespace (symbol nil "b/c"))
+;; jank => "b"
+;; clj  => nil
+```
+
 - [ ] **R53**: `seq` walks code points, disagreeing with jank's own `count` (`b02`).
   - [ ] reported
 
@@ -1279,6 +1486,25 @@ break `=` and `hash` themselves.
 ```
 
 `persistent_string_sequence.cpp` 78, 122, 128.
+
+- [ ] **LV77**: the first character of an emoji is the whole code point; Clojure's is the high surrogate (`deviations_r6_test.jank`: `v77`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(int (first "\ud83d\ude00"))
+;; jank => 128512
+;; clj  => 55357
+```
+
+- [ ] **LV79**: `char` of a number past a char's range returns a character (`deviations_r6_test.jank`: `v79`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(char -4294967231)   ; jank => \A    clj => IllegalArgumentException: Value out of range for char
+(char 128512)        ; jank => \😀   clj => IllegalArgumentException: Value out of range for char
+```
 
 - [ ] **R57**: strings compare in UTF-8 byte order (`b06`).
   - [ ] reported
@@ -1291,6 +1517,25 @@ break `=` and `hash` themselves.
 
 `immutable_string.hpp` 576.
 
+- [ ] **LV72**: `compare` of strings returns the difference of their byte lengths or bytes; Clojure's counts UTF-16 units (`deviations_r6_test.jank`: `v72`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(compare "\u00e9" "")    ; jank => 2    clj => 1
+(compare "\u00e9" "e")   ; jank => 94   clj => 132
+```
+
+- [ ] **LV73**: `compare` of characters subtracts their first bytes (`deviations_r6_test.jank`: `v73`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(compare (first "\u00e9") \e)
+;; jank => 94
+;; clj  => 132
+```
+
 - [ ] **R58**: `index-of` returns a byte index (`b07`).
   - [ ] reported
 
@@ -1302,7 +1547,27 @@ break `=` and `hash` themselves.
 
 `string.jank` 227/240 → `string_native.cpp` 257/264.
 
-- [ ] **LG3**: `subs` indexes bytes, not characters (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; R58's class, in `subs`).
+- [ ] **LV74**: `index-of` and `last-index-of` with a start outside the string give nil or the wrong index; Java clamps it (`deviations_r6_test.jank`: `v74`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(clojure.string/index-of "a" "a" -1)        ; jank => nil   clj => 0
+(clojure.string/last-index-of "aa" "a" -1)  ; jank => 1     clj => nil
+(clojure.string/index-of "a" "" 5)          ; jank => nil   clj => 1
+```
+
+- [ ] **LV75**: `split` on an empty pattern splits a non-ASCII character into its bytes (`deviations_r6_test.jank`: `v75`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(clojure.string/split "a\u00e9b" #"")
+;; jank => ["a" "\xc3" "\xa9" "b"]
+;; clj  => ["a" "é" "b"]
+```
+
+- [ ] **LG3**: `subs` indexes bytes, not characters (found by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 1, shrunk), run on jank main `7135b7708`; R58's class, in `subs`; `deviations_r6_test.jank`: `lg3`).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-25).
   - [ ] reported
 
@@ -1310,6 +1575,34 @@ break `=` and `hash` themselves.
 (subs "é-è" 2)
 ;; jank => "-è"
 ;; clj  => "è"
+```
+
+- [ ] **LV65**: `nth` of a string returns one byte (`deviations_r6_test.jank`: `v65`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(nth "\u00e9" 0)        ; jank => the byte 0xC3   clj => \é
+(nth "\u00e9a" 2 :nf)   ; jank => \a              clj => :nf
+```
+
+- [ ] **LV66**: `get` and `contains?` on a string index bytes (`deviations_r6_test.jank`: `v66`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(get "\u00e9a" 1)        ; jank => the byte 0xA9   clj => \a
+(contains? "\u00e9" 1)   ; jank => true             clj => false
+```
+
+- [ ] **LV67**: `upper-case` of a string cut inside a character returns "" or throws (`deviations_r6_test.jank`: `v67`).
+  LG3 makes the cut; Clojure's `subs` never cuts a character.
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(clojure.string/upper-case (subs "\u00e9" 0 1))   ; jank => ""                                  clj => "É"
+(clojure.string/upper-case (subs "\u00e9" 1))     ; jank throws "wstring_convert::from_bytes"  clj => ""
 ```
 
 - [ ] **R59**: `trim` keeps Unicode whitespace (`b08`).
@@ -1530,13 +1823,16 @@ exception_info.cpp 80–83. Lean theorem `jank_printed_via_wrong`.
 
 `lex.cpp` 1168.
 
-- [ ] **R5**: the int64 minimum reads as a BigInt (`a05`).
+- [ ] **R5**: the int64 minimum reads as a BigInt (`a05`; `deviations_r6_test.jank`: `lg2f`).
   - [ ] reported
 
 ```clojure
 (pr-str (read-string "-9223372036854775808"))
 ;; jank => "-9223372036854775808N"
 ;; clj  => "-9223372036854775808"
+;; its arithmetic then gives BigInts where Clojure throws or keeps a long:
+(let [x -9223372036854775808] (* x 2))   ; jank => -18446744073709551616N   clj => ArithmeticException
+(inc -9223372036854775808)               ; jank => -9223372036854775807N    clj => -9223372036854775807
 ```
 
 `lex.cpp` 1145–1156: `strtoll` on the digits after the `-` overflows.
@@ -1606,6 +1902,16 @@ The duplicate check (`parse.cpp` 722–743) compares hashes, and `1`/`1N` hash d
 ```
 
 `lex.cpp` 558 uses byte-level `isspace`. Related: #224 (closed, U+2007 on macOS).
+
+- [ ] **LV76**: a lone surrogate escape in a string reads as `?` (`deviations_r6_test.jank`: `v76`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(int (first "\ud83d"))
+;; jank => 63
+;; clj  => 55357
+```
 
 - [ ] **R16**: `:/` reads as a keyword with an empty name (`a16`).
   - [ ] reported
@@ -2381,6 +2687,37 @@ Related, closed: #1023 (`if` with two strings of the same length).
 
 `util/escape.cpp` `unescape` (35–145) has no octal case.
 
+- [ ] **LV68**: `reverse` of a string cut inside a character throws (`deviations_r6_test.jank`: `v68`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(clojure.string/reverse (subs "\u00e9" 1))
+;; jank throws "Invalid UTF-8 string."
+;; clj  => ""
+```
+
+- [ ] **LV69**: the seq of a string holding a cut character throws (`deviations_r6_test.jank`: `v69`).
+  R54's first test (`b03`, "unclear" below) predicted this; round 6's confirms it.
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(let [s (str "a" (nth "\u00e9" 0))] [(count (seq s)) (count (vec (seq s)))])
+;; jank throws "position outside of string"
+;; clj  => [2 2]
+```
+
+- [ ] **LV78**: `char` of a surrogate code throws (`deviations_r6_test.jank`: `v78`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(int (char 55296))
+;; jank throws "Unfinished character: 55296"
+;; clj  => 55296
+```
+
 - [ ] **R12**: `#()` rejects `%10` and up (`a12`).
   - [ ] reported
 
@@ -2490,6 +2827,15 @@ Related, closed: #1023 (`if` with two strings of the same length).
 ```
 
 `core.jank` 41.
+
+- [ ] **LV82**: `char-name-string` and `char-escape-string` don't exist (`deviations_r6_test.jank`: `v82`).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26).
+  - [ ] reported
+
+```clojure
+(char-name-string \space)     ; jank: "The symbol `clojure.core/char-name-string` could not be resolved."   clj => "space"
+(char-escape-string \newline) ; jank: "The symbol `clojure.core/char-escape-string` could not be resolved." clj => "\\n"
+```
 
 - [ ] **R96**: booleans can't be compared with each other (`c01`).
   - [ ] reported
@@ -3182,14 +3528,14 @@ From the first round:
 
 From the Lean replica:
 
-- Refuted on main (jank behaves like Clojure): D3, D11, D14, D16b, D20, R45, R123 and one control.
+- Refuted on main (jank behaves like Clojure): D11, D14, D16b, D20, R45, R123 and one control.
   D11, D14 and D20 were fixed after jank 0.1. But D16b (a watch that `swap!`s its atom while
   another thread adds a watch, 50 times) hangs on a 16-core Mac (macOS 15.1, the build of
   2026-11-24: 2 runs of 2, stopped at 180 s), and passes on GitHub's Linux and macOS runners
   (3 and 4 cores): a deadlock that needs more threads at once, not yet looked into.
 - Failed in another way than predicted: D15 (A2 here), D23, R89 (a C++ enum; no Clojure
-  equivalent). Unclear: R54 (`b03`, "Invalid UTF-8 string." where reading past the end was
-  predicted).
+  equivalent). R54 (`b03`, "Invalid UTF-8 string." where reading past the end was predicted):
+  round 6's test confirms it as LV69. D3, refuted by round 1's test, is LV54 since round 6.
 - `b01`, `b11`, `b24`, `b29` (R52, R62, R78, R83) first had no result: their failure reports held
   invalid UTF-8 or a NUL, which the test runner's `grep` read as a binary file. Rerun with round 4,
   all four confirmed (rounds 1 and 2: 108 of 120).
