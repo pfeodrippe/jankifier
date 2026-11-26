@@ -1,0 +1,107 @@
+# The reproductions of specs/repros.md and the Lean replica's tests, on the latest build of
+# jank's main, on Linux x86-64 (jank's apt package) and macOS on Apple Silicon (the tarball
+# Homebrew installs). Each job sums up its run per repros.md item (specs/repro/check_runs.py)
+# and compares it with the run recorded in specs/repro/baseline/PLATFORM.json: it fails when
+# something changed (a test that starts passing is likely a fix), and keeps this run, ready to
+# be recorded, among its artifacts.
+name: jank repros
+
+on:
+  schedule:
+    - cron: "30 7 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "specs/repro/**"
+      - "specs/repros.md"
+      - "specs/install-jank-main.sh"
+      - ".github/workflows/jank-repros.yml"
+
+jobs:
+  repros:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86-64
+            os: ubuntu-24.04
+          - platform: macos-arm64
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      JANK_BUILD: ${{ matrix.platform }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the Lean replica's tests
+        uses: actions/checkout@v4
+        with:
+          repository: determinismo-dst/determinismo-workloads
+          path: determinismo-workloads
+          sparse-checkout: workloads/jank-interop/lean/tests
+
+      - name: Install jank (apt)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl gnupg lsb-release locales
+          curl -s https://ppa.jank-lang.org/KEY.gpg | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/jank.gpg >/dev/null
+          echo "deb [signed-by=/etc/apt/trusted.gpg.d/jank.gpg] https://ppa.jank-lang.org $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/jank.list
+          sudo apt-get update
+          sudo apt-get install -y jank
+          # The replica's #inst tests ask for this locale.
+          sudo locale-gen en_US.UTF-8
+          published=$(curl -s "https://ppa.jank-lang.org/dists/$(lsb_release -cs)/Release" | sed -n 's/^Date: //p')
+          echo "JANK=jank" >> "$GITHUB_ENV"
+          echo "JANK_PUBLISHED=$published" >> "$GITHUB_ENV"
+
+      - name: Install jank (tarball)
+        if: runner.os == 'macOS'
+        run: |
+          # What the Homebrew formula depends on.
+          brew install boost libzip zlib
+          specs/install-jank-main.sh
+          source=$(ls ~/.local/share/jank/*/SOURCE | head -1)
+          echo "JANK=$HOME/.local/bin/jank-main" >> "$GITHUB_ENV"
+          echo "JANK_PUBLISHED=$(sed -n 's/^last-modified: //p' "$source")" >> "$GITHUB_ENV"
+
+      - name: Name the build
+        run: |
+          # The build doesn't say its commit: the last successful build of main on jank's CI
+          # is very likely the one published.
+          last=$(gh run list --repo jank-lang/jank --workflow "Build compiler+runtime" --branch main \
+                   --status success --limit 1 --json headSha,updatedAt \
+                   --jq '.[0] | "\(.headSha[0:9]), built \(.updatedAt)"' || echo "unknown")
+          echo "JANK_BUILD_INFO=published $JANK_PUBLISHED; jank's last build of main: $last" >> "$GITHUB_ENV"
+          "$JANK" check-health || true
+
+      - name: Run the reproductions
+        run: python3 -u specs/repro/run_all.py
+
+      - name: Run the Lean replica's tests
+        env:
+          REPLICA_WORKERS: "4"
+        run: python3 -u specs/repro/run_replica_tests.py determinismo-workloads/workloads/jank-interop/lean/tests
+
+      - name: Sum up and compare with the recorded run
+        run: |
+          args="--platform $JANK_BUILD --repro specs/conformance/out/repro-runs/$JANK_BUILD.json --replica specs/conformance/out/replica-runs/$JANK_BUILD.json"
+          python3 specs/repro/check_runs.py $args --baseline new-baseline --write-baseline > /dev/null
+          set +e
+          python3 specs/repro/check_runs.py $args > summary.md
+          status=$?
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jank-repros-${{ matrix.platform }}
+          path: |
+            specs/conformance/out/repro-runs
+            specs/conformance/out/replica-runs
+            new-baseline
+            summary.md
