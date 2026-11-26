@@ -631,6 +631,20 @@ ratio support in `/`).
 
 `core.jank` (6574) → `core.cpp` `hash_unordered` (1369) → `hash.cpp` `unordered(object_ref)` (181).
 
+- [ ] **LG7**: an empty lazy sequence hashes as 1, not as the empty list, so sets and maps holding one aren't `=` to ones holding `()` (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 8; minimized by hand on main 7135b7708).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26: hash, lazy).
+  - [ ] reported
+
+```clojure
+(= #{()} (set [(lazy-seq)]))        ; jank => false            clj => true
+[(hash ()) (hash (rest [1])) (hash (lazy-seq))]
+;; jank => [2277397642 2277397642 1]
+;; clj  => [-2017569654 -2017569654 -2017569654]
+```
+`(= () (lazy-seq))` is true in both, so the hash breaks `=`'s contract for empty lazy sequences
+(non-empty ones hash alike: `(hash (take 2 [1 2 3]))` equals `(hash '(1 2))`). Aside: jank's hashes
+are Clojure's read as unsigned (2277397642 = -2017569654 + 2^32).
+
 - [ ] **R24**: a `loop` local keeps its first value's native type (`r24`).
   - [ ] reported
 
@@ -2070,6 +2084,13 @@ Likely since #772 (NaN boxing).
 ```
 
 `keyword.cpp` 50; `rtti.hpp` 50–58.
+Found again by the generated differential tests (determinismo-workloads `jank-interop/gen`, seed 4,
+2026-11-26: a sorted map of mixed keys): `(sorted-map :a 1 1 2)`, `(conj (sorted-set 1) :a)` and
+`(sort [1 :a])` crash the same way, and with a string or symbol second `(compare :a "a")` returns -1
+(Clojure throws ClassCastException for all). Proposed fix, verified on a build of main 7135b7708:
+`keyword::compare(object const &)` checks the other's type with `dyn_cast` as `symbol::compare` does;
+`(compare :a 1)` then throws "The value for comparison must be a `keyword`, not a `small_integer`."
+(determinismo-workloads `jank-interop/fixes/R97.diff`).
 
 - [ ] **D24**: a `catch` that throws, then a `finally` that throws, end the process (`d24`).
   - [ ] reported
@@ -2085,6 +2106,19 @@ Likely since #772 (NaN boxing).
 
 The generated code puts `finally` in a `scope_exit` guard (`cpp_processor.cpp` 1054–1138, at
 1137), which throws while the catch's exception is unwinding.
+
+- [ ] **LG6**: an exception thrown while a set hashes a lazy element ends the process (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 8: `(set (split-with (fn [x] (< x 3)) (partition-by identity [0 1 2 3 4])))`; minimized by hand on main 7135b7708).
+  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26: terminate, hash, lazy).
+  - [ ] reported
+
+```clojure
+(try (set [(lazy-seq (list (< [0] 3)))]) (catch cpp/std.exception e :caught))
+;; jank => terminate called after throwing an instance of 'std::runtime_error' (SIGABRT)
+;; clj  => :caught   (ClassCastException, catching Exception)
+(try (hash (lazy-seq (list (< [0] 3)))) (catch cpp/std.exception e :caught))   ; jank => :caught
+```
+The same error is caught from `hash` or `doall` alone; only the set's insertion, which hashes the
+element, turns it into `std::terminate`: a path that doesn't let an exception through.
 
 - [ ] **LS34**: matching recurses per character, so long inputs overflow the stack (`deviations_r3_test.jank`: `s34`; on main: SIGSEGV).
   On macOS arm64 (build of 2026-11-24) its test passes: jank's `std::regex` is libc++'s there and libstdc++'s on Linux, where it fails.
@@ -2125,22 +2159,6 @@ core.jank `slurp`: `file_size` (7331) runs before `is_open`, and its `std::files
 ;; clj  => ExecutionException (cause: EOF while reading)
 ```
 The future's thread rethrows the `error_ref` from a `catch(...)`, which reaches `std::terminate`.
-
-- [ ] **LG4**: `compare` with a keyword first and a number, BigInt or vector second crashes jank (SIGSEGV), and so do `sort` and a sorted map or set holding a keyword and a number; with a string or symbol second it returns -1 (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 4: grammar 3's sorted map of `merge-with` over keyword and integer keys, whose test died; minimized by hand on main 7135b7708).
-  Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26: compare, sorted-map, comparable).
-  Proposed fix: `keyword::compare(object const &)` checks the other's type as `symbol::compare` does (`dyn_cast<obj::keyword>`, then "The value for comparison must be a `keyword`, not a ..."); to build and run.
-  - [ ] reported
-
-```clojure
-(compare :a 1)               ; jank => SIGSEGV        clj => ClassCastException
-(compare :a 1.5)             ; jank => SIGSEGV        clj => ClassCastException
-(compare :a [1])             ; jank => SIGSEGV        clj => ClassCastException
-(sorted-map :a 1 1 2)        ; jank => SIGSEGV        clj => ClassCastException
-(sort [1 :a])                ; jank => SIGSEGV        clj => ClassCastException
-(compare :a "a")             ; jank => -1             clj => ClassCastException
-(compare 1 :a)               ; jank throws "Objects of type `keyword` are not comparable to `small_integer`."
-```
-obj/keyword.cpp `keyword::compare(object const &)` (50-53) takes `*expect_object<keyword>(untagged(&o))` with no type check: an inline integer's tagged value is read as a keyword (the crash), a string or symbol as another keyword's fields. `symbol::compare` checks with `dyn_cast` and throws.
 
 ## Hangs
 
