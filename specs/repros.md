@@ -635,6 +635,7 @@ ratio support in `/`).
 
 - [ ] **LG7**: an empty lazy sequence hashes as 1, not as the empty list, so sets and maps holding one aren't `=` to ones holding `()` (found by the generated differential tests, determinismo-workloads `jank-interop/gen`, seed 8; minimized by hand on main 7135b7708).
   Tracker: not found in jank-lang/jank's issues or PRs (searched 2026-11-26: hash, lazy).
+  Proposed fix, verified on a build of main 7135b7708: `lazy_sequence::to_hash` returns the empty list's hash for an empty sequence instead of 1 (`obj/lazy_sequence.cpp` 101-104); `(= #{()} (set [(lazy-seq)]))` is then true (determinismo-workloads `jank-interop/fixes/LG7.diff`).
   - [ ] reported
 
 ```clojure
