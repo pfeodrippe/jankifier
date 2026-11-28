@@ -34,7 +34,7 @@
             [inkling.core :as ink]
             [harness.json :as json]
             ;; A large stack for a tool's call (the window library's part that needs no window).
-            [cards.repl :as repl]))
+            [jankifier.repl :as repl]))
 
 ;; Tools.
 

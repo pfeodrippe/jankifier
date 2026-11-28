@@ -459,8 +459,9 @@ problem of the harness, of the task or of the model.
 
 ## Two problems of jank's REPL this needed fixed
 
-Both are fixed in the window library (`cards.repl`, loaded here), for every
-evaluation of the process, a person's included:
+Both are fixed in `jankifier.repl`, which the window's REPL (jankifier.nrepl)
+runs evaluations with, for every evaluation of the process, a person's
+included:
 
 - jank's nREPL evaluates on threads with a 512 KB stack (macOS). jank's
   compiled frames are large, and a function calling itself thirty deep

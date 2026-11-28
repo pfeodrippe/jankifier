@@ -1,20 +1,20 @@
 ;; SPDX-License-Identifier: MIT
 ;; The cards' process: jank's nREPL server on a thread of its own (its port in .nrepl-port, as
-;; `jank repl` writes it), the window's frames on the main thread, where macOS wants them. A
-;; REPL connected to it works as anywhere, and the window follows: each evaluation is told to
-;; it with its value.
+;; `jank repl` writes it), the window's frames on the main thread, where macOS wants them. The
+;; server has jankifier.nrepl's ops (completion, docs, tests, output as it's written, a large
+;; stack for evaluations). What's sent with tap> goes on a card; each evaluation can too
+;; (`run!`'s :evaluations, as Portal's nREPL middleware sends each to Portal).
 ;;
 ;; A project has a -main of its own that requires what defines its cards and calls `run!`.
-;; This one shows the generic cards alone:
+;; This one shows the generic cards alone, and each evaluation:
 ;;   lein run --disable-sandbox                              the window
 ;;   lein run --disable-sandbox -- --hidden --record a.mp4   its frames to a video, nothing shown
 (ns cards.main
   (:refer-clojure :exclude [run!])
   (:require [clojure.string :as str]
             [jank.nrepl.server.core :as nrepl]
-            [jank.nrepl.server.handler :as handler]
-            ;; The eval operation on a large stack, its output captured safely.
-            [cards.repl :as repl]
+            ;; After the server: its connections are then handled by jankifier.nrepl's loop.
+            [jankifier.nrepl :as jankifier-nrepl]
             [cards.core :as cards]))
 
 (defn- after [flag args]
@@ -58,33 +58,39 @@
       ;; A client's probe on connecting.
       (= code "1")))
 
-(defn- tell-evaluations!
-  "nREPL's eval as it was, its value or its error then told to the window."
+(defonce ^:private showing (atom false))
+
+(defn show-evaluations!
+  "Whether each evaluation from the REPL goes on a card with its value or its error (and is
+  counted: `cards.core/evaluations`). `run!` sets it from its :evaluations. Either way the
+  window is told of each (`cards.core/on-evaluation!`, the pinned functions)."
+  [on?]
+  (reset! showing (boolean on?))
+  nil)
+
+(defn- watch-evaluations!
+  "The window told of each evaluation from the REPL (`cards.core/evaluated!`)."
   []
-  (let [evaluate (get-method handler/handle-message :eval)]
-    (defmethod handler/handle-message :eval [message]
-      (let [got (atom nil)
-            answer (binding [repl/*result* got] (evaluate message))
-            parts (if (map? answer) [answer] (remove nil? answer))
-            error (some :ex parts)
-            code (str/trim (get message "code" ""))]
-        (when-not (tooling? code)
-          (try
-            (cards/evaluated! code (when-not error @got) error)
-            (catch :default e
-              (println "cards:" e))))
-        answer))))
+  (jankifier-nrepl/watch-evaluations!
+   ::cards
+   (fn [{:keys [code ok result error]}]
+     (let [code (str/trim code)]
+       (when-not (tooling? code)
+         (cards/evaluated! code (when ok result) (when-not ok error) @showing))))))
 
 (defn run!
   "The REPL's server, then the window until it closes; the process ends there. `opts` as
-  `cards.core/open!` takes them."
+  `cards.core/open!` takes them, and :evaluations, whether each evaluation goes on a card
+  (`show-evaluations!`). What's sent with tap> goes on a card (`cards.core/submit`)."
   [opts]
   (deref (nrepl/background-main))
-  (tell-evaluations!)
+  (show-evaluations! (:evaluations opts))
+  (watch-evaluations!)
+  (add-tap cards/submit)
   (cards/open! opts)
   (cards/loop!)
   ;; Gone at once, nothing torn down under a REPL thread still compiling (cards::quit).
   (cpp/cards.quit))
 
 (defn -main [& args]
-  (run! (options args)))
+  (run! (assoc (options args) :evaluations true)))

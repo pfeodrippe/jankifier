@@ -1,10 +1,25 @@
 # cards
 
-A window that follows a jank REPL: each evaluation becomes a card, drawn by
-what its value is. Dear ImGui, from
-[jank-lang/commons](https://github.com/jank-lang/commons). The process is the
-REPL (jank's nREPL server), so there is nothing to call: connect an editor, or
-an agent with an nREPL client, and the window shows what either evaluates.
+A window of cards for a jank program, each drawn by what its value is. Dear
+ImGui, from [jank-lang/commons](https://github.com/jank-lang/commons). Values
+get there as they get to [Portal](https://github.com/djblue/portal):
+
+- **`tap>`.** What's sent with `(tap> value)` goes on a card. The window adds
+  `cards.core/submit` as a tap when it opens; `(remove-tap cards.core/submit)`
+  takes it off.
+- **Each evaluation, if asked for.** `run!`'s `:evaluations true` puts each
+  evaluation from the REPL on a card, with its value or its error, as Portal's
+  nREPL middleware sends each to Portal. `(cards.main/show-evaluations! false)`
+  stops it, `true` starts it again.
+- **Cards of one's own**, kinds of value drawn one's own way, and pinned cards
+  that follow an atom (below).
+
+Unlike Portal's, the window is in the program's own process. A card can draw
+the program's memory every frame (a synth's buses, a tensor), and an ImGui
+widget can change it, with nothing serialized in between. So the window is the
+program: it serves the REPL (jank's nREPL server, with jankifier.nrepl's ops),
+an editor or an agent connects to it, and macOS wants the window on the main
+thread.
 
 The mechanism comes from determinismo's `jank-viz`; this is the part of it
 that isn't about determinismo, with ways for a project to add its own cards.
@@ -221,7 +236,7 @@ To use it in a project (see `inkling/viz`):
 (ns my.viz.main
   (:require [cards.main :as main] [my.cards]))             ; my.cards defines the kinds
 (defn -main [& args]
-  (main/run! (assoc (main/options args) :title "mine")))
+  (main/run! (assoc (main/options args) :title "mine" :evaluations true)))   ; :evaluations if wanted
 ```
 
 ## Pictures and video
@@ -251,18 +266,20 @@ the value under the cursor): the scripted one was.
 
 ## The REPL's evaluation
 
-Loading the window (`cards.main`, or `cards.repl` alone, which needs no
-window) replaces jank's nREPL eval operation with the same one, changed in two
-ways. Both are for a process that does more than one thing at a time, and both
-were found by running into them:
+The window's REPL is jank's nREPL server with jankifier.nrepl's ops
+(completion, docs, tests), whose eval and load-file run code as
+`jankifier.repl` does and send its output as it's written, not when it's over.
+jankifier.repl changes jank's evaluation in two ways. Both are for a process
+that does more than one thing at a time, and both were found here by running
+into them:
 
 - **A large stack.** jank's nREPL evaluates on threads with the system's
   default stack for a thread that is not the first: 512 KB on macOS. jank's
   compiled frames are large, so a function calling itself thirty deep
   overflows it: `(fib 30)` evaluated from an editor ended the process
   (SIGBUS), while `jank run` computed it. Evaluations now run on a thread with
-  a 256 MB stack (`cards.repl/stack-megabytes`), its memory taken only as it
-  is used. `(cards.repl/on-big-stack f)` does the same for any function.
+  a 256 MB stack (`jankifier.repl/stack-megabytes`), its memory taken only as
+  it is used. `(jankifier.repl/on-big-stack f)` does the same for any function.
 - **Output captured safely.** jank captures an evaluation's output by pointing
   the process's stdout and stderr at a file for its time and back afterwards.
   Two evaluations that overlap without one being inside the other (two

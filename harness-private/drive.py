@@ -384,7 +384,7 @@ def run_form(task, mode, seed):
 
 def grade(port, task):
     text = open(PRIVATE + '/graders.jank').read()
-    loaded = ev(port, '(pr-str (select-keys (cards.repl/evaluate ' + jstr(text) +
+    loaded = ev(port, '(pr-str (select-keys (jankifier.repl/evaluate ' + jstr(text) +
                 ' "user" "graders.jank" 1 1 false) [:ok :error]))', 600)
     if ':ok true' not in loaded:
         return 'nil', jstr('the graders didn\'t load: ' + loaded)

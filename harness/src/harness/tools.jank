@@ -13,7 +13,7 @@
             [harness.core :as h]
             ;; The process's eval operation, on a large stack and safe for evaluations at the
             ;; same time (the window library's, which needs no window for it).
-            [cards.repl]
+            [jankifier.repl]
             [jank.nrepl.server.handler :as handler]))
 
 (defn- plain
@@ -114,7 +114,7 @@
 
 (defn- prepare! []
   (when-not @prepared
-    (cards.repl/evaluate "(require '[clojure.string :as str] '[clojure.set :as set])" "user" "harness" 1 1 false)
+    (jankifier.repl/evaluate "(require '[clojure.string :as str] '[clojure.set :as set])" "user" "harness" 1 1 false)
     (reset! prepared true)))
 
 (defn- forms-of
@@ -276,7 +276,7 @@
       (str "error: " path " doesn't read: " (:error found))
       (if-let [bad (cpp-check (cpp-sources text (:spans found)))]
         (str/replace-first bad "error:" (str "error loading " path ":"))
-      (let [r (or (limited (fn [] (cards.repl/evaluate text "user" (str path) 1 1 false)))
+      (let [r (or (limited (fn [] (jankifier.repl/evaluate text "user" (str path) 1 1 false)))
                   {:ok false :error timed-out-text})]
         ;; Its C++ compiled unless the error says otherwise (cpp/raw forms come first in a file).
         (when-not (and (not (:ok r)) (str/includes? (str (:error r)) "compile C++"))

@@ -9,4 +9,4 @@
   ;; What an editor or a take's script evaluates for itself: no card, no count.
   (main/quiet! "jankifier.nrepl")
   (main/quiet! "bomsom.cards/slider-at")
-  (main/run! (assoc (main/options args) :title "bomsom")))
+  (main/run! (assoc (main/options args) :title "bomsom" :evaluations true)))

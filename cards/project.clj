@@ -1,7 +1,8 @@
 (defproject io.github.pfeodrippe/cards "0.1.0-SNAPSHOT"
   :description "A window of cards (Dear ImGui) following a jank REPL: each evaluation drawn by what its value is."
   :license {:name "MIT"}
-  :dependencies [[org.jank-lang.commons/imgui-sys "2026.10-1"]
+  :dependencies [[io.github.pfeodrippe/jankifier "0.1.0-SNAPSHOT"]
+                 [org.jank-lang.commons/imgui-sys "2026.10-1"]
                  [org.jank-lang.commons/imgui-glfw-sys "2026.10-1"]
                  [org.jank-lang.commons/imgui-opengl2-sys "2026.10-1"]]
   :url "https://github.com/pfeodrippe/jankifier"

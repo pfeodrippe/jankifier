@@ -35,7 +35,7 @@
 (ns harness.verify
   (:require [clojure.string :as str]
             [veil.core :as veil]
-            [cards.repl :as repl]
+            [jankifier.repl :as repl]
             [harness.observe :as observe]))
 
 ;; Veil's session: its Lake project, relative to the process's directory.

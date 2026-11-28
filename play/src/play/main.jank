@@ -9,4 +9,4 @@
             [play.wnw]))
 
 (defn -main [& args]
-  (main/run! (assoc (main/options args) :title "play")))
+  (main/run! (assoc (main/options args) :title "play" :evaluations true)))

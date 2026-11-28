@@ -321,13 +321,19 @@
 ;; The newest card is kept whole at the bottom; the wheel looks back.
 (defonce ^:private roll (atom {:shift 0.0 :at 0.0 :total 0 :back 0.0}))
 
-(defn- add-card! [made]
-  (let [cards (conj (:cards @state) made)
-        ;; (count is unsigned: made signed before anything is taken from it.)
-        dropped (max 0 (- (long (count cards)) 200))]
-    (doseq [old (take dropped cards)]
-      (release! old))
-    (swap! state assoc :cards (vec (drop dropped cards))))
+(defn- add-card!
+  "A card added last, the oldest dropped past 200. In one swap: cards are added from more
+  than one thread (the REPL's, the taps')."
+  [made]
+  (let [[before after] (swap-vals! state update :cards
+                                   (fn [cards]
+                                     (let [cards (conj cards made)]
+                                       ;; (count is unsigned: made signed before anything is
+                                       ;; taken from it.)
+                                       (vec (drop (max 0 (- (long (count cards)) 200)) cards)))))
+        dropped (max 0 (- (+ 1 (long (count (:cards before)))) (long (count (:cards after)))))]
+    (doseq [old (take dropped (:cards before))]
+      (release! old)))
   (swap! roll assoc :back 0.0)
   nil)
 
@@ -418,25 +424,28 @@
   nil)
 
 (defn evaluated!
-  "An evaluation ended: its card, last."
-  [code value error]
-  (let [n (swap! told-count inc)]
-    (when @announcing
-      (cpp/cards.say (str "[cards] evaluated " n (when error " error")))))
-  (let [value (if (var? value) (deref value) value)]
-    (doseq [f @told]
-      (guarded (fn [] (f code value error))))
-    (when (some (fn [[_ source _]] (fn? source)) @pins)
-      (repin!))
-    (when-not (str/blank? code)
-      (cond
-        ;; (Without the colours an error is printed with: escape sequences.)
-        error (add-card! {:view :error :code code
-                          :said (str/replace (str error) (re-pattern (str (char 27) "\\[[0-9;]*m")) "")})
-        (fn? value) nil
-        :else (when-let [made (shaped value)]
-                (add-card! (assoc made :code code)))))
-    nil))
+  "An evaluation ended: told to the functions of `on-evaluation!`, the pinned functions called
+  again, and, when `card?` (by default), counted and its card added last."
+  ([code value error] (evaluated! code value error true))
+  ([code value error card?]
+   (when card?
+     (let [n (swap! told-count inc)]
+       (when @announcing
+         (cpp/cards.say (str "[cards] evaluated " n (when error " error"))))))
+   (let [value (if (var? value) (deref value) value)]
+     (doseq [f @told]
+       (guarded (fn [] (f code value error))))
+     (when (some (fn [[_ source _]] (fn? source)) @pins)
+       (repin!))
+     (when (and card? (not (str/blank? code)))
+       (cond
+         ;; (Without the colours an error is printed with: escape sequences.)
+         error (add-card! {:view :error :code code
+                           :said (str/replace (str error) (re-pattern (str (char 27) "\\[[0-9;]*m")) "")})
+         (fn? value) nil
+         :else (when-let [made (shaped value)]
+                 (add-card! (assoc made :code code)))))
+     nil)))
 
 (defn show
   "A value on a card of its own, called `what` (the REPL's results go on cards by
@@ -447,6 +456,13 @@
    (when-let [made (shaped value)]
      (add-card! (assoc made :code what)))
    nil))
+
+(defn submit
+  "A tap (add-tap): each value sent with tap> on a card of its own, called \"tap>\", as
+  Portal's submit puts it in Portal. The window adds it (cards.main/run!); remove-tap takes it
+  off."
+  [value]
+  (show "tap>" (if (var? value) (deref value) value)))
 
 (defn clear!
   "No cards (the pinned ones stay)."

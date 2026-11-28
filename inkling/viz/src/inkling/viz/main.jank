@@ -6,4 +6,4 @@
             [inkling.cards]))
 
 (defn -main [& args]
-  (main/run! (assoc (main/options args) :title "inkling")))
+  (main/run! (assoc (main/options args) :title "inkling" :evaluations true)))

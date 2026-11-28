@@ -1,7 +1,7 @@
 # Publishes jankifier's libraries to Clojars as io.github.pfeodrippe/<name>: supercollider-sys,
-# cards, jankifier (this root project), bomsom and bomsom-viz, each at the version in its
+# jankifier (this root project), cards, bomsom and bomsom-viz, each at the version in its
 # project.clj. Each is installed locally before it's deployed, so the next one resolves it
-# (bomsom on supercollider-sys, bomsom-viz on bomsom and cards). The repository's secrets hold
+# (cards on jankifier, bomsom on supercollider-sys, bomsom-viz on bomsom and cards). The repository's secrets hold
 # the Clojars account (CLOJARS_USERNAME) and a deploy token of it (CLOJARS_PASSWORD).
 name: Clojars
 
@@ -65,7 +65,7 @@ jobs:
       - name: Build and install, each before what depends on it
         run: |
           lein version
-          for p in supercollider-sys cards . bomsom bomsom/viz; do
+          for p in supercollider-sys . cards bomsom bomsom/viz; do
             echo "::group::$p"
             (cd "$p" && lein install)
             echo "::endgroup::"
@@ -73,7 +73,7 @@ jobs:
 
       - name: Deploy
         run: |
-          for p in supercollider-sys cards . bomsom bomsom/viz; do
+          for p in supercollider-sys . cards bomsom bomsom/viz; do
             echo "::group::$p"
             read -r group artifact version < <(python3 - "$p/pom.xml" <<'EOF'
           import sys, xml.etree.ElementTree as ET

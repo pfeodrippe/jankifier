@@ -13,4 +13,4 @@
 (defn -main [& args]
   (if (some (fn [arg] (= arg "--bench")) args)
     (cpp/harness.leave (if (bench/main args) 0 1))
-    (main/run! (assoc (main/options args) :title "harness"))))
+    (main/run! (assoc (main/options args) :title "harness" :evaluations true))))

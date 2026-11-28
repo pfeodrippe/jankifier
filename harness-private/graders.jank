@@ -7,7 +7,7 @@
 (ns harness-graders
   (:require [clojure.string :as str]
             [harness.verify :as verify]
-            [cards.repl :as repl]))
+            [jankifier.repl :as repl]))
 
 (def dir "work/.grading")
 
