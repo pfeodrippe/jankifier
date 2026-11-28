@@ -1,5 +1,7 @@
 (defproject io.github.pfeodrippe/jankifier "0.1.0-SNAPSHOT"
   :description "Utils for writing more jank than C++."
+  :license {:name "MIT"
+            :url  "https://opensource.org/license/mit"}
   :url "https://github.com/pfeodrippe/jankifier"
   ;; Published to Clojars by .github/workflows/clojars.yml, with the deploy token in its secrets.
   :deploy-repositories [["clojars" {:url "https://repo.clojars.org"
