@@ -1,0 +1,12 @@
+(ns bomsom.viz
+  "bomsom's REPL with its window: jank's nREPL server and the cards (cards.main), with
+  bomsom.core and its cards (bomsom.cards) loaded."
+  (:require [cards.main :as main]
+            [bomsom.core]
+            [bomsom.cards]))
+
+(defn -main [& args]
+  ;; What an editor or a take's script evaluates for itself: no card, no count.
+  (main/quiet! "jankifier.nrepl")
+  (main/quiet! "bomsom.cards/slider-at")
+  (main/run! (assoc (main/options args) :title "bomsom")))

@@ -1,0 +1,268 @@
+(ns bomsom.cards
+  "Cards for bomsom's server in the cards window, drawn every frame. (monitor!) starts a synth
+  at the end of the server's root group that measures what's played (each channel's level on
+  a control bus, the newest 4096 frames in a buffer) and pins a card with the server (its
+  counts and CPU), the levels, a scope, a spectrum, and the synths playing, a slider for each
+  of their main controls. The card reads the server's memory directly; the counts, the CPU and
+  the synths come from /status and /g_queryTree, asked four times a second."
+  (:require [bomsom.core :as b]
+            [cards.core :as c]))
+
+(cpp/raw "#include <bomsom/viz.hpp>")
+
+;; The monitor's place on the server: the last control buses and buffer, out of the way of a
+;; session's own.
+(def levels-bus 16380)
+(def phase-bus 16382)
+(def scope-buffer 1023)
+(def ^:private scope-frames 4096)
+(def ^:private monitor-node 1999999)
+
+(def monitor-synthdef
+  "Amplitude.kr of each output channel to levels-bus, and the channels into scope-buffer in a
+  loop (BufWr at a Phasor's position, which goes to phase-bus)."
+  {:name "bomsom-monitor"
+   :constants [0.0 0.01 0.3 1.0 (double levels-bus) (double phase-bus) (double scope-buffer)
+               (double scope-frames)]
+   :controls []
+   :ugens [{:name "In" :rate :audio :inputs [[:const 0]] :outputs [:audio :audio]}
+           {:name "Amplitude" :rate :control :inputs [[0 0] [:const 1] [:const 2]] :outputs [:control]}
+           {:name "Amplitude" :rate :control :inputs [[0 1] [:const 1] [:const 2]] :outputs [:control]}
+           {:name "Out" :rate :control :inputs [[:const 4] [1 0] [2 0]] :outputs []}
+           {:name "Phasor" :rate :audio :inputs [[:const 0] [:const 3] [:const 0] [:const 7] [:const 0]]
+            :outputs [:audio]}
+           {:name "BufWr" :rate :audio :inputs [[:const 6] [4 0] [:const 3] [0 0] [0 1]] :outputs [:audio]}
+           {:name "A2K" :rate :control :inputs [[4 0]] :outputs [:control]}
+           {:name "Out" :rate :control :inputs [[:const 5] [6 0]] :outputs []}]})
+
+;; Colours of the dark panels.
+(def ^:private night 0x121419)
+(def ^:private grid 0x262b35)
+(def ^:private dim 0x8b94a7)
+(def ^:private cyan 0x3fd3ea)
+(def ^:private amber 0xffae4c)
+(def ^:private violet 0xb47fff)
+(def ^:private go 0x34d27b)
+(def ^:private caution 0xf3cf48)
+(def ^:private hot 0xff5b5b)
+
+;; What the polls bring back: /status and the node tree with each synth's controls.
+
+(defonce ^:private polled (atom {:at -10.0 :status nil :synths []}))
+
+(defn- read-node
+  "A node of /g_queryTree.reply's arguments at `i` (its id, its children's count, then a synth's
+  SynthDef and controls, or a group's children): [the synths in it, where the next node is]."
+  [args i]
+  (let [id (nth args i)
+        children (nth args (inc i))]
+    (if (= -1 children)
+      (let [synthdef (nth args (+ i 2))
+            n (nth args (+ i 3))
+            controls (into {}
+                           (for [j (range n)
+                                 :let [k (nth args (+ i 4 (* 2 j)))
+                                       v (nth args (+ i 5 (* 2 j)))]
+                                 :when (number? v)]
+                             [(str k) v]))]
+        [[{:id id :synthdef synthdef :controls controls}] (+ i 4 (* 2 n))])
+      (loop [j 0
+             at (+ i 2)
+             out []]
+        (if (< j children)
+          (let [[synths next] (read-node args at)]
+            (recur (inc j) next (into out synths)))
+          [out at])))))
+
+(defn- synths-of [tree]
+  (first (read-node (vec (drop 2 tree)) 0)))
+
+(defn- poll! []
+  (when (b/running?)
+    (let [now (c/seconds)]
+      (when (> (- now (:at @polled)) 0.25)
+        (let [status (b/latest-reply "/status.reply")
+              tree (b/latest-reply "/g_queryTree.reply")]
+          (swap! polled assoc :at now :status status :synths (if tree (synths-of tree) [])))
+        (b/send-quiet! "/status")
+        (b/send-quiet! "/g_queryTree" 0 1)))))
+
+;; The server.
+
+(defn- bar! [x y width fraction rgb]
+  (c/rect! x y (+ x width) (+ y 8) grid 1.0 4.0)
+  (c/rect! x y (+ x (* width (max 0.02 (min 1.0 fraction)))) (+ y 8) rgb 1.0 4.0))
+
+(defn- draw-server [x y width]
+  (poll!)
+  (if-let [box (b/server-box)]
+    (let [w (cpp/unbox (:* World) box)
+          rate (cpp/bomsom.viz.sample_rate w)
+          seconds (/ (* 1.0 (cpp/bomsom.viz.blocks w) (cpp/bomsom.viz.block_size w)) rate)
+          [_ _ ugens synths groups synthdefs average peak] (:status @polled)]
+      (c/text! x y c/ink c/big "scsynth")
+      (c/text! (+ x 108) (+ y 7) c/muted c/mono
+               (str (c/fixed (/ rate 1000.0) 1) " kHz, " (c/fixed seconds 1) " s"))
+      (c/text! x (+ y 30) c/ink c/small
+               (str (or synths "-") " synths   " (or groups "-") " groups   " (or ugens "-") " UGens   "
+                    (or synthdefs "-") " SynthDefs"))
+      (let [bx (- (+ x width) 230)]
+        (c/text! bx (+ y 4) c/muted c/small "CPU")
+        (c/text! (+ bx 150) (+ y 4) c/ink c/small (str (c/fixed (or average 0.0) 1) "%"))
+        (bar! bx (+ y 24) 200.0 (/ (or average 0.0) 100.0) go)
+        (when peak
+          (let [px (+ bx (* 200.0 (min 1.0 (/ peak 100.0))))]
+            (c/line! px (+ y 21) px (+ y 35) hot 2.0)))))
+    (c/text! x (+ y 10) c/muted c/mono "The server isn't running: (b/start!)")))
+
+;; The levels.
+
+(defonce ^:private held (atom [[-96.0 0.0] [-96.0 0.0]]))
+
+(defn- fraction-of [db]
+  (max 0.0 (min 1.0 (/ (+ db 60.0) 60.0))))
+
+(defn- meter! [x y width channel label db now]
+  (let [[peak at] (nth @held channel)
+        peak (if (or (>= db peak) (> (- now at) 1.5)) db peak)
+        _ (when (or (>= db (first (nth @held channel))) (> (- now at) 1.5))
+            (swap! held assoc channel [db now]))
+        bx (+ x 22)
+        bw (- width 120)
+        f (fraction-of db)]
+    (c/text! x (+ y 1) c/ink c/mono-bold label)
+    (c/rect! bx y (+ bx bw) (+ y 16) night 1.0 5.0)
+    (c/clip-begin! bx y (+ bx (* bw f)) (+ y 16))
+    (c/gradient! bx y (+ bx (* bw 0.75)) (+ y 16) go caution 1.0 false)
+    (c/gradient! (+ bx (* bw 0.75)) y (+ bx bw) (+ y 16) caution hot 1.0 false)
+    (c/clip-end!)
+    (let [px (+ bx (* bw (fraction-of peak)))]
+      (c/line! px (+ y 1) px (+ y 15) 0xffffff 2.0))
+    (c/text! (+ bx bw 12) (+ y 1) c/ink c/mono (if (< db -95.0) "-inf" (str (c/fixed db 1) " dB")))))
+
+(defn- draw-levels [x y width]
+  (when-let [box (b/server-box)]
+    (let [w (cpp/unbox (:* World) box)
+          now (c/seconds)]
+      (meter! x y width 0 "L" (cpp/bomsom.viz.db (cpp/bomsom.viz.control_bus w levels-bus)) now)
+      (meter! x (+ y 22) width 1 "R" (cpp/bomsom.viz.db (cpp/bomsom.viz.control_bus w (inc levels-bus))) now)
+      (let [bx (+ x 22)
+            bw (- width 120)]
+        (doseq [db [-48 -36 -24 -12 -6 0]]
+          (let [tx (+ bx (* bw (fraction-of db)))]
+            (c/text! (- tx (/ (c/text-width c/small (str db)) 2.0)) (+ y 42) c/muted c/small (str db))))))))
+
+;; The scope and the spectrum.
+
+(defn- panel! [x y width height]
+  (c/rect! x y (+ x width) (+ y height) night 1.0 8.0))
+
+(defn- draw-scope [x y width]
+  (let [h 140.0]
+    (panel! x y width h)
+    (doseq [f [0.25 0.5 0.75]]
+      (c/line! (+ x 8) (+ y (* f h)) (- (+ x width) 8) (+ y (* f h)) grid (if (= f 0.5) 1.5 1.0)))
+    (doseq [f [0.125 0.25 0.375 0.5 0.625 0.75 0.875]]
+      (c/line! (+ x (* f width)) (+ y 8) (+ x (* f width)) (- (+ y h) 8) grid 1.0))
+    (when-let [box (b/server-box)]
+      (let [w (cpp/unbox (:* World) box)]
+        (when (cpp/bomsom.viz.measure w scope-buffer phase-bus)
+          (cpp/bomsom.viz.draw_scope x (+ y 6) width (- h 12) 1.0 cyan amber)
+          (c/text! (+ x 12) (+ y 8) dim c/small
+                   (str "scope   " (c/fixed (/ 1024000.0 (cpp/bomsom.viz.sample_rate w)) 1) " ms")))))
+    (c/text! (- (+ x width) 60) (+ y 8) cyan c/small "L")
+    (c/text! (- (+ x width) 40) (+ y 8) amber c/small "R")))
+
+(defn- draw-spectrum [x y width]
+  (let [h 130.0]
+    (panel! x y width h)
+    (doseq [db [-24 -48 -72]]
+      (let [ly (+ y (* h (/ (- db) 96.0)))]
+        (c/line! (+ x 8) ly (- (+ x width) 8) ly grid 1.0)
+        (c/text! (+ x 10) (- ly 16) dim c/small (str db " dB"))))
+    (doseq [[hz label] [[100 "100"] [1000 "1k"] [10000 "10k"]]]
+      (let [lx (+ x (* width (cpp/bomsom.viz.spectrum_at hz)))]
+        (c/line! lx (+ y 8) lx (- (+ y h) 8) grid 1.0)
+        (c/text! (+ lx 4) (- (+ y h) 20) dim c/small label)))
+    (when (b/running?)
+      (cpp/bomsom.viz.draw_spectrum x y width h -96.0 violet))
+    (c/text! (- (+ x width) 80) (+ y 8) violet c/small "spectrum")))
+
+;; The synths, with a slider for each of their main controls.
+
+(def ^:private ranges
+  {"freq" [20.0 2000.0 true] "note" [24.0 96.0 false] "cutoff" [30.0 130.0 false]
+   "amp" [0.0 1.0 false] "res" [0.0 1.0 false] "pan" [-1.0 1.0 false]})
+
+(def ^:private main-controls ["freq" "note" "cutoff" "amp" "res" "pan"])
+
+(defonce ^:private values (atom {}))
+(defonce ^:private drawn (atom {}))
+
+(defn slider-at
+  "Where the slider of a synth's control was drawn last: {:x :y :width}, in the window's points
+  (for a script pointing at it)."
+  [id control]
+  (get @drawn [id control]))
+
+(defn- value-box! [id control value]
+  (or (get-in @values [[id control] :box])
+      (let [box (cpp/box (cpp/new cpp/float (cpp/cast cpp/float value)))]
+        (swap! values assoc [id control] {:box box :set-at -10.0})
+        box)))
+
+(defn- slider! [id control value x y width now]
+  (let [box (value-box! id control value)
+        p (cpp/unbox (:* float) box)
+        [lo hi logarithmic] (get ranges control)
+        _ (c/cursor! x y)
+        state (cpp/bomsom.viz.slider (str "##" control id) p lo hi width logarithmic)]
+    (swap! drawn assoc [id control] {:x x :y y :width width})
+    (cond
+      (= 1 state) (do (b/send! "/n_set" id control (* 1.0 (cpp/* p)))
+                      (swap! values assoc-in [[id control] :set-at] now))
+      (and (= 0 state) (> (- now (get-in @values [[id control] :set-at])) 0.6))
+      (let [_ (cpp/= (cpp/* p) (cpp/cast cpp/float value))] nil)
+      :else nil)))
+
+(defn- draw-synths [x y width]
+  (let [synths (vec (remove #(contains? #{"bomsom-monitor" "bomsom-recorder"} (:synthdef %)) (:synths @polled)))
+        ids (set (map :id synths))
+        now (c/seconds)]
+    (when (some (fn [[id _]] (not (contains? ids id))) (keys @values))
+      (swap! values (fn [m] (into {} (filter (fn [[[id _] _]] (contains? ids id)) m)))))
+    (c/text! x y c/muted c/small (str (count synths) (if (= 1 (count synths)) " synth" " synths") " playing"))
+    (doseq [[row s] (map-indexed vector (take 5 synths))]
+      (let [ry (+ y 22 (* row 30))
+            shown (take 3 (filter #(contains? (:controls s) %) main-controls))
+            slot (/ (- width 250.0) 3.0)]
+        (c/rect! x (- ry 3) (+ x width) (+ ry 25) 0xf3ecd2 1.0 6.0)
+        (c/text! (+ x 8) ry c/ink c/mono-bold (str (:id s)))
+        (c/text! (+ x 88) ry c/ink c/mono (c/clip c/mono 150.0 (:synthdef s)))
+        (doseq [[i control] (map-indexed vector shown)]
+          (let [sx (+ x 250.0 (* i slot))]
+            (c/text! sx (+ ry 2) c/muted c/small control)
+            (slider! (:id s) control (get (:controls s) control) (+ sx 48.0) (- ry 1) (- slot 60.0) now)))))))
+
+(defn view
+  "The monitor's card: a layout whose parts draw every frame."
+  []
+  [:col
+   [:draw 50 (fn [x y width] (draw-server x y width))]
+   [:draw 60 (fn [x y width] (draw-levels x y width))]
+   [:draw 148 (fn [x y width] (draw-scope x y width))]
+   [:draw 138 (fn [x y width] (draw-spectrum x y width))]
+   [:draw 176 (fn [x y width] (draw-synths x y width))]])
+
+(defonce ^:private monitored (atom nil))
+
+(defn monitor!
+  "Starts the monitor synth on the running server (once a start of it) and pins its card."
+  []
+  (when-not (= @monitored (b/starts-count))
+    (b/send! "/b_alloc" scope-buffer scope-frames 2)
+    (b/load-synthdef! monitor-synthdef)
+    (b/send! "/s_new" "bomsom-monitor" monitor-node 1 0)
+    (reset! monitored (b/starts-count)))
+  (c/pin! "bomsom" (view))
+  :monitoring)

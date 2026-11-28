@@ -1,0 +1,52 @@
+;; bomsom from the REPL with its window (./viz.sh): SuperCollider's server in this process,
+;; driven with its own commands, and a card that shows what it's doing every frame. Evaluate
+;; a form at a time.
+(ns bomsom.tutorial
+  (:require [bomsom.core :as b]
+            [bomsom.cards :as bc]))
+
+(comment
+  ;; The server, then the monitor: a synth at the end of the root group that measures what's
+  ;; played, and the card pinned at the top of the window.
+  (b/start!)
+
+  (bc/monitor!)
+
+  ;; A sine, as data: written as a SynthDef file and sent to the server.
+  (b/load-sine!)
+
+  (b/send! "/s_new" "bomsom-sine" 1000 0 0 "freq" 220 "amp" 0.25)
+
+  (b/send! "/n_set" 1000 "freq" 330)
+
+  (b/send! "/s_new" "bomsom-sine" 1001 0 0 "freq" 495 "amp" 0.12)
+
+  (b/send! "/n_set" 1001 "amp" 0.3)
+
+  (b/send! "/n_free" 1001)
+
+  ;; Sonic Pi's synths, compiled SynthDefs loaded from files.
+  (def sonic-pi "/Users/pfeodrippe/dev/vybe/sonic-pi/etc/synthdefs/compiled/")
+
+  (doseq [synth ["sonic-pi-pluck" "sonic-pi-tb303" "sonic-pi-prophet"]]
+    (b/send! "/d_load" (str sonic-pi synth ".scsyndef")))
+
+  (b/sync!)
+
+  (b/send! "/n_free" 1000)
+
+  (doseq [note [48 55 60 63 67 70 72 75 79 75 72 67]]
+    (b/send! "/s_new" "sonic-pi-pluck" -1 0 0 "note" note "amp" 0.5)
+    (b/sleep! 180))
+
+  (b/send! "/s_new" "sonic-pi-tb303" 2000 0 0 "note" 36 "sustain" 12 "amp" 0.5)
+
+  (b/send! "/n_set" 2000 "note" 43)
+
+  (b/send! "/s_new" "sonic-pi-prophet" 2001 0 0 "note" 60 "sustain" 6 "amp" 0.35)
+
+  (b/send! "/n_free" 2000 2001)
+
+  (b/replies!)
+
+  (b/stop!))
