@@ -1,5 +1,5 @@
 (defproject supercollider-sys/example "0.1-SNAPSHOT"
-  :dependencies [[jankifier/supercollider-sys "0.1.0-SNAPSHOT"]]
+  :dependencies [[io.github.pfeodrippe/supercollider-sys "0.1.0-SNAPSHOT"]]
   :plugins [[org.jank-lang/lein-jank "2026.10-1"]]
   :middleware [leiningen.jank/middleware]
   :build-dependencies [[org.jank-lang.commons/jank-build "2026.10-1"]]

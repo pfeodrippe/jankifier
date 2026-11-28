@@ -1,7 +1,7 @@
 (defproject jankifier/harness "0.1.0-SNAPSHOT"
   :description "An agent's harness in jank, on the inkling engine: tools are functions, and one of them evaluates code in the process's own nREPL."
   :license {:name "MIT"}
-  :dependencies [[jankifier/cards "0.1.0-SNAPSHOT"]]
+  :dependencies [[io.github.pfeodrippe/cards "0.1.0-SNAPSHOT"]]
   :plugins [[org.jank-lang/lein-jank "2026.10-1"]]
   :middleware [leiningen.jank/middleware]
   :build-dependencies [[org.jank-lang.commons/jank-build "2026.10-1"]]

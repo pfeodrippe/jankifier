@@ -1,0 +1,68 @@
+# Publishes jankifier's libraries to Clojars as io.github.pfeodrippe/<name>: supercollider-sys,
+# cards, jankifier (this root project), bomsom and bomsom-viz, each at the version in its
+# project.clj. Each is installed locally before it's deployed, so the next one resolves it
+# (bomsom on supercollider-sys, bomsom-viz on bomsom and cards). The repository's secrets hold
+# the Clojars account (CLOJARS_USERNAME) and a deploy token of it (CLOJARS_PASSWORD).
+name: Clojars
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "project.clj"
+      - "src/**"
+      - "cards/**"
+      - "supercollider-sys/**"
+      - "bomsom/**"
+      - ".github/workflows/clojars.yml"
+
+# One deploy at a time; a newer one waits for the one running.
+concurrency:
+  group: clojars
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+      CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
+    steps:
+      - name: Check the deploy token
+        run: |
+          if [ -z "$CLOJARS_USERNAME" ] || [ -z "$CLOJARS_PASSWORD" ]; then
+            echo "::error::Set the repository's secrets CLOJARS_USERNAME and CLOJARS_PASSWORD (a Clojars deploy token)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: SuperCollider's sources, with the four of its submodules the build needs
+        run: |
+          git submodule update --init supercollider-sys/lib/supercollider
+          git -C supercollider-sys/lib/supercollider submodule update --init \
+            external_libraries/nova-simd external_libraries/nova-tt \
+            external_libraries/yaml-cpp external_libraries/portaudio/portaudio_submodule
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Leiningen
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o "$HOME/bin/lein"
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Deploy, each before what depends on it
+        run: |
+          lein version
+          for p in supercollider-sys cards . bomsom bomsom/viz; do
+            echo "::group::$p"
+            (cd "$p" && lein install && lein deploy clojars)
+            echo "::endgroup::"
+          done

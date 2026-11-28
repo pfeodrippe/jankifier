@@ -17,21 +17,22 @@ it fills) and SynthDefs are in `bomsom.core`.
 
 | | |
 |---|---|
-| `.` | the library, `jankifier/bomsom` (`bomsom.core`) |
-| `viz/` | its cards for the cards window, `jankifier/bomsom-viz` (`bomsom.cards`): the server's counts and CPU, levels, a scope, a spectrum and the synths with a slider for each main control, drawn every frame |
+| `.` | the library, `io.github.pfeodrippe/bomsom` (`bomsom.core`) |
+| `viz/` | its cards for the cards window, `io.github.pfeodrippe/bomsom-viz` (`bomsom.cards`): the server's counts and CPU, levels, a scope, a spectrum and the synths with a slider for each main control, drawn every frame |
 | `example/` | a project that uses them as a dependency, as one's own would: `./run.sh` opens the window, which serves the REPL; connect to it (`cider-connect-clj`, not jack-in: a jacked-in REPL has no window) and evaluate `src/bomsom_example/tutorial.jank` a form at a time |
 
 ## Setup
 
-Each library is installed once (and again after changing it), in this order:
+The libraries are on Clojars (`io.github.pfeodrippe/bomsom`, `bomsom-viz`, `cards`,
+`supercollider-sys`), published by `.github/workflows/clojars.yml`, so the example needs nothing
+installed:
 
 ```sh
-cd ../supercollider-sys && lein install
-cd ../cards && lein install
-cd ../bomsom && lein install
-cd viz && lein install
-cd ../example && ./run.sh                 # the window and its REPL; connect an editor
+cd example && ./run.sh                    # the window and its REPL; connect an editor
 ```
+
+To try a change to one of them before it's published, `lein install` it, and what depends on it
+after it: supercollider-sys (its submodules first: see its README), cards, bomsom, viz.
 
 `lein run` here starts the server, plays an A for a second at amp 0.1 and stops (`lein run 0`
 is silent).

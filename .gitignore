@@ -4,3 +4,4 @@
 .docs
 /trials-out
 /harness-private/**/classes/
+/pom.xml

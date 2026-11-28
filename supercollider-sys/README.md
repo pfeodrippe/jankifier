@@ -23,9 +23,11 @@ libsndfile`. On Linux, also JACK, which is scsynth's audio API there, and FFTW (
 ## Running the example
 
 ```sh
-cd supercollider-sys && lein install     # into ~/.m2
-cd example && lein run
+cd supercollider-sys/example && lein run
 ```
+
+The package is on Clojars as `io.github.pfeodrippe/supercollider-sys`. To try a change to it
+before it's published, `lein install` it first.
 
 The first run builds SuperCollider (about 15 s on 16 cores); later runs use jank-build's cache.
 The example has no audio device to use, so it renders a score (non-realtime synthesis) into a

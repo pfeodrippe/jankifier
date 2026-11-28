@@ -214,7 +214,7 @@ To use it in a project (see `inkling/viz`):
 
 ```clojure
 ;; project.clj
-:dependencies [[jankifier/cards "0.1.0-SNAPSHOT"]]         ; after `lein install` here
+:dependencies [[io.github.pfeodrippe/cards "0.1.0-SNAPSHOT"]]   ; from Clojars
 :main my.viz.main
 
 ;; src/my/viz/main.jank
