@@ -57,16 +57,31 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o "$HOME/bin/lein"
           chmod +x "$HOME/bin/lein"
           echo "$HOME/bin" >> "$GITHUB_PATH"
-          # A snapshot just deployed isn't served by Clojars for a while: what depends on it
-          # takes the copy installed here just before (no newer snapshot asked of Clojars).
-          mkdir -p "$HOME/.lein"
-          echo '{:user {:repositories [["clojars" {:url "https://repo.clojars.org/" :update :never}]]}}' > "$HOME/.lein/profiles.clj"
 
-      - name: Deploy, each before what depends on it
+      # All installed first, each before what depends on it, so that each builds on the copy
+      # installed here (newer than what Clojars has). Then each deployed from the jar and pom
+      # just made, which needs nothing resolved: a snapshot just deployed isn't served by Clojars
+      # for a while, and what depends on it couldn't get it.
+      - name: Build and install, each before what depends on it
         run: |
           lein version
           for p in supercollider-sys cards . bomsom bomsom/viz; do
             echo "::group::$p"
-            (cd "$p" && lein install && lein deploy clojars)
+            (cd "$p" && lein install)
+            echo "::endgroup::"
+          done
+
+      - name: Deploy
+        run: |
+          for p in supercollider-sys cards . bomsom bomsom/viz; do
+            echo "::group::$p"
+            read -r group artifact version < <(python3 - "$p/pom.xml" <<'EOF'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
+          print(*(root.find(ns + k).text for k in ("groupId", "artifactId", "version")))
+          EOF
+            )
+            (cd "$p" && lein deploy clojars "$group/$artifact" "$version" "target/$artifact-$version.jar" pom.xml)
             echo "::endgroup::"
           done
