@@ -1,0 +1,7 @@
+(ns jankifier.scratch)
+
+;; /Users/pfeodrippe/.local/bin/lein-jank-2026-11-24 update-in :dependencies conj \[nrepl/nrepl\ \"1.7.0\"\] -- update-in :dependencies conj \[com.cemerick/pomegranate\ \"0.4.0\"\] -- update-in :dependencies conj \[org.tcrawley/dynapath\ \"0.2.5\"\] -- update-in :plugins conj \[cider/cider-nrepl\ \"0.64.1\"\] -- repl :headless :host localhost
+
+(cpp/raw "#include <jank/util/environment.hpp>")
+
+(slurp (str (cpp/jank.util.process_dir) "/../SOURCE"))
