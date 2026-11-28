@@ -282,16 +282,39 @@
   (testing "output that doesn't start with what was sent stays whole"
     (is (= [{:out "x"}] (nrepl/without-sent {:out "x"} "a" "")))))
 
-(deftest streaming-files-test
-  (let [path (str "/tmp/jankifier-streaming-test-" (rand-int 1000000) ".txt")]
-    (spit path "abcé")
-    (testing "a file's bytes from an offset on"
-      (is (= "abcé" (cpp/jankifier.repl.read_from path 0)))
-      (is (= "cé" (cpp/jankifier.repl.read_from path 2))))
-    (testing "a UTF-8 character cut at the end waits for the next read"
-      (is (= 5 (cpp/jankifier.repl.byte_size "abcé"))))
-    (testing "a file that isn't there reads as nothing"
-      (is (= "" (cpp/jankifier.repl.read_from "/nope/nope" 0))))))
+(cpp/raw "
+#include <cstdio>
+namespace jankifier_test
+{
+  inline void write(char const *s)
+  {
+    std::fputs(s, stdout);
+    std::fflush(stdout);
+  }
+  /* An é in two writes. */
+  inline void half() { write(\"a\\xC3\"); }
+  inline void rest() { write(\"\\xA9\\n\"); }
+}")
+
+(deftest capture-test
+  (let [id (cpp/jankifier.repl.capture_start)]
+    (println "one")
+    (let [first-line (jankifier.repl/next-output id)]
+      (cpp/jankifier_test.half)
+      (let [a (jankifier.repl/next-output id)]
+        (cpp/jankifier_test.rest)
+        (let [e (jankifier.repl/next-output id)]
+          (println "two")
+          (let [wrote (cpp/jankifier.repl.capture_end id)]
+            (testing "a line is handed when it's printed"
+              (is (= {:out "one\n"} first-line)))
+            (testing "a UTF-8 character cut in two writes is handed whole"
+              (is (= {:out "a"} a))
+              (is (= {:out "é\n"} e)))
+            (testing "the end has all of it"
+              (is (= {:out "one\naé\ntwo\n" :err ""} wrote)))
+            (testing "and then there's nothing to wait for"
+              (is (nil? (jankifier.repl/next-output id))))))))))
 
 (deftest evaluation-test
   (testing "the output, then the value, then done"
@@ -324,14 +347,20 @@
 
 (deftest streamed-evaluation-test
   (let [sent (atom [])
+        ended (atom nil)
         resps (binding [nrepl/*send* (fn [resp] (swap! sent conj [(cpp/jankifier.nrepl.now_ms) resp]))]
                 (nrepl/evaluation {"ns" "user"}
                                   "(do (doseq [n [1 2 3]] (println \"tick\" n) (cpp/jankifier.repl.sleep_ms 300)) :ok)"
                                   "NO_SOURCE_PATH" false))
+        _ (reset! ended (cpp/jankifier.nrepl.now_ms))
         out (apply str (keep (comp :out second) @sent))]
-    (testing "the output is sent while it runs, a chunk a tick"
+    (testing "each line is sent when it's printed, not when the evaluation's over"
       (is (= "tick 1\ntick 2\ntick 3\n" out))
-      (is (<= 3 (count (filter (comp :out second) @sent)))))
+      (is (= ["tick 1\n" "tick 2\n" "tick 3\n"] (keep (comp :out second) @sent)))
+      (let [[t1 t2 t3] (keep (fn [[t resp]] (when (:out resp) t)) @sent)]
+        (is (<= 250 (- t2 t1)))
+        (is (<= 250 (- t3 t2)))
+        (is (<= 500 (- @ended t1)))))
     (testing "and isn't sent again with the value"
       (is (= [{:value ":ok" :ns "user"} {:status [:done]}] resps)))))
 

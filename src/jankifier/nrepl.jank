@@ -656,8 +656,8 @@ namespace jankifier::nrepl
 ;; over: the evaluation points stdout and stderr at a file for its time, which is
 ;; read back at the end, and the server writes a request's responses once its
 ;; handler returns. Here a handler can send a message before it returns (`*send*`,
-;; bound by `handle-client`), and while an evaluation runs a thread sends what's
-;; been written to its capture's files (jankifier.repl's).
+;; bound by `handle-client`), and while an evaluation runs a thread sends each line
+;; of its output when it's printed (jankifier.repl/next-output).
 
 (def ^:dynamic *send*
   "While a request is handled: a function sending a message for it to its client
@@ -704,25 +704,22 @@ namespace jankifier::nrepl
         (recur (read-message client* remainder))))))
 
 (defn- stream!
-  "Every 100 ms until `done` holds true: stdout and stderr written out, and what's
-  new in the capture `id`'s files sent with `send` as :out and :err, and added to
-  the atoms in `sent` (by the same keys)."
-  [send id sent done]
-  (loop [offsets {:out 0 :err 0}]
-    (cpp/jankifier.repl.sleep_ms 100)
-    (cpp/jankifier.repl.flush)
-    (let [offsets (reduce (fn [offsets k]
-                            (if-let [path (repl/capture-path id k)]
-                              (let [chunk (cpp/jankifier.repl.read_from path (get offsets k))]
-                                (when-not (= "" chunk)
-                                  (send {k chunk})
-                                  (swap! (get sent k) str chunk))
-                                (update offsets k + (cpp/jankifier.repl.byte_size chunk)))
-                              offsets))
-                          offsets
-                          [:out :err])]
-      (when-not @done
-        (recur offsets)))))
+  "What the capture `id` writes, sent with `send` as :out and :err when it's
+  written, until the capture's over, and added to the atoms in `sent` (by the same
+  keys). Stops sending when a send fails (the client gone): what's not sent is in
+  the evaluation's answer."
+  [send id sent]
+  (loop []
+    (when-let [chunks (repl/next-output id)]
+      (when (every? (fn [[k chunk]]
+                      (try
+                        (send {k chunk})
+                        (swap! (get sent k) str chunk)
+                        true
+                        (catch jank.runtime.object_ref _ false)
+                        (catch std.exception _ false)))
+                    chunks)
+        (recur)))))
 
 (defn without-sent
   "The responses `resps` with the output already sent (`out`, `err`) taken from
@@ -770,16 +767,15 @@ namespace jankifier::nrepl
     (let [send *send*
           inspect? (boolean (some-> (get msg "inspect") parse-boolean))
           sent {:out (atom "") :err (atom "")}
-          done (atom false)
           streamer (atom nil)
           started (when send
                     (fn [id]
-                      (reset! streamer (future (stream! send id sent done)))))
+                      (reset! streamer (future (stream! send id sent)))))
           ran (try
                 (repl/evaluate code (get msg "ns") file (get msg "line" 1) (get msg "column" 1)
                                inspect? started)
                 (finally
-                  (reset! done true)
+                  ;; Over with the capture: all it was handed has been sent.
                   (some-> @streamer deref)))]
       (when watched?
         (doseq [[k f] @watchers]
