@@ -5,12 +5,12 @@
   - [x] sys
   - [x] cpp play
   - [x] viz
+  - [ ] autocompletion and stuff
+    - [x] autocompletion
+    - [ ] pretty print
   - [ ] jank api (overtone-like? guess lower-level)
   - [ ] effects
-- [ ] autocompletion and stuff
-  - I start a nrepl from core-test, but unable to run tests or check autocompletion
-  - [ ] autocompletion
-  - [ ] run tests from the repl
+- [ ] run tests from the repl
 
 ## Jank improvements
 

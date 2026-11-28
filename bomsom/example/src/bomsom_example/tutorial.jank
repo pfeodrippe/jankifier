@@ -1,29 +1,21 @@
-;; bomsom from the REPL: SuperCollider's server in this process, driven with its own commands,
-;; and a card that shows what it's doing every frame.
-;;
-;; The REPL is the window's own: the window is a program that serves the REPL too (macOS opens
-;; windows only on a process's main thread, so a REPL started by jack-in can't open one).
-;;   1. ./run.sh in this project (the first start compiles for a minute or two);
-;;   2. in Emacs, M-x cider-connect-clj to localhost and the port in .nrepl-port;
-;;   3. evaluate the ns form, then the forms in the comment a form at a time.
-;; Or 1 and 2 at once, with CIDER waiting for the window's REPL:
-;;   (cider-jack-in-clj (list :project-dir "~/dev/jankifier/bomsom/example"
-;;                            :jack-in-cmd "bash run.sh"))
 (ns bomsom-example.tutorial
-  (:require [bomsom.core :as b]
-            [bomsom.cards :as bc]))
+  (:require
+   [bomsom.core :as b]
+   [bomsom.cards :as bc]
+   ;; jankifier.nrepl is used just to enhance the jank nREPL.
+   jankifier.nrepl))
 
+;; For starting the viz within emacs in OSX (as the first thread needs to
+;; be the one containing the window). You may also run ./run.sh and connect to it.
 '(cider-jack-in-clj (list :project-dir "~/dev/jankifier/bomsom/example"
                           :jack-in-cmd "bash run.sh"))
 
 (comment
-  ;; The server, then the monitor: a synth at the end of the root group that measures what's
-  ;; played, and the card pinned at the top of the window.
   (b/start!)
 
   (bc/monitor!)
 
-  ;; A sine, as data: written as a SynthDef file and sent to the server.
+  ;; bomsom-sine
   (b/load-sine!)
 
   (b/send! "/s_new" "bomsom-sine" 1000 0 0 "freq" 220 "amp" 0.25)
@@ -36,7 +28,6 @@
 
   (b/send! "/n_free" 1001)
 
-  ;; Sonic Pi's synths, compiled SynthDefs loaded from files.
   (def sonic-pi "/Users/pfeodrippe/dev/vybe/sonic-pi/etc/synthdefs/compiled/")
 
   (doseq [synth ["sonic-pi-pluck" "sonic-pi-tb303" "sonic-pi-prophet"]]
@@ -47,8 +38,10 @@
   (b/send! "/n_free" 1000)
 
   (doseq [note [48 55 60 63 67 70 72 75 79 75 72 67]]
-    (b/send! "/s_new" "sonic-pi-pluck" -1 0 0 "note" note "amp" 0.5)
-    (b/sleep! 180))
+    (let [t (+ 60 (rand-int 150))]
+      (b/send! "/s_new" "sonic-pi-pluck" -1 0 0 "note" note "amp" 0.5)
+      (println t)
+      (b/sleep! t)))
 
   (b/send! "/s_new" "sonic-pi-tb303" 2000 0 0 "note" 36 "sustain" 12 "amp" 0.5)
 
@@ -64,4 +57,6 @@
 
   (b/replies!)
 
-  (b/stop!))
+  (b/stop!)
+
+  ())
