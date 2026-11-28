@@ -1,0 +1,3 @@
+[submodule "supercollider-sys/lib/supercollider"]
+	path = supercollider-sys/lib/supercollider
+	url = https://github.com/supercollider/supercollider.git
