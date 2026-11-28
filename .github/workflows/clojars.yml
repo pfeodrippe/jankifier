@@ -57,6 +57,10 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o "$HOME/bin/lein"
           chmod +x "$HOME/bin/lein"
           echo "$HOME/bin" >> "$GITHUB_PATH"
+          # A snapshot just deployed isn't served by Clojars for a while: what depends on it
+          # takes the copy installed here just before (no newer snapshot asked of Clojars).
+          mkdir -p "$HOME/.lein"
+          echo '{:user {:repositories [["clojars" {:url "https://repo.clojars.org/" :update :never}]]}}' > "$HOME/.lein/profiles.clj"
 
       - name: Deploy, each before what depends on it
         run: |
