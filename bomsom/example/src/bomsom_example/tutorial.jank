@@ -6,6 +6,9 @@
 ;;   1. ./run.sh in this project (the first start compiles for a minute or two);
 ;;   2. in Emacs, M-x cider-connect-clj to localhost and the port in .nrepl-port;
 ;;   3. evaluate the ns form, then the forms in the comment a form at a time.
+;; Or 1 and 2 at once, with CIDER waiting for the window's REPL:
+;;   (cider-jack-in-clj (list :project-dir "~/dev/jankifier/bomsom/example"
+;;                            :jack-in-cmd "bash run.sh"))
 (ns bomsom-example.tutorial
   (:require [bomsom.core :as b]
             [bomsom.cards :as bc]))
