@@ -1,0 +1,91 @@
+(ns bomsom.core
+  "SuperCollider's server in this process, on the audio device, driven with its own OSC
+  commands (https://doc.sccode.org/Reference/Server-Command-Reference.html):
+
+    (start!)
+    (load-sine!)                                      ; the SynthDef bomsom-sine, then waits
+    (send! \"/s_new\" \"bomsom-sine\" 1000 0 0 \"freq\" 330 \"amp\" 0.1)
+    (send! \"/n_set\" 1000 \"freq\" 440)
+    (send! \"/n_free\" 1000)
+    (stop!)
+
+  Integers go as OSC int32, other numbers as float32, strings and keywords as strings.")
+
+(cpp/raw "#include <bomsom/server.hpp>")
+
+(defn start!
+  "Starts the server on the default audio device (2 outputs, no inputs). With a UDP port, OSC
+  clients such as sclang can talk to it too."
+  ([] (start! 0))
+  ([udp-port]
+   (let [status (cpp/bomsom.start udp-port)]
+     (case (int status)
+       0 :started
+       1 :already-running
+       (throw (ex-info (if (= 2 status) "the server didn't start (see (log!))" "the UDP port didn't open")
+                       {:status status}))))))
+
+(defn stop! []
+  (cpp/bomsom.stop)
+  :stopped)
+
+(defn running? []
+  (cpp/bomsom.running))
+
+(defn send!
+  "Sends one OSC message to the server: its address, then its arguments."
+  [address & args]
+  (cpp/bomsom.begin address)
+  (doseq [a args]
+    (cond
+      (integer? a) (cpp/bomsom.add_int a)
+      (number? a) (cpp/bomsom.add_float (double a))
+      (keyword? a) (cpp/bomsom.add_string (name a))
+      :else (cpp/bomsom.add_string (str a))))
+  (when-not (cpp/bomsom.send)
+    (throw (ex-info "not sent: is the server running?" {:address address})))
+  nil)
+
+(defn sync!
+  "Waits until the server has done everything sent before (SynthDefs loaded, buffers read)."
+  ([] (sync! 5000))
+  ([timeout-ms]
+   (or (cpp/bomsom.sync timeout-ms)
+       (throw (ex-info "no /synced from the server" {:timeout-ms timeout-ms})))))
+
+(defn load-sine!
+  "Loads the SynthDef bomsom-sine (controls freq and amp) and waits for it."
+  []
+  (cpp/bomsom.send_sine_def)
+  (sync!))
+
+(defn- drain [next]
+  (loop [out []]
+    (let [s (next)]
+      (if (= "" s) out (recur (conj out s))))))
+
+(defn replies!
+  "The server's replies since the last call, each as one line (/done /d_recv, /n_go 1000 ...)."
+  []
+  (drain #(cpp/bomsom.next_reply)))
+
+(defn log!
+  "What the server printed since the last call (also printed on the process's stdout)."
+  []
+  (drain #(cpp/bomsom.next_log)))
+
+(defn -main
+  "Starts the server, plays an A for a second and stops: a check that it all works here.
+  `lein run` plays it at amp 0.1; `lein run 0` is silent."
+  [& [amp]]
+  (println (start!))
+  (load-sine!)
+  (send! "/s_new" "bomsom-sine" 1000 0 0 "freq" 440 "amp" (if amp (parse-double amp) 0.1))
+  (send! "/status")
+  (sync!)
+  ;; /status.reply: unused, UGens, synths, groups, SynthDefs, CPU average and peak, rates.
+  (doseq [r (replies!)] (println r))
+  (cpp/bomsom.sleep_ms 1000)
+  (send! "/n_free" 1000)
+  (sync!)
+  (println (stop!)))
