@@ -294,6 +294,12 @@
 (defn monitor!
   "Starts the monitor synth on the running server (once a start of it) and pins its card."
   []
+  (when (zero? (c/frames))
+    (throw (ex-info (str "No window in this process to draw the card. The window is a program of its own that "
+                         "serves the REPL too (macOS opens windows only on a process's main thread): start it "
+                         "(the example's run.sh, or bomsom.viz/-main) and connect to it (cider-connect) instead "
+                         "of jacking in.")
+                    {})))
   (when-not (= @monitored (b/starts-count))
     (b/send! "/b_alloc" scope-buffer scope-frames 2)
     (b/load-synthdef! monitor-synthdef)

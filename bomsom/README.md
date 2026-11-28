@@ -19,7 +19,7 @@ it fills) and SynthDefs are in `bomsom.core`.
 |---|---|
 | `.` | the library, `jankifier/bomsom` (`bomsom.core`) |
 | `viz/` | its cards for the cards window, `jankifier/bomsom-viz` (`bomsom.cards`): the server's counts and CPU, levels, a scope, a spectrum and the synths with a slider for each main control, drawn every frame |
-| `example/` | a project that uses them as a dependency, as one's own would: `./run.sh` opens the REPL with its window, and `src/bomsom_example/tutorial.jank` is evaluated a form at a time |
+| `example/` | a project that uses them as a dependency, as one's own would: `./run.sh` opens the window, which serves the REPL; connect to it (`cider-connect-clj`, not jack-in: a jacked-in REPL has no window) and evaluate `src/bomsom_example/tutorial.jank` a form at a time |
 
 ## Setup
 
