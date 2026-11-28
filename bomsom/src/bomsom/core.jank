@@ -130,6 +130,7 @@
                      _ (cpp/= (.-mOutDeviceName options) name)
                      _ (cpp/= (.-mInDeviceName options) name)]
                  nil))
+           _ (cpp/bomsom.forget)
            _ (cpp/SetPrintFunc cpp/bomsom.on_print)
            w (cpp/World_New (cpp/& options))]
        (when (cpp/== w cpp/nullptr)
@@ -146,8 +147,14 @@
 (defn stop! []
   (when (running?)
     (stop-recording!)
-    (cpp/World_Cleanup (cpp/unbox (:* World) @world-box) true)
-    (reset! world-box nil))
+    (let [box @world-box]
+      ;; What reads the server's memory on another thread (a window's cards, every frame)
+      ;; looks at world-box first: it's emptied, a frame or two goes by, then the memory goes.
+      (reset! world-box nil)
+      (cpp/bomsom.sleep_ms 200)
+      ;; The plugins stay loaded: World_New loads them once a process (SC_World.cpp's
+      ;; gLibInitted), so a server started after unloading them would have no UGens.
+      (cpp/World_Cleanup (cpp/unbox (:* World) box) false)))
   :stopped)
 
 (defn server-box

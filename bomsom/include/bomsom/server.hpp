@@ -116,6 +116,15 @@ namespace bomsom
     return true;
   }
 
+  // Replies and printouts of an earlier server forgotten (when another starts).
+  inline void forget()
+  {
+    std::lock_guard<std::mutex> const l{ lock };
+    replies.clear();
+    latest.clear();
+    log.clear();
+  }
+
   // What the server prints: kept, and also written on stdout.
   inline int on_print(char const *format, va_list ap)
   {
