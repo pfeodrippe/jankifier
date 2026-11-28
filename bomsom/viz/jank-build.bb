@@ -1,7 +1,5 @@
 (require '[babashka.fs :as fs]
          '[jank.build.util :as util])
 
-;; bomsom's C++ (../include/bomsom/server.hpp) and the cards' (include/bomsom/viz.hpp).
-(let [here (fs/parent *file*)]
-  (util/include-dir (str (fs/path here "include")))
-  (util/include-dir (str (fs/path (fs/parent here) "include"))))
+;; The cards' C++ (include/bomsom/viz.hpp) on jank's include path; bomsom's own comes with it.
+(util/include-dir (str (fs/path (fs/parent *file*) "include")))

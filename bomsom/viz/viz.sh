@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bomsom in a REPL with its window of cards: `./viz.sh`, or `./viz.sh --hidden --record
-# <video.mp4>`. Its nREPL port is written to .nrepl-port. Install the cards library and
-# supercollider-sys once (`lein install` in jankifier/cards and jankifier/supercollider-sys).
+# <video.mp4>`. Its nREPL port is written to .nrepl-port. Install supercollider-sys, cards and
+# bomsom once (`lein install` in each).
 # The first start compiles Dear ImGui's packages and SuperCollider: as C++17, by the Command
 # Line Tools, and outside jank-build's sandbox (ImGui's build asks Homebrew where GLFW is).
 set -euo pipefail

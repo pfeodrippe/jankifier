@@ -46,6 +46,18 @@
 (def ^:private caution 0xf3cf48)
 (def ^:private hot 0xff5b5b)
 
+;; jank compiles a function when it's first called. The card's would be compiled in the frame
+;; that first shows it, on the window's thread, which then stands still for seconds; warm!
+;; (below, when this namespace loads) calls each of them once first, doing nothing.
+(defonce ^:private warming (atom false))
+
+(defmacro ^:private defdraw
+  "A private function that does nothing while warm! runs."
+  [name args & body]
+  `(defn- ~name ~args
+     (when-not @warming
+       ~@body)))
+
 ;; What the polls bring back: /status and the node tree with each synth's controls.
 
 (defonce ^:private polled (atom {:at -10.0 :status nil :synths []}))
@@ -77,7 +89,7 @@
 (defn- synths-of [tree]
   (first (read-node (vec (drop 2 tree)) 0)))
 
-(defn- poll! []
+(defdraw poll! []
   (when (b/running?)
     (let [now (c/seconds)]
       (when (> (- now (:at @polled)) 0.25)
@@ -89,11 +101,11 @@
 
 ;; The server.
 
-(defn- bar! [x y width fraction rgb]
+(defdraw bar! [x y width fraction rgb]
   (c/rect! x y (+ x width) (+ y 8) grid 1.0 4.0)
   (c/rect! x y (+ x (* width (max 0.02 (min 1.0 fraction)))) (+ y 8) rgb 1.0 4.0))
 
-(defn- draw-server [x y width]
+(defdraw draw-server [x y width]
   (poll!)
   (if-let [box (b/server-box)]
     (let [w (cpp/unbox (:* World) box)
@@ -122,7 +134,7 @@
 (defn- fraction-of [db]
   (max 0.0 (min 1.0 (/ (+ db 60.0) 60.0))))
 
-(defn- meter! [x y width channel label db now]
+(defdraw meter! [x y width channel label db now]
   (let [[peak at] (nth @held channel)
         peak (if (or (>= db peak) (> (- now at) 1.5)) db peak)
         _ (when (or (>= db (first (nth @held channel))) (> (- now at) 1.5))
@@ -140,7 +152,7 @@
       (c/line! px (+ y 1) px (+ y 15) 0xffffff 2.0))
     (c/text! (+ bx bw 12) (+ y 1) c/ink c/mono (if (< db -95.0) "-inf" (str (c/fixed db 1) " dB")))))
 
-(defn- draw-levels [x y width]
+(defdraw draw-levels [x y width]
   (when-let [box (b/server-box)]
     (let [w (cpp/unbox (:* World) box)
           now (c/seconds)]
@@ -154,10 +166,10 @@
 
 ;; The scope and the spectrum.
 
-(defn- panel! [x y width height]
+(defdraw panel! [x y width height]
   (c/rect! x y (+ x width) (+ y height) night 1.0 8.0))
 
-(defn- draw-scope [x y width]
+(defdraw draw-scope [x y width]
   (let [h 140.0]
     (panel! x y width h)
     (doseq [f [0.25 0.5 0.75]]
@@ -173,7 +185,7 @@
     (c/text! (- (+ x width) 60) (+ y 8) cyan c/small "L")
     (c/text! (- (+ x width) 40) (+ y 8) amber c/small "R")))
 
-(defn- draw-spectrum [x y width]
+(defdraw draw-spectrum [x y width]
   (let [h 130.0]
     (panel! x y width h)
     (doseq [db [-24 -48 -72]]
@@ -205,13 +217,13 @@
   [id control]
   (get @drawn [id control]))
 
-(defn- value-box! [id control value]
+(defdraw value-box! [id control value]
   (or (get-in @values [[id control] :box])
       (let [box (cpp/box (cpp/new cpp/float (cpp/cast cpp/float value)))]
         (swap! values assoc [id control] {:box box :set-at -10.0})
         box)))
 
-(defn- slider! [id control value x y width now]
+(defdraw slider! [id control value x y width now]
   (let [box (value-box! id control value)
         p (cpp/unbox (:* float) box)
         [lo hi logarithmic] (get ranges control)
@@ -225,7 +237,7 @@
       (let [_ (cpp/= (cpp/* p) (cpp/cast cpp/float value))] nil)
       :else nil)))
 
-(defn- draw-synths [x y width]
+(defdraw draw-synths [x y width]
   (let [synths (vec (remove #(contains? #{"bomsom-monitor" "bomsom-recorder"} (:synthdef %)) (:synths @polled)))
         ids (set (map :id synths))
         now (c/seconds)]
@@ -253,6 +265,29 @@
    [:draw 148 (fn [x y width] (draw-scope x y width))]
    [:draw 138 (fn [x y width] (draw-spectrum x y width))]
    [:draw 176 (fn [x y width] (draw-synths x y width))]])
+
+(defn- warm! []
+  (reset! warming true)
+  (try
+    (poll!)
+    (bar! 0.0 0.0 1.0 0.0 0)
+    (draw-server 0.0 0.0 1.0)
+    (meter! 0.0 0.0 1.0 0 "L" 0.0 0.0)
+    (draw-levels 0.0 0.0 1.0)
+    (panel! 0.0 0.0 1.0 1.0)
+    (draw-scope 0.0 0.0 1.0)
+    (draw-spectrum 0.0 0.0 1.0)
+    (value-box! -1 "freq" 1.0)
+    (slider! -1 "freq" 1.0 0.0 0.0 1.0 0.0)
+    (draw-synths 0.0 0.0 1.0)
+    (fraction-of 0.0)
+    (synths-of ["/g_queryTree.reply" 1 0 0])
+    (b/latest-reply "/status.reply")
+    (finally
+      (reset! warming false)))
+  nil)
+
+(warm!)
 
 (defonce ^:private monitored (atom nil))
 
