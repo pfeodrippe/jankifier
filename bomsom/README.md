@@ -13,12 +13,28 @@ jank code should run on its threads (jank's GC doesn't know them). Starting the 
 encoding and decoding, sending (`World_SendPacket`, called from jank with a `std::vector<char>`
 it fills) and SynthDefs are in `bomsom.core`.
 
+## The folders
+
+| | |
+|---|---|
+| `.` | the library, `jankifier/bomsom` (`bomsom.core`) |
+| `viz/` | its cards for the cards window, `jankifier/bomsom-viz` (`bomsom.cards`): the server's counts and CPU, levels, a scope, a spectrum and the synths with a slider for each main control, drawn every frame |
+| `example/` | a project that uses them as a dependency, as one's own would: `./run.sh` opens the REPL with its window, and `src/bomsom_example/tutorial.jank` is evaluated a form at a time |
+
 ## Setup
 
+Each library is installed once (and again after changing it), in this order:
+
 ```sh
-cd ../supercollider-sys && lein install   # once, and after changing it
-cd ../bomsom && lein run                  # an A for a second at amp 0.1; `lein run 0` is silent
+cd ../supercollider-sys && lein install
+cd ../cards && lein install
+cd ../bomsom && lein install
+cd viz && lein install
+cd ../example && ./run.sh                 # the window and its REPL; connect an editor
 ```
+
+`lein run` here starts the server, plays an A for a second at amp 0.1 and stops (`lein run 0`
+is silent).
 
 `lein run` starts the server, loads the SynthDef `bomsom-sine`, plays it, prints the server's
 replies and stops. The first run builds SuperCollider (about 15 s).

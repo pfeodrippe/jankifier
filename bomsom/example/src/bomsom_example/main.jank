@@ -1,0 +1,7 @@
+(ns bomsom-example.main
+  "The REPL with its window: jank's nREPL server and the cards, bomsom's among them. Connect an
+  editor and evaluate tutorial.jank a form at a time."
+  (:require [bomsom.viz :as viz]))
+
+(defn -main [& args]
+  (apply viz/-main args))

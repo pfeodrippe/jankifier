@@ -1,7 +1,7 @@
-;; bomsom from the REPL with its window (./viz.sh): SuperCollider's server in this process,
-;; driven with its own commands, and a card that shows what it's doing every frame. Evaluate
-;; a form at a time.
-(ns bomsom.tutorial
+;; bomsom from the REPL, with the window that the project's run.sh opens: SuperCollider's
+;; server in this process, driven with its own commands, and a card that shows what it's doing
+;; every frame. Evaluate a form at a time.
+(ns bomsom-example.tutorial
   (:require [bomsom.core :as b]
             [bomsom.cards :as bc]))
 
