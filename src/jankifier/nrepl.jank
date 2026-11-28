@@ -203,11 +203,23 @@ namespace jankifier::nrepl
         :when (string/starts-with? form prefix)]
     {:candidate form :type "special-form"}))
 
+(defn completion-parts
+  "`[qualifier name]` to complete `prefix`: as `split-symbol`, except that a
+  qualifier with its slash and nothing after (\"str/\", what an editor asks
+  right after it's typed) is that qualifier with an empty name, so all of its
+  public vars."
+  [prefix]
+  (if (and (> (count prefix) 1)
+           (string/ends-with? prefix "/")
+           (not (string/ends-with? prefix "//")))
+    [(subs prefix 0 (dec (count prefix))) ""]
+    (split-symbol prefix)))
+
 (defn completions
   "The completion candidates for `prefix` in the namespace `ns-obj`, sorted
   and without duplicates."
   [ns-obj prefix]
-  (let [[qualifier n] (split-symbol prefix)
+  (let [[qualifier n] (completion-parts prefix)
         candidates (concat (if qualifier
                              (qualified-candidates ns-obj qualifier n)
                              (unqualified-candidates ns-obj prefix))

@@ -70,8 +70,15 @@
     (let [cs (map :candidate (nrepl/completions this-ns "s"))]
       (is (= (sort cs) cs))
       (is (= (distinct cs) cs))))
+  (testing "a qualifier with its slash: all of its public vars"
+    (is (= ["string" ""] (nrepl/completion-parts "string/")))
+    (is (contains? (candidates "string/") "string/join"))
+    (is (contains? (candidates "string/") "string/split"))
+    (is (contains? (candidates "clojure.string/") "clojure.string/join"))
+    (is (contains? (candidates "cpp/") "cpp/raw")))
   (testing "nothing for unknown qualifiers"
-    (is (empty? (nrepl/completions this-ns "nope/x")))))
+    (is (empty? (nrepl/completions this-ns "nope/x")))
+    (is (empty? (nrepl/completions this-ns "nope/")))))
 
 ;; Docs.
 
