@@ -1,0 +1,82 @@
+# supercollider-sys built and its example run, on Linux x86-64 (jank's apt package) and macOS on
+# Apple Silicon (jank's tarball, what Homebrew installs). The example renders a score with no
+# audio device and fails unless it gets the 1000 Hz sine it asked for, so it checks the build,
+# the plugins and jank calling SuperCollider's C API.
+name: supercollider-sys
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "supercollider-sys/**"
+      - ".github/workflows/supercollider-sys.yml"
+
+concurrency:
+  group: supercollider-sys-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  example:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86-64
+            os: ubuntu-24.04
+          - platform: macos-arm64
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SuperCollider's sources, with the four of its submodules the build needs
+        run: |
+          git submodule update --init supercollider-sys/lib/supercollider
+          git -C supercollider-sys/lib/supercollider submodule update --init \
+            external_libraries/nova-simd external_libraries/nova-tt \
+            external_libraries/yaml-cpp external_libraries/portaudio/portaudio_submodule
+
+      - name: Install jank and the build's libraries (apt)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl gnupg lsb-release
+          curl -s https://ppa.jank-lang.org/KEY.gpg | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/jank.gpg >/dev/null
+          echo "deb [signed-by=/etc/apt/trusted.gpg.d/jank.gpg] https://ppa.jank-lang.org $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/jank.list
+          sudo apt-get update
+          # scsynth's audio API on Linux is JACK; libsndfile for sound files, FFTW for its FFTs.
+          sudo apt-get install -y jank cmake ninja-build pkg-config libjack-jackd2-dev libsndfile1-dev libfftw3-dev
+
+      - name: Install jank and the build's libraries (Homebrew, jank's tarball)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja libsndfile boost libzip zlib
+          specs/install-jank-main.sh
+          # lein-jank runs `jank` from the PATH.
+          mkdir -p "$HOME/bin"
+          ln -sf "$HOME/.local/bin/jank-main" "$HOME/bin/jank"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Leiningen
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o "$HOME/bin/lein"
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build supercollider-sys and run its example
+        run: |
+          jank check-health || true
+          (cd supercollider-sys && lein install)
+          cd supercollider-sys/example
+          # On Linux jank-build's sandbox is bubblewrap, which Ubuntu's runners don't allow
+          # (unprivileged user namespaces): the build runs outside it there. On macOS it runs
+          # inside, as it does for a person.
+          if [ "$RUNNER_OS" = Linux ]; then lein run --disable-sandbox; else lein run; fi

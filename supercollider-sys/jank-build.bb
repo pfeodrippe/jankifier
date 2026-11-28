@@ -52,6 +52,10 @@
                         ;; ccache keeps its cache in the home folder, which the sandbox closes.
                         "USE_CCACHE"       false
                         "NO_X11"           (util/linux?)
+                        ;; No network discovery (Avahi) on Linux: a server in a program's own
+                        ;; process doesn't announce itself, and libscsynth then links nothing
+                        ;; more than libsndfile, JACK and FFTW there.
+                        "NO_AVAHI"         (util/linux?)
                         ;; On macOS each plugin is also copied into an app bundle under the
                         ;; install prefix as it's built: keep that out of the output.
                         "CMAKE_INSTALL_PREFIX" (str (fs/path build-dir "install"))}
