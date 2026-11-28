@@ -242,3 +242,29 @@
                         [:info :name])))
   (is (= {:status [:no-eldoc :done]}
          (handle-message {"op" "cider/eldoc" "ns" "jankifier.nrepl-test" "sym" "nope"}))))
+
+;; Pretty printing.
+
+(deftest pretty-test
+  (testing "what fits stays on a line"
+    (is (= "[1 2 3]" (nrepl/pretty [1 2 3] 72)))
+    (is (= "{:a 1, :b 2}" (nrepl/pretty {:a 1 :b 2} 72))))
+  (testing "a collection that doesn't fit: an element a line"
+    (is (= "[[\"/done\" \"/b_alloc\" 1023]\n [\"/done\" \"/d_recv\"]]"
+           (nrepl/pretty [["/done" "/b_alloc" 1023] ["/done" "/d_recv"]] 30))))
+  (testing "a map: an entry a line, its value laid out after its key"
+    (is (= "{:a [1 2 3],\n :b {:c 4}}" (nrepl/pretty {:a [1 2 3] :b {:c 4}} 15)))))
+
+(deftest pretty-values-test
+  (let [resps [{:value "[[1 2 3] [4 5 6]]"} {:status [:done]}]
+        asking {"nrepl.middleware.print/print" "cider.nrepl.pprint/clojure-pprint"
+                "nrepl.middleware.print/options" {"right-margin" 10}}]
+    (testing "laid out when a pretty printer is asked for, in its width"
+      (is (= [{:value "[[1 2 3]\n [4 5 6]]"} {:status [:done]}]
+             (nrepl/pretty-values asking resps))))
+    (testing "as it is for pr, or no printer"
+      (is (= resps (nrepl/pretty-values {"nrepl.middleware.print/print" "cider.nrepl.pprint/pr"} resps)))
+      (is (= resps (nrepl/pretty-values {} resps))))
+    (testing "what doesn't read back as it printed stays as it is"
+      (is (= "#object[foo]" (nrepl/pretty-printed "#object[foo]" 5)))
+      (is (= "42" (nrepl/pretty-printed "42" 1))))))

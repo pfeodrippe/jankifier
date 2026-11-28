@@ -15,7 +15,8 @@
   and adds them to `describe`, so CIDER knows they're there. It also makes
   `eval` and `load-file` send their final `done` in a message of its own (see
   `done-apart`), without which CIDER never finishes an evaluation which
-  throws.
+  throws, and `eval` lay out its value when it's asked to pretty print (CIDER's
+  C-c C-p; see `pretty-values`).
 
   It's a development tool which uses jank's own nREPL server namespaces, so
   only require it in a REPL, e.g. right after connecting:
@@ -648,6 +649,63 @@ namespace jankifier::nrepl
                      [resp])))
                (remove nil? (if (map? resps) [resps] resps)))))
 
+;; Pretty printing, as nREPL's print middleware does it for an editor (CIDER's
+;; C-c C-p): jank's server has none, and sends every value on one line.
+
+(defn pretty
+  "`x` laid out to fit in `width` columns, starting at column `indent`: as it
+  prints when that fits, else a collection with an element a line (a map an
+  entry a line), each element laid out the same way."
+  ([x width] (pretty x 0 width))
+  ([x indent width]
+   (let [flat (pr-str x)]
+     (if (or (not (coll? x)) (<= (+ indent (count flat)) width))
+       flat
+       (let [[open close] (cond (map? x) ["{" "}"]
+                                (vector? x) ["[" "]"]
+                                (set? x) ["#{" "}"]
+                                :else ["(" ")"])
+             at (+ indent (count open))
+             items (if (map? x)
+                     (for [[k v] x
+                           :let [ks (pretty k at width)]]
+                       (str ks " " (pretty v (+ at (count ks) 1) width)))
+                     (map #(pretty % at width) x))]
+         (str open
+              (string/join (str (when (map? x) ",") "\n" (apply str (repeat at " "))) items)
+              close))))))
+
+(defn pretty-printed
+  "The value `printed` (as jank's eval sends it) laid out in `width` columns,
+  when it's data that reads back as it printed; else as it is (an object, a
+  function, a var)."
+  [printed width]
+  (try
+    (let [x (read-string printed)]
+      (if (and (coll? x) (= printed (pr-str x)))
+        (pretty x width)
+        printed))
+    (catch :default _
+      printed)))
+
+(defn pretty-values
+  "jank's eval responses `resps`, each value laid out when the request `msg`
+  asks for a pretty printer (`nrepl.middleware.print/print` other than
+  `.../pr`), in the width it says (its options' right-margin or width), 72
+  without one."
+  [msg resps]
+  (let [printer (get msg "nrepl.middleware.print/print")
+        options (get msg "nrepl.middleware.print/options")
+        width (or (get options "right-margin") (get options "width") 72)
+        resps (if (map? resps) [resps] resps)]
+    (if (or (nil? printer) (string/ends-with? (str printer) "/pr"))
+      resps
+      (mapv (fn [resp]
+              (if (string? (:value resp))
+                (update resp :value pretty-printed width)
+                resp))
+            resps))))
+
 (defn install!
   "Adds the ops to jank's nREPL server, and to its `describe`. Requiring this
   namespace calls it, and calling it again is harmless."
@@ -657,7 +715,7 @@ namespace jankifier::nrepl
     (defmethod handle-message op-name [msg]
       (handler msg)))
   (defmethod handle-message :eval [msg]
-    (done-apart (jank-eval msg)))
+    (done-apart (pretty-values msg (jank-eval msg))))
   (defmethod handle-message :load-file [msg]
     (done-apart (jank-load-file msg)))
   (defmethod handle-message :describe [msg]
