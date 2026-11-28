@@ -176,19 +176,19 @@
 ;; The synths, with a slider for each of their main controls.
 
 (def ^:private ranges
-  {"freq" [20.0 2000.0 true] "note" [24.0 96.0 false] "cutoff" [30.0 130.0 false]
-   "amp" [0.0 1.0 false] "res" [0.0 1.0 false] "pan" [-1.0 1.0 false]})
+  {:freq [20.0 2000.0 true] :note [24.0 96.0 false] :cutoff [30.0 130.0 false]
+   :amp [0.0 1.0 false] :res [0.0 1.0 false] :pan [-1.0 1.0 false]})
 
-(def ^:private main-controls ["freq" "note" "cutoff" "amp" "res" "pan"])
+(def ^:private main-controls [:freq :note :cutoff :amp :res :pan])
 
 (defonce ^:private values (atom {}))
 (defonce ^:private drawn (atom {}))
 
 (defn slider-at
-  "Where the slider of a synth's control was drawn last: {:x :y :width}, in the window's points
-  (for a script pointing at it)."
+  "Where the slider of a synth's control (:freq, or \"freq\") was drawn last: {:x :y :width}, in
+  the window's points (for a script pointing at it)."
   [id control]
-  (get @drawn [id control]))
+  (get @drawn [id (keyword control)]))
 
 (defdraw value-box! [id control value]
   (or (get-in @values [[id control] :box])
@@ -201,7 +201,7 @@
         p (cpp/unbox (:* float) box)
         [lo hi logarithmic] (get ranges control)
         _ (c/cursor! x y)
-        state (cpp/bomsom.viz.slider (str "##" control id) p lo hi width logarithmic)]
+        state (cpp/bomsom.viz.slider (str "##" (name control) id) p lo hi width logarithmic)]
     (swap! drawn assoc [id control] {:x x :y y :width width})
     (cond
       (= 1 state) (do (b/send! "/n_set" id control (* 1.0 (cpp/* p)))
@@ -226,7 +226,7 @@
         (c/text! (+ x 88) ry c/ink c/mono (c/clip c/mono 150.0 (:synthdef s)))
         (doseq [[i control] (map-indexed vector shown)]
           (let [sx (+ x 250.0 (* i slot))]
-            (c/text! sx (+ ry 2) c/muted c/small control)
+            (c/text! sx (+ ry 2) c/muted c/small (name control))
             (slider! (:id s) control (get (:controls s) control) (+ sx 48.0) (- ry 1) (- slot 60.0) now)))))))
 
 (defn view
@@ -250,8 +250,8 @@
     (panel! 0.0 0.0 1.0 1.0)
     (draw-scope 0.0 0.0 1.0)
     (draw-spectrum 0.0 0.0 1.0)
-    (value-box! -1 "freq" 1.0)
-    (slider! -1 "freq" 1.0 0.0 0.0 1.0 0.0)
+    (value-box! -1 :freq 1.0)
+    (slider! -1 :freq 1.0 0.0 0.0 1.0 0.0)
     (draw-synths 0.0 0.0 1.0)
     (fraction-of 0.0)
     (b/tree-synths ["/g_queryTree.reply" 1 0 0])

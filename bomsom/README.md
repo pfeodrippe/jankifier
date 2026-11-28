@@ -69,7 +69,7 @@ go to the process's stdout, in CIDER the `*nrepl-server*` buffer).
 ### What's playing
 
 ```clojure
-(b/controls 1000)          ; {"freq" 330.0, "amp" 0.1}: a synth's controls now, nil once it ended
+(b/controls 1000)          ; {:freq 330.0, :amp 0.1}: a synth's controls now, nil once it ended
 (b/synths)                 ; [{:id 1000 :synthdef "bomsom-sine" :controls {...}} ...]
 ```
 

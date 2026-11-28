@@ -245,8 +245,9 @@
       (let [synthdef (nth args (+ i 2))
             n (nth args (+ i 3))
             controls (into {}
-                           (for [j (range n)]
-                             [(str (nth args (+ i 4 (* 2 j)))) (nth args (+ i 5 (* 2 j)))]))]
+                           (for [j (range n)
+                                 :let [k (nth args (+ i 4 (* 2 j)))]]
+                             [(if (string? k) (keyword k) k) (nth args (+ i 5 (* 2 j)))]))]
         [[{:id id :synthdef synthdef :controls controls}] (+ i 4 (* 2 n))])
       (loop [j 0
              at (+ i 2)
@@ -258,8 +259,8 @@
 
 (defn tree-synths
   "The synths in a /g_queryTree.reply asked with its controls (flag 1), in the tree's order:
-  [{:id :synthdef :controls {name value}}]. A control mapped to a bus has the bus as its value
-  (\"c1\", \"a2\")."
+  [{:id :synthdef :controls {name value}}], a control's name a keyword (its index when it has
+  none). A control mapped to a bus has the bus as its value (\"c1\", \"a2\")."
   [reply]
   (first (read-node (vec (drop 2 reply)) 0)))
 
@@ -273,7 +274,8 @@
     (tree-synths reply)))
 
 (defn controls
-  "A synth's controls now, {name value}, or nil when there's no such synth (it ended)."
+  "A synth's controls now, {:name value} ({:freq 220.0 :amp 0.1}), or nil when there's no such
+  synth (it ended)."
   [id]
   (some (fn [s] (when (= id (:id s)) (:controls s))) (synths)))
 
