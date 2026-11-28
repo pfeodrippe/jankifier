@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <algorithm>
 #include <vector>
 
 #include <GLFW/glfw3.h>
@@ -928,6 +929,75 @@ namespace cards
                             shade(v < 0.0f ? neg : pos, std::sqrt(std::fabs(v) / largest)));
       }
     }
+  }
+
+  /* Values that change every frame (a scope, a spectrum), drawn from memory C++ fills: one
+   * call for the whole series and nothing a point on jank's side, for a C++ caller or jank
+   * through its interop. The `n` floats at `values` go across the rectangle (x, y, w, h), `lo`
+   * at its bottom and `hi` at its top. */
+  inline void polyline_of(float const *values, long n, float x, float y, float w, float h, float lo, float hi,
+                          ImU32 ink, float thickness)
+  {
+    if(!values || n < 2)
+    {
+      return;
+    }
+    static std::vector<ImVec2> points;
+    points.resize(static_cast<size_t>(n));
+    auto const span(hi - lo != 0.0f ? hi - lo : 1.0f);
+    for(long i{}; i < n; ++i)
+    {
+      auto const v(std::clamp(values[i], std::min(lo, hi), std::max(lo, hi)));
+      points[static_cast<size_t>(i)] = ImVec2(x + w * static_cast<float>(i) / static_cast<float>(n - 1),
+                                              y + h * (hi - v) / span);
+    }
+    ImGui::GetWindowDrawList()->AddPolyline(points.data(), static_cast<int>(n), ink, ImDrawFlags_None, thickness);
+  }
+
+  /* The area under the same kind of series, down to the rectangle's bottom: `top` where it
+   * meets the values, fading to `bottom`. */
+  inline void area_of(float const *values, long n, float x, float y, float w, float h, float lo, float hi,
+                      ImU32 top, ImU32 bottom)
+  {
+    if(!values || n < 2)
+    {
+      return;
+    }
+    auto *const list(ImGui::GetWindowDrawList());
+    auto const uv(ImGui::GetFontTexUvWhitePixel());
+    auto const span(hi - lo != 0.0f ? hi - lo : 1.0f);
+    auto const at([&](float const v) {
+      return y + h * (hi - std::clamp(v, std::min(lo, hi), std::max(lo, hi))) / span;
+    });
+    auto const base(y + h);
+    auto const step(w / static_cast<float>(n - 1));
+    list->PrimReserve(static_cast<int>(n - 1) * 6, static_cast<int>(n - 1) * 4);
+    for(long i{}; i + 1 < n; ++i)
+    {
+      auto const x0(x + step * static_cast<float>(i)), x1(x0 + step);
+      auto const index(static_cast<ImDrawIdx>(list->_VtxCurrentIdx));
+      list->PrimWriteIdx(index);
+      list->PrimWriteIdx(static_cast<ImDrawIdx>(index + 1));
+      list->PrimWriteIdx(static_cast<ImDrawIdx>(index + 2));
+      list->PrimWriteIdx(index);
+      list->PrimWriteIdx(static_cast<ImDrawIdx>(index + 2));
+      list->PrimWriteIdx(static_cast<ImDrawIdx>(index + 3));
+      list->PrimWriteVtx(ImVec2(x0, at(values[i])), uv, top);
+      list->PrimWriteVtx(ImVec2(x1, at(values[i + 1])), uv, top);
+      list->PrimWriteVtx(ImVec2(x1, base), uv, bottom);
+      list->PrimWriteVtx(ImVec2(x0, base), uv, bottom);
+    }
+  }
+
+  /* A rectangle going from one colour to another: left to right, or top to bottom. */
+  inline void gradient(obj const x1, obj const y1, obj const x2, obj const y2, obj const from, obj const to,
+                       obj const alpha, obj const vertical)
+  {
+    auto const a(color(from, num(alpha))), b(color(to, num(alpha)));
+    auto const down(jank::runtime::truthy(vertical));
+    ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
+      ImVec2(static_cast<float>(num(x1)), static_cast<float>(num(y1))),
+      ImVec2(static_cast<float>(num(x2)), static_cast<float>(num(y2))), a, down ? a : b, b, down ? b : a);
   }
 
   /* An array as a series in the rectangle: a point a column, from the lowest to the highest

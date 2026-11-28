@@ -195,9 +195,16 @@ the REPL's thread and drawn on the main one. Thousands of numbers go to the
 native side once (`c/array!`) and are drawn from there (`c/heat!`,
 `c/series!`).
 
+Numbers that change every frame (a scope, a spectrum) stay in C++ memory and
+are drawn from there in one call: `cards::polyline_of(values, n, x, y, w, h,
+lo, hi, color, thickness)` (a line, anti-aliased) and `cards::area_of(values,
+n, x, y, w, h, lo, hi, top, bottom)` (the area under it, `top` fading to
+`bottom`), with colours from `cards::color(rgb, alpha)`. A C++ helper of one's
+own calls them, or jank through its interop (`cpp/cards.polyline_of`).
+
 Drawing is in points from the window's top left: `text!`, `text-width`,
 `line!`, `curve!`, `rect!`, `frame!`, `circle!`, `ring!`, `triangle!`,
-`clip-begin!`, `clip-end!`, `cursor!`, `mouse-x`, `mouse-y`, `wheel`,
+`gradient!`, `clip-begin!`, `clip-end!`, `cursor!`, `mouse-x`, `mouse-y`, `wheel`,
 `inside?`, `clicked?` (a rectangle of the drawing that answers the mouse),
 `seconds`; `clip` and `wrap` cut text to a width; `fixed` and `said` print numbers; `build`, `height-of` and
 `draw-built!` place values and layouts inside a `:draw` function. A draw

@@ -62,6 +62,10 @@
 (defn circle! [x y radius color alpha] (cpp/cards.circle x y radius color alpha))
 (defn ring! [x y radius color thickness] (cpp/cards.ring x y radius color thickness))
 (defn triangle! [x1 y1 x2 y2 x3 y3 color alpha] (cpp/cards.triangle x1 y1 x2 y2 x3 y3 color alpha))
+(defn gradient!
+  "A rectangle going from colour `from` to `to`: left to right, or top to bottom when `vertical?`."
+  [x1 y1 x2 y2 from to alpha vertical?]
+  (cpp/cards.gradient x1 y1 x2 y2 from to alpha vertical?))
 (defn clip-begin! [x1 y1 x2 y2] (cpp/cards.clip_begin x1 y1 x2 y2))
 (defn clip-end! [] (cpp/cards.clip_end))
 (defn cursor!
