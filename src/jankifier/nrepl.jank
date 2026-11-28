@@ -640,7 +640,9 @@ namespace jankifier::nrepl
   (vec (mapcat (fn [resp]
                  (let [status (:status resp)
                        others (vec (remove #{:done "done"} status))]
-                   (if (and (not= others status)
+                   ;; Only a response with a done among its statuses is split: comparing
+                   ;; `others` with `status` took one without any status ([] isn't nil) for one.
+                   (if (and (some #{:done "done"} status)
                             (or (seq others) (seq (dissoc resp :status))))
                      [(if (seq others)
                         (assoc resp :status others)
