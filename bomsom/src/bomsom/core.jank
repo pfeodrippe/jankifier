@@ -332,8 +332,8 @@
 
 (defn record!
   "Records everything the server plays (its 2 outputs) into a WAV file of floats, from now
-  until stop-recording! or stop!. Says the wall-clock time it started on stderr, as
-  `[bomsom] recording <ms since 1970>`, to align it with a video."
+  until stop-recording! or stop!. The wall-clock time it started (ms since 1970) goes to
+  <path>.start and to stderr (`[bomsom] recording <ms>`), to align it with a video."
   [path]
   (stop-recording!)
   (send! "/b_alloc" record-buffer 65536 2)
@@ -341,7 +341,10 @@
   (send! "/b_write" record-buffer (str path) "wav" "float" 0 0 1)
   (load-synthdef! recorder)
   (send! "/s_new" "bomsom-recorder" recorder-node 1 0 "buf" record-buffer)
-  (cpp/bomsom.say (str "recording " (cpp/bomsom.now_ms) " " path))
+  (let [ms (cpp/bomsom.now_ms)]
+    ;; Its start also in <path>.start: an evaluation's stderr goes to the REPL, not to a log.
+    (spit (str path ".start") (str ms))
+    (cpp/bomsom.say (str "recording " ms " " path)))
   (reset! recording (str path)))
 
 (defn stop-recording!
