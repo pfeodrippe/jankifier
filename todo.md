@@ -2,8 +2,8 @@
 - [x] play mario
 - [x] clj-kondo
 - [ ] supercollider
-  - [ ] sys
-  - [ ] cpp play
+  - [x] sys
+  - [x] cpp play
   - [ ] jank interface (overtone-like?)
   - [ ] effects
 - [ ] autocompletion and stuff
