@@ -64,12 +64,15 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Install Leiningen
+      - name: Install Leiningen and babashka (jank-build runs each package's jank-build.bb with bb)
         run: |
           mkdir -p "$HOME/bin"
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o "$HOME/bin/lein"
           chmod +x "$HOME/bin/lein"
+          curl -fsSL https://raw.githubusercontent.com/babashka/babashka/v1.12.213/install -o /tmp/bb-install
+          bash /tmp/bb-install --dir "$HOME/bin" --version 1.12.213
           echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/bb" --version
 
       - name: Build supercollider-sys and run its example
         run: |
