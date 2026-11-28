@@ -66,6 +66,17 @@ started before that fails with "SynthDef not found". `replies!` returns the serv
 since the last call, each as `[address & args]`, and `log!` what it printed (its printouts also
 go to the process's stdout, in CIDER the `*nrepl-server*` buffer).
 
+### What's playing
+
+```clojure
+(b/controls 1000)          ; {"freq" 330.0, "amp" 0.1}: a synth's controls now, nil once it ended
+(b/synths)                 ; [{:id 1000 :synthdef "bomsom-sine" :controls {...}} ...]
+```
+
+Both ask the server for its node tree (`/g_queryTree` with the controls) and wait for it; the
+reply doesn't go to `replies!`. For a few controls, `/s_get` answers with an `/n_set`:
+`(b/send! "/s_get" 1000 "freq")`, then `(b/sync!)` and `(b/replies!)`.
+
 ### SynthDefs as data
 
 `b/sine` is the SynthDef `bomsom-sine` as jank data, which `b/synthdef-bytes` writes in

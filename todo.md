@@ -4,7 +4,8 @@
 - [ ] supercollider
   - [x] sys
   - [x] cpp play
-  - [ ] jank interface (overtone-like?)
+  - [x] viz
+  - [ ] jank api (overtone-like? guess lower-level)
   - [ ] effects
 - [ ] autocompletion and stuff
   - I start a nrepl from core-test, but unable to run tests or check autocompletion

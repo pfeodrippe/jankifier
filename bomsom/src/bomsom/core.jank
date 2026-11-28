@@ -233,6 +233,50 @@
             (recur (inc i) (conj! out (bit-and (cpp/cast cpp/int (cpp/aget p (cpp/cast cpp/long i))) 0xff)))
             (decode-osc (persistent! out))))))))
 
+;; The synths playing, from the server's node tree (/g_queryTree with their controls).
+
+(defn- read-node
+  "A node of /g_queryTree.reply's arguments at `i` (its id, its children's count, then a synth's
+  SynthDef and controls, or a group's children): [the synths in it, where the next node is]."
+  [args i]
+  (let [id (nth args i)
+        children (nth args (inc i))]
+    (if (= -1 children)
+      (let [synthdef (nth args (+ i 2))
+            n (nth args (+ i 3))
+            controls (into {}
+                           (for [j (range n)]
+                             [(str (nth args (+ i 4 (* 2 j)))) (nth args (+ i 5 (* 2 j)))]))]
+        [[{:id id :synthdef synthdef :controls controls}] (+ i 4 (* 2 n))])
+      (loop [j 0
+             at (+ i 2)
+             out []]
+        (if (< j children)
+          (let [[synths next] (read-node args at)]
+            (recur (inc j) next (into out synths)))
+          [out at])))))
+
+(defn tree-synths
+  "The synths in a /g_queryTree.reply asked with its controls (flag 1), in the tree's order:
+  [{:id :synthdef :controls {name value}}]. A control mapped to a bus has the bus as its value
+  (\"c1\", \"a2\")."
+  [reply]
+  (first (read-node (vec (drop 2 reply)) 0)))
+
+(defn synths
+  "The synths playing now, with their controls: [{:id :synthdef :controls {name value}}]. It asks
+  the server quietly (replies! doesn't see it) and waits for the answer."
+  []
+  (send-quiet! "/g_queryTree" 0 1)
+  (sync!)
+  (when-let [reply (latest-reply "/g_queryTree.reply")]
+    (tree-synths reply)))
+
+(defn controls
+  "A synth's controls now, {name value}, or nil when there's no such synth (it ended)."
+  [id]
+  (some (fn [s] (when (= id (:id s)) (:controls s))) (synths)))
+
 (defn log!
   "What the server printed since the last call (also printed on the process's stdout)."
   []

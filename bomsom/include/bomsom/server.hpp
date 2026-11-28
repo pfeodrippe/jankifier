@@ -78,7 +78,7 @@ namespace bomsom
   inline std::deque<std::string> log;
   inline int64_t last_synced{ -1 };
 
-  // A reply, kept as its OSC bytes for jank to decode; a /synced's id is read here, for
+  // A reply, kept as its OSC bytes for jank to decode; a /synced only has its id read, for
   // wait_synced. It comes on one of the server's threads.
   inline void on_reply(ReplyAddress *, char *data, int size)
   {
@@ -89,6 +89,9 @@ namespace bomsom
       auto const *u{ reinterpret_cast<unsigned char const *>(data + 12) };
       last_synced = static_cast<int32_t>((uint32_t{ u[0] } << 24) | (uint32_t{ u[1] } << 16)
                                          | (uint32_t{ u[2] } << 8) | uint32_t{ u[3] });
+      // sync! waited for it: not one of the replies for the REPL.
+      changed.notify_all();
+      return;
     }
     replies.emplace_back(data, data + size);
     if(replies.size() > 1000) { replies.pop_front(); }

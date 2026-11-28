@@ -13,6 +13,9 @@
   (:require [bomsom.core :as b]
             [bomsom.cards :as bc]))
 
+'(cider-jack-in-clj (list :project-dir "~/dev/jankifier/bomsom/example"
+                          :jack-in-cmd "bash run.sh"))
+
 (comment
   ;; The server, then the monitor: a synth at the end of the root group that measures what's
   ;; played, and the card pinned at the top of the window.
@@ -48,6 +51,10 @@
     (b/sleep! 180))
 
   (b/send! "/s_new" "sonic-pi-tb303" 2000 0 0 "note" 36 "sustain" 12 "amp" 0.5)
+
+  (select-keys (b/controls 2000) ["note" "cutoff" "res" "amp"])
+
+  (b/send! "/s_get" 2000 "note" "amp" "cutoff")
 
   (b/send! "/n_set" 2000 "note" 43)
 

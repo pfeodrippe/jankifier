@@ -62,40 +62,13 @@
 
 (defonce ^:private polled (atom {:at -10.0 :status nil :synths []}))
 
-(defn- read-node
-  "A node of /g_queryTree.reply's arguments at `i` (its id, its children's count, then a synth's
-  SynthDef and controls, or a group's children): [the synths in it, where the next node is]."
-  [args i]
-  (let [id (nth args i)
-        children (nth args (inc i))]
-    (if (= -1 children)
-      (let [synthdef (nth args (+ i 2))
-            n (nth args (+ i 3))
-            controls (into {}
-                           (for [j (range n)
-                                 :let [k (nth args (+ i 4 (* 2 j)))
-                                       v (nth args (+ i 5 (* 2 j)))]
-                                 :when (number? v)]
-                             [(str k) v]))]
-        [[{:id id :synthdef synthdef :controls controls}] (+ i 4 (* 2 n))])
-      (loop [j 0
-             at (+ i 2)
-             out []]
-        (if (< j children)
-          (let [[synths next] (read-node args at)]
-            (recur (inc j) next (into out synths)))
-          [out at])))))
-
-(defn- synths-of [tree]
-  (first (read-node (vec (drop 2 tree)) 0)))
-
 (defdraw poll! []
   (when (b/running?)
     (let [now (c/seconds)]
       (when (> (- now (:at @polled)) 0.25)
         (let [status (b/latest-reply "/status.reply")
               tree (b/latest-reply "/g_queryTree.reply")]
-          (swap! polled assoc :at now :status status :synths (if tree (synths-of tree) [])))
+          (swap! polled assoc :at now :status status :synths (if tree (b/tree-synths tree) [])))
         (b/send-quiet! "/status")
         (b/send-quiet! "/g_queryTree" 0 1)))))
 
@@ -246,7 +219,7 @@
     (c/text! x y c/muted c/small (str (count synths) (if (= 1 (count synths)) " synth" " synths") " playing"))
     (doseq [[row s] (map-indexed vector (take 5 synths))]
       (let [ry (+ y 22 (* row 30))
-            shown (take 3 (filter #(contains? (:controls s) %) main-controls))
+            shown (take 3 (filter #(number? (get (:controls s) %)) main-controls))
             slot (/ (- width 250.0) 3.0)]
         (c/rect! x (- ry 3) (+ x width) (+ ry 25) 0xf3ecd2 1.0 6.0)
         (c/text! (+ x 8) ry c/ink c/mono-bold (str (:id s)))
@@ -281,7 +254,7 @@
     (slider! -1 "freq" 1.0 0.0 0.0 1.0 0.0)
     (draw-synths 0.0 0.0 1.0)
     (fraction-of 0.0)
-    (synths-of ["/g_queryTree.reply" 1 0 0])
+    (b/tree-synths ["/g_queryTree.reply" 1 0 0])
     (b/latest-reply "/status.reply")
     (finally
       (reset! warming false)))
