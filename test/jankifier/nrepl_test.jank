@@ -2,7 +2,8 @@
   (:require [clojure.string :as string]
             [clojure.test :as test :refer [deftest is testing]]
             [jank.nrepl.server.handler :refer [handle-message]]
-            [jankifier.nrepl :as nrepl]))
+            [jankifier.nrepl :as nrepl]
+            [jankifier.repl]))
 
 (def this-ns (find-ns 'jankifier.nrepl-test))
 
@@ -285,9 +286,52 @@
   (let [path (str "/tmp/jankifier-streaming-test-" (rand-int 1000000) ".txt")]
     (spit path "abcé")
     (testing "a file's bytes from an offset on"
-      (is (= "abcé" (cpp/jankifier.nrepl.streaming.read_from path 0)))
-      (is (= "cé" (cpp/jankifier.nrepl.streaming.read_from path 2))))
+      (is (= "abcé" (cpp/jankifier.repl.read_from path 0)))
+      (is (= "cé" (cpp/jankifier.repl.read_from path 2))))
     (testing "a UTF-8 character cut at the end waits for the next read"
-      (is (= 5 (cpp/jankifier.nrepl.streaming.byte_size "abcé"))))
+      (is (= 5 (cpp/jankifier.repl.byte_size "abcé"))))
     (testing "a file that isn't there reads as nothing"
-      (is (= "" (cpp/jankifier.nrepl.streaming.read_from "/nope/nope" 0))))))
+      (is (= "" (cpp/jankifier.repl.read_from "/nope/nope" 0))))))
+
+(deftest evaluation-test
+  (testing "the output, then the value, then done"
+    (is (= [{:out "hi\n"} {:value "1" :ns "user"} {:status [:done]}]
+           (nrepl/evaluation {"ns" "user"} "(do (println \"hi\") 1)" "NO_SOURCE_PATH" false))))
+  ;; An error's responses from a result made here: a real one's text has its stack trace, and
+  ;; a process that printed one crashes when it exits (specs/RESULTS.md S1), the test run's too.
+  (testing "an error: its output, then the error as :err, then as :ex with done"
+    (is (= [{:out "a"} nil {:err "boom"} {:ex "boom" :status [:done :eval-error]}]
+           (jankifier.repl/responses {:ok false :out "a" :err "" :error "boom"} false))))
+  (testing "no code"
+    (is (= {:status [:no-code :done]} (nrepl/evaluation {} "" "NO_SOURCE_PATH" false))))
+  (testing "deep recursion, on the large stack"
+    (is (= "832040" (some :value (nrepl/evaluation {"ns" "user"} "(do (defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 30))" "NO_SOURCE_PATH" false))))))
+
+(deftest watch-evaluations-test
+  (let [seen (atom [])]
+    (nrepl/watch-evaluations! ::test (fn [ran] (swap! seen conj (select-keys ran [:code :ok :result]))))
+    (try
+      (nrepl/evaluation {"ns" "user"} "(+ 1 2)" "NO_SOURCE_PATH" true)
+      (nrepl/evaluation {"ns" "user"} "(+ 3 4)" "NO_SOURCE_PATH" false)
+      (testing "a watched evaluation is told, with its value itself"
+        (is (= [{:code "(+ 1 2)" :ok true :result 3}] @seen)))
+      (testing "a watcher that throws doesn't stop the answer"
+        (nrepl/watch-evaluations! ::bad (fn [_] (throw (ex-info "watcher" {}))))
+        (is (= "5" (:value (first (nrepl/evaluation {"ns" "user"} "(+ 2 3)" "NO_SOURCE_PATH" true))))))
+      (finally
+        (nrepl/watch-evaluations! ::test nil)
+        (nrepl/watch-evaluations! ::bad nil)))))
+
+(deftest streamed-evaluation-test
+  (let [sent (atom [])
+        resps (binding [nrepl/*send* (fn [resp] (swap! sent conj [(cpp/jankifier.nrepl.now_ms) resp]))]
+                (nrepl/evaluation {"ns" "user"}
+                                  "(do (doseq [n [1 2 3]] (println \"tick\" n) (cpp/jankifier.repl.sleep_ms 300)) :ok)"
+                                  "NO_SOURCE_PATH" false))
+        out (apply str (keep (comp :out second) @sent))]
+    (testing "the output is sent while it runs, a chunk a tick"
+      (is (= "tick 1\ntick 2\ntick 3\n" out))
+      (is (<= 3 (count (filter (comp :out second) @sent)))))
+    (testing "and isn't sent again with the value"
+      (is (= [{:value ":ok" :ns "user"} {:status [:done]}] resps)))))
+

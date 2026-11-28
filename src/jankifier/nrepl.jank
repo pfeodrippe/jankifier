@@ -16,8 +16,13 @@
   `eval` and `load-file` send their final `done` in a message of its own (see
   `done-apart`), without which CIDER never finishes an evaluation which
   throws, and `eval` lay out its value when it's asked to pretty print (CIDER's
-  C-c C-p; see `pretty-values`). An evaluation's output is sent as it's written,
-  not when it's over (see `streamed`), on connections made after it's loaded.
+  C-c C-p; see `pretty-values`).
+
+  `eval` and `load-file` run code as jankifier.repl does, on a large stack and
+  with its output captured safely when evaluations overlap. An evaluation's
+  output is sent as it's written, not when it's over (see `evaluation`), on
+  connections made after it's loaded. And a program can be told of each
+  evaluation (see `watch-evaluations!`), as the cards' window is to draw one.
 
   It's a development tool which uses jank's own nREPL server namespaces, so
   only require it in a REPL, e.g. right after connecting:
@@ -32,7 +37,8 @@
             ;; Loaded first so that the methods here replace or wrap them.
             [jank.nrepl.server.handler.describe]
             [jank.nrepl.server.handler.eval]
-            [jank.nrepl.server.handler.lookup]))
+            [jank.nrepl.server.handler.lookup]
+            [jankifier.repl :as repl]))
 
 (cpp/raw "
 #include <chrono>
@@ -622,12 +628,6 @@ namespace jankifier::nrepl
 (defonce jank-describe
   (get-method handle-message :describe))
 
-(defonce jank-eval
-  (get-method handle-message :eval))
-
-(defonce jank-load-file
-  (get-method handle-message :load-file))
-
 (defn done-apart
   "The responses `resps` (one or several, as handlers return them) with the
   final `done` in a message of its own, as Clojure's nREPL sends it.
@@ -653,108 +653,11 @@ namespace jankifier::nrepl
                (remove nil? (if (map? resps) [resps] resps)))))
 
 ;; Output as it's written. jank's server sends an evaluation's output when it's
-;; over: the evaluation points stdout and stderr at a file for its time (jank's
-;; with-capture, or cards.repl's), which is read back at the end, and the server
-;; writes a request's responses once its handler returns. Here a handler can send
-;; a message before it returns (`*send*`, bound by `handle-client`), and while an
-;; evaluation runs a thread sends what's been written to the file its stdout and
-;; stderr now go to.
-
-(cpp/raw "
-#ifndef JANKIFIER_NREPL_STREAMING
-#define JANKIFIER_NREPL_STREAMING
-#include <climits>
-#include <cstdio>
-#include <fcntl.h>
-#include <fstream>
-#include <iostream>
-#include <sys/stat.h>
-#include <thread>
-#include <unistd.h>
-
-namespace jankifier::nrepl::streaming
-{
-  inline jank::runtime::object_ref text(std::string const &s)
-  {
-    return jank::runtime::make_box<jank::runtime::obj::persistent_string>(
-      jtl::immutable_string{ s.data(), s.size() });
-  }
-
-  /* What's been written to stdout and stderr, written out to wherever they go now. */
-  inline void flush()
-  {
-    std::cout.flush();
-    std::cerr.flush();
-    std::fflush(stdout);
-    std::fflush(stderr);
-  }
-
-  inline void sleep_ms(int64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds{ ms }); }
-
-  /* The file the descriptor fd (1, 2) writes to, or \"\" when it's not a regular file (a
-   * terminal, a pipe). */
-  inline jank::runtime::object_ref path_of(int64_t fd)
-  {
-    std::string path;
-    char buf[PATH_MAX];
-#ifdef __APPLE__
-    if(fcntl(static_cast<int>(fd), F_GETPATH, buf) != -1)
-    {
-      path = buf;
-    }
-#else
-    auto const link{ \"/proc/self/fd/\" + std::to_string(fd) };
-    auto const n{ readlink(link.c_str(), buf, sizeof buf - 1) };
-    if(n > 0)
-    {
-      buf[n] = 0;
-      path = buf;
-    }
-#endif
-    struct stat st;
-    if(path.empty() || stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
-    {
-      path.clear();
-    }
-    return text(path);
-  }
-
-  /* The file's bytes from `offset` on, without a UTF-8 character cut at the end (it comes
-   * whole in the next read). */
-  inline jank::runtime::object_ref read_from(jank::runtime::object_ref const path, int64_t offset)
-  {
-    std::ifstream in{ std::string{ jank::runtime::to_string(path).c_str() }, std::ios::binary };
-    if(!in)
-    {
-      return text(\"\");
-    }
-    in.seekg(offset);
-    std::string s{ std::istreambuf_iterator<char>{ in }, std::istreambuf_iterator<char>{} };
-    /* A lead byte in the last 3 whose character needs more bytes than are left: cut there. */
-    for(size_t back{ 1 }; back <= 3 && back <= s.size(); ++back)
-    {
-      auto const c{ static_cast<unsigned char>(s[s.size() - back]) };
-      if((c & 0xC0) == 0x80)
-      {
-        continue;
-      }
-      size_t const needs{ c >= 0xF0 ? 4u : c >= 0xE0 ? 3u : c >= 0xC0 ? 2u : 1u };
-      if(needs > back)
-      {
-        s.resize(s.size() - back);
-      }
-      break;
-    }
-    return text(s);
-  }
-
-  inline int64_t byte_size(jank::runtime::object_ref const s)
-  {
-    return static_cast<int64_t>(jank::runtime::to_string(s).size());
-  }
-}
-#endif
-")
+;; over: the evaluation points stdout and stderr at a file for its time, which is
+;; read back at the end, and the server writes a request's responses once its
+;; handler returns. Here a handler can send a message before it returns (`*send*`,
+;; bound by `handle-client`), and while an evaluation runs a thread sends what's
+;; been written to its capture's files (jankifier.repl's).
 
 (def ^:dynamic *send*
   "While a request is handled: a function sending a message for it to its client
@@ -800,37 +703,26 @@ namespace jankifier::nrepl::streaming
               (fail req (.-message (cpp/* e))))))
         (recur (read-message client* remainder))))))
 
-(defn- capture-path
-  "The file the descriptor `fd` writes to now, when it's not the one it wrote to
-  before the evaluation (`before`): the evaluation's capture."
-  [fd before]
-  (let [now (cpp/jankifier.nrepl.streaming.path_of fd)]
-    (when (and (not= "" now) (not= before now))
-      now)))
-
 (defn- stream!
   "Every 100 ms until `done` holds true: stdout and stderr written out, and what's
-  new in the files they go to (the evaluation's captures) sent with `send` as
-  :out and :err, and added to the atoms in `sent`."
-  [send before sent done]
-  (loop [paths {}
-         offsets {1 0 2 0}]
-    (cpp/jankifier.nrepl.streaming.sleep_ms 100)
-    (cpp/jankifier.nrepl.streaming.flush)
-    (let [[paths offsets]
-          (reduce (fn [[paths offsets] [fd k]]
-                    (if-let [path (or (get paths fd) (capture-path fd (get before fd)))]
-                      (let [chunk (cpp/jankifier.nrepl.streaming.read_from path (get offsets fd))]
-                        (when-not (= "" chunk)
-                          (send {k chunk})
-                          (swap! (get sent fd) str chunk))
-                        [(assoc paths fd path)
-                         (update offsets fd + (cpp/jankifier.nrepl.streaming.byte_size chunk))])
-                      [paths offsets]))
-                  [paths offsets]
-                  [[1 :out] [2 :err]])]
+  new in the capture `id`'s files sent with `send` as :out and :err, and added to
+  the atoms in `sent` (by the same keys)."
+  [send id sent done]
+  (loop [offsets {:out 0 :err 0}]
+    (cpp/jankifier.repl.sleep_ms 100)
+    (cpp/jankifier.repl.flush)
+    (let [offsets (reduce (fn [offsets k]
+                            (if-let [path (repl/capture-path id k)]
+                              (let [chunk (cpp/jankifier.repl.read_from path (get offsets k))]
+                                (when-not (= "" chunk)
+                                  (send {k chunk})
+                                  (swap! (get sent k) str chunk))
+                                (update offsets k + (cpp/jankifier.repl.byte_size chunk)))
+                              offsets))
+                          offsets
+                          [:out :err])]
       (when-not @done
-        (recur paths offsets)))))
+        (recur offsets)))))
 
 (defn without-sent
   "The responses `resps` with the output already sent (`out`, `err`) taken from
@@ -853,24 +745,53 @@ namespace jankifier::nrepl::streaming
                        resp)))))
          vec)))
 
-(defn streamed
-  "The responses of the handler `f` (no arguments), whose output is sent as it's
-  written while it runs, when the request can send before it's answered
-  (`*send*`)."
-  [f]
-  (if-let [send *send*]
-    (let [before {1 (cpp/jankifier.nrepl.streaming.path_of 1)
-                  2 (cpp/jankifier.nrepl.streaming.path_of 2)}
-          sent {1 (atom "") 2 (atom "")}
+(defonce ^:private watchers (atom {}))
+
+(defn watch-evaluations!
+  "`f` called after each evaluation an nREPL client asks for (the eval op, not
+  load-file), with {:code :ns :ok :value :result :error :raised :out :err} (as
+  jankifier.repl/evaluate returns, with the code), under `key`; a nil `f` stops
+  calling the one there. What `f` throws is printed and the evaluation answered
+  all the same. Like Portal's nREPL middleware, which taps each evaluation."
+  [key f]
+  (if f
+    (swap! watchers assoc key f)
+    (swap! watchers dissoc key))
+  nil)
+
+(defn evaluation
+  "An eval or load-file request's responses, as jank's server sends them: `code`
+  evaluated by jankifier.repl, its output sent as it's written while it runs when
+  the request can send before it's answered (`*send*`), and the watchers told
+  when `watched?`."
+  [msg code file watched?]
+  (if (empty? code)
+    {:status [:no-code :done]}
+    (let [send *send*
+          inspect? (boolean (some-> (get msg "inspect") parse-boolean))
+          sent {:out (atom "") :err (atom "")}
           done (atom false)
-          streamer (future (stream! send before sent done))
-          resps (try
-                  (f)
-                  (finally
-                    (reset! done true)
-                    @streamer))]
-      (without-sent resps @(get sent 1) @(get sent 2)))
-    (f)))
+          streamer (atom nil)
+          started (when send
+                    (fn [id]
+                      (reset! streamer (future (stream! send id sent done)))))
+          ran (try
+                (repl/evaluate code (get msg "ns") file (get msg "line" 1) (get msg "column" 1)
+                               inspect? started)
+                (finally
+                  (reset! done true)
+                  (some-> @streamer deref)))]
+      (when watched?
+        (doseq [[k f] @watchers]
+          ;; (The message only: printing an exception's stack trace makes jank crash when
+          ;; the process exits, specs/RESULTS.md S1.)
+          (try
+            (f (assoc ran :code code))
+            (catch jank.runtime.object_ref e
+              (println "jankifier.nrepl: an evaluation's watcher" k "threw:" (or (ex-message e) "an exception")))
+            (catch std.exception e
+              (println "jankifier.nrepl: an evaluation's watcher" k "threw:" (.what e))))))
+      (without-sent (repl/responses ran inspect?) @(:out sent) @(:err sent)))))
 
 ;; Pretty printing, as nREPL's print middleware does it for an editor (CIDER's
 ;; C-c C-p): jank's server has none, and sends every value on one line.
@@ -938,9 +859,9 @@ namespace jankifier::nrepl::streaming
     (defmethod handle-message op-name [msg]
       (handler msg)))
   (defmethod handle-message :eval [msg]
-    (done-apart (pretty-values msg (streamed #(jank-eval msg)))))
+    (done-apart (pretty-values msg (evaluation msg (get msg "code" "") (get msg "file" "NO_SOURCE_PATH") true))))
   (defmethod handle-message :load-file [msg]
-    (done-apart (streamed #(jank-load-file msg))))
+    (done-apart (evaluation msg (get msg "file" "") (get msg "file-path" "NO_SOURCE_PATH") false)))
   ;; New connections are handled by this namespace's loop, which lets a handler send
   ;; before it returns (through its var: a reload of this namespace is used). Only in a
   ;; process serving a REPL, where jank's server is loaded.
