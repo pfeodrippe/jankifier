@@ -31,8 +31,12 @@ installed:
 cd example && ./run.sh                    # the window and its REPL; connect an editor
 ```
 
-To try a change to one of them before it's published, `lein install` it, and what depends on it
-after it: supercollider-sys (its submodules first: see its README), cards, bomsom, viz.
+`run.sh` starts the example with its `:local` profile: this repository's bomsom, bomsom-viz, cards
+and jankifier sources instead of the published jars (their native parts, SuperCollider and ImGui,
+still come from Clojars), so a change to them is there at the next start without publishing it.
+`BOMSOM_PUBLISHED=1 ./run.sh` uses only what's published, as someone else's project would. A
+change to supercollider-sys needs `lein install` there first (its submodules first: see its
+README).
 
 `lein run` here starts the server, plays an A for a second at amp 0.1 and stops (`lein run 0`
 is silent).

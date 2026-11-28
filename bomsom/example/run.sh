@@ -9,4 +9,9 @@ cd "$(dirname "$0")"
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}
 export CXXFLAGS=${CXXFLAGS:--std=c++17}
 rm -f .nrepl-port
-exec lein run --disable-sandbox -- "$@"
+# With the :local profile: the repository's own bomsom, cards and jankifier sources, not the
+# published ones (BOMSOM_PUBLISHED=1 for those).
+if [ -n "${BOMSOM_PUBLISHED:-}" ]; then
+  exec lein run --disable-sandbox -- "$@"
+fi
+exec lein with-profile +local run --disable-sandbox -- "$@"
