@@ -225,6 +225,31 @@
   []
   (load-synthdef! sine))
 
+(comment
+  (start!)
+  (load-sine!)
+
+  ;; Node 1000, at the head of group 0.
+  (send! "/s_new" "bomsom-sine" 1000 0 0 "freq" 330 "amp" 0.1)
+  (send! "/n_set" 1000 "freq" 440)
+  (send! "/n_set" 1000 "amp" 0.05)
+  (send! "/n_free" 1000)
+
+  ;; Sonic Pi's beep (MIDI notes); -1 lets the server choose the node's id.
+  (send! "/d_load" "/Users/pfeodrippe/dev/vybe/sonic-pi/etc/synthdefs/compiled/sonic-pi-beep.scsyndef")
+  (sync!)
+  (send! "/s_new" "sonic-pi-beep" -1 0 0 "note" 60 "release" 1)
+  (doseq [n [60 64 67 72]]
+    (send! "/s_new" "sonic-pi-beep" -1 0 0 "note" n "release" 0.5)
+    (cpp/bomsom.sleep_ms 250))
+
+  (send! "/status")
+  (sync!)
+  (replies!)
+  (log!)
+
+  (stop!))
+
 (defn -main
   "Starts the server, plays an A for a second and stops: a check that it all works here.
   `lein run` plays it at amp 0.1; `lein run 0` is silent."
