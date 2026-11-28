@@ -19,6 +19,13 @@
 ;; /sync.
 (defonce ^:private world-box (atom nil))
 (defonce ^:private sync-ids (atom 0))
+(defonce ^:private starts (atom 0))
+
+(defn starts-count
+  "How many times the server started in this process (to tell a running server from an earlier
+  one)."
+  []
+  @starts)
 
 ;; OSC 1.0 (https://opensoundcontrol.stanford.edu/spec-1_0.html), as vectors of byte values.
 
@@ -96,51 +103,89 @@
   (when-not (running?)
     (throw (ex-info "the server isn't running: (start!)" {}))))
 
+(declare record! stop-recording!)
+
 (defn start!
-  "Starts the server on the default audio device: 2 outputs, no inputs (so macOS doesn't ask
-  for the microphone), supercollider-sys's plugins. With a UDP port, OSC clients such as sclang
-  can talk to it too."
-  ([] (start! 0))
-  ([udp-port]
+  "Starts the server: 2 outputs, no inputs (so macOS doesn't ask for the microphone),
+  supercollider-sys's plugins. Options: :device, the output device's name (\"BlackHole 16ch\"),
+  else the default one; :udp-port, so that OSC clients such as sclang can talk to it too;
+  :record, a WAV file to record everything it plays into (record!). BOMSOM_DEVICE and
+  BOMSOM_RECORD in the environment do the same (for a video's take)."
+  ([] (start! {}))
+  ([{:keys [device udp-port record]}]
    (if (running?)
      :already-running
-     (let [options (cpp/WorldOptions.)
+     (let [device (or device (not-empty (cpp/bomsom.env "BOMSOM_DEVICE")))
+           record (or record (not-empty (cpp/bomsom.env "BOMSOM_RECORD")))
+           options (cpp/WorldOptions.)
            _ (cpp/= (.-mUGensPluginPath options) cpp/bomsom.plugin_dir)
            _ (cpp/= (.-mLoadGraphDefs options) 0)
            _ (cpp/= (.-mNumInputBusChannels options) 0)
            _ (cpp/= (.-mNumOutputBusChannels options) 2)
+           ;; Both names, as scsynth's -H sets them: SC's driver compares each device's name
+           ;; with the input device's too (strcmp of a null pointer without it). No inputs
+           ;; are opened either way.
+           _ (when device
+               (let [name (cpp/bomsom.out_device_name device)
+                     _ (cpp/= (.-mOutDeviceName options) name)
+                     _ (cpp/= (.-mInDeviceName options) name)]
+                 nil))
            _ (cpp/SetPrintFunc cpp/bomsom.on_print)
            w (cpp/World_New (cpp/& options))]
        (when (cpp/== w cpp/nullptr)
-         (throw (ex-info "the server didn't start: (log!) has what it printed" {})))
+         (throw (ex-info "the server didn't start: (log!) has what it printed" {:device device})))
        (reset! world-box (cpp/box w))
-       (when (and (pos? udp-port)
+       (swap! starts inc)
+       (when (and udp-port (pos? udp-port)
                   (not (cpp/World_OpenUDP w (.c_str (cpp/std.string "127.0.0.1")) udp-port)))
          (throw (ex-info "the UDP port didn't open" {:udp-port udp-port})))
+       (when record
+         (record! record))
        :started))))
 
 (defn stop! []
   (when (running?)
+    (stop-recording!)
     (cpp/World_Cleanup (cpp/unbox (:* World) @world-box) true)
     (reset! world-box nil))
   :stopped)
 
-(defn send-bytes!
-  "Sends an OSC packet's bytes to the server."
-  [bs]
+(defn server-box
+  "The server's World* in a box (cpp/unbox (:* World) it), nil when it isn't running: for
+  reading its memory (buses, buffers, counts), as the cards do."
+  []
+  @world-box)
+
+(defn- send-packet! [bs quiet?]
   (check-running!)
   (let [w (cpp/unbox (:* World) @world-box)
         v (#cpp (std.vector char))]
     (doseq [b bs]
       (.push_back v (cpp/cast cpp/int b)))
-    (or (cpp/World_SendPacket w (cpp/cast cpp/int (.size v)) (.data v) cpp/bomsom.on_reply)
+    (or (if quiet?
+          (cpp/World_SendPacket w (cpp/cast cpp/int (.size v)) (.data v) cpp/bomsom.on_quiet_reply)
+          (cpp/World_SendPacket w (cpp/cast cpp/int (.size v)) (.data v) cpp/bomsom.on_reply))
         (throw (ex-info "the server refused the packet" {})))
     nil))
+
+(defn send-bytes!
+  "Sends an OSC packet's bytes to the server."
+  [bs]
+  (send-packet! bs false))
 
 (defn send!
   "Sends one OSC message to the server: its address, then its arguments."
   [address & args]
   (send-bytes! (osc-message address args)))
+
+(defn send-quiet!
+  "Sends a message whose reply isn't the REPL's: only the newest reply of each address is kept,
+  for latest-reply, and replies! doesn't see it (a monitor's /status every quarter second)."
+  [address & args]
+  (send-packet! (osc-message address args) true))
+
+(defn sleep! [ms]
+  (cpp/bomsom.sleep_ms ms))
 
 (defn sync!
   "Waits until the server has done everything sent before (SynthDefs loaded, buffers read)."
@@ -168,6 +213,18 @@
     (if-let [bs (take-reply)]
       (recur (conj out (decode-osc bs)))
       out)))
+
+(defn latest-reply
+  "The newest reply with this address to a send-quiet!, as [address & args], or nil."
+  [address]
+  (let [v (#cpp (std.vector char))]
+    (when (cpp/bomsom.latest_reply address v)
+      (let [p (.data v)]
+        (loop [i 0
+               out (transient [])]
+          (if (< i (.size v))
+            (recur (inc i) (conj! out (bit-and (cpp/cast cpp/int (cpp/aget p (cpp/cast cpp/long i))) 0xff)))
+            (decode-osc (persistent! out))))))))
 
 (defn log!
   "What the server printed since the last call (also printed on the process's stdout)."
@@ -249,6 +306,48 @@
   (log!)
 
   (stop!))
+
+;; Recording what the server plays: a synth at the end of the root group writes the output
+;; buses to a WAV file as they're played (DiskOut, through a buffer).
+
+(def ^:private record-buffer 1022)
+(def ^:private recorder-node 1999998)
+(defonce ^:private recording (atom nil))
+
+(def recorder
+  "DiskOut.ar(buf, In.ar(0, 2))."
+  {:name "bomsom-recorder"
+   :constants [0.0]
+   :controls [["buf" 0.0]]
+   :ugens [{:name "Control" :rate :control :inputs [] :outputs [:control]}
+           {:name "In" :rate :audio :inputs [[:const 0]] :outputs [:audio :audio]}
+           {:name "DiskOut" :rate :audio :inputs [[0 0] [1 0] [1 1]] :outputs [:audio]}]})
+
+(defn record!
+  "Records everything the server plays (its 2 outputs) into a WAV file of floats, from now
+  until stop-recording! or stop!. Says the wall-clock time it started on stderr, as
+  `[bomsom] recording <ms since 1970>`, to align it with a video."
+  [path]
+  (stop-recording!)
+  (send! "/b_alloc" record-buffer 65536 2)
+  (sync!)
+  (send! "/b_write" record-buffer (str path) "wav" "float" 0 0 1)
+  (load-synthdef! recorder)
+  (send! "/s_new" "bomsom-recorder" recorder-node 1 0 "buf" record-buffer)
+  (cpp/bomsom.say (str "recording " (cpp/bomsom.now_ms) " " path))
+  (reset! recording (str path)))
+
+(defn stop-recording!
+  "Ends the recording, closing its file."
+  []
+  (when-let [path @recording]
+    (reset! recording nil)
+    (when (running?)
+      (send! "/n_free" recorder-node)
+      (send! "/b_close" record-buffer)
+      (send! "/b_free" record-buffer)
+      (sync!))
+    path))
 
 (defn -main
   "Starts the server, plays an A for a second and stops: a check that it all works here.
