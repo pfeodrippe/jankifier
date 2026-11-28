@@ -16,7 +16,8 @@
   `eval` and `load-file` send their final `done` in a message of its own (see
   `done-apart`), without which CIDER never finishes an evaluation which
   throws, and `eval` lay out its value when it's asked to pretty print (CIDER's
-  C-c C-p; see `pretty-values`).
+  C-c C-p; see `pretty-values`). An evaluation's output is sent as it's written,
+  not when it's over (see `streamed`), on connections made after it's loaded.
 
   It's a development tool which uses jank's own nREPL server namespaces, so
   only require it in a REPL, e.g. right after connecting:
@@ -651,6 +652,226 @@ namespace jankifier::nrepl
                      [resp])))
                (remove nil? (if (map? resps) [resps] resps)))))
 
+;; Output as it's written. jank's server sends an evaluation's output when it's
+;; over: the evaluation points stdout and stderr at a file for its time (jank's
+;; with-capture, or cards.repl's), which is read back at the end, and the server
+;; writes a request's responses once its handler returns. Here a handler can send
+;; a message before it returns (`*send*`, bound by `handle-client`), and while an
+;; evaluation runs a thread sends what's been written to the file its stdout and
+;; stderr now go to.
+
+(cpp/raw "
+#ifndef JANKIFIER_NREPL_STREAMING
+#define JANKIFIER_NREPL_STREAMING
+#include <climits>
+#include <cstdio>
+#include <fcntl.h>
+#include <fstream>
+#include <iostream>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
+
+namespace jankifier::nrepl::streaming
+{
+  inline jank::runtime::object_ref text(std::string const &s)
+  {
+    return jank::runtime::make_box<jank::runtime::obj::persistent_string>(
+      jtl::immutable_string{ s.data(), s.size() });
+  }
+
+  /* What's been written to stdout and stderr, written out to wherever they go now. */
+  inline void flush()
+  {
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(stdout);
+    std::fflush(stderr);
+  }
+
+  inline void sleep_ms(int64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds{ ms }); }
+
+  /* The file the descriptor fd (1, 2) writes to, or \"\" when it's not a regular file (a
+   * terminal, a pipe). */
+  inline jank::runtime::object_ref path_of(int64_t fd)
+  {
+    std::string path;
+    char buf[PATH_MAX];
+#ifdef __APPLE__
+    if(fcntl(static_cast<int>(fd), F_GETPATH, buf) != -1)
+    {
+      path = buf;
+    }
+#else
+    auto const link{ \"/proc/self/fd/\" + std::to_string(fd) };
+    auto const n{ readlink(link.c_str(), buf, sizeof buf - 1) };
+    if(n > 0)
+    {
+      buf[n] = 0;
+      path = buf;
+    }
+#endif
+    struct stat st;
+    if(path.empty() || stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+    {
+      path.clear();
+    }
+    return text(path);
+  }
+
+  /* The file's bytes from `offset` on, without a UTF-8 character cut at the end (it comes
+   * whole in the next read). */
+  inline jank::runtime::object_ref read_from(jank::runtime::object_ref const path, int64_t offset)
+  {
+    std::ifstream in{ std::string{ jank::runtime::to_string(path).c_str() }, std::ios::binary };
+    if(!in)
+    {
+      return text(\"\");
+    }
+    in.seekg(offset);
+    std::string s{ std::istreambuf_iterator<char>{ in }, std::istreambuf_iterator<char>{} };
+    /* A lead byte in the last 3 whose character needs more bytes than are left: cut there. */
+    for(size_t back{ 1 }; back <= 3 && back <= s.size(); ++back)
+    {
+      auto const c{ static_cast<unsigned char>(s[s.size() - back]) };
+      if((c & 0xC0) == 0x80)
+      {
+        continue;
+      }
+      size_t const needs{ c >= 0xF0 ? 4u : c >= 0xE0 ? 3u : c >= 0xC0 ? 2u : 1u };
+      if(needs > back)
+      {
+        s.resize(s.size() - back);
+      }
+      break;
+    }
+    return text(s);
+  }
+
+  inline int64_t byte_size(jank::runtime::object_ref const s)
+  {
+    return static_cast<int64_t>(jank::runtime::to_string(s).size());
+  }
+}
+#endif
+")
+
+(def ^:dynamic *send*
+  "While a request is handled: a function sending a message for it to its client
+  at once, before the handler returns. Bound by `handle-client`."
+  nil)
+
+(defn- server-fn
+  "A function of jank's nREPL server (jank.nrepl.server.core), which is loaded
+  in a process serving a REPL. Looked up, not required: loading the server in a
+  process that isn't one (the tests) is avoided."
+  [name]
+  @(resolve (symbol "jank.nrepl.server.core" name)))
+
+(defn handle-client
+  "jank's nREPL connection loop (jank.nrepl.server.core/handle-client), with
+  `*send*` bound while each request is handled. Requests on a connection are
+  handled one at a time, so a handler's messages and its responses don't
+  interleave."
+  [client*]
+  (let [connected? (server-fn "connected?")
+        read-message (server-fn "read-message")
+        write-message (server-fn "write-message")
+        response-for (server-fn "response-for")
+        responses-for (server-fn "responses-for")
+        fail (fn [req what]
+               (write-message client* (response-for req {:status [:error :done]
+                                                         :err (str "An exception was thrown from the nREPL handler:" what)})))]
+    (loop [[req remainder] nil]
+      (when (connected? client*)
+        (when req
+          (try
+            (let [send (fn [resp]
+                         (write-message client* (response-for req resp)))
+                  resps (binding [*send* send]
+                          (doall (responses-for req (handle-message req))))]
+              (doseq [resp resps]
+                (write-message client* resp)))
+            (catch std.exception e
+              (fail req (.what e)))
+            (catch jank.runtime.object_ref e
+              (fail req (pr-str e)))
+            (catch jank.error_ref e
+              (fail req (.-message (cpp/* e))))))
+        (recur (read-message client* remainder))))))
+
+(defn- capture-path
+  "The file the descriptor `fd` writes to now, when it's not the one it wrote to
+  before the evaluation (`before`): the evaluation's capture."
+  [fd before]
+  (let [now (cpp/jankifier.nrepl.streaming.path_of fd)]
+    (when (and (not= "" now) (not= before now))
+      now)))
+
+(defn- stream!
+  "Every 100 ms until `done` holds true: stdout and stderr written out, and what's
+  new in the files they go to (the evaluation's captures) sent with `send` as
+  :out and :err, and added to the atoms in `sent`."
+  [send before sent done]
+  (loop [paths {}
+         offsets {1 0 2 0}]
+    (cpp/jankifier.nrepl.streaming.sleep_ms 100)
+    (cpp/jankifier.nrepl.streaming.flush)
+    (let [[paths offsets]
+          (reduce (fn [[paths offsets] [fd k]]
+                    (if-let [path (or (get paths fd) (capture-path fd (get before fd)))]
+                      (let [chunk (cpp/jankifier.nrepl.streaming.read_from path (get offsets fd))]
+                        (when-not (= "" chunk)
+                          (send {k chunk})
+                          (swap! (get sent fd) str chunk))
+                        [(assoc paths fd path)
+                         (update offsets fd + (cpp/jankifier.nrepl.streaming.byte_size chunk))])
+                      [paths offsets]))
+                  [paths offsets]
+                  [[1 :out] [2 :err]])]
+      (when-not @done
+        (recur paths offsets)))))
+
+(defn without-sent
+  "The responses `resps` with the output already sent (`out`, `err`) taken from
+  the start of their :out and :err, and a response left with nothing dropped."
+  [resps out err]
+  (let [cut (fn [s sent]
+              (if (and (string? s) (seq sent) (string/starts-with? s sent))
+                (subs s (count sent))
+                s))]
+    (->> (if (map? resps) [resps] resps)
+         (keep (fn [resp]
+                 (when resp
+                   (let [resp (-> resp (update :out cut out) (update :err cut err))
+                         resp (cond-> resp
+                                (= "" (:out resp)) (dissoc :out)
+                                (= "" (:err resp)) (dissoc :err)
+                                (nil? (:out resp)) (dissoc :out)
+                                (nil? (:err resp)) (dissoc :err))]
+                     (when (seq resp)
+                       resp)))))
+         vec)))
+
+(defn streamed
+  "The responses of the handler `f` (no arguments), whose output is sent as it's
+  written while it runs, when the request can send before it's answered
+  (`*send*`)."
+  [f]
+  (if-let [send *send*]
+    (let [before {1 (cpp/jankifier.nrepl.streaming.path_of 1)
+                  2 (cpp/jankifier.nrepl.streaming.path_of 2)}
+          sent {1 (atom "") 2 (atom "")}
+          done (atom false)
+          streamer (future (stream! send before sent done))
+          resps (try
+                  (f)
+                  (finally
+                    (reset! done true)
+                    @streamer))]
+      (without-sent resps @(get sent 1) @(get sent 2)))
+    (f)))
+
 ;; Pretty printing, as nREPL's print middleware does it for an editor (CIDER's
 ;; C-c C-p): jank's server has none, and sends every value on one line.
 
@@ -717,9 +938,14 @@ namespace jankifier::nrepl
     (defmethod handle-message op-name [msg]
       (handler msg)))
   (defmethod handle-message :eval [msg]
-    (done-apart (pretty-values msg (jank-eval msg))))
+    (done-apart (pretty-values msg (streamed #(jank-eval msg)))))
   (defmethod handle-message :load-file [msg]
-    (done-apart (jank-load-file msg)))
+    (done-apart (streamed #(jank-load-file msg))))
+  ;; New connections are handled by this namespace's loop, which lets a handler send
+  ;; before it returns (through its var: a reload of this namespace is used). Only in a
+  ;; process serving a REPL, where jank's server is loaded.
+  (when-let [v (resolve 'jank.nrepl.server.core/handle-client)]
+    (alter-var-root v (constantly (fn [client*] (handle-client client*)))))
   (defmethod handle-message :describe [msg]
     (-> (jank-describe msg)
         (update :ops merge (zipmap (op-names) (repeat {})))

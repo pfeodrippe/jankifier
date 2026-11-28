@@ -268,3 +268,26 @@
     (testing "what doesn't read back as it printed stays as it is"
       (is (= "#object[foo]" (nrepl/pretty-printed "#object[foo]" 5)))
       (is (= "42" (nrepl/pretty-printed "42" 1))))))
+
+;; Output as it's written.
+
+(deftest without-sent-test
+  (testing "what was sent is cut from the start of :out and :err"
+    (is (= [{:out "c\n"} {:value "1"} {:status [:done]}]
+           (nrepl/without-sent [{:out "a\nb\nc\n"} {:value "1"} {:status [:done]}] "a\nb\n" ""))))
+  (testing "a response left with nothing is dropped, nils too"
+    (is (= [{:value "1"} {:status [:done]}]
+           (nrepl/without-sent [{:out "a\n"} nil {:err "e"} {:value "1"} {:status [:done]}] "a\n" "e"))))
+  (testing "output that doesn't start with what was sent stays whole"
+    (is (= [{:out "x"}] (nrepl/without-sent {:out "x"} "a" "")))))
+
+(deftest streaming-files-test
+  (let [path (str "/tmp/jankifier-streaming-test-" (rand-int 1000000) ".txt")]
+    (spit path "abcé")
+    (testing "a file's bytes from an offset on"
+      (is (= "abcé" (cpp/jankifier.nrepl.streaming.read_from path 0)))
+      (is (= "cé" (cpp/jankifier.nrepl.streaming.read_from path 2))))
+    (testing "a UTF-8 character cut at the end waits for the next read"
+      (is (= 5 (cpp/jankifier.nrepl.streaming.byte_size "abcé"))))
+    (testing "a file that isn't there reads as nothing"
+      (is (= "" (cpp/jankifier.nrepl.streaming.read_from "/nope/nope" 0))))))
